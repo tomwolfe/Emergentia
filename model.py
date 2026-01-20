@@ -85,16 +85,7 @@ class HierarchicalPooling(nn.Module):
             'pruning': pruning_loss
         }
         
-        # Weighted aggregation: [N, 1, in_channels] * [N, n_super_nodes, 1]
-        x_expanded = x.unsqueeze(1) * s.unsqueeze(2) 
-        
-        # Scatter to batch: [Batch_Size, n_super_nodes, in_channels]
-        out = scatter(x_expanded, batch, dim=0, reduce='sum')
-        
-        # If pos was provided, we already computed mu (weighted mean position)
-        # mu: [batch_size, n_super_nodes, 2]
-        # Since we are assuming single batch or handling batching via scatter, we need to be careful.
-        # Let's re-calculate mu using scatter to handle batching correctly if pos is present.
+        # Calculate mu (weighted mean position) for super-nodes
         super_node_mu = None
         if pos is not None:
             # s: [N, K], pos: [N, 2]
@@ -104,6 +95,24 @@ class HierarchicalPooling(nn.Module):
             sum_s = scatter(s, batch, dim=0, reduce='sum').unsqueeze(-1) + 1e-9 # [B, K, 1]
             super_node_mu = sum_s_pos / sum_s
 
+        # 4. Spatial Separation Loss (Centroids should be spread out)
+        if super_node_mu is not None:
+            # mu: [B, K, 2]. We want to maximize distance between centroids.
+            # Using a simple repulsive potential: 1 / (dist^2 + eps)
+            mu = super_node_mu
+            dist_sq = torch.sum((mu.unsqueeze(1) - mu.unsqueeze(2))**2, dim=-1) # [B, K, K]
+            # Mask out diagonal
+            mask = torch.eye(self.n_super_nodes, device=x.device).unsqueeze(0)
+            repulsion = 1.0 / (dist_sq + 1.0)
+            separation_loss = (repulsion * (1 - mask)).sum() / (self.n_super_nodes * (self.n_super_nodes - 1) + 1e-9)
+            assign_losses['separation'] = separation_loss
+
+        # Weighted aggregation: [N, 1, in_channels] * [N, n_super_nodes, 1]
+        x_expanded = x.unsqueeze(1) * s.unsqueeze(2) 
+        
+        # Scatter to batch: [Batch_Size, n_super_nodes, in_channels]
+        out = scatter(x_expanded, batch, dim=0, reduce='sum')
+        
         return out, s, assign_losses, super_node_mu
 
 class GNNEncoder(nn.Module):
@@ -229,8 +238,8 @@ class DiscoveryEngineModel(nn.Module):
         self.hamiltonian = hamiltonian
 
         # Learnable loss log-variances for automatic loss balancing
-        # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning
-        self.log_vars = nn.Parameter(torch.zeros(8)) 
+        # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning, 8: sep, 9: conn
+        self.log_vars = nn.Parameter(torch.zeros(10)) 
         
     def encode(self, x, edge_index, batch, tau=1.0):
         return self.encoder(x, edge_index, batch, tau=tau)
@@ -247,6 +256,16 @@ class DiscoveryEngineModel(nn.Module):
         # Scaling identity by N/K ensures that if all nodes are perfectly split, loss is 0
         identity = torch.eye(k, device=s.device).mul_(n_nodes / k)
         return torch.mean((dots - identity)**2)
+    
+    def get_connectivity_loss(self, s, edge_index):
+        """
+        Encourages nodes assigned to the same super-node to be connected.
+        Minimizes (s_i - s_j)^2 for connected nodes (i, j).
+        """
+        row, col = edge_index
+        s_i = s[row]
+        s_j = s[col]
+        return torch.mean((s_i - s_j)**2)
     
     def forward_dynamics(self, z0, t):
         # z0: [batch_size, n_super_nodes, latent_dim]

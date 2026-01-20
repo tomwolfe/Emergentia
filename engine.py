@@ -124,15 +124,23 @@ class Trainer:
     def train_step(self, data_list, dt, epoch=0, teacher_forcing_ratio=0.5):
         self.optimizer.zero_grad()
         seq_len = len(data_list)
-        tau = max(0.1, 1.0 - epoch / 2000.0)
+        
+        # Refined Tau schedule: faster initial cooling, then stable
+        if epoch < 1000:
+            tau = max(0.1, 1.0 - epoch / 1000.0)
+        else:
+            tau = 0.1
         
         batch_0 = Batch.from_data_list([data_list[0]]).to(self.device)
         z_curr, s_0, losses_0, mu_0 = self.model.encode(batch_0.x, batch_0.edge_index, batch_0.batch, tau=tau)
         
         loss_rec = 0
         loss_cons = 0
+        # Basic assignment losses
         loss_assign = losses_0['entropy'] + losses_0['diversity'] + 0.1 * losses_0['spatial']
         loss_pruning = losses_0['pruning']
+        loss_sep = losses_0.get('separation', torch.tensor(0.0, device=self.device))
+        loss_conn = self.model.get_connectivity_loss(s_0, batch_0.edge_index)
         loss_ortho = self.model.get_ortho_loss(s_0)
         
         s_prev = s_0
@@ -152,8 +160,6 @@ class Trainer:
         z_preds = torch.stack(z_preds)
         loss_l2 = torch.mean(z_preds**2)
         
-        # Latent Velocity Regularization (LVR) for smoothness
-        # Penalize large changes in latent velocity (acceleration)
         z_vel = (z_preds[1:] - z_preds[:-1]) / dt
         loss_lvr = torch.mean((z_vel[1:] - z_vel[:-1])**2) if len(z_vel) > 1 else torch.tensor(0.0, device=self.device)
         
@@ -161,7 +167,6 @@ class Trainer:
         mu_stability = 0
         loss_align = 0
         
-        # Prepare normalization stats for mu_t alignment
         mu_mean = torch.tensor(self.stats['pos_mean'], device=self.device, dtype=torch.float32) if self.stats else 0
         mu_std = torch.tensor(self.stats['pos_std'], device=self.device, dtype=torch.float32) if self.stats else 1
 
@@ -169,59 +174,54 @@ class Trainer:
             batch_t = Batch.from_data_list([data_list[t]]).to(self.device)
             z_t_target, s_t, losses_t, mu_t = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch, tau=tau)
             recon_t = self.model.decode(z_preds[t], s_t, batch_t.batch)
+            
             loss_rec += self.criterion(recon_t, batch_t.x)
             loss_assign += losses_t['entropy'] + losses_t['diversity'] + 0.1 * losses_t['spatial']
             loss_pruning += losses_t['pruning']
+            loss_sep += losses_t.get('separation', torch.tensor(0.0, device=self.device))
+            loss_conn += self.model.get_connectivity_loss(s_t, batch_t.edge_index)
             loss_ortho += self.model.get_ortho_loss(s_t)
             
-            # Latent Coordinate Alignment Loss
-            # Align latent q (first 2 dims) with normalized physical CoM (mu_t)
             mu_t_norm = (mu_t - mu_mean) / mu_std
-            # We only align if latent_dim >= 2. 
-            # In Hamiltonian mode, latent_dim // 2 is q. 
             d_sub = self.model.encoder.latent_dim // 2 if self.model.hamiltonian else 2
             d_align = min(d_sub, 2) 
             loss_align += self.criterion(z_preds[t, :, :, :d_align], mu_t_norm[:, :, :d_align])
 
             if t > 0:
                 s_diff = self.criterion(s_t, s_prev)
-                # Physical grounding: CoM should not jump between frames
-                # Normalize mu_diff by box size or expected movement if possible, 
-                # here we just use the criterion.
                 mu_diff = self.criterion(mu_t, mu_prev)
-                
-                loss_assign += s_diff + 2.0 * mu_diff # Stronger penalty for CoM jumps
+                loss_assign += s_diff + 5.0 * mu_diff # Increased CoM stability weight
                 loss_cons += self.criterion(z_preds[t], z_t_target)
                 s_stability += s_diff.item()
                 mu_stability += mu_diff.item()
             s_prev = s_t
             mu_prev = mu_t
         
+        # Normalization over sequence
         loss_rec /= seq_len
         loss_cons /= (seq_len - 1)
         loss_assign /= seq_len
         loss_pruning /= seq_len
         loss_ortho /= seq_len
         loss_align /= seq_len
+        loss_sep /= seq_len
+        loss_conn /= seq_len
         s_stability /= (seq_len - 1)
         
-        # Track assignment stability over epochs
         self.s_history.append(s_stability)
         if len(self.s_history) > self.max_s_history:
             self.s_history.pop(0)
         avg_s_stability = np.mean(self.s_history)
         
-        # Track components before weighting
         self.loss_tracker.update({
             'rec_raw': loss_rec, 'cons_raw': loss_cons, 
             'assign_raw': loss_assign, 'ortho_raw': loss_ortho, 
             'l2_raw': loss_l2, 'lvr_raw': loss_lvr,
             'mu_stability': mu_stability, 'align_raw': loss_align,
-            'pruning_raw': loss_pruning
+            'pruning_raw': loss_pruning, 'sep_raw': loss_sep, 'conn_raw': loss_conn
         })
 
-        # Adaptive Loss Weighting (Kendall et al.)
-        # log_vars: 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning
+        # Adaptive Loss Weighting (log_vars size 10)
         lvars = self.model.log_vars
         
         weighted_rec = torch.exp(-lvars[0]) * loss_rec + lvars[0]
@@ -232,23 +232,22 @@ class Trainer:
         weighted_lvr = torch.exp(-lvars[5]) * loss_lvr + lvars[5]
         weighted_align = torch.exp(-lvars[6]) * loss_align + lvars[6]
         weighted_pruning = torch.exp(-lvars[7]) * loss_pruning + lvars[7]
+        weighted_sep = torch.exp(-lvars[8]) * loss_sep + lvars[8]
+        weighted_conn = torch.exp(-lvars[9]) * loss_conn + lvars[9]
 
-        # Phased Training with Stability Check
-        # Phase 1: Assignment & Reconstruction (finding objects)
-        # Phase 2: Dynamics (learning how they move) - only if S is stable
-        stability_threshold = 0.05
-        is_stable = avg_s_stability < stability_threshold or epoch > 1500
+        stability_threshold = 0.02 # More stringent
+        is_stable = avg_s_stability < stability_threshold or epoch > 2000
         
-        if epoch < 500 or not is_stable:
-            # Focus on discovery and alignment
-            loss = weighted_rec + weighted_assign + weighted_ortho + weighted_align + weighted_pruning
-        elif epoch < 1500:
-            # Gradual introduction of dynamics
-            anneal = (epoch - 500) / 1000.0
-            loss = weighted_rec + weighted_assign + weighted_ortho + weighted_align + weighted_pruning + anneal * (weighted_cons + weighted_l2 + weighted_lvr)
+        # Core discovery losses
+        discovery_loss = weighted_rec + weighted_assign + weighted_ortho + weighted_align + weighted_pruning + weighted_sep + weighted_conn
+
+        if epoch < 600 or not is_stable:
+            loss = discovery_loss
+        elif epoch < 1800:
+            anneal = (epoch - 600) / 1200.0
+            loss = discovery_loss + anneal * (weighted_cons + weighted_l2 + weighted_lvr)
         else:
-            # Full training
-            loss = weighted_rec + weighted_cons + weighted_assign + weighted_ortho + weighted_l2 + weighted_lvr + weighted_align + weighted_pruning
+            loss = discovery_loss + weighted_cons + weighted_l2 + weighted_lvr
         
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)

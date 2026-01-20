@@ -1,7 +1,8 @@
 from gplearn.genetic import SymbolicRegressor
 import numpy as np
 import torch
-from sklearn.linear_model import LassoCV
+from sklearn.linear_model import LassoCV, RidgeCV
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.feature_selection import SelectFromModel
 from joblib import Parallel, delayed
 
@@ -61,7 +62,8 @@ class FeatureTransformer:
         for i in range(n_raw):
             poly_features.append((X[:, i:i+1]**2))
             # Cross-terms (limited to reduce explosion)
-            for j in range(i + 1, min(i + 5, n_raw)): 
+            # Only do cross-terms for adjacent super-nodes or dimensions to keep space manageable
+            for j in range(i + 1, min(i + 4, n_raw)): 
                 poly_features.append(X[:, i:i+1] * X[:, j:j+1])
         
         return np.hstack(poly_features)
@@ -76,7 +78,7 @@ class FeatureTransformer:
         return Y_norm * self.target_std + self.target_mean
 
 class SymbolicDistiller:
-    def __init__(self, populations=2000, generations=40, stopping_criteria=0.001, max_features=15):
+    def __init__(self, populations=2000, generations=40, stopping_criteria=0.001, max_features=12):
         self.max_pop = populations
         self.max_gen = generations
         self.stopping_criteria = stopping_criteria
@@ -92,13 +94,12 @@ class SymbolicDistiller:
                                  function_set=('add', 'sub', 'mul', 'div', 'neg', 'sin', 'cos'),
                                  p_crossover=0.7, p_subtree_mutation=0.1,
                                  p_hoist_mutation=0.05, p_point_mutation=0.1,
-                                 max_samples=0.7, verbose=0, 
+                                 max_samples=0.8, verbose=0, 
                                  parsimony_coefficient=parsimony,
                                  n_jobs=-1,
                                  random_state=42)
 
     def get_complexity(self, program):
-        # A simple complexity measure: number of nodes in the expression tree
         return program.length_
 
     def validate_stability(self, program, X_start, dt=0.01, steps=20):
@@ -113,82 +114,91 @@ class SymbolicDistiller:
                 return False
         return True
 
+    def _select_features(self, X, y):
+        """
+        Hybrid selection: Random Forest for non-linear importance 
+        + Lasso for linear/sparse consistency.
+        """
+        # 1. Non-linear importance (Random Forest)
+        rf = RandomForestRegressor(n_estimators=100, random_state=42)
+        rf.fit(X, y)
+        rf_importance = rf.feature_importances_
+        
+        # 2. Linear importance (LassoCV)
+        lasso = LassoCV(cv=5, max_iter=3000)
+        lasso.fit(X, y)
+        lasso_importance = np.abs(lasso.coef_)
+        
+        # Combined score (geometric mean to find features that are important in both)
+        combined_score = np.sqrt(rf_importance * (lasso_importance + 1e-9))
+        
+        # Select top-k
+        threshold = np.sort(combined_score)[-self.max_features] if len(combined_score) > self.max_features else 0
+        mask = combined_score >= threshold
+        return mask
+
     def _distill_single_target(self, i, X_norm, Y_norm, targets_shape_1, latent_states_shape_1):
         print(f"Selecting features for target_{i} (Input dim: {X_norm.shape[1]})...")
-        selector = SelectFromModel(LassoCV(cv=5, max_iter=2000), max_features=self.max_features)
-        selector.fit(X_norm, Y_norm[:, i])
-        mask = selector.get_support()
-        X_selected = X_norm[:, mask]
         
-        print(f"  -> Target_{i}: Reduced features to {X_selected.shape[1]} informative variables.")
+        # Pruning: Remove features with near-zero variance
+        variances = np.var(X_norm, axis=0)
+        valid_indices = np.where(variances > 1e-6)[0]
+        X_pruned = X_norm[:, valid_indices]
+        
+        mask_pruned = self._select_features(X_pruned, Y_norm[:, i])
+        
+        # Reconstruct full mask
+        full_mask = np.zeros(X_norm.shape[1], dtype=bool)
+        full_mask[valid_indices[mask_pruned]] = True
+        
+        X_selected = X_norm[:, full_mask]
+        print(f"  -> Target_{i}: Reduced to {X_selected.shape[1]} informative variables.")
 
         if X_selected.shape[1] == 0:
-            X_selected = np.zeros((X_norm.shape[0], 1))
-            mask = np.zeros(X_norm.shape[1], dtype=bool)
-            print(f"  -> Target_{i}: No features selected, using dummy zero feature.")
+            return np.zeros((X_norm.shape[0], 1)), full_mask
 
-        # Pareto-optimal search: try different parsimony levels
-        parsimony_levels = [0.001, 0.01, 0.05, 0.1]
-        best_prog = None
-        best_score = -np.inf
-        
-        coarse_pop = self.max_pop // 4
+        # Pareto search
+        parsimony_levels = [0.0005, 0.005, 0.05]
+        candidates = []
+        coarse_pop = self.max_pop // 2
         coarse_gen = self.max_gen // 2
         
-        print(f"Distilling target_{i} (Pareto search over parsimony)...")
-        
-        # We want to find the program that maximizes (Score - lambda * Complexity)
-        # but a better heuristic is finding the 'knee' where score stops improving significantly
-        candidates = []
         for p_coeff in parsimony_levels:
             est = self._get_regressor(coarse_pop, coarse_gen, parsimony=p_coeff)
             est.fit(X_selected, Y_norm[:, i])
             prog = est._program
             score = est.score(X_selected, Y_norm[:, i])
-            complexity = self.get_complexity(prog)
             
             is_stable = True
             if targets_shape_1 == latent_states_shape_1:
                 is_stable = self.validate_stability(prog, X_selected[0])
             
             if is_stable:
-                candidates.append({'prog': prog, 'score': score, 'complexity': complexity})
+                candidates.append({'prog': prog, 'score': score, 'complexity': self.get_complexity(prog), 'p': p_coeff})
         
         if not candidates:
-            # Fallback to no parsimony if all failed stability
-            est = self._get_regressor(coarse_pop, coarse_gen, parsimony=0.0)
+            # Absolute fallback
+            est = self._get_regressor(coarse_pop, coarse_gen, parsimony=0.001)
             est.fit(X_selected, Y_norm[:, i])
-            return est._program, mask
+            return est._program, full_mask
 
-        # Select the 'Pareto' winner: Highest score among those with 'reasonable' complexity
-        # Or simply use a weighted metric
         candidates.sort(key=lambda x: x['score'], reverse=True)
-        # Simple heuristic: pick the highest score that isn't too complex, or the best overall if it's stable
         best_candidate = candidates[0]
         for c in candidates[1:]:
-            # If a slightly worse score (within 5%) comes with > 30% reduction in complexity, prefer it
-            if (best_candidate['score'] - c['score']) < 0.05 * best_candidate['score'] and \
-               c['complexity'] < 0.7 * best_candidate['complexity']:
+            # Prefer simpler models if score difference is small (<3%)
+            if (best_candidate['score'] - c['score']) < 0.03 and c['complexity'] < 0.6 * best_candidate['complexity']:
                 best_candidate = c
                 
-        print(f"  -> Selected best parsimony candidate for target_{i}: Score={best_candidate['score']:.3f}, Complexity={best_candidate['complexity']}")
-        
-        # Fine search escalation if score is still low
-        if best_candidate['score'] < 0.8 and self.max_pop > coarse_pop:
-            print(f"  -> Escalating to Fine search for target_{i} (pop={self.max_pop}, gen={self.max_gen})...")
-            # Use the 'best' parsimony found in coarse search
-            best_p = parsimony_levels[candidates.index(best_candidate)] if best_candidate in candidates else 0.01
-            est = self._get_regressor(self.max_pop, self.max_gen, parsimony=best_p)
+        # Escalation
+        if best_candidate['score'] < 0.85 and self.max_pop > coarse_pop:
+            print(f"  -> Escalating distillation for target_{i}...")
+            est = self._get_regressor(self.max_pop, self.max_gen, parsimony=best_candidate['p'])
             est.fit(X_selected, Y_norm[:, i])
-            return est._program, mask
+            return est._program, full_mask
             
-        return best_candidate['prog'], mask
+        return best_candidate['prog'], full_mask
 
     def distill(self, latent_states, targets, n_super_nodes, latent_dim):
-        """
-        Generic distillation of targets from latent states.
-        targets can be dZ/dt or Hamiltonian H.
-        """
         self.transformer = FeatureTransformer(n_super_nodes, latent_dim)
         self.transformer.fit(latent_states, targets)
         
@@ -196,8 +206,7 @@ class SymbolicDistiller:
         X_norm = self.transformer.normalize_x(X_poly)
         Y_norm = self.transformer.normalize_y(targets)
 
-        # Parallelize over targets to improve scalability
-        results = Parallel(n_jobs=min(targets.shape[1], 4))(
+        results = Parallel(n_jobs=-1)(
             delayed(self._distill_single_target)(i, X_norm, Y_norm, targets.shape[1], latent_states.shape[1])
             for i in range(targets.shape[1])
         )
@@ -208,63 +217,40 @@ class SymbolicDistiller:
         return equations
 
     def evaluate_on_test(self, programs, latent_states, targets):
-        """
-        Evaluates discovered programs on a hold-out set to detect overfitting.
-        """
-        if self.transformer is None:
-            return None
-            
+        if self.transformer is None: return None
         X_poly = self.transformer.transform(latent_states)
         X_norm = self.transformer.normalize_x(X_poly)
         Y_norm = self.transformer.normalize_y(targets)
         
         scores = []
         for i, (prog, mask) in enumerate(zip(programs, self.feature_masks)):
-            X_selected = X_norm[:, mask]
-            y_pred = prog.execute(X_selected)
-            # R^2 score
-            u = ((Y_norm[:, i] - y_pred) ** 2).sum()
-            v = ((Y_norm[:, i] - Y_norm[:, i].mean()) ** 2).sum()
-            score = 1 - u / (v + 1e-9)
+            y_pred = prog.execute(X_norm[:, mask])
+            score = 1 - ((Y_norm[:, i] - y_pred)**2).sum() / (((Y_norm[:, i] - Y_norm[:, i].mean())**2).sum() + 1e-9)
             scores.append(score)
-            
         return np.array(scores)
 
 def extract_latent_data(model, dataset, dt, include_hamiltonian=False):
     model.eval()
-    latent_states = []
-    latent_derivs = []
-    hamiltonians = []
-    times = []
-
+    latent_states, latent_derivs, hamiltonians, times = [], [], [], []
     device = next(model.parameters()).device
 
     with torch.no_grad():
         for i in range(len(dataset)):
             data = dataset[i]
-            x = data.x.to(device)
-            edge_index = data.edge_index.to(device)
-            current_t = i * dt
-
-            z, s, _, _ = model.encode(x, edge_index, torch.zeros(x.size(0), dtype=torch.long, device=device))
+            x, edge_index = data.x.to(device), data.edge_index.to(device)
+            z, _, _, _ = model.encode(x, edge_index, torch.zeros(x.size(0), dtype=torch.long, device=device))
             z_flat = z.view(1, -1)
             
-            # Latent Derivative
             ode_device = next(model.ode_func.parameters()).device
-            t_ode = torch.tensor([current_t], dtype=torch.float32, device=ode_device)
-            z_for_ode = z_flat.to(ode_device)
-            dz = model.ode_func(t_ode, z_for_ode)
+            dz = model.ode_func(torch.tensor([i*dt], device=ode_device), z_flat.to(ode_device))
             
             latent_states.append(z_flat[0].cpu().numpy())
             latent_derivs.append(dz[0].cpu().numpy())
-            times.append(current_t)
-
+            times.append(i*dt)
             if include_hamiltonian and hasattr(model.ode_func, 'H_net'):
-                H = model.ode_func.H_net(z_for_ode)
-                hamiltonians.append(H[0].cpu().numpy())
+                hamiltonians.append(model.ode_func.H_net(z_flat.to(ode_device))[0].cpu().numpy())
 
     res = [np.array(latent_states), np.array(latent_derivs), np.array(times)]
-    if include_hamiltonian:
-        res.append(np.array(hamiltonians))
+    if include_hamiltonian: res.append(np.array(hamiltonians))
     return tuple(res)
 

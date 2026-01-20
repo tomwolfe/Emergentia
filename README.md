@@ -29,11 +29,11 @@ By minimizing an entropy loss and an orthogonality constraint on $S$, the model 
 
 ## 🛠 Features
 
-- **Hierarchical Soft-Assignment**: Uses a learned assignment matrix to preserve spatial locality during coarse-graining.
-- **Continuous Dynamics**: Employs `torchdiffeq` to model latent states as an autonomous ODE system.
+- **Hierarchical Soft-Assignment**: Uses a learned assignment matrix with **Spatial Separation** and **Graph Connectivity** constraints to discover contiguous physical objects.
+- **Hamiltonian Latent ODE**: Enforces symplectic constraints ($\dot{q} = \partial H/\partial p, \dot{p} = -\partial H/\partial q$) in the latent space for energy-conserving meso-scale dynamics.
+- **Hybrid Symbolic Distillation**: Combines **RandomForest-Lasso** feature selection with **Genetic Programming** and **SINDy-inspired pruning** for scalable and robust law discovery.
+- **Adaptive Phased Training**: Employs a learnable multi-objective loss balancing scheme and a cooling schedule for Gumbel-Softmax temperature ($\tau$).
 - **PBC Support**: Advanced neighbor discovery using KDTree tiling to handle periodic boundaries in simulation.
-- **Pareto-Optimal Training**: Configurable loss weights to balance reconstruction, latent consistency, and state-assignment stability.
-- **Two-Stage Distillation**: Implements a "Coarse-to-Fine" symbolic search to optimize computational resources.
 
 
 
