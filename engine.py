@@ -106,18 +106,19 @@ class LossTracker:
         return self.history
 
 class Trainer:
-    def __init__(self, model, lr=5e-4, device='cpu', stats=None):
+    def __init__(self, model, lr=5e-4, device='cpu', stats=None, align_anneal_epochs=1000):
         self.model = model.to(device)
         self.device = device
         self.loss_tracker = LossTracker()
         self.s_history = []
         self.max_s_history = 10
+        self.align_anneal_epochs = align_anneal_epochs
         
         # MPS fix: torchdiffeq has issues with MPS (float64 defaults and stability)
         if str(device) == 'mps':
             self.model.ode_func.to('cpu')
             
-        self.optimizer = optim.Adam(model.parameters(), lr=lr)
+        self.optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
         self.criterion = torch.nn.MSELoss().to(device)
         self.stats = stats
         
@@ -130,12 +131,18 @@ class Trainer:
         tau = max(0.1, np.exp(-epoch / 500.0))
         
         # 2. Decaying Teacher Forcing Ratio
-        # High at start to help learn mapping, then decays to encourage long-term stability
         tf_ratio = max(0.0, 0.8 * (1.0 - epoch / (0.75 * max_epochs)))
+        
+        # 3. Alignment Annealing: Reduce hand-holding over time
+        align_weight = max(0.0, 1.0 - epoch / self.align_anneal_epochs)
         
         batch_0 = Batch.from_data_list([data_list[0]]).to(self.device)
         z_curr, s_0, losses_0, mu_0 = self.model.encode(batch_0.x, batch_0.edge_index, batch_0.batch, tau=tau)
         
+        # Robustness: Initial NaN check
+        if torch.isnan(z_curr).any():
+            z_curr = torch.nan_to_num(z_curr)
+
         loss_rec = 0
         loss_cons = 0
         # Basic assignment losses
@@ -153,11 +160,12 @@ class Trainer:
             # Apply teacher forcing based on ratio
             if np.random.random() < tf_ratio:
                 batch_t_prev = Batch.from_data_list([data_list[t-1]]).to(self.device)
-                z_curr, _, _, _ = self.model.encode(batch_t_prev.x, batch_t_prev.edge_index, batch_t_prev.batch, tau=tau)
+                z_curr_forced, _, _, _ = self.model.encode(batch_t_prev.x, batch_t_prev.edge_index, batch_t_prev.batch, tau=tau)
+                z_curr = torch.nan_to_num(z_curr_forced)
             
             t_span = torch.tensor([0, dt], device=self.device, dtype=torch.float32)
             z_next_seq = self.model.forward_dynamics(z_curr, t_span)
-            z_curr = z_next_seq[1]
+            z_curr = torch.nan_to_num(z_next_seq[1]) # Defensive
             z_preds.append(z_curr)
             
         z_preds = torch.stack(z_preds)
@@ -176,7 +184,17 @@ class Trainer:
         for t in range(seq_len):
             batch_t = Batch.from_data_list([data_list[t]]).to(self.device)
             z_t_target, s_t, losses_t, mu_t = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch, tau=tau)
-            recon_t = self.model.decode(z_preds[t], s_t, batch_t.batch)
+            
+            # Robustness: Check for NaNs from encoder
+            if torch.isnan(z_t_target).any():
+                z_t_target = torch.nan_to_num(z_t_target)
+            
+            if epoch < 400 or not is_stable:
+                z_for_recon = z_t_target
+            else:
+                z_for_recon = z_preds[t]
+                
+            recon_t = self.model.decode(z_for_recon, s_t, batch_t.batch)
             
             loss_rec += self.criterion(recon_t, batch_t.x)
             loss_assign += losses_t['entropy'] + losses_t['diversity'] + 0.1 * losses_t['spatial']
@@ -185,10 +203,10 @@ class Trainer:
             loss_conn += self.model.get_connectivity_loss(s_t, batch_t.edge_index)
             loss_ortho += self.model.get_ortho_loss(s_t)
             
-            mu_t_norm = (mu_t - mu_mean) / mu_std
+            mu_t_norm = (mu_t - mu_mean) / (mu_std + 1e-6)
             d_sub = self.model.encoder.latent_dim // 2 if self.model.hamiltonian else 2
             d_align = min(d_sub, 2) 
-            loss_align += self.criterion(z_preds[t, :, :, :d_align], mu_t_norm[:, :, :d_align])
+            loss_align += align_weight * self.criterion(z_preds[t, :, :, :d_align], mu_t_norm[:, :, :d_align])
 
             if t > 0:
                 s_diff = self.criterion(s_t, s_prev)
@@ -224,8 +242,8 @@ class Trainer:
             'pruning_raw': loss_pruning, 'sep_raw': loss_sep, 'conn_raw': loss_conn
         })
 
-        # Adaptive Loss Weighting
-        lvars = self.model.log_vars
+        # Adaptive Loss Weighting with clamping for stability
+        lvars = torch.clamp(self.model.log_vars, min=-2.0, max=10.0)
         
         weighted_rec = torch.exp(-lvars[0]) * loss_rec + lvars[0]
         weighted_cons = torch.exp(-lvars[1]) * loss_cons + lvars[1]
@@ -238,31 +256,21 @@ class Trainer:
         weighted_sep = torch.exp(-lvars[8]) * loss_sep + lvars[8]
         weighted_conn = torch.exp(-lvars[9]) * loss_conn + lvars[9]
 
-        # REFINED CURRICULUM
-        # Phase 0: Discovery (Clustering + Mapping) - Until stable or enough epochs
-        # Phase 1: Dynamics (Consistency + L2) - Gradual introduction
-        
-        stability_threshold = 0.015 
-        is_stable = avg_s_stability < stability_threshold or epoch > 1500
-        
         discovery_loss = weighted_rec + weighted_assign + weighted_ortho + weighted_align + weighted_pruning + weighted_sep + weighted_conn
 
         if epoch < 400 or not is_stable:
-            # Focus on discovery only
             loss = discovery_loss
         else:
-            # Anneal dynamics losses over 1000 epochs after discovery is stable
             anneal_start = 400
             anneal_duration = 1000.0
             anneal = min(1.0, (epoch - anneal_start) / anneal_duration)
             loss = discovery_loss + anneal * (weighted_cons + weighted_l2 + weighted_lvr)
         
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
-        self.optimizer.step()
-        
-        return loss.item(), loss_rec.item(), loss_cons.item()
-        
+        if not torch.isfinite(loss):
+            print(f"Warning: Non-finite loss encountered at epoch {epoch}. Skipping step.")
+            self.optimizer.zero_grad()
+            return 0.0, 0.0, 0.0
+
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
         self.optimizer.step()

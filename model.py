@@ -40,6 +40,16 @@ class HierarchicalPooling(nn.Module):
 
     def forward(self, x, batch, pos=None, tau=1.0, hard=False):
         # x: [N, in_channels], batch: [N], pos: [N, 2]
+        if x.size(0) == 0:
+            # Fallback for empty input
+            return torch.zeros((0, self.n_super_nodes, x.size(1)), device=x.device), \
+                   torch.zeros((0, self.n_super_nodes), device=x.device), \
+                   {'entropy': torch.tensor(0.0, device=x.device), 
+                    'diversity': torch.tensor(0.0, device=x.device),
+                    'spatial': torch.tensor(0.0, device=x.device),
+                    'pruning': torch.tensor(0.0, device=x.device)}, \
+                   None
+
         # Compute assignment logits with scaling for sharpness
         logits = self.assign_mlp(x) * self.scaling
         
@@ -53,9 +63,7 @@ class HierarchicalPooling(nn.Module):
         avg_s = s.mean(dim=0)
         diversity_loss = torch.sum(avg_s * torch.log(avg_s + 1e-9))
         
-        # 2b. Pruning/Sparsity Loss: Encourage some super-nodes to have near-zero average assignment
-        # This allows the model to 'turn off' unused super-nodes.
-        # We use an L1-style penalty on the average assignment of each super-node.
+        # 2b. Pruning/Sparsity Loss
         pruning_loss = torch.mean(torch.abs(avg_s))
 
         # 3. Spatial Locality Penalty
@@ -261,19 +269,16 @@ class DiscoveryEngineModel(nn.Module):
     
     def get_ortho_loss(self, s):
         # s: [N, n_super_nodes]
-        # Encourage orthogonality between super-node assignment vectors
-        # s^T * s should be close to identity (weighted by number of particles)
+        if s.size(0) == 0:
+            return torch.tensor(0.0, device=s.device)
         n_nodes, k = s.shape
         dots = torch.matmul(s.t(), s)
-        # Scaling identity by N/K ensures that if all nodes are perfectly split, loss is 0
         identity = torch.eye(k, device=s.device).mul_(n_nodes / k)
         return torch.mean((dots - identity)**2)
     
     def get_connectivity_loss(self, s, edge_index):
-        """
-        Encourages nodes assigned to the same super-node to be connected.
-        Minimizes (s_i - s_j)^2 for connected nodes (i, j).
-        """
+        if edge_index.numel() == 0:
+            return torch.tensor(0.0, device=s.device)
         row, col = edge_index
         s_i = s[row]
         s_j = s[col]

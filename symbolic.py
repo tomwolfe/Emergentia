@@ -173,10 +173,26 @@ class SymbolicDistiller:
         if X_selected.shape[1] == 0:
             return np.zeros((X_norm.shape[0], 1)), full_mask
 
+        # SCALABILITY OPTIMIZATION: Linear Baseline Check
+        # If a simple linear model (Ridge) can explain most of the variance, 
+        # we skip the expensive GP step. 80/20 Pareto optimal.
+        ridge = RidgeCV(alphas=[1e-3, 1e-2, 1e-1, 1, 10])
+        ridge.fit(X_selected, Y_norm[:, i])
+        linear_score = ridge.score(X_selected, Y_norm[:, i])
+        
+        if linear_score > 0.98:
+            print(f"  -> Target_{i}: High linear fit (R2={linear_score:.3f}). Using linear model.")
+            # We still wrap it in a pseudo-program object for compatibility
+            class LinearProgram:
+                def __init__(self, model): self.model = model; self.length_ = 1
+                def execute(self, X): return self.model.predict(X)
+            return LinearProgram(ridge), full_mask
+
         # Pareto search
         parsimony_levels = [0.0005, 0.005, 0.05]
         candidates = []
-        coarse_pop = self.max_pop // 2
+        # Adaptive population based on target complexity
+        coarse_pop = self.max_pop // 2 if linear_score < 0.5 else self.max_pop // 4
         coarse_gen = self.max_gen // 2
         
         for p_coeff in parsimony_levels:
