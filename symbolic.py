@@ -16,7 +16,7 @@ class SymbolicDistiller:
                                  p_crossover=0.7, p_subtree_mutation=0.1, # Shifted towards crossover
                                  p_hoist_mutation=0.05, p_point_mutation=0.1,
                                  max_samples=0.9, verbose=0, 
-                                 parsimony_coefficient=0.05, # Increased to avoid trivial/overfit laws
+                                 parsimony_coefficient=0.1, # Increased to force simpler, physics-like laws
                                  random_state=42)
 
     def distill(self, latent_states, latent_derivs, times=None):
@@ -29,12 +29,22 @@ class SymbolicDistiller:
         X = (latent_states - z_mean) / z_std
         Y = (latent_derivs - dz_mean) / dz_std
 
+        # Feature Engineering: Add squared terms and interaction terms
+        n_features = X.shape[1]
+        features = [X]
+        for i in range(n_features):
+            features.append((X[:, i]**2).reshape(-1, 1))
+            for j in range(i + 1, n_features):
+                features.append((X[:, i] * X[:, j]).reshape(-1, 1))
+        
+        X_poly = np.hstack(features)
+
         if times is not None:
             # Normalize times as well if provided
             t_mean = times.mean()
             t_std = times.std() + 1e-6
             t_norm = (times - t_mean) / t_std
-            X = np.column_stack([X, t_norm])
+            X_poly = np.column_stack([X_poly, t_norm])
 
         equations = []
         for i in range(latent_derivs.shape[1]):
@@ -44,17 +54,16 @@ class SymbolicDistiller:
             
             print(f"Distilling dz_{i}/dt (Coarse search: pop={coarse_pop}, gen={coarse_gen})...")
             est = self._get_regressor(coarse_pop, coarse_gen)
-            est.fit(X, Y[:, i])
+            est.fit(X_poly, Y[:, i])
             
             # Check fit quality (if possible via gplearn score)
-            # score is R^2. If > 0.95, it's likely good enough.
-            if est.score(X, Y[:, i]) > 0.95:
-                print(f"  -> Good fit found in coarse search (R^2={est.score(X, Y[:, i]):.3f})")
+            if est.score(X_poly, Y[:, i]) > 0.95:
+                print(f"  -> Good fit found in coarse search (R^2={est.score(X_poly, Y[:, i]):.3f})")
                 equations.append(est._program)
             else:
-                print(f"  -> Low fit (R^2={est.score(X, Y[:, i]):.3f}). Escalating to Fine search...")
+                print(f"  -> Low fit (R^2={est.score(X_poly, Y[:, i]):.3f}). Escalating to Fine search...")
                 est = self._get_regressor(self.max_pop, self.max_gen)
-                est.fit(X, Y[:, i])
+                est.fit(X_poly, Y[:, i])
                 equations.append(est._program)
                 
         return equations, (z_mean, z_std, dz_mean, dz_std)

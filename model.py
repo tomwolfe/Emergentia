@@ -10,6 +10,8 @@ class GNNLayer(MessagePassing):
         self.mlp = nn.Sequential(
             nn.Linear(2 * in_channels, out_channels),
             nn.ReLU(),
+            nn.Linear(out_channels, out_channels),
+            nn.ReLU(),
             nn.Linear(out_channels, out_channels)
         )
 
@@ -24,6 +26,7 @@ class HierarchicalPooling(nn.Module):
     """
     Learned soft-assignment pooling to preserve spatial locality 
     by aggregating nodes into a fixed number of super-nodes.
+    Uses Gumbel-Softmax for 'harder' assignments.
     """
     def __init__(self, in_channels, n_super_nodes):
         super(HierarchicalPooling, self).__init__()
@@ -34,16 +37,18 @@ class HierarchicalPooling(nn.Module):
             nn.Linear(in_channels, n_super_nodes)
         )
 
-    def forward(self, x, batch):
+    def forward(self, x, batch, tau=1.0, hard=False):
         # x: [N, in_channels], batch: [N]
-        # Compute soft-assignment matrix s: [N, n_super_nodes]
-        s = torch.softmax(self.assign_mlp(x), dim=-1)
+        # Compute assignment logits
+        logits = self.assign_mlp(x)
+        
+        # Use Gumbel-Softmax for harder, more distinct assignments
+        s = nn.functional.gumbel_softmax(logits, tau=tau, hard=hard, dim=-1)
         
         # 1. Sharpness Loss (Minimize entropy per node)
         entropy = -torch.mean(torch.sum(s * torch.log(s + 1e-9), dim=1))
         
         # 2. Diversity Loss (Maximize entropy of average assignment)
-        # We add the negative entropy of the average assignment to the loss
         avg_s = s.mean(dim=0)
         diversity_loss = torch.sum(avg_s * torch.log(avg_s + 1e-9))
         
@@ -76,12 +81,12 @@ class GNNEncoder(nn.Module):
             nn.Linear(hidden_dim, latent_dim)
         )
 
-    def forward(self, x, edge_index, batch):
+    def forward(self, x, edge_index, batch, tau=1.0):
         x = self.ln1(torch.relu(self.gnn1(x, edge_index)))
         x = self.ln2(torch.relu(self.gnn2(x, edge_index)))
         
         # Pool to K super-nodes preserving spatial features
-        pooled, s, entropy = self.pooling(x, batch) # [batch_size, n_super_nodes, hidden_dim], [N, n_super_nodes]
+        pooled, s, entropy = self.pooling(x, batch, tau=tau) # [batch_size, n_super_nodes, hidden_dim], [N, n_super_nodes]
         latent = self.output_layer(pooled) # [batch_size, n_super_nodes, latent_dim]
         return latent, s, entropy
 
@@ -142,11 +147,19 @@ class DiscoveryEngineModel(nn.Module):
         self.ode_func = LatentODEFunc(latent_dim, n_super_nodes, hidden_dim)
         self.decoder = GNNDecoder(latent_dim, hidden_dim, node_features)
         
-    def encode(self, x, edge_index, batch):
-        return self.encoder(x, edge_index, batch)
+    def encode(self, x, edge_index, batch, tau=1.0):
+        return self.encoder(x, edge_index, batch, tau=tau)
     
     def decode(self, z, s, batch):
         return self.decoder(z, s, batch)
+    
+    def get_ortho_loss(self, s):
+        # s: [N, n_super_nodes]
+        # Encourage orthogonality between super-node assignment vectors
+        # s^T * s should be close to identity (weighted by number of particles)
+        dots = torch.matmul(s.t(), s)
+        identity = torch.eye(s.size(1), device=s.device) * (s.size(0) / s.size(1))
+        return torch.mean((dots - identity)**2)
     
     def forward_dynamics(self, z0, t):
         # z0: [batch_size, n_super_nodes, latent_dim]

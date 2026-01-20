@@ -22,11 +22,11 @@ def main():
 
     # 1. Setup Parameters
     n_particles = 16
-    n_super_nodes = 2
+    n_super_nodes = 4
     latent_dim = 2 
     steps = 800
     epochs = 5000
-    seq_len = 12
+    seq_len = 20
     dynamic_radius = 1.5 
     box_size = None # Disable PBC for stability
     
@@ -50,10 +50,11 @@ def main():
         'rec': 100.0,     
         'cons': 50.0,    
         'assign': 10.0,   
+        'ortho': 5.0,     
         'latent_l2': 0.1 
     }
     
-    trainer = Trainer(model, lr=8e-4, device=device, 
+    trainer = Trainer(model, lr=5e-4, device=device, 
                       loss_weights=loss_weights, stats=stats)
     
     # Increased patience and adjusted factor
@@ -96,10 +97,19 @@ def main():
     def symbolic_dynamics(z, t):
         # Normalize input
         z_norm = (z - z_mean) / z_std
-        z_input = z_norm.reshape(1, -1)
+        X = z_norm.reshape(1, -1)
+        
+        # Feature Engineering for integration
+        n_features = X.shape[1]
+        features = [X]
+        for i in range(n_features):
+            features.append((X[:, i]**2).reshape(-1, 1))
+            for j in range(i + 1, n_features):
+                features.append((X[:, i] * X[:, j]).reshape(-1, 1))
+        X_poly = np.hstack(features)
         
         # Execute symbolic equations
-        dzdt_norm = np.array([eq.execute(z_input)[0] for eq in equations])
+        dzdt_norm = np.array([eq.execute(X_poly)[0] for eq in equations])
         
         # Denormalize output
         dzdt = dzdt_norm * dz_std + dz_mean

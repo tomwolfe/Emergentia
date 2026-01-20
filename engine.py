@@ -50,7 +50,7 @@ def prepare_data(pos, vel, radius=1.1, stats=None, device='cpu'):
     return dataset, stats
 
 class Trainer:
-    def __init__(self, model, lr=1e-3, device='cpu', loss_weights=None, stats=None):
+    def __init__(self, model, lr=5e-4, device='cpu', loss_weights=None, stats=None):
         self.model = model.to(device)
         self.device = device
         
@@ -69,70 +69,96 @@ class Trainer:
             'rec': 1.0,
             'cons': 5.0,
             'assign': 2.0,
+            'ortho': 1.0,      # New orthogonality loss weight
             'latent_l2': 0.01  # Added to prevent state drift
         }
         if loss_weights is not None:
             default_weights.update(loss_weights)
         self.weights = default_weights
 
-    def train_step(self, data_list, dt, epoch=0):
+    def train_step(self, data_list, dt, epoch=0, teacher_forcing_ratio=0.5):
         self.optimizer.zero_grad()
         seq_len = len(data_list)
         
+        # Anneal Gumbel-Softmax temperature
+        tau = max(0.1, 1.0 - epoch / 2000.0)
+        
+        # Warmup phase: Only Reconstruction loss for the first 100 epochs
+        is_warmup = epoch < 100
+        
         # 1. Encode the first state
         batch_0 = Batch.from_data_list([data_list[0]]).to(self.device)
-        z_0, s_0, entropy_0 = self.model.encode(batch_0.x, batch_0.edge_index, batch_0.batch)
-        
-        # 2. Predict full sequence in latent space
-        t_span = torch.linspace(0, (seq_len - 1) * dt, seq_len, device=self.device, dtype=torch.float32)
-        z_pred_seq = self.model.forward_dynamics(z_0, t_span)
+        z_curr, s_0, entropy_0 = self.model.encode(batch_0.x, batch_0.edge_index, batch_0.batch, tau=tau)
         
         loss_rec = 0
         loss_cons = 0
-        loss_assign = entropy_0 # Initialize with first entropy
-        loss_l2 = torch.mean(z_pred_seq**2) # Penalize large latent values to ground the space
+        loss_assign = entropy_0
+        loss_ortho = self.model.get_ortho_loss(s_0)
+        loss_l2 = 0
         
         s_prev = s_0
+        
+        # Prediction sequence for integration
+        z_preds = [z_curr]
+        
+        for t in range(1, seq_len):
+            # Teacher Forcing: Occasionally use ground truth encoding as next step input
+            if not is_warmup and np.random.random() < teacher_forcing_ratio:
+                batch_t_prev = Batch.from_data_list([data_list[t-1]]).to(self.device)
+                z_curr, _, _ = self.model.encode(batch_t_prev.x, batch_t_prev.edge_index, batch_t_prev.batch, tau=tau)
+            
+            # Predict next latent state via ODE
+            t_span = torch.tensor([0, dt], device=self.device, dtype=torch.float32)
+            z_next_seq = self.model.forward_dynamics(z_curr, t_span)
+            z_curr = z_next_seq[1] # Next step prediction
+            z_preds.append(z_curr)
+            
+        z_preds = torch.stack(z_preds)
+        loss_l2 = torch.mean(z_preds**2)
         
         for t in range(seq_len):
             batch_t = Batch.from_data_list([data_list[t]]).to(self.device)
             
+            # Encode target for consistency check
+            z_t_target, s_t, entropy_t = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch, tau=tau)
+            
             # Reconstruction loss at each step
-            _, s_t, entropy_t = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch)
-            recon_t = self.model.decode(z_pred_seq[t], s_t, batch_t.batch)
+            recon_t = self.model.decode(z_preds[t], s_t, batch_t.batch)
             loss_rec += self.criterion(recon_t, batch_t.x)
             
-            # Assignment consistency loss: minimize change in super-node identity
-            # AND diversity loss (entropy)
+            # Assignment and Orthogonality losses
             loss_assign += entropy_t
+            loss_ortho += self.model.get_ortho_loss(s_t)
+            
             if t > 0:
                 loss_assign += self.criterion(s_t, s_prev)
                 # Consistency loss (encoding of real state vs predicted latent state)
-                z_t_target, _, _ = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch)
-                loss_cons += self.criterion(z_pred_seq[t], z_t_target)
+                loss_cons += self.criterion(z_preds[t], z_t_target)
             
             s_prev = s_t
         
         loss_rec /= seq_len
         loss_cons /= (seq_len - 1)
         loss_assign /= seq_len
+        loss_ortho /= seq_len
         
-        # Dynamic Loss Weighting: Faster annealing to ensure dynamics are learned early
-        anneal = min(1.0, epoch / 800.0) if epoch > 50 else 0.1
-        
-        # Apply configurable weights
-        # We increase the importance of consistency dynamically if it's lagging
-        cons_weight = self.weights['cons']
-        if loss_cons.item() > loss_rec.item() * 5: # Lowered threshold for boost
-            cons_weight *= 2.0
+        # Dynamic Loss Weighting
+        if is_warmup:
+            loss = self.weights['rec'] * loss_rec + self.weights['assign'] * loss_assign
+        else:
+            anneal = min(1.0, (epoch - 100) / 700.0)
+            
+            cons_weight = self.weights['cons']
+            if loss_cons.item() > loss_rec.item() * 5:
+                cons_weight *= 2.0
 
-        loss = (self.weights['rec'] * loss_rec + 
-                anneal * (cons_weight * loss_cons + 
-                         self.weights['latent_l2'] * loss_l2) +
-                self.weights['assign'] * loss_assign)
+            loss = (self.weights['rec'] * loss_rec + 
+                    anneal * (cons_weight * loss_cons + 
+                             self.weights['latent_l2'] * loss_l2) +
+                    self.weights['assign'] * loss_assign +
+                    self.weights['ortho'] * loss_ortho)
         
         loss.backward()
-        # Gradient Clipping to handle exploding gradients from ODE solver
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.optimizer.step()
         
