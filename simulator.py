@@ -1,3 +1,4 @@
+from scipy.spatial import KDTree
 import numpy as np
 import torch
 
@@ -19,30 +20,43 @@ class SpringMassSimulator:
         # Random initial velocity
         self.vel = np.random.randn(n_particles, 2) * 0.5
         
-        # Create initial adjacency matrix
-        self.adj = self._compute_adj(self.pos)
+        # Create initial adjacency info
+        self.radius = self.dynamic_radius if self.dynamic_radius else 1.1 * self.spring_dist
+        if not self.dynamic_radius:
+            self.fixed_pairs = self._compute_pairs(self.pos)
 
-    def _compute_adj(self, pos):
-        adj = np.zeros((self.n_particles, self.n_particles))
-        radius = self.dynamic_radius if self.dynamic_radius else 1.1 * self.spring_dist
-        for i in range(self.n_particles):
-            for j in range(i + 1, self.n_particles):
-                dist = np.linalg.norm(pos[i] - pos[j])
-                if dist < radius:
-                    adj[i, j] = adj[j, i] = 1.0
-        return adj
+    def _compute_pairs(self, pos):
+        tree = KDTree(pos)
+        # query_pairs returns a set of (i, j) with i < j
+        return list(tree.query_pairs(self.radius))
 
     def compute_forces(self, pos):
         forces = np.zeros_like(pos)
-        adj = self._compute_adj(pos) if self.dynamic_radius else self.adj
-        for i in range(self.n_particles):
-            for j in range(self.n_particles):
-                if adj[i, j] > 0:
-                    diff = pos[j] - pos[i]
-                    dist = np.linalg.norm(diff)
-                    if dist > 0:
-                        force = self.k * (dist - self.spring_dist) * (diff / dist)
-                        forces[i] += force
+        pairs = self._compute_pairs(pos) if self.dynamic_radius else self.fixed_pairs
+        
+        if len(pairs) == 0:
+            return forces
+
+        # Vectorized force calculation for all pairs
+        idx1, idx2 = zip(*pairs)
+        idx1 = np.array(idx1)
+        idx2 = np.array(idx2)
+        
+        diff = pos[idx2] - pos[idx1]
+        dist = np.linalg.norm(diff, axis=1, keepdims=True)
+        
+        # Avoid division by zero
+        mask = (dist > 0).flatten()
+        if not np.any(mask):
+            return forces
+            
+        f_mag = self.k * (dist[mask] - self.spring_dist)
+        force_vec = f_mag * (diff[mask] / dist[mask])
+        
+        # Use np.add.at for scattering forces back to particles
+        np.add.at(forces, idx1[mask], force_vec)
+        np.add.at(forces, idx2[mask], -force_vec)
+        
         return forces
 
     def step(self):

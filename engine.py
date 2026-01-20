@@ -38,7 +38,7 @@ class Trainer:
         
         # 1. Encode the first state
         batch_0 = Batch.from_data_list([data_list[0]])
-        z_0 = self.model.encode(batch_0.x, batch_0.edge_index, batch_0.batch)
+        z_0, s_0 = self.model.encode(batch_0.x, batch_0.edge_index, batch_0.batch)
         
         # 2. Predict full sequence in latent space
         t_span = torch.linspace(0, (seq_len - 1) * dt, seq_len)
@@ -51,14 +51,14 @@ class Trainer:
             batch_t = Batch.from_data_list([data_list[t]])
             
             # Reconstruction loss at each step
-            # Note: Decoder currently doesn't use edge_index, which is fine for node-wise recon
-            recon_t = self.model.decode(z_pred_seq[t])
-            loss_rec += self.criterion(recon_t, batch_t.x.unsqueeze(0))
+            # Use assignments from initial state for predicting sequence reconstruction
+            recon_t = self.model.decode(z_pred_seq[t], s_0, batch_t.batch)
+            loss_rec += self.criterion(recon_t, batch_t.x)
             
             # Consistency loss (encoding of real state vs predicted latent state)
             if t > 0:
                 # Use the dynamic edge_index for encoding the target state
-                z_t_target = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch)
+                z_t_target, _ = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch)
                 loss_cons += self.criterion(z_pred_seq[t], z_t_target)
         
         loss_rec /= seq_len

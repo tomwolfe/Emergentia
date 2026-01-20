@@ -42,11 +42,11 @@ def main():
     # 3. Extract Symbolic Equations
     print("--- 3. Distilling Symbolic Laws ---")
     # Extract states and their derivatives from the learned Latent ODE
-    z_states, dz_states = extract_latent_data(model, dataset, sim.dt)
+    z_states, dz_states, t_states = extract_latent_data(model, dataset, sim.dt)
     
     # Use the enhanced distiller with expanded function set
     distiller = SymbolicDistiller(populations=2000, generations=40) 
-    equations = distiller.distill(z_states, dz_states)
+    equations = distiller.distill(z_states, dz_states, t_states)
     
     print("\nDiscovered Meso-scale Laws (dZ/dt = ...):")
     for i, eq in enumerate(equations):
@@ -58,8 +58,9 @@ def main():
     with torch.no_grad():
         test_idx = 0
         data = dataset[test_idx]
-        z = model.encode(data.x, data.edge_index, torch.zeros(data.x.size(0), dtype=torch.long))
-        recon = model.decode(z).squeeze(0).numpy()
+        batch = torch.zeros(data.x.size(0), dtype=torch.long)
+        z, s = model.encode(data.x, data.edge_index, batch)
+        recon = model.decode(z, s, batch).numpy()
         
     plt.figure(figsize=(12, 5))
     

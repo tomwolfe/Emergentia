@@ -44,7 +44,7 @@ class HierarchicalPooling(nn.Module):
         
         # Scatter to batch: [Batch_Size, n_super_nodes, in_channels]
         out = scatter(x_expanded, batch, dim=0, reduce='sum')
-        return out
+        return out, s
 
 class GNNEncoder(nn.Module):
     def __init__(self, node_features, hidden_dim, latent_dim, n_super_nodes):
@@ -68,16 +68,16 @@ class GNNEncoder(nn.Module):
         x = torch.relu(self.gnn2(x, edge_index))
         
         # Pool to K super-nodes preserving spatial features
-        pooled = self.pooling(x, batch) # [batch_size, n_super_nodes, hidden_dim]
+        pooled, s = self.pooling(x, batch) # [batch_size, n_super_nodes, hidden_dim], [N, n_super_nodes]
         latent = self.output_layer(pooled) # [batch_size, n_super_nodes, latent_dim]
-        return latent
+        return latent, s
 
 class LatentODEFunc(nn.Module):
     def __init__(self, latent_dim, n_super_nodes, hidden_dim=64):
         super(LatentODEFunc, self).__init__()
         self.input_dim = latent_dim * n_super_nodes
         self.net = nn.Sequential(
-            nn.Linear(self.input_dim, hidden_dim),
+            nn.Linear(self.input_dim + 1, hidden_dim), # +1 for time t
             nn.Tanh(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.Tanh(),
@@ -86,37 +86,49 @@ class LatentODEFunc(nn.Module):
 
     def forward(self, t, y):
         # y: [batch_size, latent_dim * n_super_nodes]
-        return self.net(y)
+        # t is a scalar or [1]
+        t_vec = torch.ones((y.size(0), 1), device=y.device) * t
+        y_t = torch.cat([y, t_vec], dim=-1)
+        return self.net(y_t)
 
 class GNNDecoder(nn.Module):
-    def __init__(self, latent_dim, n_super_nodes, hidden_dim, out_features, n_particles):
+    def __init__(self, latent_dim, hidden_dim, out_features):
         super(GNNDecoder, self).__init__()
-        self.n_particles = n_particles
-        self.input_dim = latent_dim * n_super_nodes
-        self.net = nn.Sequential(
-            nn.Linear(self.input_dim, hidden_dim),
+        self.mlp = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, n_particles * out_features)
+            nn.Linear(hidden_dim, out_features)
         )
 
-    def forward(self, z):
+    def forward(self, z, s, batch):
         # z: [batch_size, n_super_nodes, latent_dim]
-        z_flat = z.view(z.size(0), -1)
-        out = self.net(z_flat)
-        return out.view(z.size(0), self.n_particles, -1)
+        # s: [N_total, n_super_nodes]
+        
+        # We need to map z back to nodes using s.
+        # Since s is global for the batch, we use batch index to select z
+        # batch: [N_total] contains indices of which batch item each node belongs to.
+        
+        # Expand z to match s: [N_total, n_super_nodes, latent_dim]
+        z_expanded = z[batch]
+        
+        # Weighted sum: [N_total, n_super_nodes, 1] * [N_total, n_super_nodes, latent_dim]
+        # sum over n_super_nodes
+        node_features_latent = torch.sum(s.unsqueeze(-1) * z_expanded, dim=1)
+        
+        return self.mlp(node_features_latent)
 
 class DiscoveryEngineModel(nn.Module):
     def __init__(self, n_particles, n_super_nodes, node_features=4, latent_dim=4, hidden_dim=64):
         super(DiscoveryEngineModel, self).__init__()
         self.encoder = GNNEncoder(node_features, hidden_dim, latent_dim, n_super_nodes)
         self.ode_func = LatentODEFunc(latent_dim, n_super_nodes, hidden_dim)
-        self.decoder = GNNDecoder(latent_dim, n_super_nodes, hidden_dim, node_features, n_particles)
+        self.decoder = GNNDecoder(latent_dim, hidden_dim, node_features)
         
     def encode(self, x, edge_index, batch):
         return self.encoder(x, edge_index, batch)
     
-    def decode(self, z):
-        return self.decoder(z)
+    def decode(self, z, s, batch):
+        return self.decoder(z, s, batch)
     
     def forward_dynamics(self, z0, t):
         # z0: [batch_size, n_super_nodes, latent_dim]
