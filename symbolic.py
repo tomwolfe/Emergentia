@@ -4,32 +4,46 @@ import torch
 
 class SymbolicDistiller:
     def __init__(self, populations=2000, generations=40, stopping_criteria=0.001):
-        # Using a wider set of function to capture physical laws (e.g. 1/r^2 patterns)
-        self.est = SymbolicRegressor(population_size=populations,
-                                     generations=generations, 
-                                     stopping_criteria=stopping_criteria,
-                                     function_set=('add', 'sub', 'mul', 'div', 'sin', 'cos'),
-                                     p_crossover=0.7, p_subtree_mutation=0.1,
-                                     p_hoist_mutation=0.05, p_point_mutation=0.1,
-                                     max_samples=0.9, verbose=1,
-                                     parsimony_coefficient=0.005, random_state=0)
+        self.max_pop = populations
+        self.max_gen = generations
+        self.stopping_criteria = stopping_criteria
+
+    def _get_regressor(self, pop, gen):
+        return SymbolicRegressor(population_size=pop,
+                                 generations=gen, 
+                                 stopping_criteria=self.stopping_criteria,
+                                 function_set=('add', 'sub', 'mul', 'div', 'sin', 'cos'),
+                                 p_crossover=0.7, p_subtree_mutation=0.1,
+                                 p_hoist_mutation=0.05, p_point_mutation=0.1,
+                                 max_samples=0.9, verbose=0, # Quiet by default
+                                 parsimony_coefficient=0.005, random_state=0)
 
     def distill(self, latent_states, latent_derivs, times=None):
-        """
-        latent_states: [N_samples, latent_dim * n_super_nodes]
-        latent_derivs: [N_samples, latent_dim * n_super_nodes]
-        times: [N_samples] (optional)
-        """
         X = latent_states
         if times is not None:
-            # Add time as an additional input feature for non-autonomous laws
             X = np.column_stack([latent_states, times])
 
         equations = []
         for i in range(latent_derivs.shape[1]):
-            print(f"Distilling equation for component {i} (dz_{i}/dt)...")
-            self.est.fit(X, latent_derivs[:, i])
-            equations.append(self.est._program)
+            # Start with 'Coarse' search (1/4 resources)
+            coarse_pop = self.max_pop // 4
+            coarse_gen = self.max_gen // 2
+            
+            print(f"Distilling dz_{i}/dt (Coarse search: pop={coarse_pop}, gen={coarse_gen})...")
+            est = self._get_regressor(coarse_pop, coarse_gen)
+            est.fit(X, latent_derivs[:, i])
+            
+            # Check fit quality (if possible via gplearn score)
+            # score is R^2. If > 0.95, it's likely good enough.
+            if est.score(X, latent_derivs[:, i]) > 0.95:
+                print(f"  -> Good fit found in coarse search (R^2={est.score(X, latent_derivs[:, i]):.3f})")
+                equations.append(est._program)
+            else:
+                print(f"  -> Low fit (R^2={est.score(X, latent_derivs[:, i]):.3f}). Escalating to Fine search...")
+                est = self._get_regressor(self.max_pop, self.max_gen)
+                est.fit(X, latent_derivs[:, i])
+                equations.append(est._program)
+                
         return equations
 
 def extract_latent_data(model, dataset, dt):

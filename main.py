@@ -30,14 +30,27 @@ def main():
                                  latent_dim=latent_dim)
     trainer = Trainer(model, lr=1e-3)
     
+    last_loss = 1.0
     for epoch in range(epochs):
         # Sample a short sequence for training
         idx = np.random.randint(0, len(dataset) - seq_len)
         batch_data = dataset[idx : idx + seq_len]
         loss, rec, cons = trainer.train_step(batch_data, sim.dt)
+        last_loss = loss
         
         if epoch % 50 == 0:
-            print(f"Epoch {epoch:03d} | Loss: {loss:.6f} | Rec: {rec:.6f} | Cons: {cons:.6f}")
+            progress = (epoch / epochs) * 100
+            print(f"Progress: {progress:3.0f}% | Loss: {loss:.6f} | Rec: {rec:.6f} | Cons: {cons:.6f}")
+
+    # --- Quality Gate ---
+    print(f"\nFinal Training Loss: {last_loss:.6f}")
+    if last_loss > 0.05: # Threshold for 'reasonable' convergence
+        print("CRITICAL WARNING: Model failed to converge (Loss > 0.05).")
+        print("Distilled equations will likely be nonsense.")
+        proceed = input("Abort distillation and tune parameters? (Y/n): ").lower()
+        if proceed != 'n':
+            print("Aborting. Recommended: Increase epochs or adjust dynamic_radius.")
+            return
 
     # 3. Extract Symbolic Equations
     print("--- 3. Distilling Symbolic Laws ---")

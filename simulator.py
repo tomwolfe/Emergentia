@@ -45,17 +45,24 @@ class SpringMassSimulator:
         diff = pos[idx2] - pos[idx1]
         dist = np.linalg.norm(diff, axis=1, keepdims=True)
         
-        # Avoid division by zero
-        mask = (dist > 0).flatten()
-        if not np.any(mask):
-            return forces
-            
-        f_mag = self.k * (dist[mask] - self.spring_dist)
-        force_vec = f_mag * (diff[mask] / dist[mask])
+        # Avoid division by zero and extremely small distances (repulsion)
+        dist = np.maximum(dist, 0.01)
+        
+        f_mag = self.k * (dist - self.spring_dist)
+        
+        # Add a small repulsive force at very short distances to prevent overlap
+        repulsion = 0.1 / (dist**2)
+        f_mag -= repulsion
+        
+        force_vec = f_mag * (diff / dist)
+        
+        # Clamp forces to prevent explosion
+        max_f = 100.0
+        force_vec = np.clip(force_vec, -max_f, max_f)
         
         # Use np.add.at for scattering forces back to particles
-        np.add.at(forces, idx1[mask], force_vec)
-        np.add.at(forces, idx2[mask], -force_vec)
+        np.add.at(forces, idx1, force_vec)
+        np.add.at(forces, idx2, -force_vec)
         
         return forces
 
@@ -63,7 +70,19 @@ class SpringMassSimulator:
         # Semi-implicit Euler
         forces = self.compute_forces(self.pos)
         self.vel += (forces / self.m) * self.dt
+        
+        # Clamp velocity for stability
+        max_v = 10.0
+        self.vel = np.clip(self.vel, -max_v, max_v)
+        
         self.pos += self.vel * self.dt
+        
+        # Check for NaNs
+        if np.any(np.isnan(self.pos)):
+            print("Warning: Simulation diverged (NaN). Resetting velocity.")
+            self.vel = np.zeros_like(self.vel)
+            self.pos = np.nan_to_num(self.pos)
+
         return self.pos.copy(), self.vel.copy()
 
     def generate_trajectory(self, steps=1000):
