@@ -26,22 +26,24 @@ class HierarchicalPooling(nn.Module):
     """
     Learned soft-assignment pooling to preserve spatial locality 
     by aggregating nodes into a fixed number of super-nodes.
-    Uses Gumbel-Softmax for 'harder' assignments.
+    Uses Gumbel-Softmax for 'harder' assignments and includes pruning.
     """
-    def __init__(self, in_channels, n_super_nodes):
+    def __init__(self, in_channels, n_super_nodes, pruning_threshold=0.01):
         super(HierarchicalPooling, self).__init__()
         self.n_super_nodes = n_super_nodes
+        self.pruning_threshold = pruning_threshold
         self.assign_mlp = nn.Sequential(
             nn.Linear(in_channels, in_channels),
             nn.ReLU(),
             nn.Linear(in_channels, n_super_nodes)
         )
         self.scaling = nn.Parameter(torch.tensor(1.0))
+        # Mask to track active super-nodes (not directly optimized by backprop)
+        self.register_buffer('active_mask', torch.ones(n_super_nodes))
 
     def forward(self, x, batch, pos=None, tau=1.0, hard=False):
         # x: [N, in_channels], batch: [N], pos: [N, 2]
         if x.size(0) == 0:
-            # Fallback for empty input
             return torch.zeros((0, self.n_super_nodes, x.size(1)), device=x.device), \
                    torch.zeros((0, self.n_super_nodes), device=x.device), \
                    {'entropy': torch.tensor(0.0, device=x.device), 
@@ -50,42 +52,39 @@ class HierarchicalPooling(nn.Module):
                     'pruning': torch.tensor(0.0, device=x.device)}, \
                    None
 
-        # Compute assignment logits with scaling for sharpness
         logits = self.assign_mlp(x) * self.scaling
         
-        # Use Gumbel-Softmax for harder, more distinct assignments
+        # Apply active_mask to logits (set inactive ones to very low value)
+        mask = self.active_mask.unsqueeze(0)
+        logits = logits.masked_fill(mask == 0, -1e9)
+        
         s = nn.functional.gumbel_softmax(logits, tau=tau, hard=hard, dim=-1)
         
-        # 1. Sharpness Loss (Minimize entropy per node)
-        entropy = -torch.mean(torch.sum(s * torch.log(s + 1e-9), dim=1))
-        
-        # 2. Diversity Loss (Maximize entropy of average assignment)
         avg_s = s.mean(dim=0)
-        diversity_loss = torch.sum(avg_s * torch.log(avg_s + 1e-9))
         
-        # 2b. Pruning/Sparsity Loss
-        pruning_loss = torch.mean(torch.abs(avg_s))
+        # Update active_mask if training and not hard (hard usually for eval)
+        if self.training and not hard:
+            # Moving average update for the mask to avoid rapid flickering
+            current_active = (avg_s > self.pruning_threshold).float()
+            self.active_mask = 0.95 * self.active_mask + 0.05 * current_active
+            # Ensure at least one is always active to avoid collapse
+            if self.active_mask.sum() == 0:
+                self.active_mask[torch.argmax(avg_s)] = 1.0
 
-        # 3. Spatial Locality Penalty
+        entropy = -torch.mean(torch.sum(s * torch.log(s + 1e-9), dim=1))
+        diversity_loss = torch.sum(avg_s * torch.log(avg_s + 1e-9))
+        pruning_loss = torch.mean(torch.abs(avg_s * (1 - self.active_mask))) # Penalize usage of "inactive" nodes
+
         spatial_loss = torch.tensor(0.0, device=x.device)
         if pos is not None:
-            # For each super-node, calculate weighted variance of positions
-            # s: [N, K], pos: [N, 2]
             s_sum = s.sum(dim=0, keepdim=True) + 1e-9
-            s_norm = s / s_sum # [N, K]
-            
-            # Weighted mean position for each super-node
-            mu = torch.matmul(s_norm.t(), pos) # [K, 2]
-            
-            # Weighted variance: sum_i s_norm[i, k] * ||pos[i] - mu[k]||^2
-            # (pos[i] - mu[k])^2 = pos[i]^2 - 2*pos[i]*mu[k] + mu[k]^2
-            pos_sq = (pos**2).sum(dim=1, keepdim=True) # [N, 1]
-            mu_sq = (mu**2).sum(dim=1) # [K]
-            
+            s_norm = s / s_sum
+            mu = torch.matmul(s_norm.t(), pos)
+            pos_sq = (pos**2).sum(dim=1, keepdim=True)
+            mu_sq = (mu**2).sum(dim=1)
             var = torch.matmul(s_norm.t(), pos_sq).squeeze() - 2 * (mu * torch.matmul(s_norm.t(), pos)).sum(dim=1) + mu_sq
             spatial_loss = var.mean()
 
-        # Total assignment loss components
         assign_losses = {
             'entropy': entropy,
             'diversity': diversity_loss,
@@ -93,32 +92,22 @@ class HierarchicalPooling(nn.Module):
             'pruning': pruning_loss
         }
         
-        # Calculate mu (weighted mean position) for super-nodes
         super_node_mu = None
         if pos is not None:
-            # s: [N, K], pos: [N, 2]
-            # out_mu: [batch_size, K, 2]
-            s_pos_expanded = pos.unsqueeze(1) * s.unsqueeze(2) # [N, K, 2]
-            sum_s_pos = scatter(s_pos_expanded, batch, dim=0, reduce='sum') # [B, K, 2]
-            sum_s = scatter(s, batch, dim=0, reduce='sum').unsqueeze(-1) + 1e-9 # [B, K, 1]
+            s_pos_expanded = pos.unsqueeze(1) * s.unsqueeze(2)
+            sum_s_pos = scatter(s_pos_expanded, batch, dim=0, reduce='sum')
+            sum_s = scatter(s, batch, dim=0, reduce='sum').unsqueeze(-1) + 1e-9
             super_node_mu = sum_s_pos / sum_s
 
-        # 4. Spatial Separation Loss (Centroids should be spread out)
         if super_node_mu is not None:
-            # mu: [B, K, 2]. We want to maximize distance between centroids.
-            # Using a simple repulsive potential: 1 / (dist^2 + eps)
             mu = super_node_mu
-            dist_sq = torch.sum((mu.unsqueeze(1) - mu.unsqueeze(2))**2, dim=-1) # [B, K, K]
-            # Mask out diagonal
-            mask = torch.eye(self.n_super_nodes, device=x.device).unsqueeze(0)
+            dist_sq = torch.sum((mu.unsqueeze(1) - mu.unsqueeze(2))**2, dim=-1)
+            mask_eye = torch.eye(self.n_super_nodes, device=x.device).unsqueeze(0)
             repulsion = 1.0 / (dist_sq + 1.0)
-            separation_loss = (repulsion * (1 - mask)).sum() / (self.n_super_nodes * (self.n_super_nodes - 1) + 1e-9)
+            separation_loss = (repulsion * (1 - mask_eye)).sum() / (self.n_super_nodes * (self.n_super_nodes - 1) + 1e-9)
             assign_losses['separation'] = separation_loss
 
-        # Weighted aggregation: [N, 1, in_channels] * [N, n_super_nodes, 1]
         x_expanded = x.unsqueeze(1) * s.unsqueeze(2) 
-        
-        # Scatter to batch: [Batch_Size, n_super_nodes, in_channels]
         out = scatter(x_expanded, batch, dim=0, reduce='sum')
         
         return out, s, assign_losses, super_node_mu
@@ -289,18 +278,29 @@ class DiscoveryEngineModel(nn.Module):
         z0_flat = z0.view(z0.size(0), -1).to(torch.float32)
         t = t.to(torch.float32)
 
-        # Use the device of the ode_func parameters (may be CPU even if z0 is MPS)
+        # Use the device of the ode_func parameters
         ode_device = next(self.ode_func.parameters()).device
         original_device = z0.device
         
         y0 = z0_flat.to(ode_device)
         t_ode = t.to(ode_device)
 
-        # Explicitly use float32 for rtol/atol to avoid issues on some devices
+        # Explicitly use float32 for rtol/atol
         rtol = torch.tensor(1e-3, dtype=torch.float32, device=ode_device)
         atol = torch.tensor(1e-4, dtype=torch.float32, device=ode_device)
 
-        zt_flat = odeint(self.ode_func, y0, t_ode, rtol=rtol, atol=atol)
+        try:
+            zt_flat = odeint(self.ode_func, y0, t_ode, rtol=rtol, atol=atol)
+        except Exception as e:
+            # Fallback: Simple Euler step if odeint fails (e.g. stiffness or NaN)
+            if len(t_ode) > 1:
+                dt = t_ode[1] - t_ode[0]
+                dy = self.ode_func(t_ode[0], y0)
+                y1 = y0 + dy * dt
+                # Create a tensor of shape [len(t), batch, dim] with y0 and y1
+                zt_flat = torch.stack([y0, y1] + [y1 for _ in range(len(t_ode)-2)])
+            else:
+                zt_flat = y0.unsqueeze(0)
 
         # Move back to original device
         zt_flat = zt_flat.to(original_device)

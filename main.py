@@ -109,17 +109,19 @@ def main():
         z_states, dz_states, t_states, h_states = latent_data
         print("Distilling Hamiltonian H(q, p)...")
         equations = distiller.distill(z_states, h_states, n_super_nodes, latent_dim)
+        confidences = distiller.confidences
     else:
         z_states, dz_states, t_states = latent_data
         print("Distilling derivatives dZ/dt...")
         equations = distiller.distill(z_states, dz_states, n_super_nodes, latent_dim)
+        confidences = distiller.confidences
     
     print("\nDiscovered Symbolic Laws:")
     if is_hamiltonian:
-        print(f"H(z) = {equations[0]}")
+        print(f"H(z) = {equations[0]} (Confidence: {confidences[0]:.3f})")
     else:
         for i, eq in enumerate(equations):
-            print(f"dZ_{i}/dt = {eq}")
+            print(f"dZ_{i}/dt = {eq} (Confidence: {confidences[i]:.3f})")
 
     # 4. Visualization & Integration
     print("--- 4. Visualizing Results ---")

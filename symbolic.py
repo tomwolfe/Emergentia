@@ -156,14 +156,12 @@ class SymbolicDistiller:
     def _distill_single_target(self, i, X_norm, Y_norm, targets_shape_1, latent_states_shape_1):
         print(f"Selecting features for target_{i} (Input dim: {X_norm.shape[1]})...")
         
-        # Pruning: Remove features with near-zero variance
         variances = np.var(X_norm, axis=0)
         valid_indices = np.where(variances > 1e-6)[0]
         X_pruned = X_norm[:, valid_indices]
         
         mask_pruned = self._select_features(X_pruned, Y_norm[:, i])
         
-        # Reconstruct full mask
         full_mask = np.zeros(X_norm.shape[1], dtype=bool)
         full_mask[valid_indices[mask_pruned]] = True
         
@@ -171,36 +169,34 @@ class SymbolicDistiller:
         print(f"  -> Target_{i}: Reduced to {X_selected.shape[1]} informative variables.")
 
         if X_selected.shape[1] == 0:
-            return np.zeros((X_norm.shape[0], 1)), full_mask
+            return np.zeros((X_norm.shape[0], 1)), full_mask, 0.0
 
-        # SCALABILITY OPTIMIZATION: Linear Baseline Check
         ridge = RidgeCV(alphas=[1e-4, 1e-3, 1e-2, 1e-1, 1, 10])
         ridge.fit(X_selected, Y_norm[:, i])
         linear_score = ridge.score(X_selected, Y_norm[:, i])
         
-        if linear_score > 0.985: # Slightly tighter threshold
+        if linear_score > 0.985:
             print(f"  -> Target_{i}: High linear fit (R2={linear_score:.3f}). Using linear model.")
             class LinearProgram:
                 def __init__(self, model): self.model = model; self.length_ = 1
                 def execute(self, X): 
-                    # Handle both 1D and 2D inputs
                     if X.ndim == 1: X = X.reshape(1, -1)
                     return self.model.predict(X)
-            return LinearProgram(ridge), full_mask
+            return LinearProgram(ridge), full_mask, linear_score
 
-        # Pareto search: Try multiple parsimony levels in parallel to find simplest accurate model
         parsimony_levels = [0.001, 0.005, 0.01]
-        
-        # Scale population with complexity of the problem (approximated by 1-linear_score)
         complexity_factor = max(1.0, 2.0 * (1.0 - linear_score))
         scaled_pop = int(self.max_pop * complexity_factor)
-        scaled_pop = min(scaled_pop, 5000) # Cap it
+        scaled_pop = min(scaled_pop, 5000)
         
         candidates = []
         for p_coeff in parsimony_levels:
             est = self._get_regressor(scaled_pop, self.max_gen // 2, parsimony=p_coeff)
             try:
                 est.fit(X_selected, Y_norm[:, i])
+                # gplearn's _program is the best one.
+                # We can also get the hall of fame or best from each generation, 
+                # but let's stick to the best for each parsimony level.
                 prog = est._program
                 score = est.score(X_selected, Y_norm[:, i])
                 
@@ -214,26 +210,29 @@ class SymbolicDistiller:
                 print(f"    ! GP search failed for p={p_coeff}: {e}")
         
         if not candidates:
-            # Absolute fallback
-            est = self._get_regressor(coarse_pop, coarse_gen, parsimony=0.001)
-            est.fit(X_selected, Y_norm[:, i])
-            return est._program, full_mask
+            return None, full_mask, 0.0
 
         candidates.sort(key=lambda x: x['score'], reverse=True)
         best_candidate = candidates[0]
+        
+        # Calculate "Uncertainty" based on agreement of top candidates' scores and complexities
+        # High confidence if multiple parsimony levels find similar quality models
+        top_scores = [c['score'] for c in candidates[:3]]
+        score_std = np.std(top_scores) if len(top_scores) > 1 else 0.1
+        confidence = best_candidate['score'] * (1.0 - score_std)
+
         for c in candidates[1:]:
-            # Prefer simpler models if score difference is small (<3%)
             if (best_candidate['score'] - c['score']) < 0.03 and c['complexity'] < 0.6 * best_candidate['complexity']:
                 best_candidate = c
                 
-        # Escalation
-        if best_candidate['score'] < 0.85 and self.max_pop > coarse_pop:
+        if best_candidate['score'] < 0.85:
             print(f"  -> Escalating distillation for target_{i}...")
             est = self._get_regressor(self.max_pop, self.max_gen, parsimony=best_candidate['p'])
             est.fit(X_selected, Y_norm[:, i])
-            return est._program, full_mask
+            best_candidate = {'prog': est._program, 'score': est.score(X_selected, Y_norm[:, i])}
+            confidence = best_candidate['score'] # Simplified update
             
-        return best_candidate['prog'], full_mask
+        return best_candidate['prog'], full_mask, confidence
 
     def distill(self, latent_states, targets, n_super_nodes, latent_dim):
         self.transformer = FeatureTransformer(n_super_nodes, latent_dim)
@@ -250,6 +249,7 @@ class SymbolicDistiller:
         
         equations = [r[0] for r in results]
         self.feature_masks = [r[1] for r in results]
+        self.confidences = [r[2] for r in results]
                 
         return equations
 

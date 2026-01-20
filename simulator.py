@@ -191,14 +191,71 @@ class SpringMassSimulator:
             trajectory_vel.append(v)
         return np.array(trajectory_pos), np.array(trajectory_vel)
 
-if __name__ == "__main__":
-    # Test PBC and tiling with larger N
-    n_particles = 200
-    sim = SpringMassSimulator(n_particles=n_particles, box_size=(10.0, 10.0))
-    pos, vel = sim.generate_trajectory(steps=10)
-    print(f"PBC Trajectory shape: {pos.shape}")
-    
-    # Test non-PBC
-    sim2 = SpringMassSimulator(n_particles=16)
-    pos2, vel2 = sim2.generate_trajectory(steps=100)
-    print(f"Standard Trajectory shape: {pos2.shape}")
+class LennardJonesSimulator(SpringMassSimulator):
+    """
+    Simulates particles interacting via the Lennard-Jones potential:
+    V(r) = 4*epsilon * [(sigma/r)^12 - (sigma/r)^6]
+    """
+    def __init__(self, n_particles=64, epsilon=1.0, sigma=1.0, m=1.0, dt=0.005, dynamic_radius=None, box_size=None):
+        # LJ needs smaller dt for stability due to 1/r^12 term
+        super().__init__(n_particles=n_particles, m=m, dt=dt, spring_dist=sigma, dynamic_radius=dynamic_radius, box_size=box_size)
+        self.epsilon = epsilon
+        self.sigma = sigma
+        self.radius = 2.5 * sigma if not dynamic_radius else dynamic_radius
+
+    def compute_forces(self, pos):
+        forces = np.zeros_like(pos)
+        pairs = self._compute_pairs(pos)
+        
+        if len(pairs) == 0:
+            return forces
+
+        idx1, idx2 = zip(*pairs)
+        idx1 = np.array(idx1)
+        idx2 = np.array(idx2)
+        
+        diff = pos[idx2] - pos[idx1]
+        if self.box_size:
+            for i in range(2):
+                diff[:, i] -= self.box_size[i] * np.round(diff[:, i] / self.box_size[i])
+
+        dist_sq = np.sum(diff**2, axis=1, keepdims=True)
+        # Avoid division by zero and extreme values
+        dist_sq = np.maximum(dist_sq, 0.5 * self.sigma**2)
+        
+        sr6 = (self.sigma**2 / dist_sq)**3
+        sr12 = sr6**2
+        
+        # F = 24 * epsilon / r^2 * [2*(sigma/r)^12 - (sigma/r)^6] * vec_r
+        f_mag = (24 * self.epsilon / dist_sq) * (2 * sr12 - sr6)
+        
+        force_vec = f_mag * diff
+        
+        # Stability clamping
+        max_f = 1000.0
+        force_vec = np.clip(force_vec, -max_f, max_f)
+        
+        np.add.at(forces, idx1, -force_vec)
+        np.add.at(forces, idx2, force_vec)
+        
+        return forces
+
+    def energy(self, pos=None, vel=None):
+        if pos is None: pos = self.pos
+        if vel is None: vel = self.vel
+        
+        ke = 0.5 * self.m * np.sum(vel**2)
+        pe = 0.0
+        pairs = self._compute_pairs(pos)
+        if len(pairs) > 0:
+            idx1, idx2 = zip(*pairs)
+            diff = pos[idx2] - pos[idx1]
+            if self.box_size:
+                for i in range(2):
+                    diff[:, i] -= self.box_size[i] * np.round(diff[:, i] / self.box_size[i])
+            dist_sq = np.sum(diff**2, axis=1)
+            sr6 = (self.sigma**2 / dist_sq)**3
+            sr12 = sr6**2
+            pe = 4 * self.epsilon * np.sum(sr12 - sr6)
+            
+        return ke + pe
