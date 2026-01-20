@@ -40,10 +40,12 @@ def main():
     
     # 2. Initialize Model and Trainer
     print("--- 2. Training Discovery Engine ---")
+    # Using Hamiltonian dynamics for improved physics fidelity
     model = DiscoveryEngineModel(n_particles=n_particles, 
                                  n_super_nodes=n_super_nodes, 
                                  latent_dim=latent_dim,
-                                 hidden_dim=128).to(device)
+                                 hidden_dim=128,
+                                 hamiltonian=True).to(device)
     
     # Adjusted weights: Significantly more emphasis on reconstruction
     loss_weights = {
@@ -72,6 +74,16 @@ def main():
         if epoch % 100 == 0:
             progress = (epoch / epochs) * 100
             print(f"Progress: {progress:3.0f}% | Loss: {loss:.6f} | Rec: {rec:.6f} | Cons: {cons:.6f} | LR: {trainer.optimizer.param_groups[0]['lr']:.2e}")
+
+    # --- Interpretability Check ---
+    print("\n--- 2.1 Latent Interpretability Analysis ---")
+    from engine import analyze_latent_space
+    corrs = analyze_latent_space(model, dataset, pos, device=device)
+    for k in range(n_super_nodes):
+        max_corr = np.max(np.abs(corrs[k]))
+        print(f"Super-node {k} max CoM correlation: {max_corr:.3f}")
+        if max_corr > 0.8:
+            print(f"  -> Strong physical mapping detected for super-node {k}")
 
     # --- Quality Gate ---
     print(f"\nFinal Training Loss: {last_loss:.6f}")

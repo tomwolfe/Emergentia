@@ -20,34 +20,73 @@ def prepare_data(pos, vel, radius=1.1, stats=None, device='cpu'):
     T, N, _ = pos.shape
     
     if stats is None:
-        # Fallback to computing from provided data if not given
-        # Warning: This can lead to data leakage if used on test sets
         stats = compute_stats(pos, vel)
     
-    pos_mean, pos_std = stats['pos_mean'], stats['pos_std']
-    vel_mean, vel_std = stats['vel_mean'], stats['vel_std']
-    
-    pos_norm = (pos - pos_mean) / pos_std
-    vel_norm = (vel - vel_mean) / vel_std
+    pos_norm = (pos - stats['pos_mean']) / stats['pos_std']
+    vel_norm = (vel - stats['vel_mean']) / stats['vel_std']
     
     dataset = []
+    # Pre-convert to float32 for speed
+    pos_norm = pos_norm.astype(np.float32)
+    vel_norm = vel_norm.astype(np.float32)
+    
     for t in range(T):
         curr_pos = pos[t]
         tree = KDTree(curr_pos)
-        pairs = list(tree.query_pairs(radius))
+        # query_pairs is already optimized in cKDTree (which KDTree uses)
+        pairs = tree.query_pairs(radius)
         
-        if len(pairs) > 0:
-            idx1, idx2 = zip(*pairs)
-            edges = np.array([idx1 + idx2, idx2 + idx1])
-            edge_index = torch.tensor(edges, dtype=torch.long, device=device)
+        if pairs:
+            edges = np.array(list(pairs), dtype=np.int64)
+            # Undirected graph: add both directions
+            edge_index = np.concatenate([edges, edges[:, [1, 0]]], axis=0).T
+            edge_index = torch.from_numpy(edge_index).to(device)
         else:
-            edge_index = torch.tensor([[], []], dtype=torch.long, device=device)
+            edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
         
-        x = torch.cat([torch.tensor(pos_norm[t], dtype=torch.float, device=device), 
-                       torch.tensor(vel_norm[t], dtype=torch.float, device=device)], dim=1)
+        # Fast tensor creation
+        x = torch.cat([torch.from_numpy(pos_norm[t]).to(device), 
+                       torch.from_numpy(vel_norm[t]).to(device)], dim=1)
         data = Data(x=x, edge_index=edge_index)
         dataset.append(data)
     return dataset, stats
+
+def analyze_latent_space(model, dataset, pos_raw, tau=0.1, device='cpu'):
+    """
+    Analyzes the physical meaning of latent variables Z by correlating them 
+    with the Center of Mass (CoM) of assigned particles.
+    """
+    model.eval()
+    z_list, com_list = [], []
+    
+    with torch.no_grad():
+        for t, data in enumerate(dataset):
+            batch = Batch.from_data_list([data]).to(device)
+            z, s, _ = model.encode(batch.x, batch.edge_index, batch.batch, tau=tau)
+            
+            # Compute CoM for each super-node based on assignment weights s
+            # s: [N, K], pos_raw[t]: [N, 2]
+            s_sum = s.sum(dim=0, keepdim=True) + 1e-9
+            s_norm = s / s_sum
+            curr_pos = torch.tensor(pos_raw[t], dtype=torch.float, device=device)
+            com = torch.matmul(s_norm.t(), curr_pos) # [K, 2]
+            
+            z_list.append(z[0].cpu().numpy()) 
+            com_list.append(com.cpu().numpy())
+            
+    z_all = np.array(z_list)   # [T, K, D]
+    com_all = np.array(com_list) # [T, K, 2]
+    
+    avg_corrs = []
+    for k in range(model.encoder.n_super_nodes):
+        z_k = z_all[:, k, :]
+        com_k = com_all[:, k, :]
+        # Correlate each Z dimension with each CoM dimension
+        corrs = np.array([[np.corrcoef(z_k[:, i], com_k[:, j])[0, 1] 
+                          for j in range(2)] for i in range(z_k.shape[1])])
+        avg_corrs.append(np.nan_to_num(corrs))
+        
+    return np.array(avg_corrs)
 
 class Trainer:
     def __init__(self, model, lr=5e-4, device='cpu', loss_weights=None, stats=None):
