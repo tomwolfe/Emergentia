@@ -7,6 +7,14 @@ from engine import Trainer, prepare_data
 from symbolic import SymbolicDistiller, extract_latent_data
 
 def main():
+    # 0. Device Discovery
+    # Fallback to CPU if only MPS is available due to torchdiffeq float64 issues
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+    else:
+        device = torch.device('cpu')
+    print(f"Using device: {device}")
+
     # 1. Setup Parameters
     n_particles = 16
     n_super_nodes = 2
@@ -14,25 +22,26 @@ def main():
     steps = 500
     epochs = 500
     seq_len = 5
-    dynamic_radius = 1.5 # Radius for dynamic topology
+    dynamic_radius = 1.5 
+    box_size = (10.0, 10.0) # Periodic Boundary
     
     print("--- 1. Generating Data ---")
-    # Initialize simulator with dynamic topology
-    sim = SpringMassSimulator(n_particles=n_particles, k=15.0, dynamic_radius=dynamic_radius)
+    sim = SpringMassSimulator(n_particles=n_particles, k=15.0, 
+                             dynamic_radius=dynamic_radius, box_size=box_size)
     pos, vel = sim.generate_trajectory(steps=steps)
-    # Prepare data with dynamic edge_index
-    dataset = prepare_data(pos, vel, radius=dynamic_radius)
+    
+    # Prepare data with device support and robust normalization
+    dataset, stats = prepare_data(pos, vel, radius=dynamic_radius, device=device)
     
     # 2. Initialize Model and Trainer
     print("--- 2. Training Discovery Engine ---")
     model = DiscoveryEngineModel(n_particles=n_particles, 
                                  n_super_nodes=n_super_nodes, 
-                                 latent_dim=latent_dim)
-    trainer = Trainer(model, lr=1e-3)
+                                 latent_dim=latent_dim).to(device)
+    trainer = Trainer(model, lr=1e-3, device=device)
     
     last_loss = 1.0
     for epoch in range(epochs):
-        # Sample a short sequence for training
         idx = np.random.randint(0, len(dataset) - seq_len)
         batch_data = dataset[idx : idx + seq_len]
         loss, rec, cons = trainer.train_step(batch_data, sim.dt)
@@ -68,17 +77,21 @@ def main():
     with torch.no_grad():
         test_idx = 0
         data = dataset[test_idx]
-        batch = torch.zeros(data.x.size(0), dtype=torch.long)
-        z, s = model.encode(data.x, data.edge_index, batch)
-        recon = model.decode(z, s, batch).numpy()
+        x = data.x.to(device)
+        edge_index = data.edge_index.to(device)
+        batch = torch.zeros(x.size(0), dtype=torch.long, device=device)
+        z, s = model.encode(x, edge_index, batch)
+        recon = model.decode(z, s, batch).cpu().numpy()
         
     plt.figure(figsize=(12, 5))
     
     # Micro Plot
     plt.subplot(1, 2, 1)
-    plt.scatter(pos[test_idx, :, 0], pos[test_idx, :, 1], c='blue', label='Ground Truth')
+    # Note: 'pos' contains raw coordinates, we should compare recon to normalized input or denormalize recon
+    # For simplicity, we compare recon features to data.x
+    plt.scatter(data.x.cpu().numpy()[:, 0], data.x.cpu().numpy()[:, 1], c='blue', label='Ground Truth (Norm)')
     plt.scatter(recon[:, 0], recon[:, 1], c='red', marker='x', label='Reconstruction')
-    plt.title("Micro-scale: Particles")
+    plt.title("Micro-scale: Particles (Normalized)")
     plt.legend()
     
     # Meso Plot (Latent states over time)

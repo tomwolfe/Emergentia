@@ -3,18 +3,19 @@ import numpy as np
 import torch
 
 class SpringMassSimulator:
-    def __init__(self, n_particles=64, k=10.0, m=1.0, dt=0.01, spring_dist=1.0, dynamic_radius=None):
+    def __init__(self, n_particles=64, k=10.0, m=1.0, dt=0.01, spring_dist=1.0, dynamic_radius=None, box_size=None):
         self.n_particles = n_particles
         self.k = k
         self.m = m
         self.dt = dt
         self.spring_dist = spring_dist
         self.dynamic_radius = dynamic_radius
+        self.box_size = box_size # tuple (L_x, L_y) or None
         
         # Initialize particles in a grid
         side = int(np.ceil(np.sqrt(n_particles)))
-        x = np.linspace(0, side * spring_dist, side)
-        y = np.linspace(0, side * spring_dist, side)
+        x = np.linspace(0.1 * spring_dist, side * spring_dist, side)
+        y = np.linspace(0.1 * spring_dist, side * spring_dist, side)
         xv, yv = np.meshgrid(x, y)
         self.pos = np.stack([xv.flatten()[:n_particles], yv.flatten()[:n_particles]], axis=1)
         # Random initial velocity
@@ -26,43 +27,56 @@ class SpringMassSimulator:
             self.fixed_pairs = self._compute_pairs(self.pos)
 
     def _compute_pairs(self, pos):
-        tree = KDTree(pos)
-        # query_pairs returns a set of (i, j) with i < j
-        return list(tree.query_pairs(self.radius))
+        if self.box_size:
+            # For PBC, we use a simple distance search with wrap-around
+            # KDTree doesn't natively support PBC easily without manual tiling or custom distance
+            # For 80/20 we'll use brute force or just ignore KDTree for PBC if n is small
+            # but let's try a simple approach: tiling 3x3 if needed, or just brute force
+            if self.n_particles <= 128:
+                # Brute force is fine for small n
+                diff = pos[:, np.newaxis, :] - pos[np.newaxis, :, :]
+                for i in range(2):
+                    diff[:, :, i] -= self.box_size[i] * np.round(diff[:, :, i] / self.box_size[i])
+                dist = np.linalg.norm(diff, axis=-1)
+                idx1, idx2 = np.where((dist < self.radius) & (np.arange(self.n_particles)[:, None] < np.arange(self.n_particles)[None, :]))
+                return list(zip(idx1, idx2))
+            else:
+                tree = KDTree(pos)
+                return list(tree.query_pairs(self.radius))
+        else:
+            tree = KDTree(pos)
+            return list(tree.query_pairs(self.radius))
 
     def compute_forces(self, pos):
         forces = np.zeros_like(pos)
-        pairs = self._compute_pairs(pos) if self.dynamic_radius else self.fixed_pairs
+        pairs = self._compute_pairs(pos) if (self.dynamic_radius or self.box_size) else self.fixed_pairs
         
         if len(pairs) == 0:
             return forces
 
-        # Vectorized force calculation for all pairs
         idx1, idx2 = zip(*pairs)
         idx1 = np.array(idx1)
         idx2 = np.array(idx2)
         
         diff = pos[idx2] - pos[idx1]
-        dist = np.linalg.norm(diff, axis=1, keepdims=True)
         
-        # Avoid division by zero and extremely small distances (repulsion)
-        # Use a soft-core repulsion to prevent singularities
+        # Apply Minimum Image Convention for PBC
+        if self.box_size:
+            for i in range(2):
+                diff[:, i] -= self.box_size[i] * np.round(diff[:, i] / self.box_size[i])
+
+        dist = np.linalg.norm(diff, axis=1, keepdims=True)
         dist_clamped = np.maximum(dist, 0.2 * self.spring_dist)
         
         f_mag = self.k * (dist - self.spring_dist)
-        
-        # Soft repulsive force at short distances to prevent overlap without explosion
-        # LJ-like repulsion but smoother
         repulsion = 0.5 * self.k * np.power(self.spring_dist / dist_clamped, 4)
         f_mag -= repulsion
         
-        force_vec = f_mag * (diff / dist)
+        force_vec = f_mag * (diff / (dist + 1e-9))
         
-        # Clamp forces to prevent explosion, but use a higher threshold than before
         max_f = 500.0
         force_vec = np.clip(force_vec, -max_f, max_f)
         
-        # Use np.add.at for scattering forces back to particles
         np.add.at(forces, idx1, force_vec)
         np.add.at(forces, idx2, -force_vec)
         
@@ -70,22 +84,16 @@ class SpringMassSimulator:
 
     def step(self):
         # Velocity Verlet:
-        # 1. v(t + dt/2) = v(t) + (f(t)/m) * (dt/2)
-        # 2. x(t + dt) = x(t) + v(t + dt/2) * dt
-        # 3. f(t + dt) from x(t + dt)
-        # 4. v(t + dt) = v(t + dt/2) + (f(t + dt)/m) * (dt/2)
-
-        # Step 1
         forces_t = self.compute_forces(self.pos)
         v_half = self.vel + (forces_t / self.m) * (self.dt / 2.0)
         
-        # Step 2
         self.pos += v_half * self.dt
         
-        # Step 3
-        forces_next = self.compute_forces(self.pos)
+        # Apply PBC wrap-around
+        if self.box_size:
+            self.pos = self.pos % self.box_size
         
-        # Step 4
+        forces_next = self.compute_forces(self.pos)
         self.vel = v_half + (forces_next / self.m) * (self.dt / 2.0)
         
         # Stability check & soft-clamping

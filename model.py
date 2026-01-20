@@ -130,7 +130,8 @@ class DiscoveryEngineModel(nn.Module):
     
     def forward_dynamics(self, z0, t):
         # z0: [batch_size, n_super_nodes, latent_dim]
-        z0_flat = z0.view(z0.size(0), -1)
-        zt_flat = odeint(self.ode_func, z0_flat, t)
+        z0_flat = z0.view(z0.size(0), -1).to(torch.float32)
+        t = t.to(torch.float32)
+        zt_flat = odeint(self.ode_func, z0_flat, t, rtol=1e-3, atol=1e-4)
         # zt_flat: [len(t), batch_size, latent_dim * n_super_nodes]
         return zt_flat.view(zt_flat.size(0), zt_flat.size(1), -1, z0.size(-1))
