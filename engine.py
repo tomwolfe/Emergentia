@@ -69,13 +69,13 @@ class Trainer:
             default_weights.update(loss_weights)
         self.weights = default_weights
 
-    def train_step(self, data_list, dt):
+    def train_step(self, data_list, dt, epoch=0):
         self.optimizer.zero_grad()
         seq_len = len(data_list)
         
         # 1. Encode the first state
         batch_0 = Batch.from_data_list([data_list[0]]).to(self.device)
-        z_0, s_0 = self.model.encode(batch_0.x, batch_0.edge_index, batch_0.batch)
+        z_0, s_0, entropy_0 = self.model.encode(batch_0.x, batch_0.edge_index, batch_0.batch)
         
         # 2. Predict full sequence in latent space
         t_span = torch.linspace(0, (seq_len - 1) * dt, seq_len, device=self.device, dtype=torch.float32)
@@ -83,7 +83,7 @@ class Trainer:
         
         loss_rec = 0
         loss_cons = 0
-        loss_assign = 0
+        loss_assign = entropy_0 # Initialize with first entropy
         loss_l2 = torch.mean(z_pred_seq**2) # Penalize large latent values to ground the space
         
         s_prev = s_0
@@ -92,30 +92,40 @@ class Trainer:
             batch_t = Batch.from_data_list([data_list[t]]).to(self.device)
             
             # Reconstruction loss at each step
-            _, s_t = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch)
+            _, s_t, entropy_t = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch)
             recon_t = self.model.decode(z_pred_seq[t], s_t, batch_t.batch)
             loss_rec += self.criterion(recon_t, batch_t.x)
             
             # Assignment consistency loss: minimize change in super-node identity
+            # AND diversity loss (entropy)
+            loss_assign += entropy_t
             if t > 0:
                 loss_assign += self.criterion(s_t, s_prev)
                 # Consistency loss (encoding of real state vs predicted latent state)
-                z_t_target, _ = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch)
+                z_t_target, _, _ = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch)
                 loss_cons += self.criterion(z_pred_seq[t], z_t_target)
             
             s_prev = s_t
         
         loss_rec /= seq_len
         loss_cons /= (seq_len - 1)
-        loss_assign /= (seq_len - 1)
+        loss_assign /= seq_len
+        
+        # Scheduled Warm-up: Prioritize reconstruction in early epochs or high error
+        # Gradually introduce consistency and L2 losses
+        anneal = 1.0
+        if epoch < 500 or loss_rec.item() > 0.1:
+            anneal = min(1.0, epoch / 500.0) if epoch >= 100 else 0.01
         
         # Apply configurable weights
         loss = (self.weights['rec'] * loss_rec + 
-                self.weights['cons'] * loss_cons + 
-                self.weights['assign'] * loss_assign +
-                self.weights['latent_l2'] * loss_l2)
+                anneal * (self.weights['cons'] * loss_cons + 
+                         self.weights['latent_l2'] * loss_l2) +
+                self.weights['assign'] * loss_assign)
         
         loss.backward()
+        # Gradient Clipping to handle exploding gradients from ODE solver
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.optimizer.step()
         
         return loss.item(), loss_rec.item(), loss_cons.item()

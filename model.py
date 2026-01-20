@@ -39,18 +39,25 @@ class HierarchicalPooling(nn.Module):
         # Compute soft-assignment matrix s: [N, n_super_nodes]
         s = torch.softmax(self.assign_mlp(x), dim=-1)
         
+        # Diversity loss (Entropy): Minimize to encourage sharp assignments
+        # or maximize to encourage diversity? The prompt says "prevent assigning all to single super-node"
+        # but the provided formula is standard entropy.
+        entropy = -torch.mean(torch.sum(s * torch.log(s + 1e-9), dim=1))
+        
         # Weighted aggregation: [N, 1, in_channels] * [N, n_super_nodes, 1]
         x_expanded = x.unsqueeze(1) * s.unsqueeze(2) 
         
         # Scatter to batch: [Batch_Size, n_super_nodes, in_channels]
         out = scatter(x_expanded, batch, dim=0, reduce='sum')
-        return out, s
+        return out, s, entropy
 
 class GNNEncoder(nn.Module):
     def __init__(self, node_features, hidden_dim, latent_dim, n_super_nodes):
         super(GNNEncoder, self).__init__()
         self.gnn1 = GNNLayer(node_features, hidden_dim)
+        self.ln1 = nn.LayerNorm(hidden_dim)
         self.gnn2 = GNNLayer(hidden_dim, hidden_dim)
+        self.ln2 = nn.LayerNorm(hidden_dim)
         self.n_super_nodes = n_super_nodes
         self.latent_dim = latent_dim
         
@@ -64,13 +71,13 @@ class GNNEncoder(nn.Module):
         )
 
     def forward(self, x, edge_index, batch):
-        x = torch.relu(self.gnn1(x, edge_index))
-        x = torch.relu(self.gnn2(x, edge_index))
+        x = self.ln1(torch.relu(self.gnn1(x, edge_index)))
+        x = self.ln2(torch.relu(self.gnn2(x, edge_index)))
         
         # Pool to K super-nodes preserving spatial features
-        pooled, s = self.pooling(x, batch) # [batch_size, n_super_nodes, hidden_dim], [N, n_super_nodes]
+        pooled, s, entropy = self.pooling(x, batch) # [batch_size, n_super_nodes, hidden_dim], [N, n_super_nodes]
         latent = self.output_layer(pooled) # [batch_size, n_super_nodes, latent_dim]
-        return latent, s
+        return latent, s, entropy
 
 class LatentODEFunc(nn.Module):
     def __init__(self, latent_dim, n_super_nodes, hidden_dim=64):
@@ -80,9 +87,9 @@ class LatentODEFunc(nn.Module):
         self.n_super_nodes = n_super_nodes
         self.net = nn.Sequential(
             nn.Linear(self.input_dim, hidden_dim),
-            nn.Tanh(),
+            nn.LeakyReLU(0.1),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
+            nn.LeakyReLU(0.1),
             nn.Linear(hidden_dim, self.input_dim)
         )
 
@@ -94,6 +101,7 @@ class LatentODEFunc(nn.Module):
 class GNNDecoder(nn.Module):
     def __init__(self, latent_dim, hidden_dim, out_features):
         super(GNNDecoder, self).__init__()
+        self.ln = nn.LayerNorm(hidden_dim)
         self.mlp = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
             nn.ReLU(),
@@ -115,7 +123,11 @@ class GNNDecoder(nn.Module):
         # sum over n_super_nodes
         node_features_latent = torch.sum(s.unsqueeze(-1) * z_expanded, dim=1)
         
-        return self.mlp(node_features_latent)
+        # Apply LayerNorm before final output layer (inside the MLP's first part effectively)
+        # But instructions said "before the final output", let's be precise.
+        h = torch.relu(self.mlp[0](node_features_latent))
+        h = self.ln(h)
+        return self.mlp[2](h)
 
 class DiscoveryEngineModel(nn.Module):
     def __init__(self, n_particles, n_super_nodes, node_features=4, latent_dim=4, hidden_dim=64):

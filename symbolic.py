@@ -64,7 +64,7 @@ def extract_latent_data(model, dataset, dt):
 
             current_t = i * dt
 
-            z, s = model.encode(x, edge_index, torch.zeros(x.size(0), dtype=torch.long, device=device))
+            z, s, _ = model.encode(x, edge_index, torch.zeros(x.size(0), dtype=torch.long, device=device))
             z_flat = z.view(-1).cpu().numpy()
 
             # Use the ODE function to get the derivative at this state and time

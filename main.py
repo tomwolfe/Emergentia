@@ -22,10 +22,10 @@ def main():
 
     # 1. Setup Parameters
     n_particles = 16
-    n_super_nodes = 2
+    n_super_nodes = 4
     latent_dim = 2 
     steps = 500
-    epochs = 500
+    epochs = 2000
     seq_len = 5
     dynamic_radius = 1.5 
     box_size = (10.0, 10.0) # Periodic Boundary
@@ -44,27 +44,31 @@ def main():
                                  n_super_nodes=n_super_nodes, 
                                  latent_dim=latent_dim).to(device)
     
-    # Pareto-optimal: Address hyperparameter rigidity and state drift
+    # Updated weights to prioritize reconstruction and prevent collapse
     loss_weights = {
-        'rec': 1.0,      # Prioritize micro-scale feature reconstruction
-        'cons': 5.0,     # Strong grounding of latent dynamics to encoded states
-        'assign': 2.0,   # Ensure super-node stability over time
-        'latent_l2': 0.1 # Penalty to prevent latent space drift (critical for symbolic)
+        'rec': 20.0,     # Heavily prioritize reconstruction
+        'cons': 1.0,     
+        'assign': 5.0,   # Stronger penalty for assignment instability/entropy
+        'latent_l2': 0.01 
     }
     
-    trainer = Trainer(model, lr=1e-3, device=device, 
+    trainer = Trainer(model, lr=5e-4, device=device, 
                       loss_weights=loss_weights, stats=stats)
+    
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(trainer.optimizer, mode='min', 
+                                                           factor=0.5, patience=100)
     
     last_loss = 1.0
     for epoch in range(epochs):
         idx = np.random.randint(0, len(dataset) - seq_len)
         batch_data = dataset[idx : idx + seq_len]
-        loss, rec, cons = trainer.train_step(batch_data, sim.dt)
+        loss, rec, cons = trainer.train_step(batch_data, sim.dt, epoch=epoch)
         last_loss = loss
+        scheduler.step(loss)
         
-        if epoch % 50 == 0:
+        if epoch % 100 == 0:
             progress = (epoch / epochs) * 100
-            print(f"Progress: {progress:3.0f}% | Loss: {loss:.6f} | Rec: {rec:.6f} | Cons: {cons:.6f}")
+            print(f"Progress: {progress:3.0f}% | Loss: {loss:.6f} | Rec: {rec:.6f} | Cons: {cons:.6f} | LR: {trainer.optimizer.param_groups[0]['lr']:.2e}")
 
     # --- Quality Gate ---
     print(f"\nFinal Training Loss: {last_loss:.6f}")
@@ -95,7 +99,7 @@ def main():
         x = data.x.to(device)
         edge_index = data.edge_index.to(device)
         batch = torch.zeros(x.size(0), dtype=torch.long, device=device)
-        z, s = model.encode(x, edge_index, batch)
+        z, s, _ = model.encode(x, edge_index, batch)
         recon = model.decode(z, s, batch).cpu().numpy()
         
     plt.figure(figsize=(15, 5))
