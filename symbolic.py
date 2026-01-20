@@ -12,7 +12,7 @@ class SymbolicDistiller:
         return SymbolicRegressor(population_size=pop,
                                  generations=gen, 
                                  stopping_criteria=self.stopping_criteria,
-                                 function_set=('add', 'sub', 'mul', 'div', 'sin', 'cos'),
+                                 function_set=('add', 'sub', 'mul', 'div', 'inv', 'neg', 'sin', 'cos'),
                                  p_crossover=0.7, p_subtree_mutation=0.1,
                                  p_hoist_mutation=0.05, p_point_mutation=0.1,
                                  max_samples=0.9, verbose=0, # Quiet by default

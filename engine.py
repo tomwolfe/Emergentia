@@ -4,6 +4,7 @@ from torch_geometric.data import Data, Batch
 from simulator import SpringMassSimulator
 from model import DiscoveryEngineModel
 import numpy as np
+from scipy.spatial import KDTree
 
 def prepare_data(pos, vel, radius=1.1):
     # pos, vel: [T, N, 2]
@@ -11,11 +12,18 @@ def prepare_data(pos, vel, radius=1.1):
     
     dataset = []
     for t in range(T):
-        # Compute dynamic edge_index based on distance radius
+        # Compute dynamic edge_index based on distance radius using KDTree for efficiency
         curr_pos = pos[t]
-        dist_matrix = np.linalg.norm(curr_pos[:, np.newaxis, :] - curr_pos[np.newaxis, :, :], axis=2)
-        adj = (dist_matrix < radius) & (dist_matrix > 0)
-        edge_index = torch.tensor(np.argwhere(adj).T, dtype=torch.long)
+        tree = KDTree(curr_pos)
+        pairs = list(tree.query_pairs(radius))
+        
+        if len(pairs) > 0:
+            idx1, idx2 = zip(*pairs)
+            # Bi-directional edges
+            edges = np.array([idx1 + idx2, idx2 + idx1])
+            edge_index = torch.tensor(edges, dtype=torch.long)
+        else:
+            edge_index = torch.tensor([[], []], dtype=torch.long)
         
         # Feature: [x, y, vx, vy]
         x = torch.cat([torch.tensor(pos[t], dtype=torch.float), 
