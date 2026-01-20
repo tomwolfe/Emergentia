@@ -59,10 +59,11 @@ class SymbolicDistiller:
                 
         return equations, (z_mean, z_std, dz_mean, dz_std)
 
-def extract_latent_data(model, dataset, dt):
+def extract_latent_data(model, dataset, dt, stats=None):
     model.eval()
     latent_states = []
     latent_derivs = []
+    physical_states = []
     times = []
 
     device = next(model.parameters()).device
@@ -70,26 +71,62 @@ def extract_latent_data(model, dataset, dt):
     with torch.no_grad():
         for i in range(len(dataset)):
             data = dataset[i]
-            # Ensure data is on the correct device
             x = data.x.to(device)
             edge_index = data.edge_index.to(device)
-
             current_t = i * dt
 
+            # 1. Latent State Extraction: Ensure explicit flattening to [n_super_nodes * latent_dim]
             z, s, _ = model.encode(x, edge_index, torch.zeros(x.size(0), dtype=torch.long, device=device))
-            z_flat = z.view(-1).cpu().numpy()
+            z_flat = z.view(z.size(0), -1)[0].cpu().numpy()
 
-            # Use the ODE function to get the derivative at this state and time
-            # Handle potential device mismatch (e.g. if ode_func is on CPU for MPS compatibility)
+            # 2. Latent Derivative from Neural ODE function
             ode_device = next(model.ode_func.parameters()).device
-            t = torch.tensor([current_t], dtype=torch.float32, device=ode_device)
-            z_for_ode = z.view(1, -1).to(ode_device)
-            
-            dz = model.ode_func(t, z_for_ode)
-            dz_flat = dz.view(-1).cpu().numpy()
+            t_ode = torch.tensor([current_t], dtype=torch.float32, device=ode_device)
+            z_for_ode = z.view(z.size(0), -1).to(ode_device)
+            dz = model.ode_func(t_ode, z_for_ode)
+            dz_flat = dz.view(dz.size(0), -1)[0].cpu().numpy()
 
             latent_states.append(z_flat)
             latent_derivs.append(dz_flat)
             times.append(current_t)
+            
+            # 3. Physical Aggregates (Anchors for interpretability)
+            if stats is not None:
+                # Denormalize positions and velocities for physical calculation
+                pos_norm = data.x[:, :2].cpu().numpy()
+                vel_norm = data.x[:, 2:].cpu().numpy()
+                pos = pos_norm * stats['pos_std'] + stats['pos_mean']
+                vel = vel_norm * stats['vel_std'] + stats['vel_mean']
+                
+                # Total Kinetic Energy (0.5 * m * v^2, m=1.0)
+                ke = 0.5 * np.sum(vel**2)
+                
+                # Total Potential Energy (0.5 * k * (r - r0)^2, k=15.0, r0=1.0)
+                pe = 0
+                if edge_index.numel() > 0:
+                    edges = edge_index.cpu().numpy()
+                    mask = edges[0] < edges[1] # Avoid double counting
+                    idx1, idx2 = edges[0][mask], edges[1][mask]
+                    dist = np.linalg.norm(pos[idx1] - pos[idx2], axis=1)
+                    pe = 0.5 * 15.0 * np.sum((dist - 1.0)**2)
+                
+                # Center of Mass Velocity Magnitude
+                com_vel_mag = np.linalg.norm(np.mean(vel, axis=0))
+                
+                physical_states.append([ke + pe, com_vel_mag])
 
-    return np.array(latent_states), np.array(latent_derivs), np.array(times)
+    z_array = np.array(latent_states)
+    dz_array = np.array(latent_derivs)
+    
+    if stats is not None and len(physical_states) > 0:
+        p_array = np.array(physical_states)
+        # Compute numerical derivatives for physical targets
+        dp_array = np.zeros_like(p_array)
+        dp_array[:-1] = (p_array[1:] - p_array[:-1]) / dt
+        dp_array[-1] = dp_array[-2] # Simple boundary padding
+        
+        # Append physical variables as additional targets (dz_4/dt, dz_5/dt etc.)
+        z_array = np.column_stack([z_array, p_array])
+        dz_array = np.column_stack([dz_array, dp_array])
+
+    return z_array, dz_array, np.array(times)

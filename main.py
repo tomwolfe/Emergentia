@@ -22,8 +22,8 @@ def main():
 
     # 1. Setup Parameters
     n_particles = 16
-    n_super_nodes = 4
-    latent_dim = 4 
+    n_super_nodes = 2
+    latent_dim = 2 
     steps = 800
     epochs = 5000
     seq_len = 12
@@ -79,7 +79,7 @@ def main():
 
     # 3. Extract Symbolic Equations
     print("--- 3. Distilling Symbolic Laws ---")
-    z_states, dz_states, t_states = extract_latent_data(model, dataset, sim.dt)
+    z_states, dz_states, t_states = extract_latent_data(model, dataset, sim.dt, stats=stats)
     
     distiller = SymbolicDistiller(populations=2000, generations=50) 
     equations, z_stats = distiller.distill(z_states, dz_states)
