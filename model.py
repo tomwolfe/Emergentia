@@ -219,7 +219,8 @@ class DiscoveryEngineModel(nn.Module):
         self.hamiltonian = hamiltonian
 
         # Learnable loss log-variances for automatic loss balancing
-        self.log_vars = nn.Parameter(torch.zeros(6)) # rec, cons, assign, ortho, l2, lvr
+        # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align
+        self.log_vars = nn.Parameter(torch.zeros(7)) 
         
     def encode(self, x, edge_index, batch, tau=1.0):
         return self.encoder(x, edge_index, batch, tau=tau)

@@ -3,6 +3,7 @@ import numpy as np
 import torch
 from sklearn.linear_model import LassoCV
 from sklearn.feature_selection import SelectFromModel
+from joblib import Parallel, delayed
 
 class FeatureTransformer:
     """
@@ -92,8 +93,9 @@ class SymbolicDistiller:
                                  function_set=('add', 'sub', 'mul', 'div', 'neg', 'sin', 'cos'),
                                  p_crossover=0.7, p_subtree_mutation=0.1,
                                  p_hoist_mutation=0.05, p_point_mutation=0.1,
-                                 max_samples=0.9, verbose=0, 
+                                 max_samples=0.7, verbose=0, 
                                  parsimony_coefficient=0.05,
+                                 n_jobs=-1,
                                  random_state=42)
 
     def validate_stability(self, program, X_start, dt=0.01, steps=20):
@@ -108,6 +110,51 @@ class SymbolicDistiller:
                 return False
         return True
 
+    def _distill_single_target(self, i, X_norm, Y_norm, targets_shape_1, latent_states_shape_1):
+        print(f"Selecting features for target_{i} (Input dim: {X_norm.shape[1]})...")
+        selector = SelectFromModel(LassoCV(cv=5, max_iter=2000), max_features=self.max_features)
+        selector.fit(X_norm, Y_norm[:, i])
+        mask = selector.get_support()
+        X_selected = X_norm[:, mask]
+        
+        print(f"  -> Target_{i}: Reduced features to {X_selected.shape[1]} informative variables.")
+
+        if X_selected.shape[1] == 0:
+            # If no features selected, return a constant zero program
+            # SymbolicRegressor doesn't easily let us create a custom program, 
+            # but we can return None or a very simple one. 
+            # Actually, gplearn programs are complex objects. 
+            # We'll just return a placeholder or handle it in evaluation.
+            # A better way: if 0 features, just use a dummy feature (all zeros)
+            X_selected = np.zeros((X_norm.shape[0], 1))
+            mask = np.zeros(X_norm.shape[1], dtype=bool)
+            print(f"  -> Target_{i}: No features selected, using dummy zero feature.")
+
+        coarse_pop = self.max_pop // 4
+        coarse_gen = self.max_gen // 2
+        
+        print(f"Distilling target_{i} (Coarse search)...")
+        est = self._get_regressor(coarse_pop, coarse_gen)
+        est.fit(X_selected, Y_norm[:, i])
+        
+        best_prog = est._program
+        is_stable = True
+        if targets_shape_1 == latent_states_shape_1:
+            is_stable = self.validate_stability(best_prog, X_selected[0])
+        
+        if est.score(X_selected, Y_norm[:, i]) > 0.95 and is_stable:
+            print(f"  -> Good fit found in coarse search for target_{i} (R^2={est.score(X_selected, Y_norm[:, i]):.3f})")
+            return best_prog, mask
+        else:
+            print(f"  -> Escalating to Fine search for target_{i} (pop={self.max_pop}, gen={self.max_gen})...")
+            est = self._get_regressor(self.max_pop, self.max_gen)
+            est.fit(X_selected, Y_norm[:, i])
+            
+            if hasattr(est, '_program'):
+                return est._program, mask
+            else:
+                return best_prog, mask
+
     def distill(self, latent_states, targets, n_super_nodes, latent_dim):
         """
         Generic distillation of targets from latent states.
@@ -120,48 +167,14 @@ class SymbolicDistiller:
         X_norm = self.transformer.normalize_x(X_poly)
         Y_norm = self.transformer.normalize_y(targets)
 
-        equations = []
-        self.feature_masks = []
-
-        for i in range(targets.shape[1]):
-            print(f"Selecting features for target_{i} (Input dim: {X_norm.shape[1]})...")
-            selector = SelectFromModel(LassoCV(cv=5, max_iter=2000), max_features=self.max_features)
-            selector.fit(X_norm, Y_norm[:, i])
-            mask = selector.get_support()
-            self.feature_masks.append(mask)
-            X_selected = X_norm[:, mask]
-            
-            print(f"  -> Reduced features to {X_selected.shape[1]} informative variables.")
-
-            coarse_pop = self.max_pop // 4
-            coarse_gen = self.max_gen // 2
-            
-            print(f"Distilling target_{i} (Coarse search)...")
-            est = self._get_regressor(coarse_pop, coarse_gen)
-            est.fit(X_selected, Y_norm[:, i])
-            
-            best_prog = est._program
-            # Stability check only makes sense for dZ/dt, not for H
-            # But we'll keep it as a general check if targets.shape[1] == latent_states.shape[1]
-            is_stable = True
-            if targets.shape[1] == latent_states.shape[1]:
-                is_stable = self.validate_stability(best_prog, X_selected[0])
-            
-            if est.score(X_selected, Y_norm[:, i]) > 0.95 and is_stable:
-                print(f"  -> Good fit found in coarse search (R^2={est.score(X_selected, Y_norm[:, i]):.3f})")
-                equations.append(best_prog)
-            else:
-                print(f"  -> Escalating to Fine search (pop={self.max_pop}, gen={self.max_gen})...")
-                est = self._get_regressor(self.max_pop, self.max_gen)
-                est.fit(X_selected, Y_norm[:, i])
-                
-                # Final check: is the fine search actually better?
-                # Sometimes GP just finds a complex identity that overfits.
-                # We prefer simpler programs if the score is 'good enough'.
-                if hasattr(est, '_program'):
-                    equations.append(est._program)
-                else:
-                    equations.append(best_prog) # Fallback to coarse if fine failed
+        # Parallelize over targets to improve scalability
+        results = Parallel(n_jobs=min(targets.shape[1], 4))(
+            delayed(self._distill_single_target)(i, X_norm, Y_norm, targets.shape[1], latent_states.shape[1])
+            for i in range(targets.shape[1])
+        )
+        
+        equations = [r[0] for r in results]
+        self.feature_masks = [r[1] for r in results]
                 
         return equations
 

@@ -155,8 +155,15 @@ class SpringMassSimulator:
             forces_next = self.compute_forces(self.pos)
             self.vel = v_half + (forces_next / self.m) * (dt_sub / 2.0)
             
-            # Stability check & soft-clamping (per sub-step)
-            max_v = 20.0
+            # 1. Global Energy Clamping (Proactive)
+            # Prevent runaway kinetic energy which leads to divergence
+            ke = 0.5 * self.m * np.sum(self.vel**2)
+            max_ke = 1000.0 * self.n_particles
+            if ke > max_ke:
+                self.vel *= np.sqrt(max_ke / ke)
+
+            # 2. Individual Particle Velocity Clamping
+            max_v = 30.0
             v_norm = np.linalg.norm(self.vel, axis=1, keepdims=True)
             if np.any(v_norm > max_v):
                 scale = np.where(v_norm > max_v, max_v / v_norm, 1.0)
@@ -165,9 +172,13 @@ class SpringMassSimulator:
         # Check for NaNs or massive values after all sub-steps
         if np.any(np.isnan(self.pos)) or np.any(np.abs(self.pos) > 1e6):
             print("Warning: Simulation diverged. Re-centering and damping.")
-            self.pos = np.nan_to_num(self.pos)
-            self.pos = np.clip(self.pos, -100, 100)
-            self.vel *= 0.1
+            # Graceful recovery: Re-center particles in the box and zero velocities
+            if self.box_size:
+                self.pos = self.pos % self.box_size
+            else:
+                self.pos = np.nan_to_num(self.pos)
+                self.pos = np.clip(self.pos, -5, 5)
+            self.vel = np.zeros_like(self.vel)
 
         return self.pos.copy(), self.vel.copy()
 
