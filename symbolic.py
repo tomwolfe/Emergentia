@@ -46,24 +46,40 @@ class FeatureTransformer:
         features = [z_flat]
         if self.include_dists:
             dists = []
+            inv_dists = []
+            inv_sq_dists = []
+            
             for i in range(self.n_super_nodes):
                 for j in range(i + 1, self.n_super_nodes):
-                    # Efficiently compute distances for the batch
-                    d = np.linalg.norm(z_nodes[:, i] - z_nodes[:, j], axis=1, keepdims=True)
+                    # Relative distance between super-nodes (using first 2 dims as positions)
+                    # This assumes the align_loss worked and z[:, :2] is CoM
+                    diff = z_nodes[:, i, :2] - z_nodes[:, j, :2]
+                    d = np.linalg.norm(diff, axis=1, keepdims=True)
                     dists.append(d)
+                    # Physics-informed features: inverse laws
+                    inv_dists.append(1.0 / (d + 0.1))
+                    inv_sq_dists.append(1.0 / (d**2 + 0.1))
+            
             if dists:
-                features.append(np.hstack(dists))
+                features.extend([np.hstack(dists), np.hstack(inv_dists), np.hstack(inv_sq_dists)])
         
         X = np.hstack(features)
         
         # Polynomial expansion (Linear + Quadratic)
         n_raw = X.shape[1]
         poly_features = [X]
-        for i in range(n_raw):
+        # Only square the raw latent variables to avoid feature explosion
+        n_latents = self.n_super_nodes * self.latent_dim
+        for i in range(n_latents):
             poly_features.append((X[:, i:i+1]**2))
-            # Cross-terms (limited to reduce explosion)
-            # Only do cross-terms for adjacent super-nodes or dimensions to keep space manageable
-            for j in range(i + 1, min(i + 4, n_raw)): 
+            
+            # Smart cross-terms: only between dimensions of the SAME super-node
+            # or same dimensions across DIFFERENT super-nodes
+            node_idx = i // self.latent_dim
+            dim_idx = i % self.latent_dim
+            
+            # Cross-terms within same node
+            for j in range(i + 1, (node_idx + 1) * self.latent_dim):
                 poly_features.append(X[:, i:i+1] * X[:, j:j+1])
         
         return np.hstack(poly_features)

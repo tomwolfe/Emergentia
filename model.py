@@ -167,13 +167,15 @@ class LatentODEFunc(nn.Module):
 class HamiltonianODEFunc(nn.Module):
     """
     Enforces Hamiltonian constraints: dq/dt = dH/dp, dp/dt = -dH/dq.
-    This ensures energy conservation in the latent space.
+    Optionally includes a learnable dissipation term: dp/dt = -dH/dq - gamma * p.
     """
-    def __init__(self, latent_dim, n_super_nodes, hidden_dim=64):
+    def __init__(self, latent_dim, n_super_nodes, hidden_dim=64, dissipative=True):
         super(HamiltonianODEFunc, self).__init__()
         assert latent_dim % 2 == 0, "Latent dim must be even for Hamiltonian dynamics (q, p)"
         self.latent_dim = latent_dim
         self.n_super_nodes = n_super_nodes
+        self.dissipative = dissipative
+        
         self.H_net = nn.Sequential(
             nn.Linear(latent_dim * n_super_nodes, hidden_dim),
             nn.Tanh(), # Tanh ensures second-order differentiability for dH
@@ -181,6 +183,10 @@ class HamiltonianODEFunc(nn.Module):
             nn.Tanh(),
             nn.Linear(hidden_dim, 1)
         )
+        
+        if dissipative:
+            # Small initial dissipation
+            self.gamma = nn.Parameter(torch.full((n_super_nodes, 1), -5.0)) # log space
 
     def forward(self, t, y):
         # y: [batch_size, latent_dim * n_super_nodes]
@@ -191,12 +197,18 @@ class HamiltonianODEFunc(nn.Module):
         
         # dH is [batch_size, n_super_nodes * latent_dim]
         # Reshape to [batch_size, n_super_nodes, 2, latent_dim // 2]
-        # We assume z is stored as [q1, p1, q2, p2, ...] per super-node
         d_sub = self.latent_dim // 2
-        dH = dH.view(-1, self.n_super_nodes, 2, d_sub)
+        dH_view = dH.view(-1, self.n_super_nodes, 2, d_sub)
         
-        dq = dH[:, :, 1]  # dH/dp
-        dp = -dH[:, :, 0] # -dH/dq
+        dq = dH_view[:, :, 1]  # dH/dp
+        dp = -dH_view[:, :, 0] # -dH/dq
+        
+        if self.dissipative:
+            # y: [B, K * D] -> [B, K, 2, D/2]
+            y_view = y.view(-1, self.n_super_nodes, 2, d_sub)
+            p = y_view[:, :, 1] # momentum
+            gamma = torch.exp(self.gamma)
+            dp = dp - gamma * p
         
         return torch.cat([dq, dp], dim=-1).view(y.shape[0], -1)
 
@@ -225,12 +237,12 @@ class GNNDecoder(nn.Module):
         return self.mlp[2](h)
 
 class DiscoveryEngineModel(nn.Module):
-    def __init__(self, n_particles, n_super_nodes, node_features=4, latent_dim=4, hidden_dim=64, hamiltonian=False):
+    def __init__(self, n_particles, n_super_nodes, node_features=4, latent_dim=4, hidden_dim=64, hamiltonian=False, dissipative=True):
         super(DiscoveryEngineModel, self).__init__()
         self.encoder = GNNEncoder(node_features, hidden_dim, latent_dim, n_super_nodes)
         
         if hamiltonian:
-            self.ode_func = HamiltonianODEFunc(latent_dim, n_super_nodes, hidden_dim)
+            self.ode_func = HamiltonianODEFunc(latent_dim, n_super_nodes, hidden_dim, dissipative=dissipative)
         else:
             self.ode_func = LatentODEFunc(latent_dim, n_super_nodes, hidden_dim)
             

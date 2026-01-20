@@ -43,12 +43,13 @@ def main():
     
     # 2. Initialize Model and Trainer
     print("--- 2. Training Discovery Engine ---")
-    # Using Hamiltonian dynamics for improved physics fidelity
+    # Using Hamiltonian dynamics with learnable dissipation for improved physics fidelity
     model = DiscoveryEngineModel(n_particles=n_particles, 
                                  n_super_nodes=n_super_nodes, 
                                  latent_dim=latent_dim,
                                  hidden_dim=128,
-                                 hamiltonian=True).to(device)
+                                 hamiltonian=True,
+                                 dissipative=True).to(device)
     
     # Trainer now uses adaptive loss weighting, manual weights are deprecated
     trainer = Trainer(model, lr=5e-4, device=device, stats=stats)
@@ -61,7 +62,7 @@ def main():
     for epoch in range(epochs):
         idx = np.random.randint(0, len(dataset) - seq_len)
         batch_data = dataset[idx : idx + seq_len]
-        loss, rec, cons = trainer.train_step(batch_data, sim.dt, epoch=epoch)
+        loss, rec, cons = trainer.train_step(batch_data, sim.dt, epoch=epoch, max_epochs=epochs)
         last_loss = loss
         scheduler.step(loss)
         

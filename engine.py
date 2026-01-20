@@ -121,15 +121,17 @@ class Trainer:
         self.criterion = torch.nn.MSELoss().to(device)
         self.stats = stats
         
-    def train_step(self, data_list, dt, epoch=0, teacher_forcing_ratio=0.5):
+    def train_step(self, data_list, dt, epoch=0, max_epochs=2000):
         self.optimizer.zero_grad()
         seq_len = len(data_list)
         
-        # Refined Tau schedule: faster initial cooling, then stable
-        if epoch < 1000:
-            tau = max(0.1, 1.0 - epoch / 1000.0)
-        else:
-            tau = 0.1
+        # 1. Smooth Tau schedule: Exponential decay
+        # Starts at 1.0, decays to 0.1
+        tau = max(0.1, np.exp(-epoch / 500.0))
+        
+        # 2. Decaying Teacher Forcing Ratio
+        # High at start to help learn mapping, then decays to encourage long-term stability
+        tf_ratio = max(0.0, 0.8 * (1.0 - epoch / (0.75 * max_epochs)))
         
         batch_0 = Batch.from_data_list([data_list[0]]).to(self.device)
         z_curr, s_0, losses_0, mu_0 = self.model.encode(batch_0.x, batch_0.edge_index, batch_0.batch, tau=tau)
@@ -148,7 +150,8 @@ class Trainer:
         z_preds = [z_curr]
         
         for t in range(1, seq_len):
-            if epoch > 500 and np.random.random() < teacher_forcing_ratio:
+            # Apply teacher forcing based on ratio
+            if np.random.random() < tf_ratio:
                 batch_t_prev = Batch.from_data_list([data_list[t-1]]).to(self.device)
                 z_curr, _, _, _ = self.model.encode(batch_t_prev.x, batch_t_prev.edge_index, batch_t_prev.batch, tau=tau)
             
@@ -190,14 +193,14 @@ class Trainer:
             if t > 0:
                 s_diff = self.criterion(s_t, s_prev)
                 mu_diff = self.criterion(mu_t, mu_prev)
-                loss_assign += s_diff + 5.0 * mu_diff # Increased CoM stability weight
+                loss_assign += s_diff + 5.0 * mu_diff 
                 loss_cons += self.criterion(z_preds[t], z_t_target)
                 s_stability += s_diff.item()
                 mu_stability += mu_diff.item()
             s_prev = s_t
             mu_prev = mu_t
         
-        # Normalization over sequence
+        # Normalization
         loss_rec /= seq_len
         loss_cons /= (seq_len - 1)
         loss_assign /= seq_len
@@ -221,7 +224,7 @@ class Trainer:
             'pruning_raw': loss_pruning, 'sep_raw': loss_sep, 'conn_raw': loss_conn
         })
 
-        # Adaptive Loss Weighting (log_vars size 10)
+        # Adaptive Loss Weighting
         lvars = self.model.log_vars
         
         weighted_rec = torch.exp(-lvars[0]) * loss_rec + lvars[0]
@@ -235,19 +238,30 @@ class Trainer:
         weighted_sep = torch.exp(-lvars[8]) * loss_sep + lvars[8]
         weighted_conn = torch.exp(-lvars[9]) * loss_conn + lvars[9]
 
-        stability_threshold = 0.02 # More stringent
-        is_stable = avg_s_stability < stability_threshold or epoch > 2000
+        # REFINED CURRICULUM
+        # Phase 0: Discovery (Clustering + Mapping) - Until stable or enough epochs
+        # Phase 1: Dynamics (Consistency + L2) - Gradual introduction
         
-        # Core discovery losses
+        stability_threshold = 0.015 
+        is_stable = avg_s_stability < stability_threshold or epoch > 1500
+        
         discovery_loss = weighted_rec + weighted_assign + weighted_ortho + weighted_align + weighted_pruning + weighted_sep + weighted_conn
 
-        if epoch < 600 or not is_stable:
+        if epoch < 400 or not is_stable:
+            # Focus on discovery only
             loss = discovery_loss
-        elif epoch < 1800:
-            anneal = (epoch - 600) / 1200.0
-            loss = discovery_loss + anneal * (weighted_cons + weighted_l2 + weighted_lvr)
         else:
-            loss = discovery_loss + weighted_cons + weighted_l2 + weighted_lvr
+            # Anneal dynamics losses over 1000 epochs after discovery is stable
+            anneal_start = 400
+            anneal_duration = 1000.0
+            anneal = min(1.0, (epoch - anneal_start) / anneal_duration)
+            loss = discovery_loss + anneal * (weighted_cons + weighted_l2 + weighted_lvr)
+        
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+        self.optimizer.step()
+        
+        return loss.item(), loss_rec.item(), loss_cons.item()
         
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
