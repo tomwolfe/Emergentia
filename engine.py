@@ -5,14 +5,18 @@ from simulator import SpringMassSimulator
 from model import DiscoveryEngineModel
 import numpy as np
 
-def prepare_data(pos, vel, adj):
+def prepare_data(pos, vel, radius=1.1):
     # pos, vel: [T, N, 2]
-    # adj: [N, N]
     T, N, _ = pos.shape
-    edge_index = torch.tensor(np.argwhere(adj > 0).T, dtype=torch.long)
     
     dataset = []
     for t in range(T):
+        # Compute dynamic edge_index based on distance radius
+        curr_pos = pos[t]
+        dist_matrix = np.linalg.norm(curr_pos[:, np.newaxis, :] - curr_pos[np.newaxis, :, :], axis=2)
+        adj = (dist_matrix < radius) & (dist_matrix > 0)
+        edge_index = torch.tensor(np.argwhere(adj).T, dtype=torch.long)
+        
         # Feature: [x, y, vx, vy]
         x = torch.cat([torch.tensor(pos[t], dtype=torch.float), 
                        torch.tensor(vel[t], dtype=torch.float)], dim=1)
@@ -47,11 +51,13 @@ class Trainer:
             batch_t = Batch.from_data_list([data_list[t]])
             
             # Reconstruction loss at each step
+            # Note: Decoder currently doesn't use edge_index, which is fine for node-wise recon
             recon_t = self.model.decode(z_pred_seq[t])
             loss_rec += self.criterion(recon_t, batch_t.x.unsqueeze(0))
             
             # Consistency loss (encoding of real state vs predicted latent state)
             if t > 0:
+                # Use the dynamic edge_index for encoding the target state
                 z_t_target = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch)
                 loss_cons += self.criterion(z_pred_seq[t], z_t_target)
         
@@ -67,9 +73,10 @@ class Trainer:
 
 if __name__ == "__main__":
     n_particles = 16
-    sim = SpringMassSimulator(n_particles=n_particles)
+    spring_dist = 1.0
+    sim = SpringMassSimulator(n_particles=n_particles, spring_dist=spring_dist, dynamic_radius=1.5)
     pos, vel = sim.generate_trajectory(steps=200)
-    dataset = prepare_data(pos, vel, sim.adj)
+    dataset = prepare_data(pos, vel, radius=1.5)
     
     model = DiscoveryEngineModel(n_particles=n_particles, n_super_nodes=4)
     trainer = Trainer(model)

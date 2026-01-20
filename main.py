@@ -14,11 +14,14 @@ def main():
     steps = 500
     epochs = 500
     seq_len = 5
+    dynamic_radius = 1.5 # Radius for dynamic topology
     
     print("--- 1. Generating Data ---")
-    sim = SpringMassSimulator(n_particles=n_particles, k=15.0)
+    # Initialize simulator with dynamic topology
+    sim = SpringMassSimulator(n_particles=n_particles, k=15.0, dynamic_radius=dynamic_radius)
     pos, vel = sim.generate_trajectory(steps=steps)
-    dataset = prepare_data(pos, vel, sim.adj)
+    # Prepare data with dynamic edge_index
+    dataset = prepare_data(pos, vel, radius=dynamic_radius)
     
     # 2. Initialize Model and Trainer
     print("--- 2. Training Discovery Engine ---")
@@ -38,8 +41,11 @@ def main():
 
     # 3. Extract Symbolic Equations
     print("--- 3. Distilling Symbolic Laws ---")
+    # Extract states and their derivatives from the learned Latent ODE
     z_states, dz_states = extract_latent_data(model, dataset, sim.dt)
-    distiller = SymbolicDistiller(generations=10) # Small for demo
+    
+    # Use the enhanced distiller with expanded function set
+    distiller = SymbolicDistiller(populations=2000, generations=40) 
     equations = distiller.distill(z_states, dz_states)
     
     print("\nDiscovered Meso-scale Laws (dZ/dt = ...):")
