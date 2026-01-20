@@ -1,0 +1,46 @@
+from gplearn.genetic import SymbolicRegressor
+import numpy as np
+import torch
+
+class SymbolicDistiller:
+    def __init__(self, populations=1000, generations=20, stopping_criteria=0.01):
+        self.est = SymbolicRegressor(population_size=populations,
+                                     generations=generations, 
+                                     stopping_criteria=stopping_criteria,
+                                     p_crossover=0.7, p_subtree_mutation=0.1,
+                                     p_hoist_mutation=0.05, p_point_mutation=0.1,
+                                     max_samples=0.9, verbose=1,
+                                     parsimony_coefficient=0.01, random_state=0)
+
+    def distill(self, latent_states, latent_derivs):
+        """
+        latent_states: [N_samples, latent_dim * n_super_nodes]
+        latent_derivs: [N_samples, latent_dim * n_super_nodes]
+        """
+        equations = []
+        for i in range(latent_derivs.shape[1]):
+            print(f"Distilling equation for component {i}...")
+            self.est.fit(latent_states, latent_derivs[:, i])
+            equations.append(self.est._program)
+        return equations
+
+def extract_latent_data(model, dataset, dt):
+    model.eval()
+    latent_states = []
+    latent_derivs = []
+    
+    with torch.no_grad():
+        for i in range(len(dataset)):
+            data = dataset[i]
+            z = model.encode(data.x, data.edge_index, torch.zeros(data.x.size(0), dtype=torch.long))
+            z_flat = z.view(-1).numpy()
+            
+            # Use the ODE function to get the derivative at this state
+            t = torch.tensor([0.0], dtype=torch.float)
+            dz = model.ode_func(t, z.view(1, -1))
+            dz_flat = dz.view(-1).numpy()
+            
+            latent_states.append(z_flat)
+            latent_derivs.append(dz_flat)
+            
+    return np.array(latent_states), np.array(latent_derivs)
