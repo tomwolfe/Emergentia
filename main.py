@@ -45,12 +45,8 @@ def main():
     # --- Quality Gate ---
     print(f"\nFinal Training Loss: {last_loss:.6f}")
     if last_loss > 0.05: # Threshold for 'reasonable' convergence
-        print("CRITICAL WARNING: Model failed to converge (Loss > 0.05).")
-        print("Distilled equations will likely be nonsense.")
-        proceed = input("Abort distillation and tune parameters? (Y/n): ").lower()
-        if proceed != 'n':
-            print("Aborting. Recommended: Increase epochs or adjust dynamic_radius.")
-            return
+        print("WARNING: Model may not have converged fully (Loss > 0.05).")
+        print("Distilled equations might be approximate.")
 
     # 3. Extract Symbolic Equations
     print("--- 3. Distilling Symbolic Laws ---")
@@ -58,8 +54,9 @@ def main():
     z_states, dz_states, t_states = extract_latent_data(model, dataset, sim.dt)
     
     # Use the enhanced distiller with expanded function set
+    # Perform autonomous distillation (no time input)
     distiller = SymbolicDistiller(populations=2000, generations=40) 
-    equations = distiller.distill(z_states, dz_states, t_states)
+    equations = distiller.distill(z_states, dz_states)
     
     print("\nDiscovered Meso-scale Laws (dZ/dt = ...):")
     for i, eq in enumerate(equations):

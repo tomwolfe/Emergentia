@@ -77,7 +77,7 @@ class LatentODEFunc(nn.Module):
         super(LatentODEFunc, self).__init__()
         self.input_dim = latent_dim * n_super_nodes
         self.net = nn.Sequential(
-            nn.Linear(self.input_dim + 1, hidden_dim), # +1 for time t
+            nn.Linear(self.input_dim, hidden_dim), 
             nn.Tanh(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.Tanh(),
@@ -86,10 +86,8 @@ class LatentODEFunc(nn.Module):
 
     def forward(self, t, y):
         # y: [batch_size, latent_dim * n_super_nodes]
-        # t is a scalar or [1]
-        t_vec = torch.ones((y.size(0), 1), device=y.device) * t
-        y_t = torch.cat([y, t_vec], dim=-1)
-        return self.net(y_t)
+        # t is a scalar or [1], ignored for autonomous dynamics
+        return self.net(y)
 
 class GNNDecoder(nn.Module):
     def __init__(self, latent_dim, hidden_dim, out_features):

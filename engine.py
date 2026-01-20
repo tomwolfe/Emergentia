@@ -10,9 +10,19 @@ def prepare_data(pos, vel, radius=1.1):
     # pos, vel: [T, N, 2]
     T, N, _ = pos.shape
     
+    # Standardize data
+    pos_mean = pos.mean(axis=(0, 1))
+    pos_std = pos.std(axis=(0, 1)) + 1e-6
+    vel_mean = vel.mean(axis=(0, 1))
+    vel_std = vel.std(axis=(0, 1)) + 1e-6
+    
+    pos_norm = (pos - pos_mean) / pos_std
+    vel_norm = (vel - vel_mean) / vel_std
+    
     dataset = []
     for t in range(T):
         # Compute dynamic edge_index based on distance radius using KDTree for efficiency
+        # Use original positions for radius search to stay consistent with simulator physics
         curr_pos = pos[t]
         tree = KDTree(curr_pos)
         pairs = list(tree.query_pairs(radius))
@@ -25,9 +35,9 @@ def prepare_data(pos, vel, radius=1.1):
         else:
             edge_index = torch.tensor([[], []], dtype=torch.long)
         
-        # Feature: [x, y, vx, vy]
-        x = torch.cat([torch.tensor(pos[t], dtype=torch.float), 
-                       torch.tensor(vel[t], dtype=torch.float)], dim=1)
+        # Feature: [x, y, vx, vy] - normalized
+        x = torch.cat([torch.tensor(pos_norm[t], dtype=torch.float), 
+                       torch.tensor(vel_norm[t], dtype=torch.float)], dim=1)
         data = Data(x=x, edge_index=edge_index)
         dataset.append(data)
     return dataset
@@ -59,8 +69,10 @@ class Trainer:
             batch_t = Batch.from_data_list([data_list[t]])
             
             # Reconstruction loss at each step
-            # Use assignments from initial state for predicting sequence reconstruction
-            recon_t = self.model.decode(z_pred_seq[t], s_0, batch_t.batch)
+            # Use assignments from CURRENT state for predicting sequence reconstruction
+            # to account for particle flow between super-nodes
+            _, s_t = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch)
+            recon_t = self.model.decode(z_pred_seq[t], s_t, batch_t.batch)
             loss_rec += self.criterion(recon_t, batch_t.x)
             
             # Consistency loss (encoding of real state vs predicted latent state)
