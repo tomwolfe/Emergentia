@@ -46,18 +46,20 @@ class SpringMassSimulator:
         dist = np.linalg.norm(diff, axis=1, keepdims=True)
         
         # Avoid division by zero and extremely small distances (repulsion)
-        dist = np.maximum(dist, 0.01)
+        # Use a soft-core repulsion to prevent singularities
+        dist_clamped = np.maximum(dist, 0.2 * self.spring_dist)
         
         f_mag = self.k * (dist - self.spring_dist)
         
-        # Add a small repulsive force at very short distances to prevent overlap
-        repulsion = 0.1 / (dist**2)
+        # Soft repulsive force at short distances to prevent overlap without explosion
+        # LJ-like repulsion but smoother
+        repulsion = 0.5 * self.k * np.power(self.spring_dist / dist_clamped, 4)
         f_mag -= repulsion
         
         force_vec = f_mag * (diff / dist)
         
-        # Clamp forces to prevent explosion
-        max_f = 100.0
+        # Clamp forces to prevent explosion, but use a higher threshold than before
+        max_f = 500.0
         force_vec = np.clip(force_vec, -max_f, max_f)
         
         # Use np.add.at for scattering forces back to particles
@@ -67,21 +69,38 @@ class SpringMassSimulator:
         return forces
 
     def step(self):
-        # Semi-implicit Euler
-        forces = self.compute_forces(self.pos)
-        self.vel += (forces / self.m) * self.dt
+        # Velocity Verlet:
+        # 1. v(t + dt/2) = v(t) + (f(t)/m) * (dt/2)
+        # 2. x(t + dt) = x(t) + v(t + dt/2) * dt
+        # 3. f(t + dt) from x(t + dt)
+        # 4. v(t + dt) = v(t + dt/2) + (f(t + dt)/m) * (dt/2)
+
+        # Step 1
+        forces_t = self.compute_forces(self.pos)
+        v_half = self.vel + (forces_t / self.m) * (self.dt / 2.0)
         
-        # Clamp velocity for stability
-        max_v = 10.0
-        self.vel = np.clip(self.vel, -max_v, max_v)
+        # Step 2
+        self.pos += v_half * self.dt
         
-        self.pos += self.vel * self.dt
+        # Step 3
+        forces_next = self.compute_forces(self.pos)
         
-        # Check for NaNs
-        if np.any(np.isnan(self.pos)):
-            print("Warning: Simulation diverged (NaN). Resetting velocity.")
-            self.vel = np.zeros_like(self.vel)
+        # Step 4
+        self.vel = v_half + (forces_next / self.m) * (self.dt / 2.0)
+        
+        # Stability check & soft-clamping
+        max_v = 20.0
+        v_norm = np.linalg.norm(self.vel, axis=1, keepdims=True)
+        if np.any(v_norm > max_v):
+            scale = np.where(v_norm > max_v, max_v / v_norm, 1.0)
+            self.vel *= scale
+        
+        # Check for NaNs or massive values
+        if np.any(np.isnan(self.pos)) or np.any(np.abs(self.pos) > 1e6):
+            print("Warning: Simulation diverged. Re-centering and damping.")
             self.pos = np.nan_to_num(self.pos)
+            self.pos = np.clip(self.pos, -100, 100)
+            self.vel *= 0.1
 
         return self.pos.copy(), self.vel.copy()
 

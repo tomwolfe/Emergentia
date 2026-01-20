@@ -64,6 +64,9 @@ class Trainer:
         
         loss_rec = 0
         loss_cons = 0
+        loss_assign = 0
+        
+        s_prev = s_0
         
         for t in range(seq_len):
             batch_t = Batch.from_data_list([data_list[t]])
@@ -75,17 +78,22 @@ class Trainer:
             recon_t = self.model.decode(z_pred_seq[t], s_t, batch_t.batch)
             loss_rec += self.criterion(recon_t, batch_t.x)
             
-            # Consistency loss (encoding of real state vs predicted latent state)
+            # Assignment consistency loss: minimize change in super-node identity
             if t > 0:
+                loss_assign += self.criterion(s_t, s_prev)
+                # Consistency loss (encoding of real state vs predicted latent state)
                 # Use the dynamic edge_index for encoding the target state
                 z_t_target, _ = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch)
                 loss_cons += self.criterion(z_pred_seq[t], z_t_target)
+            
+            s_prev = s_t
         
         loss_rec /= seq_len
         loss_cons /= (seq_len - 1)
+        loss_assign /= (seq_len - 1)
         
-        # Weight consistency higher to force dynamics learning
-        loss = loss_rec + 5.0 * loss_cons
+        # Weight consistency and assignment stability
+        loss = loss_rec + 5.0 * loss_cons + 2.0 * loss_assign
         loss.backward()
         self.optimizer.step()
         
