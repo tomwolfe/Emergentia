@@ -39,17 +39,23 @@ class HierarchicalPooling(nn.Module):
         # Compute soft-assignment matrix s: [N, n_super_nodes]
         s = torch.softmax(self.assign_mlp(x), dim=-1)
         
-        # Diversity loss (Entropy): Minimize to encourage sharp assignments
-        # or maximize to encourage diversity? The prompt says "prevent assigning all to single super-node"
-        # but the provided formula is standard entropy.
+        # 1. Sharpness Loss (Minimize entropy per node)
         entropy = -torch.mean(torch.sum(s * torch.log(s + 1e-9), dim=1))
+        
+        # 2. Diversity Loss (Maximize entropy of average assignment)
+        # We add the negative entropy of the average assignment to the loss
+        avg_s = s.mean(dim=0)
+        diversity_loss = torch.sum(avg_s * torch.log(avg_s + 1e-9))
+        
+        # Total assignment loss
+        assign_loss = entropy + diversity_loss
         
         # Weighted aggregation: [N, 1, in_channels] * [N, n_super_nodes, 1]
         x_expanded = x.unsqueeze(1) * s.unsqueeze(2) 
         
         # Scatter to batch: [Batch_Size, n_super_nodes, in_channels]
         out = scatter(x_expanded, batch, dim=0, reduce='sum')
-        return out, s, entropy
+        return out, s, assign_loss
 
 class GNNEncoder(nn.Module):
     def __init__(self, node_features, hidden_dim, latent_dim, n_super_nodes):
@@ -147,24 +153,21 @@ class DiscoveryEngineModel(nn.Module):
         z0_flat = z0.view(z0.size(0), -1).to(torch.float32)
         t = t.to(torch.float32)
 
-        # Handle MPS-specific issue with torchdiffeq
-        # Solve ODE on CPU to avoid MPS float64 issues, then move result back
-        original_device = z0_flat.device
-        if str(original_device).startswith('mps'):
-            # Move everything to CPU for ODE solving
-            z0_flat_cpu = z0_flat.cpu()
-            t_cpu = t.cpu()
+        # Use the device of the ode_func parameters (may be CPU even if z0 is MPS)
+        ode_device = next(self.ode_func.parameters()).device
+        original_device = z0.device
+        
+        y0 = z0_flat.to(ode_device)
+        t_ode = t.to(ode_device)
 
-            # Create a temporary copy of the ODE function on CPU
-            temp_ode_func = LatentODEFunc(self.ode_func.latent_dim,
-                                         self.ode_func.n_super_nodes,
-                                         hidden_dim=64).to('cpu')
-            temp_ode_func.load_state_dict(self.ode_func.state_dict())
+        # Explicitly use float32 for rtol/atol to avoid issues on some devices
+        rtol = torch.tensor(1e-3, dtype=torch.float32, device=ode_device)
+        atol = torch.tensor(1e-4, dtype=torch.float32, device=ode_device)
 
-            zt_flat_cpu = odeint(temp_ode_func, z0_flat_cpu, t_cpu, rtol=1e-3, atol=1e-4)
-            zt_flat = zt_flat_cpu.to(original_device)
-        else:
-            zt_flat = odeint(self.ode_func, z0_flat, t, rtol=1e-3, atol=1e-4)
+        zt_flat = odeint(self.ode_func, y0, t_ode, rtol=rtol, atol=atol)
+
+        # Move back to original device
+        zt_flat = zt_flat.to(original_device)
 
         # zt_flat: [len(t), batch_size, latent_dim * n_super_nodes]
         return zt_flat.view(zt_flat.size(0), zt_flat.size(1), -1, z0.size(-1))

@@ -53,8 +53,14 @@ class Trainer:
     def __init__(self, model, lr=1e-3, device='cpu', loss_weights=None, stats=None):
         self.model = model.to(device)
         self.device = device
+        
+        # MPS fix: torchdiffeq has issues with MPS (float64 defaults and stability)
+        # We keep the ODE function on CPU while the rest of the model stays on MPS.
+        if str(device) == 'mps':
+            self.model.ode_func.to('cpu')
+            
         self.optimizer = optim.Adam(model.parameters(), lr=lr)
-        # Ensure criterion is on the same device as the model
+        # Ensure criterion is on the same device as the model (majority of it)
         self.criterion = torch.nn.MSELoss().to(device)
         self.stats = stats
         
@@ -111,15 +117,19 @@ class Trainer:
         loss_cons /= (seq_len - 1)
         loss_assign /= seq_len
         
-        # Scheduled Warm-up: Prioritize reconstruction in early epochs or high error
-        # Gradually introduce consistency and L2 losses
-        anneal = 1.0
-        if epoch < 500 or loss_rec.item() > 0.1:
-            anneal = min(1.0, epoch / 500.0) if epoch >= 100 else 0.01
+        # Dynamic Loss Weighting: Prioritize reconstruction initially, 
+        # but force consistency as training progresses regardless of Rec loss
+        # to ensure the latent space is dynamic-aware.
+        anneal = min(1.0, epoch / 1000.0) if epoch > 100 else 0.05
         
         # Apply configurable weights
+        # We increase the importance of consistency dynamically if it's lagging
+        cons_weight = self.weights['cons']
+        if loss_cons.item() > loss_rec.item() * 10:
+            cons_weight *= 2.0
+
         loss = (self.weights['rec'] * loss_rec + 
-                anneal * (self.weights['cons'] * loss_cons + 
+                anneal * (cons_weight * loss_cons + 
                          self.weights['latent_l2'] * loss_l2) +
                 self.weights['assign'] * loss_assign)
         

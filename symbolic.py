@@ -20,9 +20,21 @@ class SymbolicDistiller:
                                  random_state=0)
 
     def distill(self, latent_states, latent_derivs, times=None):
-        X = latent_states
+        # Standardization (Z-score normalization)
+        z_mean = latent_states.mean(axis=0)
+        z_std = latent_states.std(axis=0) + 1e-6
+        dz_mean = latent_derivs.mean(axis=0)
+        dz_std = latent_derivs.std(axis=0) + 1e-6
+
+        X = (latent_states - z_mean) / z_std
+        Y = (latent_derivs - dz_mean) / dz_std
+
         if times is not None:
-            X = np.column_stack([latent_states, times])
+            # Normalize times as well if provided
+            t_mean = times.mean()
+            t_std = times.std() + 1e-6
+            t_norm = (times - t_mean) / t_std
+            X = np.column_stack([X, t_norm])
 
         equations = []
         for i in range(latent_derivs.shape[1]):
@@ -32,20 +44,20 @@ class SymbolicDistiller:
             
             print(f"Distilling dz_{i}/dt (Coarse search: pop={coarse_pop}, gen={coarse_gen})...")
             est = self._get_regressor(coarse_pop, coarse_gen)
-            est.fit(X, latent_derivs[:, i])
+            est.fit(X, Y[:, i])
             
             # Check fit quality (if possible via gplearn score)
             # score is R^2. If > 0.95, it's likely good enough.
-            if est.score(X, latent_derivs[:, i]) > 0.95:
-                print(f"  -> Good fit found in coarse search (R^2={est.score(X, latent_derivs[:, i]):.3f})")
+            if est.score(X, Y[:, i]) > 0.95:
+                print(f"  -> Good fit found in coarse search (R^2={est.score(X, Y[:, i]):.3f})")
                 equations.append(est._program)
             else:
-                print(f"  -> Low fit (R^2={est.score(X, latent_derivs[:, i]):.3f}). Escalating to Fine search...")
+                print(f"  -> Low fit (R^2={est.score(X, Y[:, i]):.3f}). Escalating to Fine search...")
                 est = self._get_regressor(self.max_pop, self.max_gen)
-                est.fit(X, latent_derivs[:, i])
+                est.fit(X, Y[:, i])
                 equations.append(est._program)
                 
-        return equations
+        return equations, (z_mean, z_std, dz_mean, dz_std)
 
 def extract_latent_data(model, dataset, dt):
     model.eval()
@@ -68,8 +80,12 @@ def extract_latent_data(model, dataset, dt):
             z_flat = z.view(-1).cpu().numpy()
 
             # Use the ODE function to get the derivative at this state and time
-            t = torch.tensor([current_t], dtype=torch.float32, device=device)
-            dz = model.ode_func(t, z.view(1, -1))
+            # Handle potential device mismatch (e.g. if ode_func is on CPU for MPS compatibility)
+            ode_device = next(model.ode_func.parameters()).device
+            t = torch.tensor([current_t], dtype=torch.float32, device=ode_device)
+            z_for_ode = z.view(1, -1).to(ode_device)
+            
+            dz = model.ode_func(t, z_for_ode)
             dz_flat = dz.view(-1).cpu().numpy()
 
             latent_states.append(z_flat)

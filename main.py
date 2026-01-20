@@ -23,12 +23,12 @@ def main():
     # 1. Setup Parameters
     n_particles = 16
     n_super_nodes = 4
-    latent_dim = 2 
-    steps = 500
-    epochs = 2000
-    seq_len = 5
+    latent_dim = 4 
+    steps = 800
+    epochs = 2500
+    seq_len = 10
     dynamic_radius = 1.5 
-    box_size = (10.0, 10.0) # Periodic Boundary
+    box_size = None # Disable PBC for stability
     
     print("--- 1. Generating Data ---")
     sim = SpringMassSimulator(n_particles=n_particles, k=15.0, 
@@ -42,21 +42,23 @@ def main():
     print("--- 2. Training Discovery Engine ---")
     model = DiscoveryEngineModel(n_particles=n_particles, 
                                  n_super_nodes=n_super_nodes, 
-                                 latent_dim=latent_dim).to(device)
+                                 latent_dim=latent_dim,
+                                 hidden_dim=128).to(device)
     
-    # Updated weights to prioritize reconstruction and prevent collapse
+    # Adjusted weights: More emphasis on reconstruction and consistency
     loss_weights = {
-        'rec': 20.0,     # Heavily prioritize reconstruction
-        'cons': 1.0,     
-        'assign': 5.0,   # Stronger penalty for assignment instability/entropy
-        'latent_l2': 0.01 
+        'rec': 40.0,     
+        'cons': 15.0,    
+        'assign': 5.0,   
+        'latent_l2': 0.05 
     }
     
     trainer = Trainer(model, lr=5e-4, device=device, 
                       loss_weights=loss_weights, stats=stats)
     
+    # Increased patience and added a warmer start (min_lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(trainer.optimizer, mode='min', 
-                                                           factor=0.5, patience=100)
+                                                           factor=0.5, patience=300, min_lr=1e-5)
     
     last_loss = 1.0
     for epoch in range(epochs):
@@ -72,26 +74,42 @@ def main():
 
     # --- Quality Gate ---
     print(f"\nFinal Training Loss: {last_loss:.6f}")
-    if last_loss > 0.05: # Threshold for 'reasonable' convergence
-        print("WARNING: Model may not have converged fully (Loss > 0.05).")
-        print("Distilled equations might be approximate.")
+    if rec > 0.1: # Check unweighted reconstruction loss
+        print(f"WARNING: Model may not have converged fully (Rec Loss: {rec:.6f}).")
 
     # 3. Extract Symbolic Equations
     print("--- 3. Distilling Symbolic Laws ---")
-    # Extract states and their derivatives from the learned Latent ODE
     z_states, dz_states, t_states = extract_latent_data(model, dataset, sim.dt)
     
-    # Use the enhanced distiller with expanded function set
-    # Perform autonomous distillation (no time input)
-    distiller = SymbolicDistiller(populations=2000, generations=40) 
-    equations = distiller.distill(z_states, dz_states)
+    distiller = SymbolicDistiller(populations=500, generations=20) 
+    equations, z_stats = distiller.distill(z_states, dz_states)
+    z_mean, z_std, dz_mean, dz_std = z_stats
     
     print("\nDiscovered Meso-scale Laws (dZ/dt = ...):")
     for i, eq in enumerate(equations):
         print(f"dZ_{i}/dt = {eq}")
 
-    # 4. Visualization
+    # 4. Visualization & Integration
     print("--- 4. Visualizing Results ---")
+    from scipy.integrate import odeint
+    
+    def symbolic_dynamics(z, t):
+        # Normalize input
+        z_norm = (z - z_mean) / z_std
+        z_input = z_norm.reshape(1, -1)
+        
+        # Execute symbolic equations
+        dzdt_norm = np.array([eq.execute(z_input)[0] for eq in equations])
+        
+        # Denormalize output
+        dzdt = dzdt_norm * dz_std + dz_mean
+        return dzdt
+
+    # Integrate the discovered equations
+    z0 = z_states[0]
+    t_eval = np.linspace(0, (len(z_states)-1)*sim.dt, len(z_states))
+    z_simulated = odeint(symbolic_dynamics, z0, t_eval)
+
     model.eval()
     with torch.no_grad():
         test_idx = 0
@@ -102,7 +120,7 @@ def main():
         z, s, _ = model.encode(x, edge_index, batch)
         recon = model.decode(z, s, batch).cpu().numpy()
         
-    plt.figure(figsize=(15, 5))
+    plt.figure(figsize=(18, 5))
     
     # 1. Micro Plot: Reconstruction
     plt.subplot(1, 3, 1)
@@ -111,18 +129,18 @@ def main():
     plt.title("Micro: Reconstruction")
     plt.legend()
     
-    # 2. Assignment Plot: Hierarchical Pooling
+    # 2. Assignment Plot
     plt.subplot(1, 3, 2)
-    # s is [N, n_super_nodes], pick the most likely super-node for each particle
     assignments = torch.argmax(s, dim=1).cpu().numpy()
     plt.scatter(data.x.cpu().numpy()[:, 0], data.x.cpu().numpy()[:, 1], c=assignments, cmap='viridis')
-    plt.title("Hierarchical: Super-node Assignments")
+    plt.title("Hierarchical: Assignments")
     
-    # 3. Meso Plot: Latent Dynamics
+    # 3. Meso Plot: Symbolic Integration vs Learned Latent
     plt.subplot(1, 3, 3)
     for i in range(z_states.shape[1]):
-        plt.plot(z_states[:, i], label=f'Z_{i}')
-    plt.title("Meso: Latent Dynamics")
+        plt.plot(t_eval, z_states[:, i], 'k--', alpha=0.3, label=f'Learned Z_{i}' if i==0 else "")
+        plt.plot(t_eval, z_simulated[:, i], label=f'Symbolic Z_{i}')
+    plt.title("Meso: Symbolic Integration")
     plt.legend()
     
     plt.tight_layout()
