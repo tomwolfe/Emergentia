@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
-from torch_geometric.nn import MessagePassing, global_mean_pool
+from torch_geometric.nn import MessagePassing
+from torch_geometric.utils import scatter
 from torchdiffeq import odeint
 
 class GNNLayer(MessagePassing):
@@ -19,6 +20,32 @@ class GNNLayer(MessagePassing):
         tmp = torch.cat([x_i, x_j], dim=1)
         return self.mlp(tmp)
 
+class HierarchicalPooling(nn.Module):
+    """
+    Learned soft-assignment pooling to preserve spatial locality 
+    by aggregating nodes into a fixed number of super-nodes.
+    """
+    def __init__(self, in_channels, n_super_nodes):
+        super(HierarchicalPooling, self).__init__()
+        self.n_super_nodes = n_super_nodes
+        self.assign_mlp = nn.Sequential(
+            nn.Linear(in_channels, in_channels),
+            nn.ReLU(),
+            nn.Linear(in_channels, n_super_nodes)
+        )
+
+    def forward(self, x, batch):
+        # x: [N, in_channels], batch: [N]
+        # Compute soft-assignment matrix s: [N, n_super_nodes]
+        s = torch.softmax(self.assign_mlp(x), dim=-1)
+        
+        # Weighted aggregation: [N, 1, in_channels] * [N, n_super_nodes, 1]
+        x_expanded = x.unsqueeze(1) * s.unsqueeze(2) 
+        
+        # Scatter to batch: [Batch_Size, n_super_nodes, in_channels]
+        out = scatter(x_expanded, batch, dim=0, reduce='sum')
+        return out
+
 class GNNEncoder(nn.Module):
     def __init__(self, node_features, hidden_dim, latent_dim, n_super_nodes):
         super(GNNEncoder, self).__init__()
@@ -27,26 +54,23 @@ class GNNEncoder(nn.Module):
         self.n_super_nodes = n_super_nodes
         self.latent_dim = latent_dim
         
-        # Mapping to K super-nodes
-        self.super_node_map = nn.Sequential(
+        # Spatially-aware pooling instead of global_mean_pool
+        self.pooling = HierarchicalPooling(hidden_dim, n_super_nodes)
+        
+        self.output_layer = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, latent_dim * n_super_nodes)
+            nn.Linear(hidden_dim, latent_dim)
         )
 
     def forward(self, x, edge_index, batch):
         x = torch.relu(self.gnn1(x, edge_index))
         x = torch.relu(self.gnn2(x, edge_index))
         
-        # Instead of global pooling to one vector, we want to cluster/pool into K nodes
-        # For simplicity, we can use a learned projection or global pooling + splitting
-        # A more robust way is top-k pooling or assigned clusters, 
-        # but here we'll use a fixed number of latent states derived from global info for now,
-        # or average across partitions if we had them.
-        # Let's use global pooling and then expand to K super-nodes for the "bottleneck".
-        pooled = global_mean_pool(x, batch) # [batch_size, hidden_dim]
-        latent = self.super_node_map(pooled) # [batch_size, latent_dim * n_super_nodes]
-        return latent.view(-1, self.n_super_nodes, self.latent_dim)
+        # Pool to K super-nodes preserving spatial features
+        pooled = self.pooling(x, batch) # [batch_size, n_super_nodes, hidden_dim]
+        latent = self.output_layer(pooled) # [batch_size, n_super_nodes, latent_dim]
+        return latent
 
 class LatentODEFunc(nn.Module):
     def __init__(self, latent_dim, n_super_nodes, hidden_dim=64):
