@@ -50,11 +50,23 @@ def prepare_data(pos, vel, radius=1.1, stats=None, device='cpu'):
     return dataset, stats
 
 class Trainer:
-    def __init__(self, model, lr=1e-3, device='cpu'):
+    def __init__(self, model, lr=1e-3, device='cpu', loss_weights=None, stats=None):
         self.model = model.to(device)
         self.device = device
         self.optimizer = optim.Adam(model.parameters(), lr=lr)
         self.criterion = torch.nn.MSELoss()
+        self.stats = stats
+        
+        # Pareto-optimal: Expose rigid hyperparameters
+        default_weights = {
+            'rec': 1.0,
+            'cons': 5.0,
+            'assign': 2.0,
+            'latent_l2': 0.01  # Added to prevent state drift
+        }
+        if loss_weights is not None:
+            default_weights.update(loss_weights)
+        self.weights = default_weights
 
     def train_step(self, data_list, dt):
         self.optimizer.zero_grad()
@@ -71,6 +83,7 @@ class Trainer:
         loss_rec = 0
         loss_cons = 0
         loss_assign = 0
+        loss_l2 = torch.mean(z_pred_seq**2) # Penalize large latent values to ground the space
         
         s_prev = s_0
         
@@ -78,8 +91,6 @@ class Trainer:
             batch_t = Batch.from_data_list([data_list[t]]).to(self.device)
             
             # Reconstruction loss at each step
-            # Use assignments from CURRENT state for predicting sequence reconstruction
-            # to account for particle flow between super-nodes
             _, s_t = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch)
             recon_t = self.model.decode(z_pred_seq[t], s_t, batch_t.batch)
             loss_rec += self.criterion(recon_t, batch_t.x)
@@ -88,7 +99,6 @@ class Trainer:
             if t > 0:
                 loss_assign += self.criterion(s_t, s_prev)
                 # Consistency loss (encoding of real state vs predicted latent state)
-                # Use the dynamic edge_index for encoding the target state
                 z_t_target, _ = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch)
                 loss_cons += self.criterion(z_pred_seq[t], z_t_target)
             
@@ -98,8 +108,12 @@ class Trainer:
         loss_cons /= (seq_len - 1)
         loss_assign /= (seq_len - 1)
         
-        # Weight consistency and assignment stability
-        loss = loss_rec + 5.0 * loss_cons + 2.0 * loss_assign
+        # Apply configurable weights
+        loss = (self.weights['rec'] * loss_rec + 
+                self.weights['cons'] * loss_cons + 
+                self.weights['assign'] * loss_assign +
+                self.weights['latent_l2'] * loss_l2)
+        
         loss.backward()
         self.optimizer.step()
         

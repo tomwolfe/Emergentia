@@ -38,7 +38,17 @@ def main():
     model = DiscoveryEngineModel(n_particles=n_particles, 
                                  n_super_nodes=n_super_nodes, 
                                  latent_dim=latent_dim).to(device)
-    trainer = Trainer(model, lr=1e-3, device=device)
+    
+    # Pareto-optimal: Address hyperparameter rigidity and state drift
+    loss_weights = {
+        'rec': 1.0,      # Prioritize micro-scale feature reconstruction
+        'cons': 5.0,     # Strong grounding of latent dynamics to encoded states
+        'assign': 2.0,   # Ensure super-node stability over time
+        'latent_l2': 0.1 # Penalty to prevent latent space drift (critical for symbolic)
+    }
+    
+    trainer = Trainer(model, lr=1e-3, device=device, 
+                      loss_weights=loss_weights, stats=stats)
     
     last_loss = 1.0
     for epoch in range(epochs):
@@ -83,22 +93,27 @@ def main():
         z, s = model.encode(x, edge_index, batch)
         recon = model.decode(z, s, batch).cpu().numpy()
         
-    plt.figure(figsize=(12, 5))
+    plt.figure(figsize=(15, 5))
     
-    # Micro Plot
-    plt.subplot(1, 2, 1)
-    # Note: 'pos' contains raw coordinates, we should compare recon to normalized input or denormalize recon
-    # For simplicity, we compare recon features to data.x
-    plt.scatter(data.x.cpu().numpy()[:, 0], data.x.cpu().numpy()[:, 1], c='blue', label='Ground Truth (Norm)')
-    plt.scatter(recon[:, 0], recon[:, 1], c='red', marker='x', label='Reconstruction')
-    plt.title("Micro-scale: Particles (Normalized)")
+    # 1. Micro Plot: Reconstruction
+    plt.subplot(1, 3, 1)
+    plt.scatter(data.x.cpu().numpy()[:, 0], data.x.cpu().numpy()[:, 1], c='blue', alpha=0.5, label='Truth')
+    plt.scatter(recon[:, 0], recon[:, 1], c='red', marker='x', label='Recon')
+    plt.title("Micro: Reconstruction")
     plt.legend()
     
-    # Meso Plot (Latent states over time)
-    plt.subplot(1, 2, 2)
-    plt.plot(z_states[:, 0], label='Z_0')
-    plt.plot(z_states[:, 1], label='Z_1')
-    plt.title("Meso-scale: Latent Dynamics")
+    # 2. Assignment Plot: Hierarchical Pooling
+    plt.subplot(1, 3, 2)
+    # s is [N, n_super_nodes], pick the most likely super-node for each particle
+    assignments = torch.argmax(s, dim=1).cpu().numpy()
+    plt.scatter(data.x.cpu().numpy()[:, 0], data.x.cpu().numpy()[:, 1], c=assignments, cmap='viridis')
+    plt.title("Hierarchical: Super-node Assignments")
+    
+    # 3. Meso Plot: Latent Dynamics
+    plt.subplot(1, 3, 3)
+    for i in range(z_states.shape[1]):
+        plt.plot(z_states[:, i], label=f'Z_{i}')
+    plt.title("Meso: Latent Dynamics")
     plt.legend()
     
     plt.tight_layout()
