@@ -25,8 +25,8 @@ def main():
     n_super_nodes = 4
     latent_dim = 4 
     steps = 800
-    epochs = 2500
-    seq_len = 10
+    epochs = 5000
+    seq_len = 12
     dynamic_radius = 1.5 
     box_size = None # Disable PBC for stability
     
@@ -45,20 +45,20 @@ def main():
                                  latent_dim=latent_dim,
                                  hidden_dim=128).to(device)
     
-    # Adjusted weights: More emphasis on reconstruction and consistency
+    # Adjusted weights: Significantly more emphasis on reconstruction and consistency
     loss_weights = {
-        'rec': 40.0,     
-        'cons': 15.0,    
-        'assign': 5.0,   
-        'latent_l2': 0.05 
+        'rec': 100.0,     
+        'cons': 50.0,    
+        'assign': 10.0,   
+        'latent_l2': 0.1 
     }
     
-    trainer = Trainer(model, lr=5e-4, device=device, 
+    trainer = Trainer(model, lr=8e-4, device=device, 
                       loss_weights=loss_weights, stats=stats)
     
-    # Increased patience and added a warmer start (min_lr)
+    # Increased patience and adjusted factor
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(trainer.optimizer, mode='min', 
-                                                           factor=0.5, patience=300, min_lr=1e-5)
+                                                           factor=0.5, patience=500, min_lr=1e-6)
     
     last_loss = 1.0
     for epoch in range(epochs):
@@ -81,7 +81,7 @@ def main():
     print("--- 3. Distilling Symbolic Laws ---")
     z_states, dz_states, t_states = extract_latent_data(model, dataset, sim.dt)
     
-    distiller = SymbolicDistiller(populations=500, generations=20) 
+    distiller = SymbolicDistiller(populations=2000, generations=50) 
     equations, z_stats = distiller.distill(z_states, dz_states)
     z_mean, z_std, dz_mean, dz_std = z_stats
     

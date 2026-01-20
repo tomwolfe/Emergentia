@@ -117,15 +117,13 @@ class Trainer:
         loss_cons /= (seq_len - 1)
         loss_assign /= seq_len
         
-        # Dynamic Loss Weighting: Prioritize reconstruction initially, 
-        # but force consistency as training progresses regardless of Rec loss
-        # to ensure the latent space is dynamic-aware.
-        anneal = min(1.0, epoch / 1000.0) if epoch > 100 else 0.05
+        # Dynamic Loss Weighting: Faster annealing to ensure dynamics are learned early
+        anneal = min(1.0, epoch / 800.0) if epoch > 50 else 0.1
         
         # Apply configurable weights
         # We increase the importance of consistency dynamically if it's lagging
         cons_weight = self.weights['cons']
-        if loss_cons.item() > loss_rec.item() * 10:
+        if loss_cons.item() > loss_rec.item() * 5: # Lowered threshold for boost
             cons_weight *= 2.0
 
         loss = (self.weights['rec'] * loss_rec + 
