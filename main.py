@@ -73,7 +73,12 @@ def main():
         
         if epoch % 100 == 0:
             progress = (epoch / epochs) * 100
-            print(f"Progress: {progress:3.0f}% | Loss: {loss:.6f} | Rec: {rec:.6f} | Cons: {cons:.6f} | LR: {trainer.optimizer.param_groups[0]['lr']:.2e}")
+            stats = trainer.loss_tracker.get_stats()
+            log_str = f"Progress: {progress:3.0f}% | Loss: {loss:.6f} | "
+            log_str += f"Rec: {stats.get('rec_raw', 0):.4f} | Cons: {stats.get('cons_raw', 0):.4f} | "
+            log_str += f"Assign: {stats.get('assign_raw', 0):.4f} | Ortho: {stats.get('ortho_raw', 0):.4f} | "
+            log_str += f"LR: {trainer.optimizer.param_groups[0]['lr']:.2e}"
+            print(log_str)
 
     # --- Interpretability Check ---
     print("\n--- 2.1 Latent Interpretability Analysis ---")
@@ -108,7 +113,6 @@ def main():
     
     def symbolic_dynamics(z, t):
         # z: [18] (16 latent vars + 2 physical vars)
-        # Reconstruct the 24-dim state used for features: [16 latent, 6 dists, 2 physical]
         z_latent = z[:16].reshape(n_super_nodes, latent_dim)
         dists = []
         for i in range(n_super_nodes):
@@ -130,8 +134,13 @@ def main():
                 features.append((X[:, i] * X[:, j]).reshape(-1, 1))
         X_poly = np.hstack(features)
         
-        # Execute symbolic equations
-        dzdt_norm = np.array([eq.execute(X_poly)[0] for eq in equations])
+        # Execute symbolic equations with feature masks
+        dzdt_norm = []
+        for i, (eq, mask) in enumerate(zip(equations, distiller.feature_masks)):
+            X_selected = X_poly[:, mask]
+            dzdt_norm.append(eq.execute(X_selected)[0])
+        
+        dzdt_norm = np.array(dzdt_norm)
         
         # Denormalize output
         dzdt = dzdt_norm * dz_std + dz_mean

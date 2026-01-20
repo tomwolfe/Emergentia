@@ -88,28 +88,43 @@ def analyze_latent_space(model, dataset, pos_raw, tau=0.1, device='cpu'):
         
     return np.array(avg_corrs)
 
+class LossTracker:
+    """Tracks running averages of loss components to help with balancing."""
+    def __init__(self, alpha=0.9):
+        self.alpha = alpha
+        self.history = {}
+
+    def update(self, components):
+        for k, v in components.items():
+            val = v.item() if hasattr(v, 'item') else v
+            if k not in self.history:
+                self.history[k] = val
+            else:
+                self.history[k] = self.alpha * self.history[k] + (1 - self.alpha) * val
+
+    def get_stats(self):
+        return self.history
+
 class Trainer:
     def __init__(self, model, lr=5e-4, device='cpu', loss_weights=None, stats=None):
         self.model = model.to(device)
         self.device = device
+        self.loss_tracker = LossTracker()
         
         # MPS fix: torchdiffeq has issues with MPS (float64 defaults and stability)
-        # We keep the ODE function on CPU while the rest of the model stays on MPS.
         if str(device) == 'mps':
             self.model.ode_func.to('cpu')
             
         self.optimizer = optim.Adam(model.parameters(), lr=lr)
-        # Ensure criterion is on the same device as the model (majority of it)
         self.criterion = torch.nn.MSELoss().to(device)
         self.stats = stats
         
-        # Pareto-optimal: Expose rigid hyperparameters
         default_weights = {
             'rec': 1.0,
             'cons': 5.0,
             'assign': 2.0,
-            'ortho': 1.0,      # New orthogonality loss weight
-            'latent_l2': 0.01  # Added to prevent state drift
+            'ortho': 1.0,      
+            'latent_l2': 0.01  
         }
         if loss_weights is not None:
             default_weights.update(loss_weights)
@@ -118,11 +133,8 @@ class Trainer:
     def train_step(self, data_list, dt, epoch=0, teacher_forcing_ratio=0.5):
         self.optimizer.zero_grad()
         seq_len = len(data_list)
-        
-        # Anneal Gumbel-Softmax temperature
         tau = max(0.1, 1.0 - epoch / 2000.0)
         
-        # 1. Encode the first state
         batch_0 = Batch.from_data_list([data_list[0]]).to(self.device)
         z_curr, s_0, entropy_0 = self.model.encode(batch_0.x, batch_0.edge_index, batch_0.batch, tau=tau)
         
@@ -130,24 +142,18 @@ class Trainer:
         loss_cons = 0
         loss_assign = entropy_0
         loss_ortho = self.model.get_ortho_loss(s_0)
-        loss_l2 = 0
         
         s_prev = s_0
-        
-        # Prediction sequence for integration
         z_preds = [z_curr]
         
         for t in range(1, seq_len):
-            # Teacher Forcing: Occasionally use ground truth encoding as next step input
-            # Disable teacher forcing during early warmup to force model to learn stable mappings
             if epoch > 500 and np.random.random() < teacher_forcing_ratio:
                 batch_t_prev = Batch.from_data_list([data_list[t-1]]).to(self.device)
                 z_curr, _, _ = self.model.encode(batch_t_prev.x, batch_t_prev.edge_index, batch_t_prev.batch, tau=tau)
             
-            # Predict next latent state via ODE
             t_span = torch.tensor([0, dt], device=self.device, dtype=torch.float32)
             z_next_seq = self.model.forward_dynamics(z_curr, t_span)
-            z_curr = z_next_seq[1] # Next step prediction
+            z_curr = z_next_seq[1]
             z_preds.append(z_curr)
             
         z_preds = torch.stack(z_preds)
@@ -155,23 +161,15 @@ class Trainer:
         
         for t in range(seq_len):
             batch_t = Batch.from_data_list([data_list[t]]).to(self.device)
-            
-            # Encode target for consistency check
             z_t_target, s_t, entropy_t = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch, tau=tau)
-            
-            # Reconstruction loss at each step
             recon_t = self.model.decode(z_preds[t], s_t, batch_t.batch)
             loss_rec += self.criterion(recon_t, batch_t.x)
-            
-            # Assignment and Orthogonality losses
             loss_assign += entropy_t
             loss_ortho += self.model.get_ortho_loss(s_t)
             
             if t > 0:
                 loss_assign += self.criterion(s_t, s_prev)
-                # Consistency loss (encoding of real state vs predicted latent state)
                 loss_cons += self.criterion(z_preds[t], z_t_target)
-            
             s_prev = s_t
         
         loss_rec /= seq_len
@@ -179,14 +177,18 @@ class Trainer:
         loss_assign /= seq_len
         loss_ortho /= seq_len
         
-        # Two-Phase Training Schedule
+        # Track components before weighting
+        self.loss_tracker.update({
+            'rec_raw': loss_rec, 'cons_raw': loss_cons, 
+            'assign_raw': loss_assign, 'ortho_raw': loss_ortho, 
+            'l2_raw': loss_l2
+        })
+
         if epoch < 1000:
-            # Phase 1 (Warm-up): Focus entirely on reconstruction and assignments
             loss = (self.weights['rec'] * loss_rec + 
                     self.weights['assign'] * loss_assign +
                     self.weights['ortho'] * loss_ortho)
         elif epoch < 2000:
-            # Phase 2 (Discovery): Gradually anneal the consistency and L2 constraints
             anneal = (epoch - 1000) / 1000.0
             loss = (self.weights['rec'] * loss_rec + 
                     anneal * (self.weights['cons'] * loss_cons + 
@@ -194,7 +196,6 @@ class Trainer:
                     self.weights['assign'] * loss_assign +
                     self.weights['ortho'] * loss_ortho)
         else:
-            # Full Discovery Phase
             loss = (self.weights['rec'] * loss_rec + 
                     self.weights['cons'] * loss_cons + 
                     self.weights['latent_l2'] * loss_l2 +

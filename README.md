@@ -10,7 +10,20 @@ The engine operates in three distinct phases:
 2. **Discovery (Neural)**: A `DiscoveryEngineModel` uses Hierarchical Pooling to aggregate particles into "super-nodes". A Latent ODE then learns the continuous-time dynamics of these super-nodes.
 3. **Distillation (Symbolic)**: A `SymbolicDistiller` extracts the learned latent derivatives and uses Genetic Programming to find the underlying symbolic equations.
 
+---
 
+## 🔬 Meso-scale Theory & Hierarchical Pooling
+
+### Theoretical Background
+Physical systems often exhibit different behaviors at different scales. While micro-scale dynamics (e.g., individual atoms) are governed by fundamental forces, the macro-scale (e.g., fluid flow) is described by coarse-grained equations like Navier-Stokes. The **Meso-scale** is the bridge between these two, where emergent structures (clusters of particles) form the basis of the dynamics.
+
+### Hierarchical Pooling (Soft-Assignment)
+To learn these meso-scale structures, the Discovery Engine employs a differentiable pooling layer. Instead of fixed clustering (like K-Means), it learns an **Assignment Matrix** $S \in \mathbb{R}^{N \times K}$ using a Gumbel-Softmax distribution:
+- **$N$**: Number of micro-particles.
+- **$K$**: Number of super-nodes (coarse-grained objects).
+- **$S_{i,j}$**: The probability that particle $i$ belongs to super-node $j$.
+
+By minimizing an entropy loss and an orthogonality constraint on $S$, the model is forced to find distinct, non-overlapping clusters that maximize spatial locality, effectively "discovering" the meso-scale objects.
 
 ---
 

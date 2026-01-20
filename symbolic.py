@@ -1,26 +1,28 @@
 from gplearn.genetic import SymbolicRegressor
 import numpy as np
 import torch
+from sklearn.linear_model import LassoCV
+from sklearn.feature_selection import SelectFromModel
 
 class SymbolicDistiller:
-    def __init__(self, populations=2000, generations=40, stopping_criteria=0.001):
+    def __init__(self, populations=2000, generations=40, stopping_criteria=0.001, max_features=15):
         self.max_pop = populations
         self.max_gen = generations
         self.stopping_criteria = stopping_criteria
+        self.max_features = max_features
 
     def _get_regressor(self, pop, gen):
         return SymbolicRegressor(population_size=pop,
                                  generations=gen, 
                                  stopping_criteria=self.stopping_criteria,
                                  function_set=('add', 'sub', 'mul', 'div', 'neg', 'sin', 'cos', 'sqrt', 'log', 'abs'),
-                                 p_crossover=0.7, p_subtree_mutation=0.1, # Shifted towards crossover
+                                 p_crossover=0.7, p_subtree_mutation=0.1,
                                  p_hoist_mutation=0.05, p_point_mutation=0.1,
                                  max_samples=0.9, verbose=0, 
-                                 parsimony_coefficient=0.01, # Lowered to allow slightly more complex features if needed
+                                 parsimony_coefficient=0.01,
                                  random_state=42)
 
     def distill(self, latent_states, latent_derivs, times=None):
-        # Standardization (Z-score normalization)
         z_mean = latent_states.mean(axis=0)
         z_std = latent_states.std(axis=0) + 1e-6
         dz_mean = latent_derivs.mean(axis=0)
@@ -29,41 +31,48 @@ class SymbolicDistiller:
         X = (latent_states - z_mean) / z_std
         Y = (latent_derivs - dz_mean) / dz_std
 
-        # Feature Engineering: Add squared terms and interaction terms
-        n_features = X.shape[1]
+        n_features_raw = X.shape[1]
         features = [X]
-        for i in range(n_features):
+        for i in range(n_features_raw):
             features.append((X[:, i]**2).reshape(-1, 1))
-            for j in range(i + 1, n_features):
+            for j in range(i + 1, n_features_raw):
                 features.append((X[:, i] * X[:, j]).reshape(-1, 1))
         
         X_poly = np.hstack(features)
 
         if times is not None:
-            # Normalize times as well if provided
-            t_mean = times.mean()
-            t_std = times.std() + 1e-6
-            t_norm = (times - t_mean) / t_std
+            t_norm = (times - times.mean()) / (times.std() + 1e-6)
             X_poly = np.column_stack([X_poly, t_norm])
 
         equations = []
+        # Store feature masks for each output dimension
+        self.feature_masks = []
+
         for i in range(latent_derivs.shape[1]):
-            # Start with 'Coarse' search (1/4 resources)
+            # Feature Selection Step (Pareto-optimal: reduce complexity before GP)
+            print(f"Selecting features for dz_{i}/dt (Input dim: {X_poly.shape[1]})...")
+            selector = SelectFromModel(LassoCV(cv=5, max_iter=2000), max_features=self.max_features)
+            selector.fit(X_poly, Y[:, i])
+            X_selected = selector.transform(X_poly)
+            mask = selector.get_support()
+            self.feature_masks.append(mask)
+            
+            print(f"  -> Reduced features to {X_selected.shape[1]} informative variables.")
+
             coarse_pop = self.max_pop // 4
             coarse_gen = self.max_gen // 2
             
             print(f"Distilling dz_{i}/dt (Coarse search: pop={coarse_pop}, gen={coarse_gen})...")
             est = self._get_regressor(coarse_pop, coarse_gen)
-            est.fit(X_poly, Y[:, i])
+            est.fit(X_selected, Y[:, i])
             
-            # Check fit quality (if possible via gplearn score)
-            if est.score(X_poly, Y[:, i]) > 0.95:
-                print(f"  -> Good fit found in coarse search (R^2={est.score(X_poly, Y[:, i]):.3f})")
+            if est.score(X_selected, Y[:, i]) > 0.95:
+                print(f"  -> Good fit found in coarse search (R^2={est.score(X_selected, Y[:, i]):.3f})")
                 equations.append(est._program)
             else:
-                print(f"  -> Low fit (R^2={est.score(X_poly, Y[:, i]):.3f}). Escalating to Fine search...")
+                print(f"  -> Low fit (R^2={est.score(X_selected, Y[:, i]):.3f}). Escalating to Fine search...")
                 est = self._get_regressor(self.max_pop, self.max_gen)
-                est.fit(X_poly, Y[:, i])
+                est.fit(X_selected, Y[:, i])
                 equations.append(est._program)
                 
         return equations, (z_mean, z_std, dz_mean, dz_std)
