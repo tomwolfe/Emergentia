@@ -6,22 +6,26 @@ from model import DiscoveryEngineModel
 import numpy as np
 from scipy.spatial import KDTree
 
+def compute_stats(pos, vel):
+    # pos, vel: [T, N, 2]
+    pos_mean = pos.mean(axis=(0, 1))
+    pos_std = pos.std(axis=(0, 1)) + 1e-6
+    vel_mean = vel.mean(axis=(0, 1))
+    vel_std = vel.std(axis=(0, 1)) + 1e-6
+    return {'pos_mean': pos_mean, 'pos_std': pos_std, 
+            'vel_mean': vel_mean, 'vel_std': vel_std}
+
 def prepare_data(pos, vel, radius=1.1, stats=None, device='cpu'):
     # pos, vel: [T, N, 2]
     T, N, _ = pos.shape
     
     if stats is None:
-        # Standardize data based on the whole provided trajectory (default)
-        # In production, stats should be fixed from training data
-        pos_mean = pos.mean(axis=(0, 1))
-        pos_std = pos.std(axis=(0, 1)) + 1e-6
-        vel_mean = vel.mean(axis=(0, 1))
-        vel_std = vel.std(axis=(0, 1)) + 1e-6
-        stats = {'pos_mean': pos_mean, 'pos_std': pos_std, 
-                 'vel_mean': vel_mean, 'vel_std': vel_std}
-    else:
-        pos_mean, pos_std = stats['pos_mean'], stats['pos_std']
-        vel_mean, vel_std = stats['vel_mean'], stats['vel_std']
+        # Fallback to computing from provided data if not given
+        # Warning: This can lead to data leakage if used on test sets
+        stats = compute_stats(pos, vel)
+    
+    pos_mean, pos_std = stats['pos_mean'], stats['pos_std']
+    vel_mean, vel_std = stats['vel_mean'], stats['vel_std']
     
     pos_norm = (pos - pos_mean) / pos_std
     vel_norm = (vel - vel_mean) / vel_std
@@ -105,8 +109,14 @@ if __name__ == "__main__":
     n_particles = 16
     spring_dist = 1.0
     sim = SpringMassSimulator(n_particles=n_particles, spring_dist=spring_dist, dynamic_radius=1.5)
-    pos, vel = sim.generate_trajectory(steps=200)
-    dataset, stats = prepare_data(pos, vel, radius=1.5)
+    
+    # Generate 'train' data to compute stats
+    train_pos, train_vel = sim.generate_trajectory(steps=100)
+    stats = compute_stats(train_pos, train_vel)
+    
+    # Generate 'eval' data and prepare it using training stats
+    eval_pos, eval_vel = sim.generate_trajectory(steps=100)
+    dataset, _ = prepare_data(eval_pos, eval_vel, radius=1.5, stats=stats)
     
     model = DiscoveryEngineModel(n_particles=n_particles, n_super_nodes=4)
     trainer = Trainer(model)

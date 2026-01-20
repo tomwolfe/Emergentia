@@ -28,12 +28,8 @@ class SpringMassSimulator:
 
     def _compute_pairs(self, pos):
         if self.box_size:
-            # For PBC, we use a simple distance search with wrap-around
-            # KDTree doesn't natively support PBC easily without manual tiling or custom distance
-            # For 80/20 we'll use brute force or just ignore KDTree for PBC if n is small
-            # but let's try a simple approach: tiling 3x3 if needed, or just brute force
             if self.n_particles <= 128:
-                # Brute force is fine for small n
+                # Brute force is fine for small n and handles PBC correctly
                 diff = pos[:, np.newaxis, :] - pos[np.newaxis, :, :]
                 for i in range(2):
                     diff[:, :, i] -= self.box_size[i] * np.round(diff[:, :, i] / self.box_size[i])
@@ -41,8 +37,42 @@ class SpringMassSimulator:
                 idx1, idx2 = np.where((dist < self.radius) & (np.arange(self.n_particles)[:, None] < np.arange(self.n_particles)[None, :]))
                 return list(zip(idx1, idx2))
             else:
-                tree = KDTree(pos)
-                return list(tree.query_pairs(self.radius))
+                # For larger N, use tiling + KDTree for efficiency with PBC
+                # Tile the points in 3x3 to cover all possible periodic neighbors
+                L_x, L_y = self.box_size
+                offsets = np.array([
+                    [-L_x, -L_y], [-L_x, 0], [-L_x, L_y],
+                    [0, -L_y],    [0, 0],    [0, L_y],
+                    [L_x, -L_y],  [L_x, 0],  [L_x, L_y]
+                ])
+                
+                all_pos = []
+                original_indices = []
+                for off in offsets:
+                    all_pos.append(pos + off)
+                    original_indices.append(np.arange(self.n_particles))
+                
+                all_pos = np.concatenate(all_pos, axis=0)
+                original_indices = np.concatenate(original_indices, axis=0)
+                
+                # Query tree: find neighbors of original points (the middle tile) in all tiles
+                tree = KDTree(all_pos)
+                # Middle tile is at index offset 4 (0-based: 0,1,2,3,4...)
+                start_idx = 4 * self.n_particles
+                end_idx = 5 * self.n_particles
+                
+                # Use query_ball_point for each point in the middle tile
+                results = tree.query_ball_point(pos, self.radius)
+                
+                pairs = set()
+                for i, neighbors in enumerate(results):
+                    for n_idx in neighbors:
+                        j = original_indices[n_idx]
+                        if i < j:
+                            pairs.add((i, j))
+                        elif j < i:
+                            pairs.add((j, i))
+                return list(pairs)
         else:
             tree = KDTree(pos)
             return list(tree.query_pairs(self.radius))
@@ -122,6 +152,13 @@ class SpringMassSimulator:
         return np.array(trajectory_pos), np.array(trajectory_vel)
 
 if __name__ == "__main__":
-    sim = SpringMassSimulator(n_particles=16)
-    pos, vel = sim.generate_trajectory(steps=100)
-    print(f"Trajectory shape: {pos.shape}")
+    # Test PBC and tiling with larger N
+    n_particles = 200
+    sim = SpringMassSimulator(n_particles=n_particles, box_size=(10.0, 10.0))
+    pos, vel = sim.generate_trajectory(steps=10)
+    print(f"PBC Trajectory shape: {pos.shape}")
+    
+    # Test non-PBC
+    sim2 = SpringMassSimulator(n_particles=16)
+    pos2, vel2 = sim2.generate_trajectory(steps=100)
+    print(f"Standard Trajectory shape: {pos2.shape}")
