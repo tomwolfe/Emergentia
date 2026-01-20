@@ -66,21 +66,24 @@ class FeatureTransformer:
         X = np.hstack(features)
         
         # Polynomial expansion (Linear + Quadratic)
-        n_raw = X.shape[1]
         poly_features = [X]
-        # Only square the raw latent variables to avoid feature explosion
         n_latents = self.n_super_nodes * self.latent_dim
+        
+        # Squares of latent variables
         for i in range(n_latents):
             poly_features.append((X[:, i:i+1]**2))
             
-            # Smart cross-terms: only between dimensions of the SAME super-node
-            # or same dimensions across DIFFERENT super-nodes
             node_idx = i // self.latent_dim
             dim_idx = i % self.latent_dim
             
-            # Cross-terms within same node
+            # Cross-terms within same node (e.g. q1*p1)
             for j in range(i + 1, (node_idx + 1) * self.latent_dim):
                 poly_features.append(X[:, i:i+1] * X[:, j:j+1])
+            
+            # Cross-terms with same dimension in other nodes (e.g. q1*q2)
+            for other_node in range(node_idx + 1, self.n_super_nodes):
+                other_idx = other_node * self.latent_dim + dim_idx
+                poly_features.append(X[:, i:i+1] * X[:, other_idx:other_idx+1])
         
         return np.hstack(poly_features)
 
@@ -184,19 +187,16 @@ class SymbolicDistiller:
                     return self.model.predict(X)
             return LinearProgram(ridge), full_mask, linear_score
 
-        parsimony_levels = [0.001, 0.005, 0.01]
-        complexity_factor = max(1.0, 2.0 * (1.0 - linear_score))
+        parsimony_levels = [0.001, 0.01, 0.05, 0.1]
+        complexity_factor = max(1.0, 3.0 * (1.0 - linear_score))
         scaled_pop = int(self.max_pop * complexity_factor)
-        scaled_pop = min(scaled_pop, 5000)
+        scaled_pop = min(scaled_pop, 10000)
         
         candidates = []
         for p_coeff in parsimony_levels:
             est = self._get_regressor(scaled_pop, self.max_gen // 2, parsimony=p_coeff)
             try:
                 est.fit(X_selected, Y_norm[:, i])
-                # gplearn's _program is the best one.
-                # We can also get the hall of fame or best from each generation, 
-                # but let's stick to the best for each parsimony level.
                 prog = est._program
                 score = est.score(X_selected, Y_norm[:, i])
                 
@@ -212,17 +212,15 @@ class SymbolicDistiller:
         if not candidates:
             return None, full_mask, 0.0
 
+        # Sort by score, then apply a Pareto-inspired selection
         candidates.sort(key=lambda x: x['score'], reverse=True)
         best_candidate = candidates[0]
         
-        # Calculate "Uncertainty" based on agreement of top candidates' scores and complexities
-        # High confidence if multiple parsimony levels find similar quality models
-        top_scores = [c['score'] for c in candidates[:3]]
-        score_std = np.std(top_scores) if len(top_scores) > 1 else 0.1
-        confidence = best_candidate['score'] * (1.0 - score_std)
-
+        # Pareto selection: if a much simpler model is almost as good, prefer it.
         for c in candidates[1:]:
-            if (best_candidate['score'] - c['score']) < 0.03 and c['complexity'] < 0.6 * best_candidate['complexity']:
+            # If the candidate is significantly simpler (e.g. < 50% complexity) 
+            # and within 5% of the best score, choose it.
+            if (best_candidate['score'] - c['score']) < 0.05 and c['complexity'] < 0.5 * best_candidate['complexity']:
                 best_candidate = c
                 
         if best_candidate['score'] < 0.85:

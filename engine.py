@@ -154,6 +154,7 @@ class Trainer:
         loss_cons = 0
         loss_assign = losses_0['entropy'] + losses_0['diversity'] + 0.1 * losses_0['spatial']
         loss_pruning = losses_0['pruning']
+        loss_sparsity = losses_0['sparsity']
         loss_sep = losses_0.get('separation', torch.tensor(0.0, device=self.device))
         loss_conn = self.model.get_connectivity_loss(s_0, batch_0.edge_index)
         loss_ortho = self.model.get_ortho_loss(s_0)
@@ -211,6 +212,7 @@ class Trainer:
             loss_rec += self.criterion(recon_t, batch_t.x)
             loss_assign += losses_t['entropy'] + losses_t['diversity'] + 0.1 * losses_t['spatial']
             loss_pruning += losses_t['pruning']
+            loss_sparsity += losses_t['sparsity']
             loss_sep += losses_t.get('separation', torch.tensor(0.0, device=self.device))
             loss_conn += self.model.get_connectivity_loss(s_t, batch_t.edge_index)
             loss_ortho += self.model.get_ortho_loss(s_t)
@@ -255,6 +257,7 @@ class Trainer:
         loss_cons /= (seq_len - 1)
         loss_assign /= seq_len
         loss_pruning /= seq_len
+        loss_sparsity /= seq_len
         loss_ortho /= seq_len
         loss_align /= seq_len
         loss_sep /= seq_len
@@ -274,13 +277,15 @@ class Trainer:
             'assign_raw': loss_assign, 'ortho_raw': loss_ortho, 
             'l2_raw': loss_l2, 'lvr_raw': loss_lvr,
             'mu_stability': mu_stability, 'align_raw': loss_align,
-            'pruning_raw': loss_pruning, 'sep_raw': loss_sep, 'conn_raw': loss_conn
+            'pruning_raw': loss_pruning, 'sep_raw': loss_sep, 
+            'conn_raw': loss_conn, 'sparsity_raw': loss_sparsity
         }, weights={
             'rec': torch.exp(-lvars[0]), 'cons': torch.exp(-lvars[1]),
             'assign': torch.exp(-lvars[2]), 'ortho': torch.exp(-lvars[3]),
             'l2': torch.exp(-lvars[4]), 'lvr': torch.exp(-lvars[5]),
             'align': torch.exp(-lvars[6]), 'pruning': torch.exp(-lvars[7]),
-            'sep': torch.exp(-lvars[8]), 'conn': torch.exp(-lvars[9])
+            'sep': torch.exp(-lvars[8]), 'conn': torch.exp(-lvars[9]),
+            'sparsity': torch.exp(-lvars[10])
         })
 
         weighted_rec = torch.exp(-lvars[0]) * loss_rec + lvars[0]
@@ -293,8 +298,10 @@ class Trainer:
         weighted_pruning = torch.exp(-lvars[7]) * loss_pruning + lvars[7]
         weighted_sep = torch.exp(-lvars[8]) * loss_sep + lvars[8]
         weighted_conn = torch.exp(-lvars[9]) * loss_conn + lvars[9]
+        weighted_sparsity = torch.exp(-lvars[10]) * loss_sparsity + lvars[10]
 
-        discovery_loss = weighted_rec + weighted_assign + weighted_ortho + weighted_align + weighted_pruning + weighted_sep + weighted_conn
+        discovery_loss = weighted_rec + weighted_assign + weighted_ortho + weighted_align + \
+                         weighted_pruning + weighted_sep + weighted_conn + weighted_sparsity
 
         if epoch < 400 or not is_stable:
             loss = discovery_loss

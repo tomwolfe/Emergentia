@@ -66,7 +66,7 @@ class HierarchicalPooling(nn.Module):
         if self.training and not hard:
             # Moving average update for the mask to avoid rapid flickering
             current_active = (avg_s > self.pruning_threshold).float()
-            self.active_mask = 0.95 * self.active_mask + 0.05 * current_active
+            self.active_mask.copy_(0.95 * self.active_mask + 0.05 * current_active)
             # Ensure at least one is always active to avoid collapse
             if self.active_mask.sum() == 0:
                 self.active_mask[torch.argmax(avg_s)] = 1.0
@@ -74,6 +74,9 @@ class HierarchicalPooling(nn.Module):
         entropy = -torch.mean(torch.sum(s * torch.log(s + 1e-9), dim=1))
         diversity_loss = torch.sum(avg_s * torch.log(avg_s + 1e-9))
         pruning_loss = torch.mean(torch.abs(avg_s * (1 - self.active_mask))) # Penalize usage of "inactive" nodes
+        
+        # Sparsity loss to encourage finding the minimal scale
+        sparsity_loss = torch.sum(self.active_mask) / self.n_super_nodes
 
         spatial_loss = torch.tensor(0.0, device=x.device)
         if pos is not None:
@@ -89,7 +92,8 @@ class HierarchicalPooling(nn.Module):
             'entropy': entropy,
             'diversity': diversity_loss,
             'spatial': spatial_loss,
-            'pruning': pruning_loss
+            'pruning': pruning_loss,
+            'sparsity': sparsity_loss
         }
         
         super_node_mu = None
@@ -187,10 +191,12 @@ class HamiltonianODEFunc(nn.Module):
 
     def forward(self, t, y):
         # y: [batch_size, latent_dim * n_super_nodes]
+        training = torch.is_grad_enabled() and self.H_net[0].weight.requires_grad
+        
         with torch.set_grad_enabled(True):
-            y = y.requires_grad_(True)
+            y = y.detach().requires_grad_(True)
             H = self.H_net(y).sum()
-            dH = torch.autograd.grad(H, y, create_graph=True)[0]
+            dH = torch.autograd.grad(H, y, create_graph=training)[0]
         
         # dH is [batch_size, n_super_nodes * latent_dim]
         # Reshape to [batch_size, n_super_nodes, 2, latent_dim // 2]
@@ -247,8 +253,8 @@ class DiscoveryEngineModel(nn.Module):
         self.hamiltonian = hamiltonian
 
         # Learnable loss log-variances for automatic loss balancing
-        # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning, 8: sep, 9: conn
-        self.log_vars = nn.Parameter(torch.zeros(10)) 
+        # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning, 8: sep, 9: conn, 10: sparsity
+        self.log_vars = nn.Parameter(torch.zeros(11)) 
         
     def encode(self, x, edge_index, batch, tau=1.0):
         return self.encoder(x, edge_index, batch, tau=tau)

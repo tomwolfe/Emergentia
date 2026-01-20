@@ -13,10 +13,14 @@ def main():
     parser.add_argument('--steps', type=int, default=800)
     parser.add_argument('--particles', type=int, default=16)
     parser.add_argument('--super_nodes', type=int, default=4)
+    parser.add_argument('--device', type=str, default=None, help='Device to use (cpu, cuda, mps)')
     args = parser.parse_args()
 
     # 0. Device Discovery
-    if torch.cuda.is_available():
+    if args.device:
+        device = torch.device(args.device)
+        print(f"Manually selected device: {device}")
+    elif torch.cuda.is_available():
         device = torch.device('cuda')
         print("CUDA is available")
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -38,8 +42,9 @@ def main():
     box_size = None # Disable PBC for stability
     
     print("--- 1. Generating Data ---")
-    sim = SpringMassSimulator(n_particles=n_particles, k=15.0, 
-                             dynamic_radius=dynamic_radius, box_size=box_size)
+    from simulator import LennardJonesSimulator
+    sim = LennardJonesSimulator(n_particles=n_particles, epsilon=1.0, sigma=1.0, 
+                                dynamic_radius=dynamic_radius, box_size=box_size)
     pos, vel = sim.generate_trajectory(steps=steps)
     initial_energy = sim.energy(pos[0], vel[0])
     final_energy = sim.energy(pos[-1], vel[-1])
@@ -76,10 +81,11 @@ def main():
         if epoch % 100 == 0:
             progress = (epoch / epochs) * 100
             stats_tracker = trainer.loss_tracker.get_stats()
+            active_nodes = int(model.encoder.pooling.active_mask.sum().item())
             log_str = f"Progress: {progress:3.0f}% | Loss: {loss:.6f} | "
             log_str += f"Rec: {stats_tracker.get('rec_raw', 0):.4f} | "
+            log_str += f"Active Nodes: {active_nodes} | "
             log_str += f"W_Rec: {stats_tracker.get('w_rec', 0):.2e} | "
-            log_str += f"Mu_Stab: {stats_tracker.get('mu_stability', 0):.6f} | "
             log_str += f"LR: {trainer.optimizer.param_groups[0]['lr']:.2e}"
             print(log_str)
 
@@ -127,56 +133,67 @@ def main():
     print("--- 4. Visualizing Results ---")
     from scipy.integrate import odeint
     
-    def symbolic_dynamics(z, t):
-        # z: [n_super_nodes * latent_dim]
-        z_reshaped = z.reshape(1, -1)
-        X_poly = distiller.transformer.transform(z_reshaped)
-        X_norm = distiller.transformer.normalize_x(X_poly)
-        
-        if is_hamiltonian:
-            # Numerical gradient of H to get dq/dt, dp/dt
-            # dq/dt = dH/dp, dp/dt = -dH/dq
-            eps = 1e-4
-            grad = np.zeros_like(z)
-            for i in range(len(z)):
-                z_plus = z.copy()
-                z_plus[i] += eps
-                z_minus = z.copy()
-                z_minus[i] -= eps
-                
-                # Evaluate H at z_plus and z_minus
-                def get_h(z_val):
-                    zv_reshaped = z_val.reshape(1, -1)
-                    xv_poly = distiller.transformer.transform(zv_reshaped)
-                    xv_norm = distiller.transformer.normalize_x(xv_poly)
-                    # Mask and execute
-                    h_norm = equations[0].execute(xv_norm[:, distiller.feature_masks[0]])
-                    return distiller.transformer.denormalize_y(h_norm)[0]
-                
-                grad[i] = (get_h(z_plus) - get_h(z_minus)) / (2 * eps)
+    class SymbolicDynamics:
+        def __init__(self, distiller, equations, feature_masks, is_hamiltonian, n_super_nodes, latent_dim):
+            self.distiller = distiller
+            self.equations = equations
+            self.feature_masks = feature_masks
+            self.is_hamiltonian = is_hamiltonian
+            self.n_super_nodes = n_super_nodes
+            self.latent_dim = latent_dim
             
-            # z is [q1, p1, q2, p2, ...] per super-node
-            # grad is [dH/dq1, dH/dp1, dH/dq2, dH/dp2, ...]
-            # dz/dt = [dH/dp1, -dH/dq1, dH/dp2, -dH/dq2, ...]
-            dzdt = np.zeros_like(z)
-            for k in range(n_super_nodes):
-                dq_idx = k * latent_dim + np.arange(latent_dim // 2)
-                dp_idx = k * latent_dim + latent_dim // 2 + np.arange(latent_dim // 2)
-                dzdt[dq_idx] = grad[dp_idx]
-                dzdt[dp_idx] = -grad[dq_idx]
-            return dzdt
-        else:
-            dzdt_norm = []
-            for i, (eq, mask) in enumerate(zip(equations, distiller.feature_masks)):
-                X_selected = X_norm[:, mask]
-                dzdt_norm.append(eq.execute(X_selected)[0])
-            
-            return distiller.transformer.denormalize_y(np.array(dzdt_norm))
+            # Cache transformer for speed
+            self.transformer = distiller.transformer
+
+        def __call__(self, z, t):
+            # z: [n_super_nodes * latent_dim]
+            if self.is_hamiltonian:
+                # Optimized vectorized numerical gradient
+                eps = 1e-4
+                n_dims = len(z)
+                # Create a batch of perturbed inputs: [2 * n_dims, n_dims]
+                z_batch = np.tile(z, (2 * n_dims, 1))
+                for i in range(n_dims):
+                    z_batch[2*i, i] += eps
+                    z_batch[2*i+1, i] -= eps
+                
+                # Transform all at once
+                X_poly = self.transformer.transform(z_batch)
+                X_norm = self.transformer.normalize_x(X_poly)
+                
+                # Execute symbolic H on the batch
+                h_norm = self.equations[0].execute(X_norm[:, self.feature_masks[0]])
+                h_val = self.transformer.denormalize_y(h_norm)
+                
+                # Compute gradients: (H(z+eps) - H(z-eps)) / 2eps
+                grad = (h_val[0::2] - h_val[1::2]) / (2 * eps)
+                
+                dzdt = np.zeros_like(z)
+                d_sub = self.latent_dim // 2
+                for k in range(self.n_super_nodes):
+                    dq_idx = k * self.latent_dim + np.arange(d_sub)
+                    dp_idx = k * self.latent_dim + d_sub + np.arange(d_sub)
+                    dzdt[dq_idx] = grad[dp_idx]
+                    dzdt[dp_idx] = -grad[dq_idx]
+                return dzdt
+            else:
+                z_reshaped = z.reshape(1, -1)
+                X_poly = self.transformer.transform(z_reshaped)
+                X_norm = self.transformer.normalize_x(X_poly)
+                
+                dzdt_norm = []
+                for i, (eq, mask) in enumerate(zip(self.equations, self.feature_masks)):
+                    X_selected = X_norm[:, mask]
+                    dzdt_norm.append(eq.execute(X_selected)[0])
+                
+                return self.transformer.denormalize_y(np.array(dzdt_norm))
+
+    dyn_fn = SymbolicDynamics(distiller, equations, distiller.feature_masks, is_hamiltonian, n_super_nodes, latent_dim)
 
     # Integrate the discovered equations
     z0 = z_states[0]
     t_eval = np.linspace(0, (len(z_states)-1)*sim.dt, len(z_states))
-    z_simulated = odeint(symbolic_dynamics, z0, t_eval)
+    z_simulated = odeint(dyn_fn, z0, t_eval)
 
 
     model.eval()
