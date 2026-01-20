@@ -34,6 +34,9 @@ def main():
     sim = SpringMassSimulator(n_particles=n_particles, k=15.0, 
                              dynamic_radius=dynamic_radius, box_size=box_size)
     pos, vel = sim.generate_trajectory(steps=steps)
+    initial_energy = sim.energy(pos[0], vel[0])
+    final_energy = sim.energy(pos[-1], vel[-1])
+    print(f"Energy conservation: {initial_energy:.2f} -> {final_energy:.2f} ({(final_energy/initial_energy-1)*100:.2f}%)")
     
     # Prepare data with device support and robust normalization
     dataset, stats = prepare_data(pos, vel, radius=dynamic_radius, device=device)
@@ -64,10 +67,10 @@ def main():
         
         if epoch % 100 == 0:
             progress = (epoch / epochs) * 100
-            stats = trainer.loss_tracker.get_stats()
+            stats_tracker = trainer.loss_tracker.get_stats()
             log_str = f"Progress: {progress:3.0f}% | Loss: {loss:.6f} | "
-            log_str += f"Rec: {stats.get('rec_raw', 0):.4f} | Cons: {stats.get('cons_raw', 0):.4f} | "
-            log_str += f"Assign: {stats.get('assign_raw', 0):.4f} | Ortho: {stats.get('ortho_raw', 0):.4f} | "
+            log_str += f"Rec: {stats_tracker.get('rec_raw', 0):.4f} | "
+            log_str += f"Mu_Stab: {stats_tracker.get('mu_stability', 0):.6f} | "
             log_str += f"LR: {trainer.optimizer.param_groups[0]['lr']:.2e}"
             print(log_str)
 
@@ -172,7 +175,7 @@ def main():
         x = data.x.to(device)
         edge_index = data.edge_index.to(device)
         batch = torch.zeros(x.size(0), dtype=torch.long, device=device)
-        z, s, _ = model.encode(x, edge_index, batch)
+        z, s, _, _ = model.encode(x, edge_index, batch)
         recon = model.decode(z, s, batch).cpu().numpy()
         
     plt.figure(figsize=(18, 5))

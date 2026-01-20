@@ -117,28 +117,52 @@ class SpringMassSimulator:
         
         return forces
 
-    def step(self):
-        # Velocity Verlet:
-        forces_t = self.compute_forces(self.pos)
-        v_half = self.vel + (forces_t / self.m) * (self.dt / 2.0)
+    def energy(self, pos=None, vel=None):
+        if pos is None: pos = self.pos
+        if vel is None: vel = self.vel
         
-        self.pos += v_half * self.dt
+        # Kinetic Energy: 0.5 * m * v^2
+        ke = 0.5 * self.m * np.sum(vel**2)
         
-        # Apply PBC wrap-around
-        if self.box_size:
-            self.pos = self.pos % self.box_size
+        # Potential Energy: 0.5 * k * (d - d0)^2
+        pe = 0.0
+        pairs = self._compute_pairs(pos) if (self.dynamic_radius or self.box_size) else self.fixed_pairs
+        if len(pairs) > 0:
+            idx1 = np.array([p[0] for p in pairs])
+            idx2 = np.array([p[1] for p in pairs])
+            diff = pos[idx2] - pos[idx1]
+            if self.box_size:
+                for i in range(2):
+                    diff[:, i] -= self.box_size[i] * np.round(diff[:, i] / self.box_size[i])
+            dist = np.linalg.norm(diff, axis=1)
+            pe = 0.5 * self.k * np.sum((dist - self.spring_dist)**2)
+            
+        return ke + pe
+
+    def step(self, sub_steps=4):
+        dt_sub = self.dt / sub_steps
+        for _ in range(sub_steps):
+            # Velocity Verlet:
+            forces_t = self.compute_forces(self.pos)
+            v_half = self.vel + (forces_t / self.m) * (dt_sub / 2.0)
+            
+            self.pos += v_half * dt_sub
+            
+            # Apply PBC wrap-around
+            if self.box_size:
+                self.pos = self.pos % self.box_size
+            
+            forces_next = self.compute_forces(self.pos)
+            self.vel = v_half + (forces_next / self.m) * (dt_sub / 2.0)
+            
+            # Stability check & soft-clamping (per sub-step)
+            max_v = 20.0
+            v_norm = np.linalg.norm(self.vel, axis=1, keepdims=True)
+            if np.any(v_norm > max_v):
+                scale = np.where(v_norm > max_v, max_v / v_norm, 1.0)
+                self.vel *= scale
         
-        forces_next = self.compute_forces(self.pos)
-        self.vel = v_half + (forces_next / self.m) * (self.dt / 2.0)
-        
-        # Stability check & soft-clamping
-        max_v = 20.0
-        v_norm = np.linalg.norm(self.vel, axis=1, keepdims=True)
-        if np.any(v_norm > max_v):
-            scale = np.where(v_norm > max_v, max_v / v_norm, 1.0)
-            self.vel *= scale
-        
-        # Check for NaNs or massive values
+        # Check for NaNs or massive values after all sub-steps
         if np.any(np.isnan(self.pos)) or np.any(np.abs(self.pos) > 1e6):
             print("Warning: Simulation diverged. Re-centering and damping.")
             self.pos = np.nan_to_num(self.pos)

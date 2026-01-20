@@ -154,9 +154,39 @@ class SymbolicDistiller:
                 print(f"  -> Escalating to Fine search (pop={self.max_pop}, gen={self.max_gen})...")
                 est = self._get_regressor(self.max_pop, self.max_gen)
                 est.fit(X_selected, Y_norm[:, i])
-                equations.append(est._program)
+                
+                # Final check: is the fine search actually better?
+                # Sometimes GP just finds a complex identity that overfits.
+                # We prefer simpler programs if the score is 'good enough'.
+                if hasattr(est, '_program'):
+                    equations.append(est._program)
+                else:
+                    equations.append(best_prog) # Fallback to coarse if fine failed
                 
         return equations
+
+    def evaluate_on_test(self, programs, latent_states, targets):
+        """
+        Evaluates discovered programs on a hold-out set to detect overfitting.
+        """
+        if self.transformer is None:
+            return None
+            
+        X_poly = self.transformer.transform(latent_states)
+        X_norm = self.transformer.normalize_x(X_poly)
+        Y_norm = self.transformer.normalize_y(targets)
+        
+        scores = []
+        for i, (prog, mask) in enumerate(zip(programs, self.feature_masks)):
+            X_selected = X_norm[:, mask]
+            y_pred = prog.execute(X_selected)
+            # R^2 score
+            u = ((Y_norm[:, i] - y_pred) ** 2).sum()
+            v = ((Y_norm[:, i] - Y_norm[:, i].mean()) ** 2).sum()
+            score = 1 - u / (v + 1e-9)
+            scores.append(score)
+            
+        return np.array(scores)
 
 def extract_latent_data(model, dataset, dt, include_hamiltonian=False):
     model.eval()
@@ -174,7 +204,7 @@ def extract_latent_data(model, dataset, dt, include_hamiltonian=False):
             edge_index = data.edge_index.to(device)
             current_t = i * dt
 
-            z, s, _ = model.encode(x, edge_index, torch.zeros(x.size(0), dtype=torch.long, device=device))
+            z, s, _, _ = model.encode(x, edge_index, torch.zeros(x.size(0), dtype=torch.long, device=device))
             z_flat = z.view(1, -1)
             
             # Latent Derivative

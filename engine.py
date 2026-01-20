@@ -62,7 +62,7 @@ def analyze_latent_space(model, dataset, pos_raw, tau=0.1, device='cpu'):
     with torch.no_grad():
         for t, data in enumerate(dataset):
             batch = Batch.from_data_list([data]).to(device)
-            z, s, _ = model.encode(batch.x, batch.edge_index, batch.batch, tau=tau)
+            z, s, _, _ = model.encode(batch.x, batch.edge_index, batch.batch, tau=tau)
             
             # Compute CoM for each super-node based on assignment weights s
             # s: [N, K], pos_raw[t]: [N, 2]
@@ -127,7 +127,7 @@ class Trainer:
         tau = max(0.1, 1.0 - epoch / 2000.0)
         
         batch_0 = Batch.from_data_list([data_list[0]]).to(self.device)
-        z_curr, s_0, entropy_0 = self.model.encode(batch_0.x, batch_0.edge_index, batch_0.batch, tau=tau)
+        z_curr, s_0, entropy_0, mu_0 = self.model.encode(batch_0.x, batch_0.edge_index, batch_0.batch, tau=tau)
         
         loss_rec = 0
         loss_cons = 0
@@ -135,12 +135,13 @@ class Trainer:
         loss_ortho = self.model.get_ortho_loss(s_0)
         
         s_prev = s_0
+        mu_prev = mu_0
         z_preds = [z_curr]
         
         for t in range(1, seq_len):
             if epoch > 500 and np.random.random() < teacher_forcing_ratio:
                 batch_t_prev = Batch.from_data_list([data_list[t-1]]).to(self.device)
-                z_curr, _, _ = self.model.encode(batch_t_prev.x, batch_t_prev.edge_index, batch_t_prev.batch, tau=tau)
+                z_curr, _, _, _ = self.model.encode(batch_t_prev.x, batch_t_prev.edge_index, batch_t_prev.batch, tau=tau)
             
             t_span = torch.tensor([0, dt], device=self.device, dtype=torch.float32)
             z_next_seq = self.model.forward_dynamics(z_curr, t_span)
@@ -156,9 +157,10 @@ class Trainer:
         loss_lvr = torch.mean((z_vel[1:] - z_vel[:-1])**2) if len(z_vel) > 1 else torch.tensor(0.0, device=self.device)
         
         s_stability = 0
+        mu_stability = 0
         for t in range(seq_len):
             batch_t = Batch.from_data_list([data_list[t]]).to(self.device)
-            z_t_target, s_t, entropy_t = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch, tau=tau)
+            z_t_target, s_t, entropy_t, mu_t = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch, tau=tau)
             recon_t = self.model.decode(z_preds[t], s_t, batch_t.batch)
             loss_rec += self.criterion(recon_t, batch_t.x)
             loss_assign += entropy_t
@@ -166,10 +168,17 @@ class Trainer:
             
             if t > 0:
                 s_diff = self.criterion(s_t, s_prev)
-                loss_assign += s_diff
+                # Physical grounding: CoM should not jump between frames
+                # Normalize mu_diff by box size or expected movement if possible, 
+                # here we just use the criterion.
+                mu_diff = self.criterion(mu_t, mu_prev)
+                
+                loss_assign += s_diff + 2.0 * mu_diff # Stronger penalty for CoM jumps
                 loss_cons += self.criterion(z_preds[t], z_t_target)
                 s_stability += s_diff.item()
+                mu_stability += mu_diff.item()
             s_prev = s_t
+            mu_prev = mu_t
         
         loss_rec /= seq_len
         loss_cons /= (seq_len - 1)
@@ -187,7 +196,8 @@ class Trainer:
         self.loss_tracker.update({
             'rec_raw': loss_rec, 'cons_raw': loss_cons, 
             'assign_raw': loss_assign, 'ortho_raw': loss_ortho, 
-            'l2_raw': loss_l2, 'lvr_raw': loss_lvr
+            'l2_raw': loss_l2, 'lvr_raw': loss_lvr,
+            'mu_stability': mu_stability
         })
 
         # Adaptive Loss Weighting (Kendall et al.)

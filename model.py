@@ -80,7 +80,21 @@ class HierarchicalPooling(nn.Module):
         
         # Scatter to batch: [Batch_Size, n_super_nodes, in_channels]
         out = scatter(x_expanded, batch, dim=0, reduce='sum')
-        return out, s, assign_loss
+        
+        # If pos was provided, we already computed mu (weighted mean position)
+        # mu: [batch_size, n_super_nodes, 2]
+        # Since we are assuming single batch or handling batching via scatter, we need to be careful.
+        # Let's re-calculate mu using scatter to handle batching correctly if pos is present.
+        super_node_mu = None
+        if pos is not None:
+            # s: [N, K], pos: [N, 2]
+            # out_mu: [batch_size, K, 2]
+            s_pos_expanded = pos.unsqueeze(1) * s.unsqueeze(2) # [N, K, 2]
+            sum_s_pos = scatter(s_pos_expanded, batch, dim=0, reduce='sum') # [B, K, 2]
+            sum_s = scatter(s, batch, dim=0, reduce='sum').unsqueeze(-1) + 1e-9 # [B, K, 1]
+            super_node_mu = sum_s_pos / sum_s
+
+        return out, s, assign_loss, super_node_mu
 
 class GNNEncoder(nn.Module):
     def __init__(self, node_features, hidden_dim, latent_dim, n_super_nodes):
@@ -109,9 +123,9 @@ class GNNEncoder(nn.Module):
         x = self.ln2(torch.relu(self.gnn2(x, edge_index)))
         
         # Pool to K super-nodes preserving spatial features
-        pooled, s, entropy = self.pooling(x, batch, pos=pos, tau=tau) # [batch_size, n_super_nodes, hidden_dim], [N, n_super_nodes]
+        pooled, s, entropy, mu = self.pooling(x, batch, pos=pos, tau=tau) # [batch_size, n_super_nodes, hidden_dim], [N, n_super_nodes], mu: [B, K, 2]
         latent = self.output_layer(pooled) # [batch_size, n_super_nodes, latent_dim]
-        return latent, s, entropy
+        return latent, s, entropy, mu
 
 class LatentODEFunc(nn.Module):
     def __init__(self, latent_dim, n_super_nodes, hidden_dim=64):
