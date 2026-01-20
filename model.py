@@ -36,11 +36,12 @@ class HierarchicalPooling(nn.Module):
             nn.ReLU(),
             nn.Linear(in_channels, n_super_nodes)
         )
+        self.scaling = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, x, batch, tau=1.0, hard=False):
         # x: [N, in_channels], batch: [N]
-        # Compute assignment logits
-        logits = self.assign_mlp(x)
+        # Compute assignment logits with scaling for sharpness
+        logits = self.assign_mlp(x) * self.scaling
         
         # Use Gumbel-Softmax for harder, more distinct assignments
         s = nn.functional.gumbel_softmax(logits, tau=tau, hard=hard, dim=-1)

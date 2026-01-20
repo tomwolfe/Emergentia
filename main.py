@@ -23,7 +23,7 @@ def main():
     # 1. Setup Parameters
     n_particles = 16
     n_super_nodes = 4
-    latent_dim = 2 
+    latent_dim = 4 
     steps = 800
     epochs = 5000
     seq_len = 20
@@ -45,11 +45,11 @@ def main():
                                  latent_dim=latent_dim,
                                  hidden_dim=128).to(device)
     
-    # Adjusted weights: Significantly more emphasis on reconstruction and consistency
+    # Adjusted weights: Significantly more emphasis on reconstruction
     loss_weights = {
-        'rec': 100.0,     
-        'cons': 50.0,    
-        'assign': 10.0,   
+        'rec': 250.0,     
+        'cons': 40.0,    
+        'assign': 20.0,   
         'ortho': 5.0,     
         'latent_l2': 0.1 
     }
@@ -57,9 +57,9 @@ def main():
     trainer = Trainer(model, lr=5e-4, device=device, 
                       loss_weights=loss_weights, stats=stats)
     
-    # Increased patience and adjusted factor
+    # Increased patience and adjusted factor to prevent premature decay
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(trainer.optimizer, mode='min', 
-                                                           factor=0.5, patience=500, min_lr=1e-6)
+                                                           factor=0.8, patience=800, min_lr=1e-6)
     
     last_loss = 1.0
     for epoch in range(epochs):
@@ -95,8 +95,18 @@ def main():
     from scipy.integrate import odeint
     
     def symbolic_dynamics(z, t):
+        # z: [18] (16 latent vars + 2 physical vars)
+        # Reconstruct the 24-dim state used for features: [16 latent, 6 dists, 2 physical]
+        z_latent = z[:16].reshape(n_super_nodes, latent_dim)
+        dists = []
+        for i in range(n_super_nodes):
+            for j in range(i + 1, n_super_nodes):
+                dists.append(np.linalg.norm(z_latent[i] - z_latent[j]))
+        
+        z_full = np.concatenate([z[:16], np.array(dists), z[16:]])
+        
         # Normalize input
-        z_norm = (z - z_mean) / z_std
+        z_norm = (z_full - z_mean) / z_std
         X = z_norm.reshape(1, -1)
         
         # Feature Engineering for integration
@@ -115,8 +125,9 @@ def main():
         dzdt = dzdt_norm * dz_std + dz_mean
         return dzdt
 
-    # Integrate the discovered equations
-    z0 = z_states[0]
+    # Integrate the discovered equations (only independent variables)
+    # z_states: [16 latent, 6 dists, 2 physical] -> extract 16+2
+    z0 = np.concatenate([z_states[0, :16], z_states[0, 22:]])
     t_eval = np.linspace(0, (len(z_states)-1)*sim.dt, len(z_states))
     z_simulated = odeint(symbolic_dynamics, z0, t_eval)
 
@@ -147,9 +158,11 @@ def main():
     
     # 3. Meso Plot: Symbolic Integration vs Learned Latent
     plt.subplot(1, 3, 3)
-    for i in range(z_states.shape[1]):
-        plt.plot(t_eval, z_states[:, i], 'k--', alpha=0.3, label=f'Learned Z_{i}' if i==0 else "")
-        plt.plot(t_eval, z_simulated[:, i], label=f'Symbolic Z_{i}')
+    z_states_independent = np.concatenate([z_states[:, :16], z_states[:, 22:]], axis=1)
+    for i in range(z_states_independent.shape[1]):
+        if i < 4: # Plot first 4 for clarity
+            plt.plot(t_eval, z_states_independent[:, i], 'k--', alpha=0.3, label=f'Learned Z_{i}' if i==0 else "")
+            plt.plot(t_eval, z_simulated[:, i], label=f'Symbolic Z_{i}')
     plt.title("Meso: Symbolic Integration")
     plt.legend()
     

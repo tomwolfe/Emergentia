@@ -16,7 +16,7 @@ class SymbolicDistiller:
                                  p_crossover=0.7, p_subtree_mutation=0.1, # Shifted towards crossover
                                  p_hoist_mutation=0.05, p_point_mutation=0.1,
                                  max_samples=0.9, verbose=0, 
-                                 parsimony_coefficient=0.1, # Increased to force simpler, physics-like laws
+                                 parsimony_coefficient=0.01, # Lowered to allow slightly more complex features if needed
                                  random_state=42)
 
     def distill(self, latent_states, latent_derivs, times=None):
@@ -86,7 +86,16 @@ def extract_latent_data(model, dataset, dt, stats=None):
 
             # 1. Latent State Extraction: Ensure explicit flattening to [n_super_nodes * latent_dim]
             z, s, _ = model.encode(x, edge_index, torch.zeros(x.size(0), dtype=torch.long, device=device))
-            z_flat = z.view(z.size(0), -1)[0].cpu().numpy()
+            z_nodes = z[0].cpu().numpy() # [n_super_nodes, latent_dim]
+            z_flat = z_nodes.flatten()
+            
+            # Feature Engineering: Include relative distances between super-nodes
+            dists = []
+            for i in range(len(z_nodes)):
+                for j in range(i + 1, len(z_nodes)):
+                    dists.append(np.linalg.norm(z_nodes[i] - z_nodes[j]))
+            
+            z_with_dists = np.concatenate([z_flat, np.array(dists)])
 
             # 2. Latent Derivative from Neural ODE function
             ode_device = next(model.ode_func.parameters()).device
@@ -95,7 +104,7 @@ def extract_latent_data(model, dataset, dt, stats=None):
             dz = model.ode_func(t_ode, z_for_ode)
             dz_flat = dz.view(dz.size(0), -1)[0].cpu().numpy()
 
-            latent_states.append(z_flat)
+            latent_states.append(z_with_dists)
             latent_derivs.append(dz_flat)
             times.append(current_t)
             

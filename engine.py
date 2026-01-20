@@ -83,9 +83,6 @@ class Trainer:
         # Anneal Gumbel-Softmax temperature
         tau = max(0.1, 1.0 - epoch / 2000.0)
         
-        # Warmup phase: Only Reconstruction loss for the first 100 epochs
-        is_warmup = epoch < 100
-        
         # 1. Encode the first state
         batch_0 = Batch.from_data_list([data_list[0]]).to(self.device)
         z_curr, s_0, entropy_0 = self.model.encode(batch_0.x, batch_0.edge_index, batch_0.batch, tau=tau)
@@ -103,7 +100,8 @@ class Trainer:
         
         for t in range(1, seq_len):
             # Teacher Forcing: Occasionally use ground truth encoding as next step input
-            if not is_warmup and np.random.random() < teacher_forcing_ratio:
+            # Disable teacher forcing during early warmup to force model to learn stable mappings
+            if epoch > 500 and np.random.random() < teacher_forcing_ratio:
                 batch_t_prev = Batch.from_data_list([data_list[t-1]]).to(self.device)
                 z_curr, _, _ = self.model.encode(batch_t_prev.x, batch_t_prev.edge_index, batch_t_prev.batch, tau=tau)
             
@@ -142,24 +140,30 @@ class Trainer:
         loss_assign /= seq_len
         loss_ortho /= seq_len
         
-        # Dynamic Loss Weighting
-        if is_warmup:
-            loss = self.weights['rec'] * loss_rec + self.weights['assign'] * loss_assign
-        else:
-            anneal = min(1.0, (epoch - 100) / 700.0)
-            
-            cons_weight = self.weights['cons']
-            if loss_cons.item() > loss_rec.item() * 5:
-                cons_weight *= 2.0
-
+        # Two-Phase Training Schedule
+        if epoch < 1000:
+            # Phase 1 (Warm-up): Focus entirely on reconstruction and assignments
             loss = (self.weights['rec'] * loss_rec + 
-                    anneal * (cons_weight * loss_cons + 
+                    self.weights['assign'] * loss_assign +
+                    self.weights['ortho'] * loss_ortho)
+        elif epoch < 2000:
+            # Phase 2 (Discovery): Gradually anneal the consistency and L2 constraints
+            anneal = (epoch - 1000) / 1000.0
+            loss = (self.weights['rec'] * loss_rec + 
+                    anneal * (self.weights['cons'] * loss_cons + 
                              self.weights['latent_l2'] * loss_l2) +
+                    self.weights['assign'] * loss_assign +
+                    self.weights['ortho'] * loss_ortho)
+        else:
+            # Full Discovery Phase
+            loss = (self.weights['rec'] * loss_rec + 
+                    self.weights['cons'] * loss_cons + 
+                    self.weights['latent_l2'] * loss_l2 +
                     self.weights['assign'] * loss_assign +
                     self.weights['ortho'] * loss_ortho)
         
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
         self.optimizer.step()
         
         return loss.item(), loss_rec.item(), loss_cons.item()
