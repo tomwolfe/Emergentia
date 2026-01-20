@@ -8,11 +8,16 @@ from symbolic import SymbolicDistiller, extract_latent_data
 
 def main():
     # 0. Device Discovery
-    # Fallback to CPU if only MPS is available due to torchdiffeq float64 issues
+    # Check for CUDA first, then MPS (for Apple Silicon), then fall back to CPU
     if torch.cuda.is_available():
         device = torch.device('cuda')
+        print("CUDA is available")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device('mps')
+        print("MPS (Apple Silicon) is available")
     else:
         device = torch.device('cpu')
+        print("GPU not available, falling back to CPU")
     print(f"Using device: {device}")
 
     # 1. Setup Parameters

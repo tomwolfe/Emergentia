@@ -54,7 +54,8 @@ class Trainer:
         self.model = model.to(device)
         self.device = device
         self.optimizer = optim.Adam(model.parameters(), lr=lr)
-        self.criterion = torch.nn.MSELoss()
+        # Ensure criterion is on the same device as the model
+        self.criterion = torch.nn.MSELoss().to(device)
         self.stats = stats
         
         # Pareto-optimal: Expose rigid hyperparameters

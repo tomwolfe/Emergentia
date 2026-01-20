@@ -52,28 +52,28 @@ def extract_latent_data(model, dataset, dt):
     latent_states = []
     latent_derivs = []
     times = []
-    
+
     device = next(model.parameters()).device
-    
+
     with torch.no_grad():
         for i in range(len(dataset)):
             data = dataset[i]
             # Ensure data is on the correct device
             x = data.x.to(device)
             edge_index = data.edge_index.to(device)
-            
+
             current_t = i * dt
-            
+
             z, s = model.encode(x, edge_index, torch.zeros(x.size(0), dtype=torch.long, device=device))
             z_flat = z.view(-1).cpu().numpy()
-            
+
             # Use the ODE function to get the derivative at this state and time
             t = torch.tensor([current_t], dtype=torch.float32, device=device)
             dz = model.ode_func(t, z.view(1, -1))
             dz_flat = dz.view(-1).cpu().numpy()
-            
+
             latent_states.append(z_flat)
             latent_derivs.append(dz_flat)
             times.append(current_t)
-            
+
     return np.array(latent_states), np.array(latent_derivs), np.array(times)

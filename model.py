@@ -76,8 +76,10 @@ class LatentODEFunc(nn.Module):
     def __init__(self, latent_dim, n_super_nodes, hidden_dim=64):
         super(LatentODEFunc, self).__init__()
         self.input_dim = latent_dim * n_super_nodes
+        self.latent_dim = latent_dim
+        self.n_super_nodes = n_super_nodes
         self.net = nn.Sequential(
-            nn.Linear(self.input_dim, hidden_dim), 
+            nn.Linear(self.input_dim, hidden_dim),
             nn.Tanh(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.Tanh(),
@@ -132,6 +134,25 @@ class DiscoveryEngineModel(nn.Module):
         # z0: [batch_size, n_super_nodes, latent_dim]
         z0_flat = z0.view(z0.size(0), -1).to(torch.float32)
         t = t.to(torch.float32)
-        zt_flat = odeint(self.ode_func, z0_flat, t, rtol=1e-3, atol=1e-4)
+
+        # Handle MPS-specific issue with torchdiffeq
+        # Solve ODE on CPU to avoid MPS float64 issues, then move result back
+        original_device = z0_flat.device
+        if str(original_device).startswith('mps'):
+            # Move everything to CPU for ODE solving
+            z0_flat_cpu = z0_flat.cpu()
+            t_cpu = t.cpu()
+
+            # Create a temporary copy of the ODE function on CPU
+            temp_ode_func = LatentODEFunc(self.ode_func.latent_dim,
+                                         self.ode_func.n_super_nodes,
+                                         hidden_dim=64).to('cpu')
+            temp_ode_func.load_state_dict(self.ode_func.state_dict())
+
+            zt_flat_cpu = odeint(temp_ode_func, z0_flat_cpu, t_cpu, rtol=1e-3, atol=1e-4)
+            zt_flat = zt_flat_cpu.to(original_device)
+        else:
+            zt_flat = odeint(self.ode_func, z0_flat, t, rtol=1e-3, atol=1e-4)
+
         # zt_flat: [len(t), batch_size, latent_dim * n_super_nodes]
         return zt_flat.view(zt_flat.size(0), zt_flat.size(1), -1, z0.size(-1))
