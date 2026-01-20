@@ -84,14 +84,16 @@ class SymbolicDistiller:
         self.transformer = None
 
     def _get_regressor(self, pop, gen):
+        # Increased parsimony_coefficient to 0.05 (from 0.01) to penalize complex junk terms
+        # Simplified function_set: removed 'log', 'sqrt', 'abs' which are often sources of instability
         return SymbolicRegressor(population_size=pop,
                                  generations=gen, 
                                  stopping_criteria=self.stopping_criteria,
-                                 function_set=('add', 'sub', 'mul', 'div', 'neg', 'sin', 'cos', 'sqrt', 'log', 'abs'),
+                                 function_set=('add', 'sub', 'mul', 'div', 'neg', 'sin', 'cos'),
                                  p_crossover=0.7, p_subtree_mutation=0.1,
                                  p_hoist_mutation=0.05, p_point_mutation=0.1,
                                  max_samples=0.9, verbose=0, 
-                                 parsimony_coefficient=0.01,
+                                 parsimony_coefficient=0.05,
                                  random_state=42)
 
     def validate_stability(self, program, X_start, dt=0.01, steps=20):

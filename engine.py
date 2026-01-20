@@ -110,6 +110,8 @@ class Trainer:
         self.model = model.to(device)
         self.device = device
         self.loss_tracker = LossTracker()
+        self.s_history = []
+        self.max_s_history = 10
         
         # MPS fix: torchdiffeq has issues with MPS (float64 defaults and stability)
         if str(device) == 'mps':
@@ -148,6 +150,12 @@ class Trainer:
         z_preds = torch.stack(z_preds)
         loss_l2 = torch.mean(z_preds**2)
         
+        # Latent Velocity Regularization (LVR) for smoothness
+        # Penalize large changes in latent velocity (acceleration)
+        z_vel = (z_preds[1:] - z_preds[:-1]) / dt
+        loss_lvr = torch.mean((z_vel[1:] - z_vel[:-1])**2) if len(z_vel) > 1 else torch.tensor(0.0, device=self.device)
+        
+        s_stability = 0
         for t in range(seq_len):
             batch_t = Batch.from_data_list([data_list[t]]).to(self.device)
             z_t_target, s_t, entropy_t = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch, tau=tau)
@@ -157,24 +165,33 @@ class Trainer:
             loss_ortho += self.model.get_ortho_loss(s_t)
             
             if t > 0:
-                loss_assign += self.criterion(s_t, s_prev)
+                s_diff = self.criterion(s_t, s_prev)
+                loss_assign += s_diff
                 loss_cons += self.criterion(z_preds[t], z_t_target)
+                s_stability += s_diff.item()
             s_prev = s_t
         
         loss_rec /= seq_len
         loss_cons /= (seq_len - 1)
         loss_assign /= seq_len
         loss_ortho /= seq_len
+        s_stability /= (seq_len - 1)
+        
+        # Track assignment stability over epochs
+        self.s_history.append(s_stability)
+        if len(self.s_history) > self.max_s_history:
+            self.s_history.pop(0)
+        avg_s_stability = np.mean(self.s_history)
         
         # Track components before weighting
         self.loss_tracker.update({
             'rec_raw': loss_rec, 'cons_raw': loss_cons, 
             'assign_raw': loss_assign, 'ortho_raw': loss_ortho, 
-            'l2_raw': loss_l2
+            'l2_raw': loss_l2, 'lvr_raw': loss_lvr
         })
 
         # Adaptive Loss Weighting (Kendall et al.)
-        # log_vars: 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2
+        # log_vars: 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr
         lvars = self.model.log_vars
         
         weighted_rec = torch.exp(-lvars[0]) * loss_rec + lvars[0]
@@ -182,14 +199,24 @@ class Trainer:
         weighted_assign = torch.exp(-lvars[2]) * loss_assign + lvars[2]
         weighted_ortho = torch.exp(-lvars[3]) * loss_ortho + lvars[3]
         weighted_l2 = torch.exp(-lvars[4]) * loss_l2 + lvars[4]
+        weighted_lvr = torch.exp(-lvars[5]) * loss_lvr + lvars[5]
 
-        if epoch < 1000:
+        # Phased Training with Stability Check
+        # Phase 1: Assignment & Reconstruction (finding objects)
+        # Phase 2: Dynamics (learning how they move) - only if S is stable
+        stability_threshold = 0.05
+        is_stable = avg_s_stability < stability_threshold or epoch > 1500
+        
+        if epoch < 500 or not is_stable:
+            # Focus on discovery
             loss = weighted_rec + weighted_assign + weighted_ortho
-        elif epoch < 2000:
-            anneal = (epoch - 1000) / 1000.0
-            loss = weighted_rec + weighted_assign + weighted_ortho + anneal * (weighted_cons + weighted_l2)
+        elif epoch < 1500:
+            # Gradual introduction of dynamics
+            anneal = (epoch - 500) / 1000.0
+            loss = weighted_rec + weighted_assign + weighted_ortho + anneal * (weighted_cons + weighted_l2 + weighted_lvr)
         else:
-            loss = weighted_rec + weighted_cons + weighted_assign + weighted_ortho + weighted_l2
+            # Full training
+            loss = weighted_rec + weighted_cons + weighted_assign + weighted_ortho + weighted_l2 + weighted_lvr
         
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)

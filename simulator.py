@@ -28,14 +28,19 @@ class SpringMassSimulator:
 
     def _compute_pairs(self, pos):
         if self.box_size:
-            if self.n_particles <= 128:
-                # Brute force is fine for small n and handles PBC correctly
-                diff = pos[:, np.newaxis, :] - pos[np.newaxis, :, :]
-                for i in range(2):
-                    diff[:, :, i] -= self.box_size[i] * np.round(diff[:, :, i] / self.box_size[i])
-                dist = np.linalg.norm(diff, axis=-1)
-                idx1, idx2 = np.where((dist < self.radius) & (np.arange(self.n_particles)[:, None] < np.arange(self.n_particles)[None, :]))
-                return list(zip(idx1, idx2))
+            if self.n_particles <= 64:
+                # Optimized vectorized brute force for small N
+                # pos: [N, 2]
+                diff = pos[:, np.newaxis, :] - pos[np.newaxis, :, :] # [N, N, 2]
+                L = np.array(self.box_size)
+                # Minimum Image Convention
+                diff -= L * np.round(diff / L)
+                dist_sq = np.sum(diff**2, axis=-1)
+                
+                # Use upper triangle indices to avoid self-loops and double counting
+                idx1, idx2 = np.triu_indices(self.n_particles, k=1)
+                mask = dist_sq[idx1, idx2] < self.radius**2
+                return list(zip(idx1[mask], idx2[mask]))
             else:
                 # For larger N, use tiling + KDTree for efficiency with PBC
                 # Tile the points in 3x3 to cover all possible periodic neighbors

@@ -205,7 +205,7 @@ class DiscoveryEngineModel(nn.Module):
         self.hamiltonian = hamiltonian
 
         # Learnable loss log-variances for automatic loss balancing
-        self.log_vars = nn.Parameter(torch.zeros(5)) # rec, cons, assign, ortho, l2
+        self.log_vars = nn.Parameter(torch.zeros(6)) # rec, cons, assign, ortho, l2, lvr
         
     def encode(self, x, edge_index, batch, tau=1.0):
         return self.encoder(x, edge_index, batch, tau=tau)
@@ -217,8 +217,10 @@ class DiscoveryEngineModel(nn.Module):
         # s: [N, n_super_nodes]
         # Encourage orthogonality between super-node assignment vectors
         # s^T * s should be close to identity (weighted by number of particles)
+        n_nodes, k = s.shape
         dots = torch.matmul(s.t(), s)
-        identity = torch.eye(s.size(1), device=s.device) * (s.size(0) / s.size(1))
+        # Scaling identity by N/K ensures that if all nodes are perfectly split, loss is 0
+        identity = torch.eye(k, device=s.device).mul_(n_nodes / k)
         return torch.mean((dots - identity)**2)
     
     def forward_dynamics(self, z0, t):
