@@ -88,60 +88,82 @@ def main():
 
     # 3. Extract Symbolic Equations
     print("--- 3. Distilling Symbolic Laws ---")
-    z_states, dz_states, t_states = extract_latent_data(model, dataset, sim.dt, stats=stats)
+    is_hamiltonian = model.hamiltonian
+    latent_data = extract_latent_data(model, dataset, sim.dt, include_hamiltonian=is_hamiltonian)
     
     distiller = SymbolicDistiller(populations=2000, generations=50) 
-    equations, z_stats = distiller.distill(z_states, dz_states)
-    z_mean, z_std, dz_mean, dz_std = z_stats
     
-    print("\nDiscovered Meso-scale Laws (dZ/dt = ...):")
-    for i, eq in enumerate(equations):
-        print(f"dZ_{i}/dt = {eq}")
+    if is_hamiltonian:
+        z_states, dz_states, t_states, h_states = latent_data
+        print("Distilling Hamiltonian H(q, p)...")
+        equations = distiller.distill(z_states, h_states, n_super_nodes, latent_dim)
+    else:
+        z_states, dz_states, t_states = latent_data
+        print("Distilling derivatives dZ/dt...")
+        equations = distiller.distill(z_states, dz_states, n_super_nodes, latent_dim)
+    
+    print("\nDiscovered Symbolic Laws:")
+    if is_hamiltonian:
+        print(f"H(z) = {equations[0]}")
+    else:
+        for i, eq in enumerate(equations):
+            print(f"dZ_{i}/dt = {eq}")
 
     # 4. Visualization & Integration
     print("--- 4. Visualizing Results ---")
     from scipy.integrate import odeint
     
     def symbolic_dynamics(z, t):
-        # z: [18] (16 latent vars + 2 physical vars)
-        z_latent = z[:16].reshape(n_super_nodes, latent_dim)
-        dists = []
-        for i in range(n_super_nodes):
-            for j in range(i + 1, n_super_nodes):
-                dists.append(np.linalg.norm(z_latent[i] - z_latent[j]))
+        # z: [n_super_nodes * latent_dim]
+        z_reshaped = z.reshape(1, -1)
+        X_poly = distiller.transformer.transform(z_reshaped)
+        X_norm = distiller.transformer.normalize_x(X_poly)
         
-        z_full = np.concatenate([z[:16], np.array(dists), z[16:]])
-        
-        # Normalize input
-        z_norm = (z_full - z_mean) / z_std
-        X = z_norm.reshape(1, -1)
-        
-        # Feature Engineering for integration
-        n_features = X.shape[1]
-        features = [X]
-        for i in range(n_features):
-            features.append((X[:, i]**2).reshape(-1, 1))
-            for j in range(i + 1, n_features):
-                features.append((X[:, i] * X[:, j]).reshape(-1, 1))
-        X_poly = np.hstack(features)
-        
-        # Execute symbolic equations with feature masks
-        dzdt_norm = []
-        for i, (eq, mask) in enumerate(zip(equations, distiller.feature_masks)):
-            X_selected = X_poly[:, mask]
-            dzdt_norm.append(eq.execute(X_selected)[0])
-        
-        dzdt_norm = np.array(dzdt_norm)
-        
-        # Denormalize output
-        dzdt = dzdt_norm * dz_std + dz_mean
-        return dzdt
+        if is_hamiltonian:
+            # Numerical gradient of H to get dq/dt, dp/dt
+            # dq/dt = dH/dp, dp/dt = -dH/dq
+            eps = 1e-4
+            grad = np.zeros_like(z)
+            for i in range(len(z)):
+                z_plus = z.copy()
+                z_plus[i] += eps
+                z_minus = z.copy()
+                z_minus[i] -= eps
+                
+                # Evaluate H at z_plus and z_minus
+                def get_h(z_val):
+                    zv_reshaped = z_val.reshape(1, -1)
+                    xv_poly = distiller.transformer.transform(zv_reshaped)
+                    xv_norm = distiller.transformer.normalize_x(xv_poly)
+                    # Mask and execute
+                    h_norm = equations[0].execute(xv_norm[:, distiller.feature_masks[0]])
+                    return distiller.transformer.denormalize_y(h_norm)[0]
+                
+                grad[i] = (get_h(z_plus) - get_h(z_minus)) / (2 * eps)
+            
+            # z is [q1, p1, q2, p2, ...] per super-node
+            # grad is [dH/dq1, dH/dp1, dH/dq2, dH/dp2, ...]
+            # dz/dt = [dH/dp1, -dH/dq1, dH/dp2, -dH/dq2, ...]
+            dzdt = np.zeros_like(z)
+            for k in range(n_super_nodes):
+                dq_idx = k * latent_dim + np.arange(latent_dim // 2)
+                dp_idx = k * latent_dim + latent_dim // 2 + np.arange(latent_dim // 2)
+                dzdt[dq_idx] = grad[dp_idx]
+                dzdt[dp_idx] = -grad[dq_idx]
+            return dzdt
+        else:
+            dzdt_norm = []
+            for i, (eq, mask) in enumerate(zip(equations, distiller.feature_masks)):
+                X_selected = X_norm[:, mask]
+                dzdt_norm.append(eq.execute(X_selected)[0])
+            
+            return distiller.transformer.denormalize_y(np.array(dzdt_norm))
 
-    # Integrate the discovered equations (only independent variables)
-    # z_states: [16 latent, 6 dists, 2 physical] -> extract 16+2
-    z0 = np.concatenate([z_states[0, :16], z_states[0, 22:]])
+    # Integrate the discovered equations
+    z0 = z_states[0]
     t_eval = np.linspace(0, (len(z_states)-1)*sim.dt, len(z_states))
     z_simulated = odeint(symbolic_dynamics, z0, t_eval)
+
 
     model.eval()
     with torch.no_grad():
@@ -170,11 +192,11 @@ def main():
     
     # 3. Meso Plot: Symbolic Integration vs Learned Latent
     plt.subplot(1, 3, 3)
-    z_states_independent = np.concatenate([z_states[:, :16], z_states[:, 22:]], axis=1)
-    for i in range(z_states_independent.shape[1]):
-        if i < 4: # Plot first 4 for clarity
-            plt.plot(t_eval, z_states_independent[:, i], 'k--', alpha=0.3, label=f'Learned Z_{i}' if i==0 else "")
-            plt.plot(t_eval, z_simulated[:, i], label=f'Symbolic Z_{i}')
+    # Plot first few dimensions for clarity
+    n_plot = min(4, z_states.shape[1])
+    for i in range(n_plot):
+        plt.plot(t_eval, z_states[:, i], 'k--', alpha=0.3, label=f'Learned Z_{i}' if i==0 else "")
+        plt.plot(t_eval, z_simulated[:, i], label=f'Symbolic Z_{i}')
     plt.title("Meso: Symbolic Integration")
     plt.legend()
     

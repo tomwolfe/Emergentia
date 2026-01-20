@@ -4,12 +4,84 @@ import torch
 from sklearn.linear_model import LassoCV
 from sklearn.feature_selection import SelectFromModel
 
+class FeatureTransformer:
+    """
+    Encapsulates feature engineering logic: polynomial expansions, 
+    relative distances, and normalization. Ensures consistency between 
+    training and inference (integration).
+    """
+    def __init__(self, n_super_nodes, latent_dim, include_dists=True):
+        self.n_super_nodes = n_super_nodes
+        self.latent_dim = latent_dim
+        self.include_dists = include_dists
+        self.z_mean = None
+        self.z_std = None
+        self.x_poly_mean = None
+        self.x_poly_std = None
+        self.target_mean = None
+        self.target_std = None
+
+    def fit(self, latent_states, targets):
+        # 1. Fit raw latent normalization
+        self.z_mean = latent_states.mean(axis=0)
+        self.z_std = latent_states.std(axis=0) + 1e-6
+        
+        # 2. Transform to poly features
+        X_poly = self.transform(latent_states)
+        
+        # 3. Fit poly feature normalization
+        self.x_poly_mean = X_poly.mean(axis=0)
+        self.x_poly_std = X_poly.std(axis=0) + 1e-6
+        
+        # 4. Fit target normalization
+        self.target_mean = targets.mean(axis=0)
+        self.target_std = targets.std(axis=0) + 1e-6
+
+    def transform(self, z_flat):
+        # z_flat: [Batch, n_super_nodes * latent_dim]
+        z_nodes = z_flat.reshape(-1, self.n_super_nodes, self.latent_dim)
+        
+        features = [z_flat]
+        if self.include_dists:
+            dists = []
+            for i in range(self.n_super_nodes):
+                for j in range(i + 1, self.n_super_nodes):
+                    # Efficiently compute distances for the batch
+                    d = np.linalg.norm(z_nodes[:, i] - z_nodes[:, j], axis=1, keepdims=True)
+                    dists.append(d)
+            if dists:
+                features.append(np.hstack(dists))
+        
+        X = np.hstack(features)
+        
+        # Polynomial expansion (Linear + Quadratic)
+        n_raw = X.shape[1]
+        poly_features = [X]
+        for i in range(n_raw):
+            poly_features.append((X[:, i:i+1]**2))
+            # Cross-terms (limited to reduce explosion)
+            for j in range(i + 1, min(i + 5, n_raw)): 
+                poly_features.append(X[:, i:i+1] * X[:, j:j+1])
+        
+        return np.hstack(poly_features)
+
+    def normalize_x(self, X_poly):
+        return (X_poly - self.x_poly_mean) / self.x_poly_std
+
+    def normalize_y(self, Y):
+        return (Y - self.target_mean) / self.target_std
+
+    def denormalize_y(self, Y_norm):
+        return Y_norm * self.target_std + self.target_mean
+
 class SymbolicDistiller:
     def __init__(self, populations=2000, generations=40, stopping_criteria=0.001, max_features=15):
         self.max_pop = populations
         self.max_gen = generations
         self.stopping_criteria = stopping_criteria
         self.max_features = max_features
+        self.feature_masks = []
+        self.transformer = None
 
     def _get_regressor(self, pop, gen):
         return SymbolicRegressor(population_size=pop,
@@ -23,14 +95,9 @@ class SymbolicDistiller:
                                  random_state=42)
 
     def validate_stability(self, program, X_start, dt=0.01, steps=20):
-        """
-        Validates the numerical stability of a symbolic program by 
-        performing a short forward rollout.
-        """
         curr_x = X_start.copy()
         for _ in range(steps):
             try:
-                # Symbolic regression often produces values that can explode
                 deriv = program.execute(curr_x.reshape(1, -1))
                 curr_x += deriv * dt
                 if np.any(np.isnan(curr_x)) or np.any(np.isinf(curr_x)) or np.any(np.abs(curr_x) > 1e6):
@@ -39,78 +106,61 @@ class SymbolicDistiller:
                 return False
         return True
 
-    def distill(self, latent_states, latent_derivs, times=None):
-        z_mean = latent_states.mean(axis=0)
-        z_std = latent_states.std(axis=0) + 1e-6
-        dz_mean = latent_derivs.mean(axis=0)
-        dz_std = latent_derivs.std(axis=0) + 1e-6
-
-        X = (latent_states - z_mean) / z_std
-        Y = (latent_derivs - dz_mean) / dz_std
-
-        n_features_raw = X.shape[1]
-        features = [X]
-        for i in range(n_features_raw):
-            features.append((X[:, i]**2).reshape(-1, 1))
-            for j in range(i + 1, n_features_raw):
-                features.append((X[:, i] * X[:, j]).reshape(-1, 1))
+    def distill(self, latent_states, targets, n_super_nodes, latent_dim):
+        """
+        Generic distillation of targets from latent states.
+        targets can be dZ/dt or Hamiltonian H.
+        """
+        self.transformer = FeatureTransformer(n_super_nodes, latent_dim)
+        self.transformer.fit(latent_states, targets)
         
-        X_poly = np.hstack(features)
-
-        if times is not None:
-            t_norm = (times - times.mean()) / (times.std() + 1e-6)
-            X_poly = np.column_stack([X_poly, t_norm])
+        X_poly = self.transformer.transform(latent_states)
+        X_norm = self.transformer.normalize_x(X_poly)
+        Y_norm = self.transformer.normalize_y(targets)
 
         equations = []
-        # Store feature masks for each output dimension
         self.feature_masks = []
 
-        for i in range(latent_derivs.shape[1]):
-            # Feature Selection Step (Pareto-optimal: reduce complexity before GP)
-            print(f"Selecting features for dz_{i}/dt (Input dim: {X_poly.shape[1]})...")
+        for i in range(targets.shape[1]):
+            print(f"Selecting features for target_{i} (Input dim: {X_norm.shape[1]})...")
             selector = SelectFromModel(LassoCV(cv=5, max_iter=2000), max_features=self.max_features)
-            selector.fit(X_poly, Y[:, i])
-            X_selected = selector.transform(X_poly)
+            selector.fit(X_norm, Y_norm[:, i])
             mask = selector.get_support()
             self.feature_masks.append(mask)
+            X_selected = X_norm[:, mask]
             
             print(f"  -> Reduced features to {X_selected.shape[1]} informative variables.")
 
             coarse_pop = self.max_pop // 4
             coarse_gen = self.max_gen // 2
             
-            print(f"Distilling dz_{i}/dt (Coarse search: pop={coarse_pop}, gen={coarse_gen})...")
+            print(f"Distilling target_{i} (Coarse search)...")
             est = self._get_regressor(coarse_pop, coarse_gen)
-            est.fit(X_selected, Y[:, i])
+            est.fit(X_selected, Y_norm[:, i])
             
-            # Use a slightly more robust selection criteria including stability
             best_prog = est._program
-            is_stable = self.validate_stability(best_prog, X_selected[0])
+            # Stability check only makes sense for dZ/dt, not for H
+            # But we'll keep it as a general check if targets.shape[1] == latent_states.shape[1]
+            is_stable = True
+            if targets.shape[1] == latent_states.shape[1]:
+                is_stable = self.validate_stability(best_prog, X_selected[0])
             
-            if est.score(X_selected, Y[:, i]) > 0.95 and is_stable:
-                print(f"  -> Good stable fit found in coarse search (R^2={est.score(X_selected, Y[:, i]):.3f})")
+            if est.score(X_selected, Y_norm[:, i]) > 0.95 and is_stable:
+                print(f"  -> Good fit found in coarse search (R^2={est.score(X_selected, Y_norm[:, i]):.3f})")
                 equations.append(best_prog)
             else:
-                if not is_stable:
-                    print(f"  -> Warning: Coarse search result is unstable. Escalating...")
-                else:
-                    print(f"  -> Low fit (R^2={est.score(X_selected, Y[:, i]):.3f}). Escalating to Fine search...")
-                
+                print(f"  -> Escalating to Fine search (pop={self.max_pop}, gen={self.max_gen})...")
                 est = self._get_regressor(self.max_pop, self.max_gen)
-                est.fit(X_selected, Y[:, i])
-                
-                if not self.validate_stability(est._program, X_selected[0]):
-                    print(f"  -> Critical Warning: dz_{i}/dt equation remains numerically unstable after fine search.")
-                
+                est.fit(X_selected, Y_norm[:, i])
                 equations.append(est._program)
                 
-        return equations, (z_mean, z_std, dz_mean, dz_std)
+        return equations
 
-def extract_latent_data(model, dataset, dt, stats=None):
+def extract_latent_data(model, dataset, dt, include_hamiltonian=False):
     model.eval()
     latent_states = []
     latent_derivs = []
-    physical_states = []
+    hamiltonians = []
     times = []
 
     device = next(model.parameters()).device
@@ -122,67 +172,25 @@ def extract_latent_data(model, dataset, dt, stats=None):
             edge_index = data.edge_index.to(device)
             current_t = i * dt
 
-            # 1. Latent State Extraction: Ensure explicit flattening to [n_super_nodes * latent_dim]
             z, s, _ = model.encode(x, edge_index, torch.zeros(x.size(0), dtype=torch.long, device=device))
-            z_nodes = z[0].cpu().numpy() # [n_super_nodes, latent_dim]
-            z_flat = z_nodes.flatten()
+            z_flat = z.view(1, -1)
             
-            # Feature Engineering: Include relative distances between super-nodes
-            dists = []
-            for i in range(len(z_nodes)):
-                for j in range(i + 1, len(z_nodes)):
-                    dists.append(np.linalg.norm(z_nodes[i] - z_nodes[j]))
-            
-            z_with_dists = np.concatenate([z_flat, np.array(dists)])
-
-            # 2. Latent Derivative from Neural ODE function
+            # Latent Derivative
             ode_device = next(model.ode_func.parameters()).device
             t_ode = torch.tensor([current_t], dtype=torch.float32, device=ode_device)
-            z_for_ode = z.view(z.size(0), -1).to(ode_device)
+            z_for_ode = z_flat.to(ode_device)
             dz = model.ode_func(t_ode, z_for_ode)
-            dz_flat = dz.view(dz.size(0), -1)[0].cpu().numpy()
-
-            latent_states.append(z_with_dists)
-            latent_derivs.append(dz_flat)
-            times.append(current_t)
             
-            # 3. Physical Aggregates (Anchors for interpretability)
-            if stats is not None:
-                # Denormalize positions and velocities for physical calculation
-                pos_norm = data.x[:, :2].cpu().numpy()
-                vel_norm = data.x[:, 2:].cpu().numpy()
-                pos = pos_norm * stats['pos_std'] + stats['pos_mean']
-                vel = vel_norm * stats['vel_std'] + stats['vel_mean']
-                
-                # Total Kinetic Energy (0.5 * m * v^2, m=1.0)
-                ke = 0.5 * np.sum(vel**2)
-                
-                # Total Potential Energy (0.5 * k * (r - r0)^2, k=15.0, r0=1.0)
-                pe = 0
-                if edge_index.numel() > 0:
-                    edges = edge_index.cpu().numpy()
-                    mask = edges[0] < edges[1] # Avoid double counting
-                    idx1, idx2 = edges[0][mask], edges[1][mask]
-                    dist = np.linalg.norm(pos[idx1] - pos[idx2], axis=1)
-                    pe = 0.5 * 15.0 * np.sum((dist - 1.0)**2)
-                
-                # Center of Mass Velocity Magnitude
-                com_vel_mag = np.linalg.norm(np.mean(vel, axis=0))
-                
-                physical_states.append([ke + pe, com_vel_mag])
+            latent_states.append(z_flat[0].cpu().numpy())
+            latent_derivs.append(dz[0].cpu().numpy())
+            times.append(current_t)
 
-    z_array = np.array(latent_states)
-    dz_array = np.array(latent_derivs)
-    
-    if stats is not None and len(physical_states) > 0:
-        p_array = np.array(physical_states)
-        # Compute numerical derivatives for physical targets
-        dp_array = np.zeros_like(p_array)
-        dp_array[:-1] = (p_array[1:] - p_array[:-1]) / dt
-        dp_array[-1] = dp_array[-2] # Simple boundary padding
-        
-        # Append physical variables as additional targets (dz_4/dt, dz_5/dt etc.)
-        z_array = np.column_stack([z_array, p_array])
-        dz_array = np.column_stack([dz_array, dp_array])
+            if include_hamiltonian and hasattr(model.ode_func, 'H_net'):
+                H = model.ode_func.H_net(z_for_ode)
+                hamiltonians.append(H[0].cpu().numpy())
 
-    return z_array, dz_array, np.array(times)
+    res = [np.array(latent_states), np.array(latent_derivs), np.array(times)]
+    if include_hamiltonian:
+        res.append(np.array(hamiltonians))
+    return tuple(res)
+
