@@ -53,6 +53,11 @@ class HierarchicalPooling(nn.Module):
         avg_s = s.mean(dim=0)
         diversity_loss = torch.sum(avg_s * torch.log(avg_s + 1e-9))
         
+        # 2b. Pruning/Sparsity Loss: Encourage some super-nodes to have near-zero average assignment
+        # This allows the model to 'turn off' unused super-nodes.
+        # We use an L1-style penalty on the average assignment of each super-node.
+        pruning_loss = torch.mean(torch.abs(avg_s))
+
         # 3. Spatial Locality Penalty
         spatial_loss = torch.tensor(0.0, device=x.device)
         if pos is not None:
@@ -72,8 +77,13 @@ class HierarchicalPooling(nn.Module):
             var = torch.matmul(s_norm.t(), pos_sq).squeeze() - 2 * (mu * torch.matmul(s_norm.t(), pos)).sum(dim=1) + mu_sq
             spatial_loss = var.mean()
 
-        # Total assignment loss
-        assign_loss = entropy + diversity_loss + 0.1 * spatial_loss
+        # Total assignment loss components
+        assign_losses = {
+            'entropy': entropy,
+            'diversity': diversity_loss,
+            'spatial': spatial_loss,
+            'pruning': pruning_loss
+        }
         
         # Weighted aggregation: [N, 1, in_channels] * [N, n_super_nodes, 1]
         x_expanded = x.unsqueeze(1) * s.unsqueeze(2) 
@@ -94,7 +104,7 @@ class HierarchicalPooling(nn.Module):
             sum_s = scatter(s, batch, dim=0, reduce='sum').unsqueeze(-1) + 1e-9 # [B, K, 1]
             super_node_mu = sum_s_pos / sum_s
 
-        return out, s, assign_loss, super_node_mu
+        return out, s, assign_losses, super_node_mu
 
 class GNNEncoder(nn.Module):
     def __init__(self, node_features, hidden_dim, latent_dim, n_super_nodes):
@@ -123,9 +133,9 @@ class GNNEncoder(nn.Module):
         x = self.ln2(torch.relu(self.gnn2(x, edge_index)))
         
         # Pool to K super-nodes preserving spatial features
-        pooled, s, entropy, mu = self.pooling(x, batch, pos=pos, tau=tau) # [batch_size, n_super_nodes, hidden_dim], [N, n_super_nodes], mu: [B, K, 2]
+        pooled, s, assign_losses, mu = self.pooling(x, batch, pos=pos, tau=tau) # [batch_size, n_super_nodes, hidden_dim], [N, n_super_nodes], mu: [B, K, 2]
         latent = self.output_layer(pooled) # [batch_size, n_super_nodes, latent_dim]
-        return latent, s, entropy, mu
+        return latent, s, assign_losses, mu
 
 class LatentODEFunc(nn.Module):
     def __init__(self, latent_dim, n_super_nodes, hidden_dim=64):
@@ -219,8 +229,8 @@ class DiscoveryEngineModel(nn.Module):
         self.hamiltonian = hamiltonian
 
         # Learnable loss log-variances for automatic loss balancing
-        # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align
-        self.log_vars = nn.Parameter(torch.zeros(7)) 
+        # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning
+        self.log_vars = nn.Parameter(torch.zeros(8)) 
         
     def encode(self, x, edge_index, batch, tau=1.0):
         return self.encoder(x, edge_index, batch, tau=tau)

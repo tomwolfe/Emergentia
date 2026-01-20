@@ -84,9 +84,8 @@ class SymbolicDistiller:
         self.feature_masks = []
         self.transformer = None
 
-    def _get_regressor(self, pop, gen):
-        # Increased parsimony_coefficient to 0.05 (from 0.01) to penalize complex junk terms
-        # Simplified function_set: removed 'log', 'sqrt', 'abs' which are often sources of instability
+    def _get_regressor(self, pop, gen, parsimony=0.01):
+        # Allow dynamic parsimony to find the 'knee' of the Pareto front
         return SymbolicRegressor(population_size=pop,
                                  generations=gen, 
                                  stopping_criteria=self.stopping_criteria,
@@ -94,9 +93,13 @@ class SymbolicDistiller:
                                  p_crossover=0.7, p_subtree_mutation=0.1,
                                  p_hoist_mutation=0.05, p_point_mutation=0.1,
                                  max_samples=0.7, verbose=0, 
-                                 parsimony_coefficient=0.05,
+                                 parsimony_coefficient=parsimony,
                                  n_jobs=-1,
                                  random_state=42)
+
+    def get_complexity(self, program):
+        # A simple complexity measure: number of nodes in the expression tree
+        return program.length_
 
     def validate_stability(self, program, X_start, dt=0.01, steps=20):
         curr_x = X_start.copy()
@@ -120,40 +123,66 @@ class SymbolicDistiller:
         print(f"  -> Target_{i}: Reduced features to {X_selected.shape[1]} informative variables.")
 
         if X_selected.shape[1] == 0:
-            # If no features selected, return a constant zero program
-            # SymbolicRegressor doesn't easily let us create a custom program, 
-            # but we can return None or a very simple one. 
-            # Actually, gplearn programs are complex objects. 
-            # We'll just return a placeholder or handle it in evaluation.
-            # A better way: if 0 features, just use a dummy feature (all zeros)
             X_selected = np.zeros((X_norm.shape[0], 1))
             mask = np.zeros(X_norm.shape[1], dtype=bool)
             print(f"  -> Target_{i}: No features selected, using dummy zero feature.")
 
+        # Pareto-optimal search: try different parsimony levels
+        parsimony_levels = [0.001, 0.01, 0.05, 0.1]
+        best_prog = None
+        best_score = -np.inf
+        
         coarse_pop = self.max_pop // 4
         coarse_gen = self.max_gen // 2
         
-        print(f"Distilling target_{i} (Coarse search)...")
-        est = self._get_regressor(coarse_pop, coarse_gen)
-        est.fit(X_selected, Y_norm[:, i])
+        print(f"Distilling target_{i} (Pareto search over parsimony)...")
         
-        best_prog = est._program
-        is_stable = True
-        if targets_shape_1 == latent_states_shape_1:
-            is_stable = self.validate_stability(best_prog, X_selected[0])
-        
-        if est.score(X_selected, Y_norm[:, i]) > 0.95 and is_stable:
-            print(f"  -> Good fit found in coarse search for target_{i} (R^2={est.score(X_selected, Y_norm[:, i]):.3f})")
-            return best_prog, mask
-        else:
-            print(f"  -> Escalating to Fine search for target_{i} (pop={self.max_pop}, gen={self.max_gen})...")
-            est = self._get_regressor(self.max_pop, self.max_gen)
+        # We want to find the program that maximizes (Score - lambda * Complexity)
+        # but a better heuristic is finding the 'knee' where score stops improving significantly
+        candidates = []
+        for p_coeff in parsimony_levels:
+            est = self._get_regressor(coarse_pop, coarse_gen, parsimony=p_coeff)
             est.fit(X_selected, Y_norm[:, i])
+            prog = est._program
+            score = est.score(X_selected, Y_norm[:, i])
+            complexity = self.get_complexity(prog)
             
-            if hasattr(est, '_program'):
-                return est._program, mask
-            else:
-                return best_prog, mask
+            is_stable = True
+            if targets_shape_1 == latent_states_shape_1:
+                is_stable = self.validate_stability(prog, X_selected[0])
+            
+            if is_stable:
+                candidates.append({'prog': prog, 'score': score, 'complexity': complexity})
+        
+        if not candidates:
+            # Fallback to no parsimony if all failed stability
+            est = self._get_regressor(coarse_pop, coarse_gen, parsimony=0.0)
+            est.fit(X_selected, Y_norm[:, i])
+            return est._program, mask
+
+        # Select the 'Pareto' winner: Highest score among those with 'reasonable' complexity
+        # Or simply use a weighted metric
+        candidates.sort(key=lambda x: x['score'], reverse=True)
+        # Simple heuristic: pick the highest score that isn't too complex, or the best overall if it's stable
+        best_candidate = candidates[0]
+        for c in candidates[1:]:
+            # If a slightly worse score (within 5%) comes with > 30% reduction in complexity, prefer it
+            if (best_candidate['score'] - c['score']) < 0.05 * best_candidate['score'] and \
+               c['complexity'] < 0.7 * best_candidate['complexity']:
+                best_candidate = c
+                
+        print(f"  -> Selected best parsimony candidate for target_{i}: Score={best_candidate['score']:.3f}, Complexity={best_candidate['complexity']}")
+        
+        # Fine search escalation if score is still low
+        if best_candidate['score'] < 0.8 and self.max_pop > coarse_pop:
+            print(f"  -> Escalating to Fine search for target_{i} (pop={self.max_pop}, gen={self.max_gen})...")
+            # Use the 'best' parsimony found in coarse search
+            best_p = parsimony_levels[candidates.index(best_candidate)] if best_candidate in candidates else 0.01
+            est = self._get_regressor(self.max_pop, self.max_gen, parsimony=best_p)
+            est.fit(X_selected, Y_norm[:, i])
+            return est._program, mask
+            
+        return best_candidate['prog'], mask
 
     def distill(self, latent_states, targets, n_super_nodes, latent_dim):
         """
