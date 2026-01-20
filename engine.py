@@ -93,17 +93,26 @@ class LossTracker:
     def __init__(self, alpha=0.9):
         self.alpha = alpha
         self.history = {}
+        self.weights = {}
 
-    def update(self, components):
+    def update(self, components, weights=None):
         for k, v in components.items():
             val = v.item() if hasattr(v, 'item') else v
             if k not in self.history:
                 self.history[k] = val
             else:
                 self.history[k] = self.alpha * self.history[k] + (1 - self.alpha) * val
+        
+        if weights is not None:
+            for k, v in weights.items():
+                val = v.item() if hasattr(v, 'item') else v
+                if k not in self.weights:
+                    self.weights[k] = val
+                else:
+                    self.weights[k] = self.alpha * self.weights[k] + (1 - self.alpha) * val
 
     def get_stats(self):
-        return self.history
+        return {**self.history, **{f"w_{k}": v for k, v in self.weights.items()}}
 
 class Trainer:
     def __init__(self, model, lr=5e-4, device='cpu', stats=None, align_anneal_epochs=1000):
@@ -127,25 +136,22 @@ class Trainer:
         seq_len = len(data_list)
         
         # 1. Smooth Tau schedule: Exponential decay
-        # Starts at 1.0, decays to 0.1
         tau = max(0.1, np.exp(-epoch / 500.0))
         
         # 2. Decaying Teacher Forcing Ratio
         tf_ratio = max(0.0, 0.8 * (1.0 - epoch / (0.75 * max_epochs)))
         
-        # 3. Alignment Annealing: Reduce hand-holding over time
+        # 3. Alignment Annealing
         align_weight = max(0.0, 1.0 - epoch / self.align_anneal_epochs)
         
         batch_0 = Batch.from_data_list([data_list[0]]).to(self.device)
         z_curr, s_0, losses_0, mu_0 = self.model.encode(batch_0.x, batch_0.edge_index, batch_0.batch, tau=tau)
         
-        # Robustness: Initial NaN check
         if torch.isnan(z_curr).any():
             z_curr = torch.nan_to_num(z_curr)
 
         loss_rec = 0
         loss_cons = 0
-        # Basic assignment losses
         loss_assign = losses_0['entropy'] + losses_0['diversity'] + 0.1 * losses_0['spatial']
         loss_pruning = losses_0['pruning']
         loss_sep = losses_0.get('separation', torch.tensor(0.0, device=self.device))
@@ -157,7 +163,6 @@ class Trainer:
         z_preds = [z_curr]
         
         for t in range(1, seq_len):
-            # Apply teacher forcing based on ratio
             if np.random.random() < tf_ratio:
                 batch_t_prev = Batch.from_data_list([data_list[t-1]]).to(self.device)
                 z_curr_forced, _, _, _ = self.model.encode(batch_t_prev.x, batch_t_prev.edge_index, batch_t_prev.batch, tau=tau)
@@ -165,7 +170,7 @@ class Trainer:
             
             t_span = torch.tensor([0, dt], device=self.device, dtype=torch.float32)
             z_next_seq = self.model.forward_dynamics(z_curr, t_span)
-            z_curr = torch.nan_to_num(z_next_seq[1]) # Defensive
+            z_curr = torch.nan_to_num(z_next_seq[1])
             z_preds.append(z_curr)
             
         z_preds = torch.stack(z_preds)
@@ -180,16 +185,23 @@ class Trainer:
         
         mu_mean = torch.tensor(self.stats['pos_mean'], device=self.device, dtype=torch.float32) if self.stats else 0
         mu_std = torch.tensor(self.stats['pos_std'], device=self.device, dtype=torch.float32) if self.stats else 1
+        vel_mean = torch.tensor(self.stats['vel_mean'], device=self.device, dtype=torch.float32) if self.stats else 0
+        vel_std = torch.tensor(self.stats['vel_std'], device=self.device, dtype=torch.float32) if self.stats else 1
+
+        # Heuristic for assignment stability: average change in S over time
+        # If assignments are shifting rapidly, we shouldn't trust the ODE dynamics yet.
+        avg_s_stability = np.mean(self.s_history) if self.s_history else 1.0
+        is_stable = avg_s_stability < 0.05 
 
         for t in range(seq_len):
             batch_t = Batch.from_data_list([data_list[t]]).to(self.device)
             z_t_target, s_t, losses_t, mu_t = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch, tau=tau)
             
-            # Robustness: Check for NaNs from encoder
             if torch.isnan(z_t_target).any():
                 z_t_target = torch.nan_to_num(z_t_target)
             
-            if epoch < 400 or not is_stable:
+            # Reconstruction check for stability
+            if epoch < 400:
                 z_for_recon = z_t_target
             else:
                 z_for_recon = z_preds[t]
@@ -203,10 +215,30 @@ class Trainer:
             loss_conn += self.model.get_connectivity_loss(s_t, batch_t.edge_index)
             loss_ortho += self.model.get_ortho_loss(s_t)
             
+            # CoM Position Alignment
             mu_t_norm = (mu_t - mu_mean) / (mu_std + 1e-6)
             d_sub = self.model.encoder.latent_dim // 2 if self.model.hamiltonian else 2
             d_align = min(d_sub, 2) 
-            loss_align += align_weight * self.criterion(z_preds[t, :, :, :d_align], mu_t_norm[:, :, :d_align])
+            
+            # z_preds is [T, B, K, D]
+            # mu_t_norm is [B, K, 2]
+            p_align = self.criterion(z_preds[t, :, :, :d_align], mu_t_norm[:, :, :d_align])
+            
+            # CoM Velocity Alignment (Optional but helps robustness)
+            v_align = torch.tensor(0.0, device=self.device)
+            if t < seq_len - 1:
+                # Approximate CoM velocity from consecutive assignments
+                batch_t_next = Batch.from_data_list([data_list[t+1]]).to(self.device)
+                _, s_t_next, _, mu_t_next = self.model.encode(batch_t_next.x, batch_t_next.edge_index, batch_t_next.batch, tau=tau)
+                mu_vel = (mu_t_next - mu_t) / dt
+                mu_vel_norm = (mu_vel - vel_mean) / (vel_std + 1e-6)
+                
+                # If Hamiltonian, z[:, :, d_sub:] are momenta (p). 
+                # p should align with velocity if mass is assumed constant (normalized).
+                v_start = d_sub
+                v_align = self.criterion(z_preds[t, :, :, v_start:v_start+d_align], mu_vel_norm[:, :, :d_align])
+
+            loss_align += align_weight * (p_align + 0.5 * v_align)
 
             if t > 0:
                 s_diff = self.criterion(s_t, s_prev)
@@ -234,17 +266,23 @@ class Trainer:
             self.s_history.pop(0)
         avg_s_stability = np.mean(self.s_history)
         
+        # Adaptive Loss Weighting with clamping for stability
+        lvars = torch.clamp(self.model.log_vars, min=-2.0, max=10.0)
+        
         self.loss_tracker.update({
             'rec_raw': loss_rec, 'cons_raw': loss_cons, 
             'assign_raw': loss_assign, 'ortho_raw': loss_ortho, 
             'l2_raw': loss_l2, 'lvr_raw': loss_lvr,
             'mu_stability': mu_stability, 'align_raw': loss_align,
             'pruning_raw': loss_pruning, 'sep_raw': loss_sep, 'conn_raw': loss_conn
+        }, weights={
+            'rec': torch.exp(-lvars[0]), 'cons': torch.exp(-lvars[1]),
+            'assign': torch.exp(-lvars[2]), 'ortho': torch.exp(-lvars[3]),
+            'l2': torch.exp(-lvars[4]), 'lvr': torch.exp(-lvars[5]),
+            'align': torch.exp(-lvars[6]), 'pruning': torch.exp(-lvars[7]),
+            'sep': torch.exp(-lvars[8]), 'conn': torch.exp(-lvars[9])
         })
 
-        # Adaptive Loss Weighting with clamping for stability
-        lvars = torch.clamp(self.model.log_vars, min=-2.0, max=10.0)
-        
         weighted_rec = torch.exp(-lvars[0]) * loss_rec + lvars[0]
         weighted_cons = torch.exp(-lvars[1]) * loss_cons + lvars[1]
         weighted_assign = torch.exp(-lvars[2]) * loss_assign + lvars[2]

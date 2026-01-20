@@ -174,39 +174,44 @@ class SymbolicDistiller:
             return np.zeros((X_norm.shape[0], 1)), full_mask
 
         # SCALABILITY OPTIMIZATION: Linear Baseline Check
-        # If a simple linear model (Ridge) can explain most of the variance, 
-        # we skip the expensive GP step. 80/20 Pareto optimal.
-        ridge = RidgeCV(alphas=[1e-3, 1e-2, 1e-1, 1, 10])
+        ridge = RidgeCV(alphas=[1e-4, 1e-3, 1e-2, 1e-1, 1, 10])
         ridge.fit(X_selected, Y_norm[:, i])
         linear_score = ridge.score(X_selected, Y_norm[:, i])
         
-        if linear_score > 0.98:
+        if linear_score > 0.985: # Slightly tighter threshold
             print(f"  -> Target_{i}: High linear fit (R2={linear_score:.3f}). Using linear model.")
-            # We still wrap it in a pseudo-program object for compatibility
             class LinearProgram:
                 def __init__(self, model): self.model = model; self.length_ = 1
-                def execute(self, X): return self.model.predict(X)
+                def execute(self, X): 
+                    # Handle both 1D and 2D inputs
+                    if X.ndim == 1: X = X.reshape(1, -1)
+                    return self.model.predict(X)
             return LinearProgram(ridge), full_mask
 
-        # Pareto search
-        parsimony_levels = [0.0005, 0.005, 0.05]
-        candidates = []
-        # Adaptive population based on target complexity
-        coarse_pop = self.max_pop // 2 if linear_score < 0.5 else self.max_pop // 4
-        coarse_gen = self.max_gen // 2
+        # Pareto search: Try multiple parsimony levels in parallel to find simplest accurate model
+        parsimony_levels = [0.001, 0.005, 0.01]
         
+        # Scale population with complexity of the problem (approximated by 1-linear_score)
+        complexity_factor = max(1.0, 2.0 * (1.0 - linear_score))
+        scaled_pop = int(self.max_pop * complexity_factor)
+        scaled_pop = min(scaled_pop, 5000) # Cap it
+        
+        candidates = []
         for p_coeff in parsimony_levels:
-            est = self._get_regressor(coarse_pop, coarse_gen, parsimony=p_coeff)
-            est.fit(X_selected, Y_norm[:, i])
-            prog = est._program
-            score = est.score(X_selected, Y_norm[:, i])
-            
-            is_stable = True
-            if targets_shape_1 == latent_states_shape_1:
-                is_stable = self.validate_stability(prog, X_selected[0])
-            
-            if is_stable:
-                candidates.append({'prog': prog, 'score': score, 'complexity': self.get_complexity(prog), 'p': p_coeff})
+            est = self._get_regressor(scaled_pop, self.max_gen // 2, parsimony=p_coeff)
+            try:
+                est.fit(X_selected, Y_norm[:, i])
+                prog = est._program
+                score = est.score(X_selected, Y_norm[:, i])
+                
+                is_stable = True
+                if targets_shape_1 == latent_states_shape_1:
+                    is_stable = self.validate_stability(prog, X_selected[0])
+                
+                if is_stable:
+                    candidates.append({'prog': prog, 'score': score, 'complexity': self.get_complexity(prog), 'p': p_coeff})
+            except Exception as e:
+                print(f"    ! GP search failed for p={p_coeff}: {e}")
         
         if not candidates:
             # Absolute fallback

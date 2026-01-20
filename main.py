@@ -5,10 +5,17 @@ from simulator import SpringMassSimulator
 from model import DiscoveryEngineModel
 from engine import Trainer, prepare_data
 from symbolic import SymbolicDistiller, extract_latent_data
+import argparse
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--epochs', type=int, default=5000)
+    parser.add_argument('--steps', type=int, default=800)
+    parser.add_argument('--particles', type=int, default=16)
+    parser.add_argument('--super_nodes', type=int, default=4)
+    args = parser.parse_args()
+
     # 0. Device Discovery
-    # Check for CUDA first, then MPS (for Apple Silicon), then fall back to CPU
     if torch.cuda.is_available():
         device = torch.device('cuda')
         print("CUDA is available")
@@ -21,11 +28,11 @@ def main():
     print(f"Using device: {device}")
 
     # 1. Setup Parameters
-    n_particles = 16
-    n_super_nodes = 4
+    n_particles = args.particles
+    n_super_nodes = args.super_nodes
     latent_dim = 4 
-    steps = 800
-    epochs = 5000
+    steps = args.steps
+    epochs = args.epochs
     seq_len = 20
     dynamic_radius = 1.5 
     box_size = None # Disable PBC for stability
@@ -71,6 +78,7 @@ def main():
             stats_tracker = trainer.loss_tracker.get_stats()
             log_str = f"Progress: {progress:3.0f}% | Loss: {loss:.6f} | "
             log_str += f"Rec: {stats_tracker.get('rec_raw', 0):.4f} | "
+            log_str += f"W_Rec: {stats_tracker.get('w_rec', 0):.2e} | "
             log_str += f"Mu_Stab: {stats_tracker.get('mu_stability', 0):.6f} | "
             log_str += f"LR: {trainer.optimizer.param_groups[0]['lr']:.2e}"
             print(log_str)
