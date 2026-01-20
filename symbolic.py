@@ -22,6 +22,23 @@ class SymbolicDistiller:
                                  parsimony_coefficient=0.01,
                                  random_state=42)
 
+    def validate_stability(self, program, X_start, dt=0.01, steps=20):
+        """
+        Validates the numerical stability of a symbolic program by 
+        performing a short forward rollout.
+        """
+        curr_x = X_start.copy()
+        for _ in range(steps):
+            try:
+                # Symbolic regression often produces values that can explode
+                deriv = program.execute(curr_x.reshape(1, -1))
+                curr_x += deriv * dt
+                if np.any(np.isnan(curr_x)) or np.any(np.isinf(curr_x)) or np.any(np.abs(curr_x) > 1e6):
+                    return False
+            except:
+                return False
+        return True
+
     def distill(self, latent_states, latent_derivs, times=None):
         z_mean = latent_states.mean(axis=0)
         z_std = latent_states.std(axis=0) + 1e-6
@@ -66,13 +83,25 @@ class SymbolicDistiller:
             est = self._get_regressor(coarse_pop, coarse_gen)
             est.fit(X_selected, Y[:, i])
             
-            if est.score(X_selected, Y[:, i]) > 0.95:
-                print(f"  -> Good fit found in coarse search (R^2={est.score(X_selected, Y[:, i]):.3f})")
-                equations.append(est._program)
+            # Use a slightly more robust selection criteria including stability
+            best_prog = est._program
+            is_stable = self.validate_stability(best_prog, X_selected[0])
+            
+            if est.score(X_selected, Y[:, i]) > 0.95 and is_stable:
+                print(f"  -> Good stable fit found in coarse search (R^2={est.score(X_selected, Y[:, i]):.3f})")
+                equations.append(best_prog)
             else:
-                print(f"  -> Low fit (R^2={est.score(X_selected, Y[:, i]):.3f}). Escalating to Fine search...")
+                if not is_stable:
+                    print(f"  -> Warning: Coarse search result is unstable. Escalating...")
+                else:
+                    print(f"  -> Low fit (R^2={est.score(X_selected, Y[:, i]):.3f}). Escalating to Fine search...")
+                
                 est = self._get_regressor(self.max_pop, self.max_gen)
                 est.fit(X_selected, Y[:, i])
+                
+                if not self.validate_stability(est._program, X_selected[0]):
+                    print(f"  -> Critical Warning: dz_{i}/dt equation remains numerically unstable after fine search.")
+                
                 equations.append(est._program)
                 
         return equations, (z_mean, z_std, dz_mean, dz_std)

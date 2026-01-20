@@ -47,17 +47,8 @@ def main():
                                  hidden_dim=128,
                                  hamiltonian=True).to(device)
     
-    # Adjusted weights: Significantly more emphasis on reconstruction
-    loss_weights = {
-        'rec': 250.0,     
-        'cons': 40.0,    
-        'assign': 20.0,   
-        'ortho': 5.0,     
-        'latent_l2': 0.1 
-    }
-    
-    trainer = Trainer(model, lr=5e-4, device=device, 
-                      loss_weights=loss_weights, stats=stats)
+    # Trainer now uses adaptive loss weighting, manual weights are deprecated
+    trainer = Trainer(model, lr=5e-4, device=device, stats=stats)
     
     # Increased patience and adjusted factor to prevent premature decay
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(trainer.optimizer, mode='min', 

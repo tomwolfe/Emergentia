@@ -106,7 +106,7 @@ class LossTracker:
         return self.history
 
 class Trainer:
-    def __init__(self, model, lr=5e-4, device='cpu', loss_weights=None, stats=None):
+    def __init__(self, model, lr=5e-4, device='cpu', stats=None):
         self.model = model.to(device)
         self.device = device
         self.loss_tracker = LossTracker()
@@ -119,17 +119,6 @@ class Trainer:
         self.criterion = torch.nn.MSELoss().to(device)
         self.stats = stats
         
-        default_weights = {
-            'rec': 1.0,
-            'cons': 5.0,
-            'assign': 2.0,
-            'ortho': 1.0,      
-            'latent_l2': 0.01  
-        }
-        if loss_weights is not None:
-            default_weights.update(loss_weights)
-        self.weights = default_weights
-
     def train_step(self, data_list, dt, epoch=0, teacher_forcing_ratio=0.5):
         self.optimizer.zero_grad()
         seq_len = len(data_list)
@@ -184,23 +173,23 @@ class Trainer:
             'l2_raw': loss_l2
         })
 
+        # Adaptive Loss Weighting (Kendall et al.)
+        # log_vars: 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2
+        lvars = self.model.log_vars
+        
+        weighted_rec = torch.exp(-lvars[0]) * loss_rec + lvars[0]
+        weighted_cons = torch.exp(-lvars[1]) * loss_cons + lvars[1]
+        weighted_assign = torch.exp(-lvars[2]) * loss_assign + lvars[2]
+        weighted_ortho = torch.exp(-lvars[3]) * loss_ortho + lvars[3]
+        weighted_l2 = torch.exp(-lvars[4]) * loss_l2 + lvars[4]
+
         if epoch < 1000:
-            loss = (self.weights['rec'] * loss_rec + 
-                    self.weights['assign'] * loss_assign +
-                    self.weights['ortho'] * loss_ortho)
+            loss = weighted_rec + weighted_assign + weighted_ortho
         elif epoch < 2000:
             anneal = (epoch - 1000) / 1000.0
-            loss = (self.weights['rec'] * loss_rec + 
-                    anneal * (self.weights['cons'] * loss_cons + 
-                             self.weights['latent_l2'] * loss_l2) +
-                    self.weights['assign'] * loss_assign +
-                    self.weights['ortho'] * loss_ortho)
+            loss = weighted_rec + weighted_assign + weighted_ortho + anneal * (weighted_cons + weighted_l2)
         else:
-            loss = (self.weights['rec'] * loss_rec + 
-                    self.weights['cons'] * loss_cons + 
-                    self.weights['latent_l2'] * loss_l2 +
-                    self.weights['assign'] * loss_assign +
-                    self.weights['ortho'] * loss_ortho)
+            loss = weighted_rec + weighted_cons + weighted_assign + weighted_ortho + weighted_l2
         
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
