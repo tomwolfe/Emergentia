@@ -82,12 +82,12 @@ class FeatureTransformer:
         for i in range(n_latents):
             poly_features.append((X[:, i:i+1]**2))
             node_idx = i // self.latent_dim
-            dim_idx = i % self.latent_dim
+            # ONLY interactions within the SAME super-node to prevent explosion
             for j in range(i + 1, (node_idx + 1) * self.latent_dim):
                 poly_features.append(X[:, i:i+1] * X[:, j:j+1])
-            for other_node in range(node_idx + 1, self.n_super_nodes):
-                other_idx = other_node * self.latent_dim + dim_idx
-                poly_features.append(X[:, i:i+1] * X[:, other_idx:other_idx+1])
+            
+            # Interactions with other nodes are excluded as per "non-adjacent" rule
+            # since adjacency is dynamic, we stick to same-node locality for discovery.
 
         res = np.hstack(poly_features)
         return np.clip(res, -1e6, 1e6) # Final safety clamp
@@ -363,13 +363,35 @@ class SymbolicDistiller:
         return True
 
     def _select_features(self, X, y):
+        from sklearn.feature_selection import SelectKBest, f_regression
+        # Top 30 features as requested
+        k = min(30, X.shape[1])
+        selector = SelectKBest(score_func=f_regression, k=k)
+        try:
+            selector.fit(X, y)
+            kbest_mask = selector.get_support()
+        except:
+            kbest_mask = np.ones(X.shape[1], dtype=bool)
+
         rf = RandomForestRegressor(n_estimators=100, random_state=42)
-        rf.fit(X, y)
+        rf.fit(X[:, kbest_mask], y)
         lasso = LassoCV(cv=5, max_iter=3000)
-        lasso.fit(X, y)
-        combined_score = np.sqrt(rf.feature_importances_ * (np.abs(lasso.coef_) + 1e-9))
-        threshold = np.sort(combined_score)[-self.max_features] if len(combined_score) > self.max_features else 0
-        return combined_score >= threshold
+        lasso.fit(X[:, kbest_mask], y)
+        
+        combined_score_subset = np.sqrt(rf.feature_importances_ * (np.abs(lasso.coef_) + 1e-9))
+        
+        # We want to select max_features from the k-best subset
+        n_to_select = min(self.max_features, X[:, kbest_mask].shape[1])
+        threshold = np.sort(combined_score_subset)[-n_to_select] if len(combined_score_subset) > n_to_select else 0
+        
+        subset_mask = combined_score_subset >= threshold
+        
+        # Map back to full feature set
+        full_mask = np.zeros(X.shape[1], dtype=bool)
+        indices_of_kbest = np.where(kbest_mask)[0]
+        full_mask[indices_of_kbest[subset_mask]] = True
+        
+        return full_mask
 
     def _refine_constants(self, candidate, X, y_true):
         try:

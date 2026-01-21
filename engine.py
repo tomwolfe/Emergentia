@@ -305,8 +305,9 @@ class Trainer:
         # Progress ratio
         progress = epoch / max_epochs
 
-        # 1. Smooth Tau schedule: Exponential decay (faster annealing)
-        tau = max(0.1, 0.5 * np.exp(-epoch / 500.0))  # Faster decay
+        # 1. Tau schedule: Faster annealing as requested
+        # Start at 1.0 and anneal to 0.1 by epoch 50
+        tau = max(0.1, 1.0 * np.exp(-epoch / 25.0))
 
         # 2. Hard assignment scheduling:
         # Gradually increase the probability of using 'hard' assignments in Gumbel-Softmax
@@ -324,9 +325,9 @@ class Trainer:
         # Start with higher weight and anneal more gradually to ensure strong initial alignment
         align_weight = max(0.3, 1.2 - epoch / (self.align_anneal_epochs * 0.7 + 1e-9))  # Higher initial weight and slower decay
 
-        # 5. Adaptive Entropy Weight: Increase over time to force discrete clusters
+        # 5. Adaptive Entropy Weight: Doubled growth rate to force discrete clusters
         # Point 1: Addressing "Blurry" Meso-scale
-        entropy_weight = 1.0 + 1.5 * progress  # Reduced growth rate
+        entropy_weight = 1.0 + 5.0 * progress  # Increased from 1.5 to 5.0 for harder assignments
 
         # Warmup logic
         is_warmup = epoch < self.warmup_epochs

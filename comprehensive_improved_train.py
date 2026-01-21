@@ -393,9 +393,9 @@ def main():
             original_energy_weight = getattr(trainer, 'energy_weight', 0.1)
             trainer.energy_weight = min(0.8, original_energy_weight * 1.2)  # NEW: Use 1.2x multiplier instead of 3x
 
-            # NEW: Reduce learning rate significantly WITHOUT resetting optimizer for more stable energy-focused training
+            # NEW: Reduce learning rate to 0.1x for more stable energy-focused training
             original_lr = trainer.optimizer.param_groups[0]['lr']
-            new_lr = original_lr * 0.01 # Less drastic reduction than before
+            new_lr = original_lr * 0.1 
             for param_group in trainer.optimizer.param_groups:
                 param_group['lr'] = new_lr
 

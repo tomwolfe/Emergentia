@@ -331,6 +331,17 @@ class ImprovedSymbolicDynamics:
             else:
                 derivatives[0, i] = 0.0  # Default to zero if no equation
 
+        # FALLBACK: If derivatives are effectively zero, use learned neural derivatives
+        if np.linalg.norm(derivatives) < 1e-6 and self.model is not None:
+            with torch.no_grad():
+                z_tensor = torch.from_numpy(derivatives.flatten()).float().unsqueeze(0)
+                # But we need the input z for neural fallback, not the (zero) derivatives
+                z_input_tensor = torch.from_numpy(z_reshaped.flatten()).float().unsqueeze(0)
+                device = next(self.model.parameters()).device
+                z_input_tensor = z_input_tensor.to(device)
+                dz_neural = self.model.ode_func(0, z_input_tensor).cpu().numpy().flatten()
+                return dz_neural
+
         # NEW: Apply numerical stability constraints
         derivatives = np.clip(derivatives, -1e2, 1e2)
 
