@@ -233,6 +233,8 @@ class LennardJonesSimulator(SpringMassSimulator):
         dist_sq = np.maximum(dist_sq, 0.7 * self.sigma**2)
 
         sr6 = (self.sigma**2 / dist_sq)**3
+        # Prevent overflow by clamping sr6 before squaring
+        sr6 = np.clip(sr6, -1e10, 1e10)
         sr12 = sr6**2
 
         # F = 24 * epsilon / r^2 * [2*(sigma/r)^12 - (sigma/r)^6] * vec_r
@@ -266,6 +268,8 @@ class LennardJonesSimulator(SpringMassSimulator):
                     diff[:, i] -= self.box_size[i] * np.round(diff[:, i] / self.box_size[i])
             dist_sq = np.sum(diff**2, axis=1)
             sr6 = (self.sigma**2 / dist_sq)**3
+            # Prevent overflow by clamping sr6 before squaring
+            sr6 = np.clip(sr6, -1e10, 1e10)
             sr12 = sr6**2
             pe = 4 * self.epsilon * np.sum(sr12 - sr6)
             

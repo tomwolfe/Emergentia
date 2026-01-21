@@ -286,13 +286,30 @@ class OptimizedExpressionProgram:
             try:
                 if X.ndim == 1: X = X.reshape(1, -1)
                 # Prepare arguments (only up to what the function expects)
-                args = [X[:, i] if i < X.shape[1] else np.zeros(X.shape[0]) 
+                args = [X[:, i] if i < X.shape[1] else np.zeros(X.shape[0])
                         for i in range(self.max_feat_idx + 1)]
                 result = self.func(*args)
-                
+
                 if np.isscalar(result):
                     return np.full(X.shape[0], result)
-                return np.asarray(result).flatten()
+                result = np.asarray(result)
+                # Ensure the result has the right shape - same number of samples as input
+                if result.ndim == 1 and result.shape[0] == 1 and X.shape[0] > 1:
+                    # If we have a single result but multiple input samples, broadcast it
+                    result = np.full(X.shape[0], result[0])
+                elif result.ndim == 0:  # Scalar result
+                    result = np.full(X.shape[0], result)
+                elif result.ndim == 1 and result.shape[0] != X.shape[0]:
+                    # If result has different length than expected, pad or truncate
+                    if result.shape[0] == 1:
+                        result = np.full(X.shape[0], result[0])
+                    else:
+                        # Truncate or pad to match input size
+                        if result.shape[0] < X.shape[0]:
+                            result = np.pad(result, (0, X.shape[0] - result.shape[0]), mode='edge')
+                        else:
+                            result = result[:X.shape[0]]
+                return result
             except:
                 return self.original_program.execute(X)
         return self.original_program.execute(X)

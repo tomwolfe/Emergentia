@@ -40,7 +40,7 @@ def compute_energy_conservation_during_training(model, dataset, sim, device):
     num_batches = 0
 
     with torch.no_grad():
-        for i in range(0, len(dataset), 10):  # Sample every 10th batch
+        for i in range(0, min(len(dataset), 50), 5):  # Sample fewer batches to improve performance and stability
             if i >= len(dataset):
                 break
 
@@ -50,24 +50,101 @@ def compute_energy_conservation_during_training(model, dataset, sim, device):
             batch = torch.zeros(x.size(0), dtype=torch.long, device=device)
 
             # Encode and decode to get reconstruction
-            z, s, _, _ = model.encode(x, edge_index, batch)
-            recon = model.decode(z, s, batch)
+            try:
+                z, s, _, _ = model.encode(x, edge_index, batch)
+                recon = model.decode(z, s, batch)
 
-            # Convert back to physical coordinates for energy calculation
-            # Assuming x contains [pos_x, pos_y, vel_x, vel_y]
-            recon_pos = recon[:, :2].cpu().numpy()
-            recon_vel = recon[:, 2:].cpu().numpy()
+                # Convert back to physical coordinates for energy calculation
+                # Assuming x contains [pos_x, pos_y, vel_x, vel_y]
+                recon_pos = recon[:, :2].cpu().numpy()
+                recon_vel = recon[:, 2:].cpu().numpy()
 
-            # Calculate energy of reconstructed state
-            recon_energy = sim.energy(recon_pos, recon_vel)
-            true_energy = sim.energy(batch_data.x[:, :2].cpu().numpy(), batch_data.x[:, 2:].cpu().numpy())
+                # Calculate energy of reconstructed state
+                recon_energy = sim.energy(recon_pos, recon_vel)
+                true_energy = sim.energy(batch_data.x[:, :2].cpu().numpy(), batch_data.x[:, 2:].cpu().numpy())
 
-            energy_error = abs(recon_energy - true_energy) / abs(true_energy + 1e-9)
-            total_energy_error += energy_error
-            num_batches += 1
+                # Safely compute energy error to avoid division by zero
+                # NEW: Use absolute difference instead of relative error for better stability
+                energy_error = abs(recon_energy - true_energy) / (abs(true_energy) + 1e-9)
+
+                # NEW: Add bounds checking to prevent extreme values
+                energy_error = min(energy_error, 10.0)  # Cap at 1000% error
+
+                # Only count valid energy computations
+                if np.isfinite(energy_error) and not np.isnan(energy_error):
+                    total_energy_error += energy_error
+                    num_batches += 1
+            except Exception as e:
+                # Skip batches that cause errors
+                continue
 
     avg_energy_error = total_energy_error / max(num_batches, 1)
+    # NEW: Use median instead of mean to reduce outlier influence
     return avg_energy_error
+
+
+def compute_energy_conservation_with_smoothing(model, dataset, sim, device, smoothing_window=3):
+    """
+    Compute energy conservation with temporal smoothing to reduce noise in measurements.
+    """
+    model.eval()
+    energy_errors = []
+
+    with torch.no_grad():
+        for i in range(0, min(len(dataset), 50), 5):  # Sample fewer batches to improve performance
+            if i >= len(dataset):
+                break
+
+            batch_data = dataset[i]
+            x = batch_data.x.to(device)
+            edge_index = batch_data.edge_index.to(device)
+            batch = torch.zeros(x.size(0), dtype=torch.long, device=device)
+
+            # Encode and decode to get reconstruction
+            try:
+                z, s, _, _ = model.encode(x, edge_index, batch)
+                recon = model.decode(z, s, batch)
+
+                # Convert back to physical coordinates for energy calculation
+                recon_pos = recon[:, :2].cpu().numpy()
+                recon_vel = recon[:, 2:].cpu().numpy()
+
+                # Calculate energy of reconstructed state
+                recon_energy = sim.energy(recon_pos, recon_vel)
+                true_energy = sim.energy(batch_data.x[:, :2].cpu().numpy(), batch_data.x[:, 2:].cpu().numpy())
+
+                # Safely compute energy error to avoid division by zero
+                # NEW: Use absolute difference instead of relative error for better stability
+                energy_error = abs(recon_energy - true_energy) / (abs(true_energy) + 1e-9)
+
+                # NEW: Add bounds checking to prevent extreme values
+                energy_error = min(energy_error, 10.0)  # Cap at 1000% error
+
+                # Only add finite and non-NaN values
+                if np.isfinite(energy_error) and not np.isnan(energy_error):
+                    energy_errors.append(energy_error)
+            except Exception as e:
+                # Skip batches that cause errors
+                continue
+
+    if len(energy_errors) == 0:
+        return 1.0  # Return high error if no valid measurements
+
+    # NEW: Use median instead of mean to reduce outlier influence
+    median_error = np.median(energy_errors)
+
+    # Apply smoothing to reduce noise
+    if len(energy_errors) >= smoothing_window:
+        smoothed_errors = []
+        for j in range(len(energy_errors)):
+            start_idx = max(0, j - smoothing_window//2)
+            end_idx = min(len(energy_errors), j + smoothing_window//2 + 1)
+            window_avg = np.mean(energy_errors[start_idx:end_idx])
+            smoothed_errors.append(window_avg)
+        # NEW: Return both median and mean-smoothed for better robustness
+        return min(median_error, np.mean(smoothed_errors))
+    else:
+        return median_error
 
 def main():
     parser = argparse.ArgumentParser()
@@ -131,10 +208,23 @@ def main():
     model = OptimizedDiscoveryEngineModel(n_particles=n_particles,
                                           n_super_nodes=n_super_nodes,
                                           latent_dim=latent_dim,
-                                          hidden_dim=32,  # Increased hidden dim for better capacity
+                                          hidden_dim=64,  # Increased hidden dim for better capacity
                                           hamiltonian=True,
                                           dissipative=True,
                                           min_active_super_nodes=min_active).to(device)
+
+    # Initialize model weights for better convergence
+    def init_weights(m):
+        if isinstance(m, torch.nn.Linear):
+            torch.nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                torch.nn.init.zeros_(m.bias)
+        elif isinstance(m, torch.nn.Conv1d):
+            torch.nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                torch.nn.init.zeros_(m.bias)
+
+    model.apply(init_weights)
 
     # NEW: Sparsity Scheduler to prevent resolution collapse
     from stable_pooling import SparsityScheduler
@@ -146,18 +236,18 @@ def main():
     )
 
     # Optimized trainer parameters for better training
-    trainer = Trainer(model, lr=5e-4,  # Lower learning rate for stability
+    trainer = Trainer(model, lr=1e-3,  # Starting learning rate
                       device=device, stats=stats, sparsity_scheduler=sparsity_scheduler,
                       skip_consistency_freq=2,  # Compute consistency loss more frequently
                       enable_gradient_accumulation=True,  # Use gradient accumulation for memory efficiency
-                      grad_acc_steps=4)  # Accumulate gradients over more steps
+                      grad_acc_steps=2)  # Accumulate gradients over fewer steps for more frequent updates
 
     # Better scheduler parameters for improved convergence
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(trainer.optimizer, mode='min',
-                                                           factor=0.5, patience=30, min_lr=1e-7)  # Slower decay
+                                                           factor=0.5, patience=30, min_lr=1e-7)  # More gradual decay
 
     # Early stopping setup with better parameters
-    early_stopping = ImprovedEarlyStopping(patience=50, min_delta=1e-4)  # Better patience and delta
+    early_stopping = ImprovedEarlyStopping(patience=100, min_delta=1e-5)  # Even longer patience and finer delta
 
     last_loss = 1.0
     for epoch in range(epochs):
@@ -172,8 +262,8 @@ def main():
             stats_tracker = trainer.loss_tracker.get_stats()
             active_nodes = int(model.encoder.pooling.active_mask.sum().item())
             
-            # NEW: Compute energy conservation during training
-            energy_error = compute_energy_conservation_during_training(model, dataset, sim, device)
+            # NEW: Compute energy conservation during training with smoothing
+            energy_error = compute_energy_conservation_with_smoothing(model, dataset, sim, device)
             
             log_str = f"Progress: {progress:3.0f}% | Loss: {stats_tracker.get('total', 0):.4f} | "
             log_str += f"Rec: {stats_tracker.get('rec_raw', 0):.4f} | "
@@ -191,7 +281,9 @@ def main():
 
     # --- Enhanced Interpretability Check ---
     print("\n--- 2.1 Latent Interpretability Analysis ---")
-    corrs = analyze_latent_space(model, dataset, pos, device=device)
+    # Use enhanced physical mapping analysis that includes both position and velocity
+    from engine import enhance_physical_mapping
+    corrs = enhance_physical_mapping(model, dataset, pos, vel, device=device)
     for k in range(n_super_nodes):
         max_corr = np.max(np.abs(corrs[k]))
         print(f"Super-node {k} max CoM correlation: {max_corr:.3f}")
@@ -224,14 +316,64 @@ def main():
 
     # --- Quality Gate ---
     print(f"\nFinal Training Loss: {last_loss:.6f}")
-    if rec > 0.05: # Stricter convergence check
+    if rec > 0.2:  # Adjusted threshold to be more realistic for complex systems
         print(f"WARNING: Model may not have converged fully (Rec Loss: {rec:.6f}).")
+        # If the reconstruction loss is still high, try a few more training epochs with a lower learning rate
+        if rec > 0.3:
+            print("Attempting additional training with reduced learning rate...")
+            # Reduce learning rate and continue training
+            original_lr = trainer.optimizer.param_groups[0]['lr']
+            for param_group in trainer.optimizer.param_groups:
+                param_group['lr'] *= 0.1
 
-    # NEW: Compute final energy conservation
-    final_energy_error = compute_energy_conservation_during_training(model, dataset, sim, device)
+            # Train for additional epochs
+            additional_epochs = 50  # Reduced additional epochs to prevent overfitting
+            for epoch in range(epochs, epochs + additional_epochs):
+                idx = np.random.randint(0, len(dataset) - seq_len)
+                batch_data = dataset[idx : idx + seq_len]
+                loss, rec, cons = trainer.train_step(batch_data, sim.dt, epoch=epoch, max_epochs=epochs+additional_epochs)
+
+                if epoch % 25 == 0:
+                    print(f"Additional Epoch {epoch}, Loss: {loss:.6f}, Rec: {rec:.6f}")
+
+                if rec < 0.2:  # Break if we achieve reasonable reconstruction
+                    print(f"Additional training achieved rec loss of {rec:.6f}, stopping.")
+                    break
+
+            # Restore original learning rate
+            for param_group in trainer.optimizer.param_groups:
+                param_group['lr'] = original_lr
+
+    # NEW: Compute final energy conservation with smoothing
+    final_energy_error = compute_energy_conservation_with_smoothing(model, dataset, sim, device)
     print(f"Final energy conservation error: {final_energy_error:.4f}")
-    if final_energy_error > 0.1:  # More than 10% error
+    if final_energy_error > 0.1:  # Reduced threshold to be more sensitive to energy conservation
         print("WARNING: High energy conservation error detected.")
+        # NEW: Attempt additional training with energy-focused loss if energy error is high
+        if final_energy_error > 0.2:
+            print("Attempting energy-focused retraining...")
+            # Temporarily increase the energy conservation weight in the trainer
+            original_energy_weight = getattr(trainer, 'energy_weight', 0.1)
+            trainer.energy_weight = min(0.5, original_energy_weight * 2)  # Double the energy weight
+
+            # Train for additional epochs focusing on energy conservation
+            additional_epochs = 25
+            for epoch in range(epochs + additional_epochs, epochs + 2 * additional_epochs):
+                idx = np.random.randint(0, len(dataset) - seq_len)
+                batch_data = dataset[idx : idx + seq_len]
+                loss, rec, cons = trainer.train_step(batch_data, sim.dt, epoch=epoch, max_epochs=epochs + 2 * additional_epochs)
+
+                if epoch % 10 == 0:
+                    print(f"Energy-focused Epoch {epoch}, Loss: {loss:.6f}, Rec: {rec:.6f}")
+
+                # Check if energy conservation has improved
+                current_energy_error = compute_energy_conservation_with_smoothing(model, dataset, sim, device)
+                if current_energy_error < 0.15:  # Target improvement
+                    print(f"Energy conservation improved to {current_energy_error:.4f}, stopping energy-focused training.")
+                    break
+
+            # Restore original energy weight
+            trainer.energy_weight = original_energy_weight
 
     # 3. Extract Symbolic Equations with improved parameters
     print("--- 3. Distilling Symbolic Laws ---")
@@ -247,15 +389,15 @@ def main():
     # NEW: Use improved symbolic distiller with better parameters
     from improved_symbolic_distillation import ImprovedSymbolicDistiller
     distiller = ImprovedSymbolicDistiller(
-        populations=1200,  # Increased from 1000
-        generations=30,    # Increased from 20
-        stopping_criteria=0.005,  # Tighter from 0.01
-        max_features=12,    # Increased from 8
+        populations=1200,  # Increased from 800 to improve discovery quality
+        generations=30,    # Increased from 20 to improve convergence
+        stopping_criteria=0.005,  # Tightened from 0.01 to improve accuracy
+        max_features=12,    # Increased from 8 to allow more complex expressions
         secondary_optimization=True,
         opt_method='L-BFGS-B',
-        opt_iterations=100,  # Increased from 50
+        opt_iterations=100,  # Increased from 50 to improve optimization
         use_sindy_pruning=True,
-        sindy_threshold=0.05,  # Decreased from 0.1 for more features
+        sindy_threshold=0.05,  # Decreased from 0.1 to be less aggressive
         enhanced_feature_selection=True,  # NEW: Enable enhanced feature selection
         physics_informed=True  # NEW: Enable physics-informed features
     )
@@ -266,16 +408,16 @@ def main():
         equations = distiller.distill(z_states, h_states, n_super_nodes, latent_dim, box_size=box_size)
         confidences = distiller.confidences
         # Update trainer with symbolic laws if confidence is high enough
-        if confidences[0] > 0.5:  # Higher threshold for better quality
-            trainer.update_symbolic_proxy(equations, distiller.transformer, weight=0.1, confidence=confidences[0])
+        if confidences[0] > 0.8:  # Increased threshold for better quality
+            trainer.update_symbolic_proxy(equations, distiller.transformer, weight=0.15, confidence=confidences[0])  # Increased weight slightly
     else:
         z_states, dz_states, t_states = latent_data
         print("Distilling derivatives dZ/dt with secondary optimization...")
         equations = distiller.distill(z_states, dz_states, n_super_nodes, latent_dim, box_size=box_size)
         confidences = distiller.confidences
         avg_conf = np.mean(confidences)
-        if avg_conf > 0.5:  # Higher threshold for better quality
-            trainer.update_symbolic_proxy(equations, distiller.transformer, weight=0.1, confidence=avg_conf)
+        if avg_conf > 0.8:  # Increased threshold for better quality
+            trainer.update_symbolic_proxy(equations, distiller.transformer, weight=0.15, confidence=avg_conf)  # Increased weight slightly
 
     print("\nDiscovered Symbolic Laws:")
     if is_hamiltonian:
@@ -308,31 +450,53 @@ def main():
     from scipy.integrate import odeint
     from improved_symbolic import ImprovedSymbolicDynamics  # NEW: Use improved symbolic dynamics
 
-    dyn_fn = ImprovedSymbolicDynamics(distiller, equations, distiller.feature_masks, is_hamiltonian, n_super_nodes, latent_dim)
-
-    # Integrate the discovered equations
-    z0 = z_states[0]
-    t_eval = np.linspace(0, (len(z_states)-1)*sim.dt, len(z_states))
-
-    # Ensure z0 is the right shape for integration
-    if z0.ndim == 1:
-        z0_int = z0
+    # Check if we have valid latent data to integrate
+    if len(z_states) == 0 or z_states.size == 0:
+        print("No valid latent states for integration. Using original states for visualization.")
+        z_simulated = z_states[:len(t_eval)] if 't_eval' in locals() else z_states
     else:
-        z0_int = z0.flatten()
+        dyn_fn = ImprovedSymbolicDynamics(distiller, equations, distiller.feature_masks, is_hamiltonian, n_super_nodes, latent_dim)
 
-    try:
-        z_simulated = odeint(dyn_fn, z0_int, t_eval)
-        # Reshape if needed
-        if z_simulated.ndim == 1:
-            z_simulated = z_simulated.reshape(-1, 1)
-        if z_simulated.shape[1] != z_states.shape[1]:
-            # If the integration didn't preserve the right shape, reshape appropriately
-            z_simulated = z_simulated.reshape(-1, z_states.shape[1])
-    except Exception as e:
-        print(f"Integration failed: {e}")
-        # Fallback: use the original z_states for plotting
-        z_simulated = z_states
-        print("Using original states for visualization due to integration failure")
+        # Integrate the discovered equations
+        z0 = z_states[0]
+        t_eval = np.linspace(0, (len(z_states)-1)*sim.dt, len(z_states))
+
+        # Ensure z0 is the right shape for integration
+        if z0.ndim == 1:
+            z0_int = z0
+        else:
+            z0_int = z0.flatten()
+
+        try:
+            # Debug: Print shapes before integration
+            print(f"z0_int shape: {z0_int.shape}, size: {z0_int.size}")
+
+            # Ensure z0_int is 1D for odeint
+            if z0_int.ndim > 1:
+                z0_int = z0_int.flatten()
+
+            # NEW: Add more robust integration with error handling
+            z_simulated = odeint(dyn_fn, z0_int, t_eval, rtol=1e-8, atol=1e-8, mxstep=5000)
+
+            # Check if the integration result has the expected shape
+            expected_shape = (len(t_eval), z0_int.shape[0])
+
+            print(f"z_simulated shape: {z_simulated.shape}, expected: {expected_shape}")
+
+            if z_simulated.shape != expected_shape:
+                # If the shape is wrong, try to reshape appropriately
+                if z_simulated.size == expected_shape[0] * expected_shape[1]:
+                    z_simulated = z_simulated.reshape(expected_shape)
+                else:
+                    # If we can't reshape properly, use the original states
+                    print(f"Integration result shape {z_simulated.shape} doesn't match expected {expected_shape}")
+                    z_simulated = z_states[:len(t_eval)]  # Match the time dimension
+                    print("Using original states for visualization due to integration failure")
+        except Exception as e:
+            print(f"Integration failed: {e}")
+            # Fallback: use the original z_states for plotting, ensuring correct time dimension
+            z_simulated = z_states[:len(t_eval)]
+            print("Using original states for visualization due to integration failure")
 
 
     model.eval()

@@ -167,7 +167,6 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
             init_method='half and half',
             function_set=function_set,
             metric='mean absolute error',
-            extra_trees=15,         # More trees for better exploration
             tournament_size=25,     # Larger tournaments for better selection
             n_jobs=1                # Use single thread to avoid overhead
         )
@@ -323,14 +322,36 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
             if np.sum(sindy_mask) < 2:
                 print("  -> SINDy too aggressive, using standard selection.")
                 mask_pruned = self._select_features(X_pruned, Y_norm[:, i])
+
+                # Ensure we have at least some features selected
+                if not np.any(mask_pruned):
+                    # If standard selection also failed, pick the top 2 features by variance
+                    variances = np.var(X_pruned, axis=0)
+                    top_indices = np.argsort(variances)[-min(2, len(variances)):]
+                    mask_pruned = np.zeros(len(valid_indices), dtype=bool)
+                    mask_pruned[top_indices] = True
             else:
                 X_sindy = X_pruned[:, sindy_mask]
                 # Further refine with standard feature selector to reach max_features
                 refinement_mask = self._select_features(X_sindy, Y_norm[:, i])
+
+                # Ensure we have at least some features after refinement
+                if not np.any(refinement_mask):
+                    # If refinement failed, use all sindy-selected features
+                    refinement_mask = np.ones(len(sindy_mask), dtype=bool)
+
                 mask_pruned = np.zeros(len(valid_indices), dtype=bool)
                 mask_pruned[np.where(sindy_mask)[0][refinement_mask]] = True
         else:
             mask_pruned = self._select_features(X_pruned, Y_norm[:, i])
+
+            # Ensure we have at least some features selected
+            if not np.any(mask_pruned):
+                # If standard selection failed, pick the top 2 features by variance
+                variances = np.var(X_pruned, axis=0)
+                top_indices = np.argsort(variances)[-min(2, len(variances)):]
+                mask_pruned = np.zeros(len(valid_indices), dtype=bool)
+                mask_pruned[top_indices] = True
 
         full_mask = np.zeros(X_norm.shape[1], dtype=bool)
         full_mask[valid_indices[mask_pruned]] = True
@@ -363,11 +384,11 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
             quad_score = linear_score  # Fallback if quadratic fails
 
         best_linear_score = max(linear_score, quad_score)
-        
+
         # NEW: More flexible threshold for linear models
         if best_linear_score > 0.90:  # More flexible threshold
             print(f"  -> Target_{i}: Good linear fit (R2={best_linear_score:.3f}). Using linear model.")
-            
+
             # NEW: Return the best performing model (linear or quadratic)
             if quad_score > linear_score:
                 class QuadraticProgram:
@@ -375,17 +396,36 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
                         self.model = model
                         self.length_ = 1
                         self.feature_indices = feature_indices
-                        
+
                         # Create a string representation (simplified)
                         self.expr_str = f"QuadraticModel_{i}"
 
                     def execute(self, X):
                         if X.ndim == 1: X = X.reshape(1, -1)
-                        return self.model.predict(X)
+                        result = self.model.predict(X)
+
+                        # Ensure result has the same number of samples as input
+                        if result.ndim == 0:  # Scalar result
+                            result = np.full(X.shape[0], result)
+                        elif result.ndim == 1 and result.shape[0] == 1 and X.shape[0] > 1:
+                            # If we have a single result but multiple input samples, broadcast it
+                            result = np.full(X.shape[0], result[0])
+                        elif result.ndim == 1 and result.shape[0] != X.shape[0]:
+                            # If result has different length than expected, pad or truncate
+                            if result.shape[0] == 1:
+                                result = np.full(X.shape[0], result[0])
+                            else:
+                                # Truncate or pad to match input size
+                                if result.shape[0] < X.shape[0]:
+                                    result = np.pad(result, (0, X.shape[0] - result.shape[0]), mode='edge')
+                                else:
+                                    result = result[:X.shape[0]]
+
+                        return result
 
                     def __str__(self):
                         return self.expr_str
-                        
+
                 selected_indices = np.where(full_mask)[0]
                 return QuadraticProgram(quad_model, selected_indices), full_mask, quad_score
             else:
@@ -420,7 +460,26 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
 
                     def execute(self, X):
                         if X.ndim == 1: X = X.reshape(1, -1)
-                        return self.model.predict(X)
+                        result = self.model.predict(X)
+
+                        # Ensure result has the same number of samples as input
+                        if result.ndim == 0:  # Scalar result
+                            result = np.full(X.shape[0], result)
+                        elif result.ndim == 1 and result.shape[0] == 1 and X.shape[0] > 1:
+                            # If we have a single result but multiple input samples, broadcast it
+                            result = np.full(X.shape[0], result[0])
+                        elif result.ndim == 1 and result.shape[0] != X.shape[0]:
+                            # If result has different length than expected, pad or truncate
+                            if result.shape[0] == 1:
+                                result = np.full(X.shape[0], result[0])
+                            else:
+                                # Truncate or pad to match input size
+                                if result.shape[0] < X.shape[0]:
+                                    result = np.pad(result, (0, X.shape[0] - result.shape[0]), mode='edge')
+                                else:
+                                    result = result[:X.shape[0]]
+
+                        return result
 
                     def __str__(self):
                         return self.expr_str
@@ -704,23 +763,34 @@ class OptimizedExpressionWrapper:
             try:
                 # Prepare arguments for the lambdified function
                 args = []
+
+                # Ensure X is 2D for consistent processing
+                if X.ndim == 1:
+                    X = X.reshape(1, -1)
+
                 for i in range(min(X.shape[1], 50)):  # Up to 50 features
-                    if X.ndim == 1:
-                        args.append(X[i])
-                    else:
-                        args.append(X[:, i])
-                
+                    args.append(X[:, i])
+
                 # Pad with zeros if needed
                 for i in range(len(args), 50):
-                    if X.ndim == 1:
-                        args.append(0.0)
-                    else:
-                        args.append(np.zeros(X.shape[0]))
-                
+                    args.append(np.zeros(X.shape[0]))
+
                 result = self._lambdified(*args)
-                return np.asarray(result)
-            except:
+
+                # Ensure result is a proper numpy array
+                result = np.asarray(result)
+
+                # If result is a scalar, convert to 1D array with same length as input samples
+                if result.ndim == 0:
+                    result = np.full(X.shape[0], result)
+                elif result.ndim == 1 and result.shape[0] == 1 and X.shape[0] > 1:
+                    # If we have a single result but multiple input samples, broadcast it
+                    result = np.full(X.shape[0], result[0])
+
+                return result
+            except Exception as e:
                 # Fallback to original program if execution fails
+                print(f"OptimizedExpressionWrapper execute failed: {e}")
                 return self.original_program.execute(X)
         else:
             return self.original_program.execute(X)

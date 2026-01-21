@@ -68,40 +68,91 @@ def prepare_data(pos, vel, radius=1.1, stats=None, device='cpu', cache_edges=Tru
 
 def analyze_latent_space(model, dataset, pos_raw, tau=0.1, device='cpu'):
     """
-    Analyzes the physical meaning of latent variables Z by correlating them 
+    Analyzes the physical meaning of latent variables Z by correlating them
     with the Center of Mass (CoM) of assigned particles.
     """
     model.eval()
     z_list, com_list = [], []
-    
+
     with torch.no_grad():
         for t, data in enumerate(dataset):
             batch = Batch.from_data_list([data]).to(device)
             z, s, _, _ = model.encode(batch.x, batch.edge_index, batch.batch, tau=tau)
-            
+
             # Compute CoM for each super-node based on assignment weights s
             # s: [N, K], pos_raw[t]: [N, 2]
             s_sum = s.sum(dim=0, keepdim=True) + 1e-9
             s_norm = s / s_sum
             curr_pos = torch.tensor(pos_raw[t], dtype=torch.float, device=device)
             com = torch.matmul(s_norm.t(), curr_pos) # [K, 2]
-            
-            z_list.append(z[0].cpu().numpy()) 
+
+            z_list.append(z[0].cpu().numpy())
             com_list.append(com.cpu().numpy())
-            
+
     z_all = np.array(z_list)   # [T, K, D]
     com_all = np.array(com_list) # [T, K, 2]
-    
+
     avg_corrs = []
     for k in range(model.encoder.n_super_nodes):
         z_k = z_all[:, k, :]
         com_k = com_all[:, k, :]
         # Correlate each Z dimension with each CoM dimension
-        corrs = np.array([[np.corrcoef(z_k[:, i], com_k[:, j])[0, 1] 
+        corrs = np.array([[np.corrcoef(z_k[:, i], com_k[:, j])[0, 1]
                           for j in range(2)] for i in range(z_k.shape[1])])
         avg_corrs.append(np.nan_to_num(corrs))
-        
+
     return np.array(avg_corrs)
+
+
+def enhance_physical_mapping(model, dataset, pos_raw, vel_raw, tau=0.1, device='cpu'):
+    """
+    Enhanced analysis that correlates latent variables with both position and velocity
+    to improve physical interpretability.
+    """
+    model.eval()
+    z_list, pos_com_list, vel_com_list = [], [], []
+
+    with torch.no_grad():
+        for t, data in enumerate(dataset):
+            batch = Batch.from_data_list([data]).to(device)
+            z, s, _, _ = model.encode(batch.x, batch.edge_index, batch.batch, tau=tau)
+
+            # Compute CoM for each super-node based on assignment weights s
+            # s: [N, K], pos_raw[t]: [N, 2], vel_raw[t]: [N, 2]
+            s_sum = s.sum(dim=0, keepdim=True) + 1e-9
+            s_norm = s / s_sum
+            curr_pos = torch.tensor(pos_raw[t], dtype=torch.float, device=device)
+            curr_vel = torch.tensor(vel_raw[t], dtype=torch.float, device=device)
+
+            pos_com = torch.matmul(s_norm.t(), curr_pos)  # [K, 2]
+            vel_com = torch.matmul(s_norm.t(), curr_vel)  # [K, 2]
+
+            z_list.append(z[0].cpu().numpy())
+            pos_com_list.append(pos_com.cpu().numpy())
+            vel_com_list.append(vel_com.cpu().numpy())
+
+    z_all = np.array(z_list)           # [T, K, D]
+    pos_com_all = np.array(pos_com_list)  # [T, K, 2]
+    vel_com_all = np.array(vel_com_list)  # [T, K, 2]
+
+    # Calculate correlations for both position and velocity
+    all_corrs = []
+    for k in range(model.encoder.n_super_nodes):
+        z_k = z_all[:, k, :]
+        pos_k = pos_com_all[:, k, :]
+        vel_k = vel_com_all[:, k, :]
+
+        # Correlate each Z dimension with position and velocity
+        pos_corrs = np.array([[np.corrcoef(z_k[:, i], pos_k[:, j])[0, 1]
+                              for j in range(2)] for i in range(z_k.shape[1])])
+        vel_corrs = np.array([[np.corrcoef(z_k[:, i], vel_k[:, j])[0, 1]
+                              for j in range(2)] for i in range(z_k.shape[1])])
+
+        # Combine position and velocity correlations
+        combined_corrs = np.sqrt(pos_corrs**2 + vel_corrs**2)  # Magnitude of correlation vector
+        all_corrs.append(np.nan_to_num(combined_corrs))
+
+    return np.array(all_corrs)
 
 class LossTracker:
     """Tracks running averages of loss components to help with balancing."""
