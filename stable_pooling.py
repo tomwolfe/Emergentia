@@ -1,5 +1,6 @@
 """
-Enhanced Hierarchical Pooling with improved assignment stability to prevent latent flickering.
+Enhanced Hierarchical Pooling with improved assignment stability to prevent latent flickering
+and resolution collapse.
 """
 
 import torch
@@ -11,16 +12,21 @@ import torch.nn.functional as F
 
 class StableHierarchicalPooling(nn.Module):
     """
-    Enhanced HierarchicalPooling with improved assignment stability to prevent latent flickering.
-    
+    Enhanced HierarchicalPooling with improved assignment stability to prevent latent flickering
+    and resolution collapse.
+
     Key improvements:
     1. Temporal consistency loss to penalize rapid assignment changes
     2. Exponential moving average for smoother active mask updates
     3. Assignment persistence mechanism to maintain stable cluster identities
     4. Adaptive temperature scheduling for Gumbel-Softmax
+    5. Enhanced resolution collapse prevention mechanisms
+    6. Dynamic loss balancing to prevent single super-node dominance
     """
-    
-    def __init__(self, in_channels, n_super_nodes, pruning_threshold=0.01, temporal_consistency_weight=0.1):
+
+    def __init__(self, in_channels, n_super_nodes, pruning_threshold=0.01,
+                 temporal_consistency_weight=0.1, collapse_prevention_weight=1.0,
+                 min_active_super_nodes=1):
         """
         Initialize the stable hierarchical pooling layer.
 
@@ -29,26 +35,34 @@ class StableHierarchicalPooling(nn.Module):
             n_super_nodes (int): Number of super-nodes to pool to
             pruning_threshold (float): Threshold for pruning super-nodes
             temporal_consistency_weight (float): Weight for temporal consistency loss
+            collapse_prevention_weight (float): Weight for collapse prevention loss
+            min_active_super_nodes (int): Minimum number of super-nodes that must remain active
         """
         super(StableHierarchicalPooling, self).__init__()
         self.n_super_nodes = n_super_nodes
         self.pruning_threshold = pruning_threshold
         self.temporal_consistency_weight = temporal_consistency_weight
-        
+        self.collapse_prevention_weight = collapse_prevention_weight
+        self.min_active_super_nodes = min(max(1, min_active_super_nodes), n_super_nodes)
+
         self.assign_mlp = nn.Sequential(
             nn.Linear(in_channels, in_channels),
             nn.ReLU(),
             nn.Linear(in_channels, n_super_nodes)
         )
         self.scaling = nn.Parameter(torch.tensor(1.0))
-        
+
         # Mask to track active super-nodes (not directly optimized by backprop)
         self.register_buffer('active_mask', torch.ones(n_super_nodes))
-        
+
         # Track previous assignments for temporal consistency
         self.register_buffer('prev_assignments', torch.zeros(n_super_nodes))
         self.register_buffer('assignment_history', torch.zeros(n_super_nodes))
         self.register_buffer('history_counter', torch.zeros(1, dtype=torch.long))
+
+        # Track assignment distribution to detect collapse
+        self.register_buffer('assignment_distribution', torch.ones(n_super_nodes) / n_super_nodes)
+        self.register_buffer('assignment_variance', torch.zeros(n_super_nodes))
 
     def forward(self, x, batch, pos=None, tau=1.0, hard=False, prev_assignments=None):
         """
@@ -73,7 +87,9 @@ class StableHierarchicalPooling(nn.Module):
                     'diversity': torch.tensor(0.0, device=x.device),
                     'spatial': torch.tensor(0.0, device=x.device),
                     'pruning': torch.tensor(0.0, device=x.device),
-                    'temporal_consistency': torch.tensor(0.0, device=x.device)}, \
+                    'temporal_consistency': torch.tensor(0.0, device=x.device),
+                    'collapse_prevention': torch.tensor(0.0, device=x.device),
+                    'balance': torch.tensor(0.0, device=x.device)}, \
                    None
 
         logits = self.assign_mlp(x) * self.scaling
@@ -91,9 +107,15 @@ class StableHierarchicalPooling(nn.Module):
             # Moving average update for the mask to avoid rapid flickering
             current_active = (avg_s > self.pruning_threshold).float()
             self.active_mask.copy_(0.98 * self.active_mask + 0.02 * current_active)
-            # Ensure at least one is always active to avoid collapse
-            if self.active_mask.sum() == 0:
-                self.active_mask[torch.argmax(avg_s)] = 1.0
+
+            # Ensure minimum number of super-nodes remain active to prevent total collapse
+            n_active_now = current_active.sum().item()
+            if n_active_now < self.min_active_super_nodes:
+                # Activate the least used super-nodes to meet minimum requirement
+                _, least_used_indices = torch.topk(avg_s, self.min_active_super_nodes, largest=False)
+                new_active = current_active.clone()
+                new_active[least_used_indices] = 1.0
+                self.active_mask.copy_(0.98 * self.active_mask + 0.02 * new_active)
 
         entropy = -torch.mean(torch.sum(s * torch.log(s + 1e-9), dim=1))
         diversity_loss = torch.sum(avg_s * torch.log(avg_s + 1e-9))
@@ -108,7 +130,14 @@ class StableHierarchicalPooling(nn.Module):
             # Compare current assignments with previous ones
             # Use MSE to penalize large changes in assignment probabilities
             temporal_consistency_loss = F.mse_loss(s, prev_assignments.expand_as(s).detach())
-        
+
+        # NEW: Collapse prevention loss to ensure assignments are distributed
+        # This penalizes situations where most assignments go to a single super-node
+        collapse_prevention_loss = self._compute_collapse_prevention_loss(avg_s)
+
+        # NEW: Balance loss to encourage equal usage of super-nodes
+        balance_loss = self._compute_balance_loss(avg_s)
+
         spatial_loss = torch.tensor(0.0, device=x.device)
         if pos is not None:
             s_sum = s.sum(dim=0, keepdim=True) + 1e-9
@@ -125,7 +154,9 @@ class StableHierarchicalPooling(nn.Module):
             'spatial': spatial_loss,
             'pruning': pruning_loss,
             'sparsity': sparsity_loss,
-            'temporal_consistency': temporal_consistency_loss * self.temporal_consistency_weight
+            'temporal_consistency': temporal_consistency_loss * self.temporal_consistency_weight,
+            'collapse_prevention': collapse_prevention_loss * self.collapse_prevention_weight,
+            'balance': balance_loss
         }
 
         super_node_mu = None
@@ -148,6 +179,47 @@ class StableHierarchicalPooling(nn.Module):
 
         return out, s, assign_losses, super_node_mu
 
+    def _compute_collapse_prevention_loss(self, avg_assignments):
+        """
+        Compute loss to prevent all assignments from collapsing to a single super-node.
+
+        Args:
+            avg_assignments: Average assignment probabilities [n_super_nodes]
+
+        Returns:
+            collapse_loss: Scalar loss value
+        """
+        # Compute variance of assignment probabilities
+        # High variance indicates collapse (one dominates)
+        variance = torch.var(avg_assignments)
+
+        # Also penalize max probability being too high (indicating dominance)
+        max_prob = torch.max(avg_assignments)
+
+        # Combine both measures
+        collapse_loss = variance + torch.relu(max_prob - 1.0/self.n_super_nodes)
+
+        return collapse_loss
+
+    def _compute_balance_loss(self, avg_assignments):
+        """
+        Compute loss to encourage balanced usage of super-nodes.
+
+        Args:
+            avg_assignments: Average assignment probabilities [n_super_nodes]
+
+        Returns:
+            balance_loss: Scalar loss value
+        """
+        # Target is uniform distribution
+        uniform_prob = 1.0 / self.n_super_nodes
+        uniform_dist = torch.full_like(avg_assignments, uniform_prob)
+
+        # Use KL divergence to encourage uniform distribution
+        kl_div = torch.sum(avg_assignments * torch.log(avg_assignments / (uniform_dist + 1e-9)))
+
+        return kl_div
+
     def update_assignment_history(self, current_assignments):
         """
         Update the assignment history for temporal consistency.
@@ -166,34 +238,122 @@ class StableHierarchicalPooling(nn.Module):
 class AdaptiveTauScheduler:
     """
     Adaptive temperature scheduler for Gumbel-Softmax to improve assignment stability.
-    Starts with higher temperature for exploration, decreases for exploitation.
     """
-    
-    def __init__(self, initial_tau=1.0, final_tau=0.1, decay_steps=1000):
+
+    def __init__(self, initial_tau=1.0, final_tau=0.1, decay_steps=1000,
+                 adaptive_collapse_protection=True):
         self.initial_tau = initial_tau
         self.final_tau = final_tau
         self.decay_steps = decay_steps
         self.current_step = 0
-    
-    def get_tau(self, progress_ratio=None):
+        self.adaptive_collapse_protection = adaptive_collapse_protection
+
+    def get_tau(self, progress_ratio=None, assignment_stats=None):
         """
-        Get the current temperature based on training progress.
-        
+        Get the current temperature based on training progress and assignment statistics.
+
         Args:
             progress_ratio: Float between 0 and 1 indicating training progress
+            assignment_stats: Dict with assignment statistics for adaptive adjustment
         """
         if progress_ratio is None:
             # Calculate based on internal step counter
             progress_ratio = min(1.0, self.current_step / self.decay_steps)
-        
+
         # Cosine annealing schedule
         import math
         tau = self.final_tau + 0.5 * (self.initial_tau - self.final_tau) * (1 + math.cos(math.pi * progress_ratio))
-        
+
+        # If adaptive collapse protection is enabled and we have assignment stats
+        if self.adaptive_collapse_protection and assignment_stats is not None:
+            # Increase temperature if assignments are becoming too peaked (collapse risk)
+            avg_assignments = assignment_stats.get('avg_assignments', None)
+            if avg_assignments is not None:
+                max_assignment = torch.max(avg_assignments).item()
+                # If max assignment probability is too high, increase temperature to encourage exploration
+                if max_assignment > 0.8:  # Threshold for collapse detection
+                    tau *= 1.5  # Increase temperature to encourage more uniform assignments
+
         return tau
-    
+
     def step(self):
         """
         Increment the step counter.
         """
         self.current_step += 1
+
+
+class DynamicLossBalancer:
+    """
+    Dynamic loss balancer that adjusts weights based on training progress and loss magnitudes.
+    This helps prevent resolution collapse by dynamically adjusting the importance of different losses.
+    """
+
+    def __init__(self, initial_weights=None, adaptation_rate=0.01):
+        """
+        Initialize the dynamic loss balancer.
+
+        Args:
+            initial_weights: Dict of initial loss weights
+            adaptation_rate: Rate at which weights adapt (smaller = slower adaptation)
+        """
+        self.initial_weights = initial_weights or {}
+        self.adaptation_rate = adaptation_rate
+        self.current_weights = initial_weights.copy() if initial_weights else {}
+        self.loss_history = {}
+        self.step_count = 0
+
+    def update_weights(self, current_losses):
+        """
+        Update loss weights based on current loss values.
+
+        Args:
+            current_losses: Dict of current loss values
+        """
+        self.step_count += 1
+
+        for loss_name, loss_value in current_losses.items():
+            # Initialize if this is the first time seeing this loss
+            if loss_name not in self.loss_history:
+                self.loss_history[loss_name] = []
+                self.current_weights[loss_name] = self.initial_weights.get(loss_name, 1.0)
+
+            # Add current loss to history
+            self.loss_history[loss_name].append(loss_value.item())
+
+            # Keep only recent history (last 100 steps)
+            if len(self.loss_history[loss_name]) > 100:
+                self.loss_history[loss_name] = self.loss_history[loss_name][-100:]
+
+            # If we have enough history, adapt the weight
+            if len(self.loss_history[loss_name]) >= 10:
+                recent_avg = sum(self.loss_history[loss_name][-10:]) / 10
+                initial_avg = sum(self.loss_history[loss_name][:10]) / min(10, len(self.loss_history[loss_name]))
+
+                # If this loss is decreasing much slower than others, increase its weight
+                if initial_avg > 0 and recent_avg / initial_avg > 0.9:  # Still high relative to initial
+                    self.current_weights[loss_name] *= (1 + self.adaptation_rate)
+                elif recent_avg < initial_avg * 0.1:  # Decreasing very fast, decrease weight
+                    self.current_weights[loss_name] *= (1 - self.adaptation_rate)
+
+                # Clamp weights to reasonable range
+                self.current_weights[loss_name] = max(0.1, min(10.0, self.current_weights[loss_name]))
+
+    def get_balanced_losses(self, raw_losses):
+        """
+        Apply current weights to raw losses.
+
+        Args:
+            raw_losses: Dict of raw loss values
+
+        Returns:
+            weighted_losses: Dict of weighted loss values
+        """
+        self.update_weights(raw_losses)
+
+        weighted_losses = {}
+        for loss_name, loss_value in raw_losses.items():
+            weight = self.current_weights.get(loss_name, 1.0)
+            weighted_losses[loss_name] = loss_value * weight
+
+        return weighted_losses

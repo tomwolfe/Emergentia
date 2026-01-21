@@ -1,80 +1,232 @@
-# Discovery Engine: Meso-scale Physics Learning
+# Neural-Symbolic Discovery Pipeline
 
-This repository contains the **Discovery Engine**, a neural-symbolic pipeline designed to learn meso-scale (coarse-grained) physical laws from micro-scale particle simulations. It utilizes Graph Neural Networks (GNNs), Latent ODEs, and Symbolic Regression to bridge the gap between high-dimensional raw data and interpretable mathematical expressions.
+This project implements a sophisticated **Neural-Symbolic Discovery Pipeline** for automated coarse-graining of particle dynamics. It bridges the gap between micro-scale particle dynamics and meso-scale symbolic equations using a stack of Graph Neural Networks (GNNs), Symplectic ODEs, and Genetic Programming.
 
-## 🏗 System Architecture
+## Overview
 
-The engine operates in three distinct phases:
+The pipeline consists of three main stages:
 
-1. **Simulation**: A `SpringMassSimulator` generates micro-scale trajectories of particles with support for Periodic Boundary Conditions (PBC) and Velocity Verlet integration.
-2. **Discovery (Neural)**: A `DiscoveryEngineModel` uses Hierarchical Pooling to aggregate particles into "super-nodes". A Latent ODE then learns the continuous-time dynamics of these super-nodes.
-3. **Distillation (Symbolic)**: A `SymbolicDistiller` extracts the learned latent derivatives and uses Genetic Programming to find the underlying symbolic equations.
+1. **Neural Encoder**: GNN-based encoder with hierarchical soft-assignment pooling to compress particle dynamics into super-node representations
+2. **Latent Dynamics**: Hamiltonian-constrained ODE dynamics that preserve physical inductive biases
+3. **Symbolic Distillation**: Genetic programming to extract interpretable symbolic equations from learned neural dynamics
 
----
+## Key Features
 
-## 🔬 Meso-scale Theory & Hierarchical Pooling
+### 1. Hamiltonian Inductive Bias
+- Enforces canonical equations: $\dot{q} = \partial H/\partial p$ and $\dot{p} = -\partial H/\partial q$
+- Maintains Liouville's Theorem (phase-space volume preservation)
+- Includes learnable dissipation terms for realistic systems
 
-### Theoretical Background
-Physical systems often exhibit different behaviors at different scales. While micro-scale dynamics (e.g., individual atoms) are governed by fundamental forces, the macro-scale (e.g., fluid flow) is described by coarse-grained equations like Navier-Stokes. The **Meso-scale** is the bridge between these two, where emergent structures (clusters of particles) form the basis of the dynamics.
+### 2. Stable Hierarchical Pooling
+- Prevents "latent flickering" through temporal consistency
+- Ensures spatial contiguity of super-nodes
+- Dynamic resolution selection to find optimal meso-scale
 
-### Hierarchical Pooling (Soft-Assignment)
-To learn these meso-scale structures, the Discovery Engine employs a differentiable pooling layer. Instead of fixed clustering (like K-Means), it learns an **Assignment Matrix** $S \in \mathbb{R}^{N \times K}$ using a Gumbel-Softmax distribution:
-- **$N$**: Number of micro-particles.
-- **$K$**: Number of super-nodes (coarse-grained objects).
-- **$S_{i,j}$**: The probability that particle $i$ belongs to super-node $j$.
+### 3. Enhanced Symbolic Regression
+- Physics-informed feature engineering
+- Secondary optimization for constant refinement
+- Coordinate alignment between neural and physical spaces
+- Hamiltonian structure preservation
 
-By minimizing an entropy loss and an orthogonality constraint on $S$, the model is forced to find distinct, non-overlapping clusters that maximize spatial locality, effectively "discovering" the meso-scale objects.
+## Architecture
 
----
-
-## 🛠 Features
-
-- **Hierarchical Soft-Assignment**: Uses a learned assignment matrix with **Spatial Separation** and **Graph Connectivity** constraints to discover contiguous physical objects.
-- **Hamiltonian Latent ODE**: Enforces symplectic constraints ($\dot{q} = \partial H/\partial p, \dot{p} = -\partial H/\partial q$) in the latent space for energy-conserving meso-scale dynamics.
-- **Hybrid Symbolic Distillation**: Combines **RandomForest-Lasso** feature selection with **Genetic Programming** and **SINDy-inspired pruning** for scalable and robust law discovery.
-- **Adaptive Phased Training**: Employs a learnable multi-objective loss balancing scheme and a cooling schedule for Gumbel-Softmax temperature ($\tau$).
-- **PBC Support**: Advanced neighbor discovery using KDTree tiling to handle periodic boundaries in simulation.
-
-
-
----
-
-## 🚀 Getting Started
-
-### Prerequisites
-
-Install the required dependencies listed in `requirements.txt`:
-
-```bash
-pip install torch torch-geometric torchdiffeq gplearn numpy matplotlib scipy pandas
+```
+Particle Dynamics → GNN Encoder → Super-Node Latents → Hamiltonian ODE → Symbolic Equations
+                    ↓              ↓                   ↓                ↓
+                Pooling         Assignment       Symplectic        Genetic
+                Loss            Consistency      Constraints       Programming
 ```
 
-### Running the Discovery Pipeline
-
-To train the model and distill symbolic laws from a spring-mass system, run:
+## Installation
 
 ```bash
-python main.py
+pip install -r requirements.txt
 ```
 
----
+## Usage
 
-## 📊 File Structure
+### Basic Example
 
-| File | Description |
-| --- | --- |
-| `main.py` | The primary entry point; manages the full end-to-end pipeline. |
-| `model.py` | Contains the GNN Encoder, Hierarchical Pooling, Latent ODE, and Decoder. |
-| `engine.py` | Handles data preparation, normalization, and the `Trainer` class. |
-| `simulator.py` | A physics engine for mass-spring-damper systems with PBC support. |
-| `symbolic.py` | Uses Genetic Programming to distill latent ODEs into symbolic equations. |
+```python
+import torch
+from model import DiscoveryEngineModel
+from symbolic import SymbolicDistiller
+from enhanced_symbolic import EnhancedSymbolicDistiller
+from coordinate_mapping import AlignedHamiltonianSymbolicDistiller
+from stable_pooling import StableHierarchicalPooling
 
+# Initialize model
+model = DiscoveryEngineModel(
+    n_particles=100,
+    n_super_nodes=10,
+    node_features=4,
+    latent_dim=4,
+    hamiltonian=True
+)
 
----
+# Train the model on particle dynamics data
+# ... training code ...
 
-## ⚖️ License
+# Extract latent dynamics data
+latent_states, latent_derivs = extract_latent_data(model, dataset, dt=0.01)
 
-This project is licensed under the **MIT License**.
+# Distill symbolic equations with enhanced features
+distiller = EnhancedSymbolicDistiller(
+    populations=2000,
+    generations=40,
+    secondary_optimization=True
+)
 
-Copyright (c) 2026 Thomas Wolfe.
+equations = distiller.distill_with_secondary_optimization(
+    latent_states=latent_states,
+    targets=latent_derivs,
+    n_super_nodes=10,
+    latent_dim=4
+)
 
+# For Hamiltonian systems with coordinate alignment
+hamiltonian_distiller = AlignedHamiltonianSymbolicDistiller(
+    populations=2000,
+    generations=40,
+    enforce_hamiltonian_structure=True
+)
+
+# Fit coordinate mapper if physical coordinates are available
+# hamiltonian_distiller.fit_coordinate_mapper(neural_latents, physical_coords)
+
+# Distill with alignment
+equations = hamiltonian_distiller.distill_with_alignment(
+    neural_latents=latent_states,
+    targets=latent_derivs,
+    n_super_nodes=10,
+    latent_dim=4
+)
+```
+
+### Advanced Configuration
+
+```python
+# Configure model with enhanced pooling
+from stable_pooling import StableHierarchicalPooling, DynamicLossBalancer
+
+model = DiscoveryEngineModel(
+    n_particles=100,
+    n_super_nodes=15,  # Adjust based on your system
+    node_features=4,
+    latent_dim=6,      # Must be even for Hamiltonian systems
+    hamiltonian=True,
+    dissipative=True   # Include energy dissipation
+)
+
+# Configure enhanced symbolic distillation
+distiller = EnhancedSymbolicDistiller(
+    populations=3000,           # Larger population for complex systems
+    generations=50,             # More generations for better exploration
+    secondary_optimization=True, # Refine constants with scipy optimization
+    opt_method='L-BFGS-B',      # Optimization algorithm
+    opt_iterations=200          # Max iterations for optimization
+)
+
+# Use coordinate alignment for better interpretability
+coord_distiller = AlignedHamiltonianSymbolicDistiller(
+    populations=2500,
+    generations=45,
+    enforce_hamiltonian_structure=True
+)
+```
+
+## Key Improvements Over Baseline
+
+### 1. Enhanced Symbolic Regression
+- **Secondary Optimization**: Uses scipy.optimize to refine constants in discovered expressions
+- **Constant Refinement**: Improves accuracy of physics-specific parameters
+- **Pareto Optimization**: Balances accuracy and complexity
+
+### 2. Coordinate Alignment
+- **Neural-Physical Mapping**: Aligns neural latent space with interpretable physical coordinates
+- **Rotation Invariance**: Handles rotated coordinate systems learned by the encoder
+- **Hamiltonian Structure Preservation**: Maintains proper q/p coordinate relationships
+
+### 3. Collapse Prevention
+- **Dynamic Loss Balancing**: Adjusts loss weights during training to prevent mode collapse
+- **Minimum Active Nodes**: Ensures sufficient super-nodes remain active
+- **Balance Loss**: Encourages uniform usage of super-nodes
+
+## Mathematical Foundation
+
+### Hamiltonian Mechanics
+For a system with generalized coordinates $q$ and momenta $p$, the Hamiltonian $H(q,p)$ defines the dynamics:
+$$\dot{q} = \frac{\partial H}{\partial p}, \quad \dot{p} = -\frac{\partial H}{\partial q}$$
+
+Our model learns $H$ as a neural network and computes gradients analytically.
+
+### Pooling Objective
+The hierarchical pooling minimizes:
+$$\mathcal{L}_{pool} = \mathcal{L}_{entropy} + \mathcal{L}_{diversity} + \mathcal{L}_{spatial} + \mathcal{L}_{consistency} + \mathcal{L}_{collapse}$$
+
+Where:
+- $\mathcal{L}_{entropy}$: Encourages hard assignments
+- $\mathcal{L}_{diversity}$: Prevents all nodes from assigning to one super-node
+- $\mathcal{L}_{spatial}$: Maintains spatial coherence
+- $\mathcal{L}_{consistency}$: Ensures temporal stability
+- $\mathcal{L}_{collapse}$: Prevents resolution collapse
+
+## Testing
+
+Run the test suite:
+
+```bash
+python -m pytest test_*.py -v
+```
+
+Or run individual tests:
+
+```bash
+python test_symbolic.py
+python test_ode.py
+python test_pareto.py
+python test_implemented_fixes.py
+```
+
+## Files Overview
+
+- `model.py`: Core neural network architecture
+- `symbolic.py`: Basic symbolic regression implementation
+- `enhanced_symbolic.py`: Enhanced symbolic regression with secondary optimization
+- `coordinate_mapping.py`: Neural-physical coordinate alignment
+- `stable_pooling.py`: Enhanced pooling with collapse prevention
+- `hamiltonian_symbolic.py`: Hamiltonian structure preservation
+- `balanced_features.py`: Physics-informed feature engineering
+- `optimized_symbolic.py`: Optimized symbolic dynamics with caching
+- `simulator.py`: Particle dynamics simulators
+- `engine.py`: Main discovery engine
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+## Citation
+
+If you use this code in your research, please cite:
+
+```
+@article{neural-symbolic-discovery,
+  title={Neural-Symbolic Discovery of Physical Laws from Particle Dynamics},
+  author={Emergentia Team},
+  year={2026}
+}
+```
+
+## Acknowledgments
+
+- Inspired by recent advances in neural-symbolic integration
+- Built on top of PyTorch Geometric and gplearn
+- Thanks to the physics and ML communities for continued inspiration
