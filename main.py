@@ -55,7 +55,7 @@ def main():
     dataset, stats = prepare_data(pos, vel, radius=dynamic_radius, device=device)
     
     # 2. Initialize Model and Trainer
-    print("--- 2. Training Discovery Engine ---")
+    print("--- 2. Initialize Model and Trainer ---")
     # Using Hamiltonian dynamics with learnable dissipation for improved physics fidelity
     model = DiscoveryEngineModel(n_particles=n_particles, 
                                  n_super_nodes=n_super_nodes, 
@@ -64,8 +64,17 @@ def main():
                                  hamiltonian=True,
                                  dissipative=True).to(device)
     
+    # NEW: Sparsity Scheduler to prevent resolution collapse
+    from stable_pooling import SparsityScheduler
+    sparsity_scheduler = SparsityScheduler(
+        initial_weight=0.001, 
+        target_weight=0.05, 
+        warmup_steps=int(epochs * 0.1), 
+        max_steps=int(epochs * 0.8)
+    )
+
     # Trainer now uses adaptive loss weighting, manual weights are deprecated
-    trainer = Trainer(model, lr=5e-4, device=device, stats=stats)
+    trainer = Trainer(model, lr=5e-4, device=device, stats=stats, sparsity_scheduler=sparsity_scheduler)
     
     # Increased patience and adjusted factor to prevent premature decay
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(trainer.optimizer, mode='min', 

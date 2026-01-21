@@ -15,27 +15,60 @@ class RecursiveFeatureSelector:
     Selects features recursively by iteratively adding the most informative ones.
     This prevents the combinatorial explosion of polynomial terms.
     """
-    def __init__(self, max_features=100, tolerance=1e-4):
+    def __init__(self, max_features=100, tolerance=1e-4, min_variance=1e-6):
         self.max_features = max_features
         self.tolerance = tolerance
+        self.min_variance = min_variance
         self.selected_indices = []
 
     def fit(self, X, y):
-        from sklearn.linear_model import OrthogonalMatchingPursuit
+        # 1. Variance filtering to remove constant or near-constant features
+        variances = np.var(X, axis=0)
+        high_variance_indices = np.where(variances > self.min_variance)[0]
         
-        n_samples, n_features = X.shape
-        n_to_select = min(self.max_features, n_features, n_samples)
-        
-        omp = OrthogonalMatchingPursuit(n_nonzero_coefs=n_to_select, tol=self.tolerance)
-        try:
-            omp.fit(X, y.ravel() if y.ndim > 1 else y)
-            self.selected_indices = np.where(omp.coef_ != 0)[0]
-        except:
-            # Fallback to a simpler selection if OMP fails
-            from sklearn.feature_selection import f_regression
-            scores, _ = f_regression(X, y.ravel() if y.ndim > 1 else y)
-            self.selected_indices = np.argsort(scores)[-n_to_select:]
+        if len(high_variance_indices) == 0:
+            self.selected_indices = np.array([], dtype=int)
+            return self
             
+        X_filtered = X[:, high_variance_indices]
+        
+        # 2. Use Orthogonal Matching Pursuit or LassoLars for selection
+        from sklearn.linear_model import OrthogonalMatchingPursuit, LassoLarsCV
+        
+        n_samples, n_features = X_filtered.shape
+        n_to_select = min(self.max_features, n_features, n_samples - 1)
+        
+        if n_to_select <= 0:
+            self.selected_indices = high_variance_indices[:min(self.max_features, len(high_variance_indices))]
+            return self
+
+        try:
+            # LassoLars is often more stable for feature selection than OMP
+            lasso = LassoLarsCV(cv=3, max_iter=500)
+            lasso.fit(X_filtered, y.ravel() if y.ndim > 1 else y)
+            
+            # Get indices of non-zero coefficients
+            nonzero = np.where(np.abs(lasso.coef_) > 1e-10)[0]
+            
+            if len(nonzero) > 0:
+                # If too many features selected, take the ones with largest coefficients
+                if len(nonzero) > self.max_features:
+                    top_indices = np.argsort(np.abs(lasso.coef_[nonzero]))[-self.max_features:]
+                    selected_filtered_indices = nonzero[top_indices]
+                else:
+                    selected_filtered_indices = nonzero
+            else:
+                # Fallback to OMP if Lasso selected nothing
+                omp = OrthogonalMatchingPursuit(n_nonzero_coefs=n_to_select, tol=self.tolerance)
+                omp.fit(X_filtered, y.ravel() if y.ndim > 1 else y)
+                selected_filtered_indices = np.where(omp.coef_ != 0)[0]
+        except:
+            # Fallback to simple univariate selection
+            from sklearn.feature_selection import f_regression
+            scores, _ = f_regression(X_filtered, y.ravel() if y.ndim > 1 else y)
+            selected_filtered_indices = np.argsort(np.nan_to_num(scores))[-n_to_select:]
+            
+        self.selected_indices = high_variance_indices[selected_filtered_indices]
         return self
 
     def transform(self, X):

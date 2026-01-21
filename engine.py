@@ -115,7 +115,8 @@ class LossTracker:
         return {**self.history, **{f"w_{k}": v for k, v in self.weights.items()}}
 
 class Trainer:
-    def __init__(self, model, lr=5e-4, device='cpu', stats=None, align_anneal_epochs=1000, warmup_epochs=400):
+    def __init__(self, model, lr=5e-4, device='cpu', stats=None, align_anneal_epochs=1000, 
+                 warmup_epochs=400, sparsity_scheduler=None):
         self.model = model.to(device)
         self.device = device
         self.loss_tracker = LossTracker()
@@ -123,6 +124,7 @@ class Trainer:
         self.max_s_history = 10
         self.align_anneal_epochs = align_anneal_epochs
         self.warmup_epochs = warmup_epochs
+        self.sparsity_scheduler = sparsity_scheduler
         
         # MPS fix: torchdiffeq has issues with MPS (float64 defaults and stability)
         if str(device) == 'mps':
@@ -133,6 +135,12 @@ class Trainer:
         self.stats = stats
         
     def train_step(self, data_list, dt, epoch=0, max_epochs=2000):
+        # Update sparsity weight if scheduler is present
+        if self.sparsity_scheduler is not None:
+            new_weight = self.sparsity_scheduler.step()
+            if hasattr(self.model.encoder.pooling, 'set_sparsity_weight'):
+                self.model.encoder.pooling.set_sparsity_weight(new_weight)
+
         self.optimizer.zero_grad()
         seq_len = len(data_list)
         

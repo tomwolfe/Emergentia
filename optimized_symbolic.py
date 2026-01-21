@@ -59,55 +59,67 @@ class OptimizedSymbolicDynamics:
             # Get the expression string representation
             expr_str = str(gp_program)
             
-            # Identify all variables X0, X1, ...
+            # 1. Pre-process the string for better SymPy compatibility
+            # Replace prefix notation 'add(x, y)' with infix '(x + y)' if needed,
+            # but SymPy's sympify can actually handle 'add(x, y)' if 'add' is in locals.
+            
+            # 2. Identify all variables X0, X1, ...
             import re
             feat_indices = sorted(list(set([int(m) for m in re.findall(r'X(\d+)', expr_str)])))
             
             # Create a mapping for variables
             var_mapping = {f'X{i}': sp.Symbol(f'x{i}') for i in feat_indices}
             
-            # Define local functions for gplearn standard functions
+            # 3. Define local functions for gplearn standard and potentially custom functions
             local_dict = {
                 'add': lambda x, y: x + y,
                 'sub': lambda x, y: x - y,
                 'mul': lambda x, y: x * y,
                 'div': lambda x, y: x / y,
-                'sqrt': sp.sqrt,
-                'log': sp.log,
+                'sqrt': lambda x: sp.sqrt(sp.Abs(x)), # More robust sqrt
+                'log': lambda x: sp.log(sp.Abs(x) + 1e-6), # More robust log
                 'abs': sp.Abs,
                 'neg': lambda x: -x,
-                'inv': lambda x: 1.0 / x,
+                'inv': lambda x: 1.0 / (x + 1e-6), # More robust inv
                 'sin': sp.sin,
                 'cos': sp.cos,
                 'tan': sp.tan,
+                'sig': lambda x: 1 / (1 + sp.exp(-x)),
+                'gauss': lambda x: sp.exp(-x**2),
             }
             local_dict.update(var_mapping)
 
-            # Parse the expression string using SymPy
+            # 4. Parse the expression string using SymPy
+            # Using evaluate=False can sometimes help with complex nested structures
             sympy_expr = sp.sympify(expr_str, locals=local_dict)
+            
+            # Simplify to clean up the expression
+            sympy_expr = sp.simplify(sympy_expr)
+            
             return sympy_expr
         except Exception as e:
+            # More detailed fallback for Robustness
             print(f"SymPy conversion failed: {e}")
-            # Fallback: if it's an OptimizedExpressionWrapper, it might already have a string
             if hasattr(gp_program, 'expr_str'):
                 try:
-                    # Try parsing the expr_str which might be more SymPy friendly
-                    # We need to recreate local_dict here or move it up
                     import re
-                    feat_indices = sorted(list(set([int(m) for m in re.findall(r'X(\d+)', gp_program.expr_str)])))
+                    # Re-run the same logic on the internal expr_str
+                    internal_str = gp_program.expr_str
+                    feat_indices = sorted(list(set([int(m) for m in re.findall(r'X(\d+)', internal_str)])))
                     var_mapping = {f'X{i}': sp.Symbol(f'x{i}') for i in feat_indices}
                     local_dict = {
                         'add': lambda x, y: x + y, 'sub': lambda x, y: x - y,
                         'mul': lambda x, y: x * y, 'div': lambda x, y: x / y,
-                        'sqrt': sp.sqrt, 'log': sp.log, 'abs': sp.Abs,
-                        'neg': lambda x: -x, 'inv': lambda x: 1.0 / x,
+                        'sqrt': lambda x: sp.sqrt(sp.Abs(x)), 'log': lambda x: sp.log(sp.Abs(x) + 1e-6),
+                        'abs': sp.Abs, 'neg': lambda x: -x, 'inv': lambda x: 1.0 / (x + 1e-6),
                         'sin': sp.sin, 'cos': sp.cos, 'tan': sp.tan,
+                        'sig': lambda x: 1 / (1 + sp.exp(-x)), 'gauss': lambda x: sp.exp(-x**2),
                     }
                     local_dict.update(var_mapping)
-                    return sp.sympify(gp_program.expr_str, locals=local_dict)
+                    return sp.simplify(sp.sympify(internal_str, locals=local_dict))
                 except:
                     pass
-            return 0
+            return sp.Float(0.0)
 
     def _get_cached_transformation(self, z_tuple):
         """

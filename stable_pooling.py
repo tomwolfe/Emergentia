@@ -26,7 +26,7 @@ class StableHierarchicalPooling(nn.Module):
 
     def __init__(self, in_channels, n_super_nodes, pruning_threshold=0.01,
                  temporal_consistency_weight=0.1, collapse_prevention_weight=1.0,
-                 min_active_super_nodes=1):
+                 sparsity_weight=0.01, min_active_super_nodes=1):
         """
         Initialize the stable hierarchical pooling layer.
 
@@ -36,6 +36,7 @@ class StableHierarchicalPooling(nn.Module):
             pruning_threshold (float): Threshold for pruning super-nodes
             temporal_consistency_weight (float): Weight for temporal consistency loss
             collapse_prevention_weight (float): Weight for collapse prevention loss
+            sparsity_weight (float): Initial weight for sparsity loss
             min_active_super_nodes (int): Minimum number of super-nodes that must remain active
         """
         super(StableHierarchicalPooling, self).__init__()
@@ -43,6 +44,7 @@ class StableHierarchicalPooling(nn.Module):
         self.pruning_threshold = pruning_threshold
         self.temporal_consistency_weight = temporal_consistency_weight
         self.collapse_prevention_weight = collapse_prevention_weight
+        self.sparsity_weight = sparsity_weight
         self.min_active_super_nodes = min(max(1, min_active_super_nodes), n_super_nodes)
 
         self.assign_mlp = nn.Sequential(
@@ -63,6 +65,13 @@ class StableHierarchicalPooling(nn.Module):
         # Track assignment distribution to detect collapse
         self.register_buffer('assignment_distribution', torch.ones(n_super_nodes) / n_super_nodes)
         self.register_buffer('assignment_variance', torch.zeros(n_super_nodes))
+        
+        # Adaptive sparsity scheduling
+        self.current_sparsity_weight = sparsity_weight
+
+    def set_sparsity_weight(self, weight):
+        """Manually set or update the sparsity weight."""
+        self.current_sparsity_weight = weight
 
     def forward(self, x, batch, pos=None, tau=1.0, hard=False, prev_assignments=None):
         """
@@ -160,7 +169,7 @@ class StableHierarchicalPooling(nn.Module):
             'diversity': diversity_loss,
             'spatial': spatial_loss,
             'pruning': pruning_loss,
-            'sparsity': sparsity_loss,
+            'sparsity': sparsity_loss * self.current_sparsity_weight,
             'temporal_consistency': temporal_consistency_loss * self.temporal_consistency_weight,
             'collapse_prevention': collapse_prevention_loss * self.collapse_prevention_weight,
             'balance': balance_loss
@@ -364,3 +373,47 @@ class DynamicLossBalancer:
             weighted_losses[loss_name] = loss_value * weight
 
         return weighted_losses
+
+
+class SparsityScheduler:
+    """
+    Sparsity scheduler that gradually increases sparsity pressure.
+    This prevents resolution collapse by allowing the model to find a good
+    representation before aggressively pruning super-nodes.
+    """
+
+    def __init__(self, initial_weight=0.0, target_weight=0.1, warmup_steps=1000, 
+                 max_steps=5000, schedule_type='sigmoid'):
+        self.initial_weight = initial_weight
+        self.target_weight = target_weight
+        self.warmup_steps = warmup_steps
+        self.max_steps = max_steps
+        self.schedule_type = schedule_type
+        self.current_step = 0
+
+    def step(self):
+        self.current_step += 1
+        return self.get_weight()
+
+    def get_weight(self):
+        if self.current_step < self.warmup_steps:
+            return self.initial_weight
+        
+        progress = min(1.0, (self.current_step - self.warmup_steps) / (self.max_steps - self.warmup_steps))
+        
+        if self.schedule_type == 'linear':
+            weight = self.initial_weight + progress * (self.target_weight - self.initial_weight)
+        elif self.schedule_type == 'cosine':
+            import math
+            weight = self.target_weight + 0.5 * (self.initial_weight - self.target_weight) * (1 + math.cos(math.pi * progress))
+        elif self.schedule_type == 'sigmoid':
+            # Sigmoid schedule for smoother transition
+            steepness = 10
+            midpoint = 0.5
+            import math
+            sig = 1 / (1 + math.exp(-steepness * (progress - midpoint)))
+            weight = self.initial_weight + sig * (self.target_weight - self.initial_weight)
+        else:
+            weight = self.target_weight
+            
+        return weight
