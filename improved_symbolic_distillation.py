@@ -286,7 +286,9 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
         from sklearn.linear_model import ElasticNet
         n_features = X.shape[1]
         
-        curr_threshold = threshold
+        y_std = np.std(y)
+        # Use relative threshold based on signal standard deviation, but with a floor
+        curr_threshold = max(threshold * y_std, 1e-4)
         best_mask = np.ones(n_features, dtype=bool)
         
         # Adaptive loop: if we prune too much, try again with smaller threshold
@@ -311,6 +313,7 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
                 active_coeffs = np.abs(model.coef_)
 
                 if len(active_coeffs) > 0:
+                    # Adaptive thresholding: combination of base threshold and percentile
                     percentile_threshold = np.percentile(active_coeffs, 40)
                     adaptive_threshold = max(adaptive_base_threshold, percentile_threshold)
                     new_mask[mask] = active_coeffs > adaptive_threshold
@@ -323,13 +326,22 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
             
             # Check if we have enough features
             num_selected = np.sum(mask)
-            if num_selected >= 5 or (attempt > 0 and num_selected >= 2):
+            if num_selected >= 2: # At least 2 features
                 best_mask = mask
                 break
             
             # If not enough features, reduce threshold and try again
             curr_threshold *= 0.5
             best_mask = mask # Keep the best so far just in case
+
+        # FEATURE FALLBACK: If SINDy prunes to 0 features, force a fallback
+        if np.sum(best_mask) == 0:
+            print("  -> SINDy pruned all features. Falling back to top 5 features by Mutual Information.")
+            from sklearn.feature_selection import mutual_info_regression
+            mi_scores = mutual_info_regression(X, y, random_state=42)
+            top_indices = np.argsort(mi_scores)[-min(5, n_features):]
+            best_mask = np.zeros(n_features, dtype=bool)
+            best_mask[top_indices] = True
             
         return best_mask
 
@@ -866,7 +878,7 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
         for i in range(targets.shape[1]):
             eq, mask, conf = self._distill_single_target(i, X_norm, Y_norm, targets.shape[1], latent_states.shape[1], is_hamiltonian=is_hamiltonian_distill)
             
-            # PHYSICALITY VALIDATION for Hamiltonian
+            # SOFT PHYSICALITY GATING for Hamiltonian
             if is_hamiltonian_distill and eq is not None:
                 # Get the set of features used in the equation
                 eq_str = str(eq)
@@ -874,11 +886,6 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
                 used_features = [int(f) for f in re.findall(r'X(\d+)', eq_str)]
                 
                 # Check if it contains at least one q and one p from the latent space
-                # q indices: k*D + d where d < D/2
-                # p indices: k*D + d where d >= D/2
-                # Features are indexed by the full_mask/valid_indices in _distill_single_target
-                # But here we just check if any X{i} where i is a q-index or p-index is present
-                
                 half_d = latent_dim // 2
                 q_indices = []
                 p_indices = []
@@ -892,9 +899,9 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
                 has_p = any(f in p_indices for f in used_features)
                 
                 if not (has_q and has_p):
-                    print(f"  -> WARNING: Discovered Hamiltonian H(z) = {eq_str} lacks physical dependency (needs both q and p). Discarding.")
-                    eq = None
-                    conf = 0.0
+                    print(f"  -> WARNING: Discovered Hamiltonian H(z) = {eq_str} lacks physical dependency (needs both q and p). Reducing confidence.")
+                    # Soft gating: reduce confidence by 50% instead of discarding
+                    conf *= 0.5
             
             equations.append(eq)
             self.feature_masks.append(mask)

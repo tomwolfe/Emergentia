@@ -302,7 +302,7 @@ def main():
             log_str += f"Rec: {stats_tracker.get('rec_raw', 0):.4f} | "
             log_str += f"Cons: {stats_tracker.get('cons_raw', 0):.4f} | "
             log_str += f"Energy Err: {energy_error:.4f} | "
-            log_str += f"LVar: {stats_tracker.get('lvars_mean', 0):.2f} | "
+            log_str += f"LVar: {stats_tracker.get('lvar_raw', 0):.4f} | "
             log_str += f"Active: {active_nodes} | "
             log_str += f"LR: {trainer.optimizer.param_groups[0]['lr']:.2e}"
             print(log_str)
@@ -349,24 +349,28 @@ def main():
 
     # --- Quality Gate ---
     print(f"\nFinal Training Loss: {last_loss:.6f}")
-    if rec > 0.2:  # Adjusted threshold to be more realistic for complex systems
+    # NEW: Minimum Epoch Guard: Only attempt additional training if we've run for a minimum number of epochs
+    if rec > 0.2 and epoch >= 50:  # Adjusted threshold to be more realistic for complex systems
         print(f"WARNING: Model may not have converged fully (Rec Loss: {rec:.6f}).")
         # If the reconstruction loss is still high, try a few more training epochs with a lower learning rate
         if rec > 0.3:
-            print("Attempting additional training with reduced learning rate and optimizer reset...")
-            # Reduce learning rate and re-initialize optimizer to clear momentum buffers
-            new_lr = trainer.optimizer.param_groups[0]['lr'] * 0.1
-            trainer.optimizer = torch.optim.Adam(model.parameters(), lr=new_lr, weight_decay=1e-5)
+            print("Attempting additional training with reduced learning rate...")
+            # Reduce learning rate instead of re-initializing optimizer to preserve momentum
+            for param_group in trainer.optimizer.param_groups:
+                param_group['lr'] *= 0.1
 
             # Train for additional epochs
             additional_epochs = 50  # Reduced additional epochs to prevent overfitting
-            for epoch in range(epochs, epochs + additional_epochs):
+            for epoch_add in range(epoch + 1, epoch + 1 + additional_epochs):
                 idx = np.random.randint(0, len(dataset) - seq_len)
                 batch_data = dataset[idx : idx + seq_len]
-                loss, rec, cons = trainer.train_step(batch_data, sim.dt, epoch=epoch, max_epochs=epochs+additional_epochs)
+                loss, rec, cons = trainer.train_step(batch_data, sim.dt, epoch=epoch_add, max_epochs=epoch + 1 + additional_epochs)
 
-                if epoch % 25 == 0:
-                    print(f"Additional Epoch {epoch}, Loss: {loss:.6f}, Rec: {rec:.6f}")
+                # NEW: Gradient Safeguard
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
+
+                if epoch_add % 25 == 0:
+                    print(f"Additional Epoch {epoch_add}, Loss: {loss:.6f}, Rec: {rec:.6f}")
 
                 if rec < 0.2:  # Break if we achieve reasonable reconstruction
                     print(f"Additional training achieved rec loss of {rec:.6f}, stopping.")
@@ -389,10 +393,11 @@ def main():
             original_energy_weight = getattr(trainer, 'energy_weight', 0.1)
             trainer.energy_weight = min(0.8, original_energy_weight * 1.2)  # NEW: Use 1.2x multiplier instead of 3x
 
-            # NEW: Reduce learning rate significantly and RESET optimizer for more stable energy-focused training
+            # NEW: Reduce learning rate significantly WITHOUT resetting optimizer for more stable energy-focused training
             original_lr = trainer.optimizer.param_groups[0]['lr']
-            new_lr = original_lr * 0.001
-            trainer.optimizer = torch.optim.Adam(model.parameters(), lr=new_lr, weight_decay=1e-5)
+            new_lr = original_lr * 0.01 # Less drastic reduction than before
+            for param_group in trainer.optimizer.param_groups:
+                param_group['lr'] = new_lr
 
             # NEW: Use a more conservative energy weight to prevent divergence
             original_energy_weight = getattr(trainer, 'energy_weight', 0.1)
@@ -402,12 +407,15 @@ def main():
             # NEW: More targeted energy-focused training with physics-informed loss
             additional_epochs = 50  # Reduced epochs to prevent overfitting
             diverged = False
-            for epoch in range(epochs + additional_epochs, epochs + 2 * additional_epochs):
+            for epoch_energy in range(epochs + additional_epochs, epochs + 2 * additional_epochs):
                 idx = np.random.randint(0, len(dataset) - seq_len)
                 batch_data = dataset[idx : idx + seq_len]
 
                 # NEW: Add physics-informed loss during energy-focused training
-                loss, rec, cons = trainer.train_step(batch_data, sim.dt, epoch=epoch, max_epochs=epochs + 2 * additional_epochs)
+                loss, rec, cons = trainer.train_step(batch_data, sim.dt, epoch=epoch_energy, max_epochs=epochs + 2 * additional_epochs)
+
+                # NEW: Implement gradient clipping specifically for energy-focused training to prevent divergence
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)  # More conservative clipping
 
                 # ROLLBACK CHECK: If total loss increases by more than 15%, abort and restore
                 if loss > initial_energy_phase_loss * 1.15:
@@ -416,20 +424,15 @@ def main():
                     diverged = True
                     break
 
-                # NEW: Implement gradient clipping specifically for energy-focused training to prevent divergence
-                if hasattr(trainer, 'optimizer'):
-                    # Clip gradients to prevent explosion during energy-focused training
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)  # More conservative clipping
-
-                if epoch % 10 == 0:
+                if epoch_energy % 10 == 0:
                     current_energy_error = compute_energy_conservation_with_smoothing(model, dataset, sim, device)
-                    print(f"Energy-focused Epoch {epoch}, Loss: {loss:.6f}, Rec: {rec:.6f}, Energy Err: {current_energy_error:.4f}")
+                    print(f"Energy-focused Epoch {epoch_energy}, Loss: {loss:.6f}, Rec: {rec:.6f}, Energy Err: {current_energy_error:.4f}")
 
                 # NEW: More aggressive target for energy conservation improvement
                 current_energy_error = compute_energy_conservation_with_smoothing(model, dataset, sim, device)
 
                 # NEW: Early stopping if energy error starts increasing (indicating divergence)
-                if epoch > (epochs + additional_epochs + 5):  # Allow some initial exploration
+                if epoch_energy > (epochs + additional_epochs + 5):  # Allow some initial exploration
                     if 'prev_energy_errors_list' not in locals():
                         prev_energy_errors_list = []
                     prev_energy_errors_list.append(current_energy_error)

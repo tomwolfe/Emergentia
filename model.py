@@ -456,15 +456,26 @@ class DiscoveryEngineModel(nn.Module):
         self.mi_discriminator = MIDiscriminator(min(latent_dim, 2), 2, hidden_dim)
 
         # Learnable loss log-variances for automatic loss balancing
-        # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning, 8: sep, 9: conn, 10: sparsity, 11: mi, 12: sym
+        # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning, 8: sep, 9: conn, 10: sparsity, 11: mi, 12: sym, 13: var
         # Initialize log_vars[0] (rec) to a negative value to give it higher initial weight
-        lvars = torch.zeros(13)
+        lvars = torch.zeros(14)
         lvars[0] = -2.0 # Boost reconstruction significantly
         lvars[2] = 0.0  # Balanced initial assignment weight
         lvars[3] = -1.6 # Boost ortho (0.0 - 1.6)
         lvars[6] = 0.5  # Suppress alignment slightly
+        lvars[13] = -1.0 # Boost latent variance loss to prevent collapse
         self.log_vars = nn.Parameter(lvars) 
         
+    def get_latent_variance_loss(self, z):
+        """
+        Explicitly penalize low latent variance to prevent manifold collapse.
+        z: [B, K, D] or [T, B, K, D]
+        """
+        # Calculate variance across the feature dimension D for each super-node
+        # We want the latent space to be utilized, so we penalize low variance
+        var = z.var(dim=-1).mean()
+        return -torch.log(var + 1e-6)
+
     def get_mi_loss(self, z, mu):
         """
         Unsupervised alignment loss via Mutual Information Maximization (MINE).

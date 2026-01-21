@@ -379,7 +379,8 @@ class SparsityScheduler:
         if self.current_step < self.warmup_steps:
             return self.initial_weight
         
-        progress = min(1.0, (self.current_step - self.warmup_steps) / (self.max_steps - self.warmup_steps))
+        # Calculate progress relative to the remaining steps after warmup
+        progress = min(1.0, (self.current_step - self.warmup_steps) / max(1, self.max_steps - self.warmup_steps))
         
         if self.schedule_type == 'linear':
             weight = self.initial_weight + progress * (self.target_weight - self.initial_weight)
@@ -388,10 +389,17 @@ class SparsityScheduler:
             weight = self.target_weight + 0.5 * (self.initial_weight - self.target_weight) * (1 + math.cos(math.pi * progress))
         elif self.schedule_type == 'sigmoid':
             # Sigmoid schedule for smoother transition
-            steepness = 10
+            # Stays low for longer if we shift the midpoint or increase steepness
+            steepness = 12.0
             midpoint = 0.5
             import math
+            # Shifted sigmoid to stay near zero longer
             sig = 1 / (1 + math.exp(-steepness * (progress - midpoint)))
+            # Re-normalize sigmoid to [0, 1] range within the progress window
+            sig_min = 1 / (1 + math.exp(-steepness * (0 - midpoint)))
+            sig_max = 1 / (1 + math.exp(-steepness * (1 - midpoint)))
+            sig = (sig - sig_min) / (sig_max - sig_min)
+            
             weight = self.initial_weight + sig * (self.target_weight - self.initial_weight)
         else:
             weight = self.target_weight

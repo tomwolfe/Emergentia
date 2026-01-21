@@ -349,6 +349,7 @@ class Trainer:
         loss_align = torch.tensor(0.0, device=self.device)
         loss_mi = torch.tensor(0.0, device=self.device)
         loss_sym = torch.tensor(0.0, device=self.device)
+        loss_var = self.model.get_latent_variance_loss(z_curr)
 
         # Symbolic-in-the-loop loss with FIDELITY GATING
         # Point 3: Addressing Symbolic-Neural Feedback Loop Fragility
@@ -467,8 +468,7 @@ class Trainer:
         loss_sep /= (seq_len // 2)
         loss_conn /= (seq_len // 2)
 
-        # Adaptive Loss Weighting with slightly more conservative clamping
-        # Increasing min from -1.0 to -0.5 to prevent weights from exploding too much
+        # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning, 8: sep, 9: conn, 10: sparsity, 11: mi, 12: sym, 13: var
         lvars = torch.clamp(self.model.log_vars, min=-0.5, max=5.0)
 
         raw_weights = {
@@ -478,7 +478,7 @@ class Trainer:
             'align': torch.exp(-lvars[6]), 'pruning': torch.exp(-lvars[7]),
             'sep': torch.exp(-lvars[8]), 'conn': torch.exp(-lvars[9]),
             'sparsity': torch.exp(-lvars[10]), 'mi': torch.exp(-lvars[11]),
-            'sym': torch.exp(-lvars[12])
+            'sym': torch.exp(-lvars[12]), 'var': torch.exp(-lvars[13])
         }
 
         # NEW: Use enhanced loss balancer if available
@@ -491,7 +491,7 @@ class Trainer:
                 'align': loss_align, 'pruning': loss_pruning,
                 'sep': loss_sep, 'conn': loss_conn,
                 'sparsity': loss_sparsity, 'mi': loss_mi,
-                'sym': loss_sym
+                'sym': loss_sym, 'var': loss_var
             }
 
             # Update weights using enhanced balancer
@@ -521,7 +521,8 @@ class Trainer:
                          (weights['conn'] * loss_conn + lvars[9]) + \
                          (weights['sparsity'] * loss_sparsity + lvars[10]) + \
                          (weights['mi'] * loss_mi + lvars[11]) + \
-                         (weights['sym'] * self.symbolic_weight * loss_sym + lvars[12])
+                         (weights['sym'] * self.symbolic_weight * loss_sym + lvars[12]) + \
+                         (weights['var'] * loss_var + lvars[13])
 
         if is_warmup:
             loss = discovery_loss
@@ -583,6 +584,7 @@ class Trainer:
             'align': loss_align,
             'mi': loss_mi,
             'sym': loss_sym,
+            'lvar_raw': loss_var,
             'lvars_mean': lvars.mean()
         }, weights=weights)
 
