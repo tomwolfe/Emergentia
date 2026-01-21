@@ -319,8 +319,9 @@ class Trainer:
         # 3. Decaying Teacher Forcing Ratio (more aggressive decay)
         tf_ratio = max(0.0, 0.8 * (1.0 - epoch / (0.5 * max_epochs + 1e-9)))  # Faster decay
 
-        # 4. Alignment Annealing
-        align_weight = max(0.1, 1.0 - epoch / (self.align_anneal_epochs + 1e-9))
+        # 4. Alignment Annealing - Enhanced to promote better physical mapping
+        # Start with higher weight and anneal more gradually to ensure strong initial alignment
+        align_weight = max(0.3, 1.2 - epoch / (self.align_anneal_epochs * 0.7 + 1e-9))  # Higher initial weight and slower decay
 
         # 5. Adaptive Entropy Weight: Increase over time to force discrete clusters
         # Point 1: Addressing "Blurry" Meso-scale
@@ -430,13 +431,14 @@ class Trainer:
             loss_conn += self.model.get_connectivity_loss(s_t, batch_t.edge_index)
             loss_ortho += self.model.get_ortho_loss(s_t)
 
-            # CoM Position Alignment
+            # CoM Position Alignment - Enhanced weight for better physical mapping
             mu_t_norm = (mu_t - mu_mean) / (mu_std + 1e-6)
             d_sub = self.model.encoder.latent_dim // 2 if self.model.hamiltonian else 2
             d_align = min(d_sub, 2)
 
             p_align = self.criterion(z_preds[t, :, :, :d_align], mu_t_norm[:, :, :d_align])
-            loss_align += align_weight * p_align
+            # Increase the alignment weight to promote stronger physical mapping
+            loss_align += align_weight * 2.0 * p_align  # Doubled the alignment contribution
 
             # Mutual Information Alignment (Unsupervised)
             loss_mi += self.model.get_mi_loss(z_preds[t], mu_t_norm)

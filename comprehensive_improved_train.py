@@ -371,7 +371,12 @@ def main():
             # NEW: Reduce learning rate for more stable energy-focused training
             original_lr = trainer.optimizer.param_groups[0]['lr']
             for param_group in trainer.optimizer.param_groups:
-                param_group['lr'] *= 0.1  # Reduce learning rate by factor of 10
+                param_group['lr'] *= 0.05  # Reduce learning rate by factor of 20 for more stability
+
+            # NEW: Use a more conservative energy weight to prevent divergence
+            original_energy_weight = getattr(trainer, 'energy_weight', 0.1)
+            # Reduce the energy weight to be less aggressive and prevent loss explosion
+            trainer.energy_weight = min(0.3, original_energy_weight * 1.5)  # Less aggressive increase
 
             # NEW: More targeted energy-focused training with physics-informed loss
             additional_epochs = 100  # Increased epochs for better energy conservation
@@ -382,12 +387,32 @@ def main():
                 # NEW: Add physics-informed loss during energy-focused training
                 loss, rec, cons = trainer.train_step(batch_data, sim.dt, epoch=epoch, max_epochs=epochs + 2 * additional_epochs)
 
+                # NEW: Implement gradient clipping specifically for energy-focused training to prevent divergence
+                if hasattr(trainer, 'optimizer'):
+                    # Clip gradients to prevent explosion during energy-focused training
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+
                 if epoch % 10 == 0:
                     current_energy_error = compute_energy_conservation_with_smoothing(model, dataset, sim, device)
                     print(f"Energy-focused Epoch {epoch}, Loss: {loss:.6f}, Rec: {rec:.6f}, Energy Err: {current_energy_error:.4f}")
 
                 # NEW: More aggressive target for energy conservation improvement
                 current_energy_error = compute_energy_conservation_with_smoothing(model, dataset, sim, device)
+
+                # NEW: Early stopping if energy error starts increasing (indicating divergence)
+                if epoch > (epochs + additional_epochs + 10):  # Allow some initial exploration
+                    prev_energy_errors = []
+                    if 'prev_energy_errors' not in locals():
+                        prev_energy_errors = []
+                    prev_energy_errors.append(current_energy_error)
+
+                    # Check if energy error is increasing over recent epochs (sign of divergence)
+                    if len(prev_energy_errors) > 5:
+                        prev_energy_errors = prev_energy_errors[-5:]
+                        if all(prev_energy_errors[i] > prev_energy_errors[i-1] for i in range(1, len(prev_energy_errors))):
+                            print(f"Energy error consistently increasing, stopping energy-focused training to prevent divergence.")
+                            break
+
                 if current_energy_error < 0.05:  # More aggressive target
                     print(f"Energy conservation improved to {current_energy_error:.4f}, stopping energy-focused training.")
                     break
@@ -602,7 +627,13 @@ def main():
 
                 # Transform z to features for the symbolic equation
                 if hasattr(distiller, 'transformer') and distiller.transformer:
-                    X = distiller.transformer.transform(z_state.reshape(1, -1))
+                    # Ensure z_state is properly shaped for transformer
+                    if z_state.ndim == 1:
+                        z_input = z_state.reshape(1, -1)
+                    else:
+                        z_input = z_state
+
+                    X = distiller.transformer.transform(z_input)
                     X_full = distiller.transformer.normalize_x(X)
                 else:
                     X_full = z_state.reshape(1, -1)

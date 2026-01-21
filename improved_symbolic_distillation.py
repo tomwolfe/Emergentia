@@ -32,17 +32,27 @@ class ImprovedFeatureTransformer(FeatureTransformer):
         Improved feature transformation with better physics-inspired features.
         Input: z_flat [batch_size, n_features] where n_features = n_nodes * n_dims
         """
+        # Handle 1D input by reshaping to 2D with batch_size=1
+        if z_flat.ndim == 1:
+            # Calculate n_nodes and n_dims from the flattened shape
+            total_features = z_flat.shape[0]
+            n_nodes = self.n_super_nodes
+            n_dims = self.latent_dim
+
+            # Reshape 1D to 2D with batch_size=1
+            z_flat = z_flat.reshape(1, -1)
+        else:
+            # For 2D input, determine batch_size and feature count
+            batch_size = z_flat.shape[0]
+            total_features = z_flat.shape[1]
+            n_nodes = self.n_super_nodes
+            n_dims = self.latent_dim
+
         # Clamp input for stability
         z_flat = np.clip(z_flat, -1e6, 1e6)
-        batch_size = z_flat.shape[0]
-
-        # Calculate n_nodes and n_dims from the flattened shape
-        total_features = z_flat.shape[1]
-        n_nodes = self.n_super_nodes
-        n_dims = self.latent_dim
 
         # Reshape to [batch_size, n_nodes, n_dims]
-        z_nodes = z_flat.reshape(batch_size, n_nodes, n_dims)
+        z_nodes = z_flat.reshape(z_flat.shape[0], n_nodes, n_dims)
 
         features = [z_flat]
 
@@ -120,7 +130,14 @@ class ImprovedFeatureTransformer(FeatureTransformer):
                 poly_features.append((X[:, i:i+1]**3))
 
         res = np.hstack(poly_features)
-        return np.clip(res, -1e6, 1e6) # Final safety clamp
+
+        # If the original input was 1D, return 1D result
+        if z_flat.shape[0] == 1:  # batch_size was 1 (original input was 1D)
+            result = np.clip(res[0], -1e6, 1e6)  # Return the single sample as 1D
+        else:
+            result = np.clip(res, -1e6, 1e6)  # Return 2D result
+
+        return result
 
 
 class ImprovedSymbolicDistiller(SymbolicDistiller):
@@ -130,7 +147,7 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
 
     def __init__(self, populations=1500, generations=40, stopping_criteria=0.001, max_features=15,
                  secondary_optimization=True, opt_method='L-BFGS-B', opt_iterations=100,
-                 use_sindy_pruning=True, sindy_threshold=0.01, 
+                 use_sindy_pruning=True, sindy_threshold=0.001,  # Reduced from 0.01 to prevent over-pruning
                  enhanced_feature_selection=True, physics_informed=True):
         super().__init__(populations, generations, stopping_criteria, max_features)
         self.secondary_optimization = secondary_optimization
@@ -250,31 +267,37 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
         n_features = X.shape[1]
         mask = np.ones(n_features, dtype=bool)
 
+        # NEW: Make threshold adaptive based on target variance to prevent over-pruning
+        y_var = np.var(y)
+        adaptive_base_threshold = max(threshold, 0.001 * np.sqrt(y_var))  # Base threshold adapts to target scale
+
         for iteration in range(max_iter):
-            if not np.any(mask): 
+            if not np.any(mask):
                 break
-                
+
             # NEW: Use ElasticNet instead of Ridge for better sparsity
             model = ElasticNet(alpha=1e-5, l1_ratio=0.9, max_iter=1000)
             X_active = X[:, mask]
-            
+
             if X_active.shape[1] == 0:
                 break
-                
+
             model.fit(X_active, y)
 
             # Update mask: threshold coefficients
             new_mask = np.zeros(n_features, dtype=bool)
             active_coeffs = np.abs(model.coef_)
-            
-            # NEW: Adaptive thresholding based on coefficient distribution
+
+            # NEW: Adaptive thresholding based on coefficient distribution and target variance
             if len(active_coeffs) > 0:
-                adaptive_threshold = max(threshold, np.percentile(active_coeffs, 70))  # Top 30% kept
+                # Use both percentile and variance-adaptive thresholds
+                percentile_threshold = np.percentile(active_coeffs, 60)  # Keep more features (top 40%)
+                adaptive_threshold = max(adaptive_base_threshold, percentile_threshold)
                 new_mask[mask] = active_coeffs > adaptive_threshold
             else:
                 new_mask[mask] = True
 
-            if np.array_equal(mask, new_mask): 
+            if np.array_equal(mask, new_mask):
                 break
             mask = new_mask
 

@@ -139,10 +139,20 @@ class ImprovedSymbolicDynamics:
         else:
             z_reshaped = z.flatten()
 
-        # Transform z to features
+        # Transform z to features - ensure proper input shape for transformer
         if self.transformer:
-            # Handle both 1D and 2D inputs for transformer
-            X = self.transformer.transform(z_reshaped.reshape(1, -1))
+            # Handle both 1D and 2D inputs for transformer - ensure 2D input
+            if z_reshaped.ndim == 1:
+                z_input = z_reshaped.reshape(1, -1)
+            else:
+                z_input = z_reshaped
+
+            # DEBUG: Check input shape before calling transformer
+            if z_input.ndim != 2:
+                print(f"DEBUG: Expected 2D input for transformer, got {z_input.ndim}D with shape {z_input.shape}")
+                z_input = z_input.reshape(1, -1)  # Ensure 2D
+
+            X = self.transformer.transform(z_input)
             X_full = self.transformer.normalize_x(X)
         else:
             X_full = z_reshaped.reshape(1, -1)
@@ -157,10 +167,25 @@ class ImprovedSymbolicDynamics:
             z_plus[i] += eps
             z_minus[i] -= eps
 
-            # Transform and normalize both perturbed states
+            # Transform and normalize both perturbed states - ensure proper input shape
             if self.transformer:
-                X_plus = self.transformer.transform(z_plus.reshape(1, -1))
-                X_minus = self.transformer.transform(z_minus.reshape(1, -1))
+                if z_plus.ndim == 1:
+                    z_plus_input = z_plus.reshape(1, -1)
+                    z_minus_input = z_minus.reshape(1, -1)
+                else:
+                    z_plus_input = z_plus
+                    z_minus_input = z_minus
+
+                # DEBUG: Check input shapes before calling transformer
+                if z_plus_input.ndim != 2:
+                    print(f"DEBUG: Expected 2D input for transformer (plus), got {z_plus_input.ndim}D with shape {z_plus_input.shape}")
+                    z_plus_input = z_plus_input.reshape(1, -1)  # Ensure 2D
+                if z_minus_input.ndim != 2:
+                    print(f"DEBUG: Expected 2D input for transformer (minus), got {z_minus_input.ndim}D with shape {z_minus_input.shape}")
+                    z_minus_input = z_minus_input.reshape(1, -1)  # Ensure 2D
+
+                X_plus = self.transformer.transform(z_plus_input)
+                X_minus = self.transformer.transform(z_minus_input)
                 X_plus_full = self.transformer.normalize_x(X_plus)
                 X_minus_full = self.transformer.normalize_x(X_minus)
             else:
@@ -174,17 +199,17 @@ class ImprovedSymbolicDynamics:
             try:
                 if feature_mask is not None and np.any(feature_mask):
                     # Use only the selected features
-                    H_plus = self.equations[0].execute(X_plus_full[:, feature_mask])
-                    H_minus = self.equations[0].execute(X_minus_full[:, feature_mask])
+                    H_plus_raw = self.equations[0].execute(X_plus_full[:, feature_mask])
+                    H_minus_raw = self.equations[0].execute(X_minus_full[:, feature_mask])
                 else:
                     # Use all features if no mask
-                    H_plus = self.equations[0].execute(X_plus_full)
-                    H_minus = self.equations[0].execute(X_minus_full)
+                    H_plus_raw = self.equations[0].execute(X_plus_full)
+                    H_minus_raw = self.equations[0].execute(X_minus_full)
 
                 # Handle cases where execute returns arrays or scalars
                 # NEW: More robust handling to prevent tuple index out of range
-                H_plus = self._safe_extract_value(H_plus)
-                H_minus = self._safe_extract_value(H_minus)
+                H_plus = self._safe_extract_value(H_plus_raw)
+                H_minus = self._safe_extract_value(H_minus_raw)
 
                 grad_H[i] = (H_plus - H_minus) / (2 * eps)
             except Exception as e:
