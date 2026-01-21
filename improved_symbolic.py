@@ -13,13 +13,14 @@ class ImprovedSymbolicDynamics:
     """
     Enhanced symbolic dynamics class for integrating discovered equations.
     """
-    def __init__(self, distiller, equations, feature_masks, is_hamiltonian, n_super_nodes, latent_dim):
+    def __init__(self, distiller, equations, feature_masks, is_hamiltonian, n_super_nodes, latent_dim, model=None):
         self.distiller = distiller
         self.equations = equations
         self.feature_masks = feature_masks
         self.is_hamiltonian = is_hamiltonian
         self.n_super_nodes = n_super_nodes
         self.latent_dim = latent_dim
+        self.model = model
 
         # NEW: Precompute transformation parameters for efficiency
         if hasattr(distiller, 'transformer'):
@@ -235,6 +236,17 @@ class ImprovedSymbolicDynamics:
         # Final safety check for gradient
         if not np.all(np.isfinite(grad_H)):
             grad_H = np.nan_to_num(grad_H, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # FALLBACK: If grad_H is effectively zero, use learned neural derivatives
+        if np.linalg.norm(grad_H) < 1e-6 and self.model is not None:
+            # print("Warning: Symbolic gradient is zero. Using neural fallback.")
+            with torch.no_grad():
+                z_tensor = torch.from_numpy(z_reshaped).float().unsqueeze(0)
+                # Ensure it's on the correct device
+                device = next(self.model.parameters()).device
+                z_tensor = z_tensor.to(device)
+                dz_neural = self.model.ode_func(0, z_tensor).cpu().numpy().flatten()
+                return dz_neural
 
         # For Hamiltonian systems: [dq/dt, dp/dt] = [dH/dp, -dH/dq]
         # Assuming z = [q, p] where q and p have equal dimensions

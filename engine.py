@@ -564,12 +564,14 @@ class Trainer:
             if ((epoch + 1) % self.grad_acc_steps == 0) or (epoch == max_epochs - 1):
                 # Increased gradient clipping for better stability
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_value_(self.model.parameters(), clip_value=0.5)
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
         else:
             loss.backward()
             # Increased gradient clipping for better stability
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_value_(self.model.parameters(), clip_value=0.5)
             self.optimizer.step()
 
         # Update loss tracker for logging

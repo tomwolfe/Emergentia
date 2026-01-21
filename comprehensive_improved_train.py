@@ -49,9 +49,9 @@ def robust_energy(sim, pos, vel):
         
         dist_sq = np.sum(diff**2, axis=1)
         
-        # NEW: Implement 'soft-floor' for particle distances: clip at 0.7 * sigma
+        # NEW: Implement 'soft-floor' for particle distances: clip at 0.9 * sigma
         sigma = getattr(sim, 'sigma', 1.0)
-        dist_sq = np.maximum(dist_sq, (0.7 * sigma)**2)
+        dist_sq = np.maximum(dist_sq, (0.9 * sigma)**2)
         
         if hasattr(sim, 'epsilon'): # Lennard-Jones
             sr6 = (sim.sigma**2 / dist_sq)**3
@@ -96,10 +96,12 @@ def compute_energy_conservation_during_training(model, dataset, sim, device):
                 true_energy = robust_energy(sim, batch_data.x[:, :2].cpu().numpy(), batch_data.x[:, 2:].cpu().numpy())
 
                 # Safely compute energy error to avoid division by zero
+                # Use log1p to compress the range without losing the gradient signal
                 energy_error = abs(recon_energy - true_energy) / (abs(true_energy) + 1e-9)
+                energy_error = np.log1p(energy_error)
 
-                # Cap error to prevent extreme values
-                energy_error = min(energy_error, 100.0)
+                # Cap error to prevent extreme values (increased cap)
+                energy_error = min(energy_error, 1e6)
 
                 if np.isfinite(energy_error) and not np.isnan(energy_error):
                     total_energy_error += energy_error
@@ -139,8 +141,9 @@ def compute_energy_conservation_with_smoothing(model, dataset, sim, device, smoo
                 recon_energy = robust_energy(sim, recon_pos, recon_vel)
                 true_energy = robust_energy(sim, batch_data.x[:, :2].cpu().numpy(), batch_data.x[:, 2:].cpu().numpy())
 
+                # Use log1p to compress the range without losing the gradient signal
                 energy_error = abs(recon_energy - true_energy) / (abs(true_energy) + 1e-9)
-                energy_error = min(energy_error, 100.0)
+                energy_error = np.log1p(min(energy_error, 1e6))
 
                 if np.isfinite(energy_error) and not np.isnan(energy_error):
                     energy_errors.append(energy_error)
@@ -169,7 +172,7 @@ def compute_energy_conservation_with_smoothing(model, dataset, sim, device, smoo
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--epochs', type=int, default=500)  # Increased epochs for better convergence
+    parser.add_argument('--epochs', type=int, default=300)  # Increased default epochs for better convergence
     parser.add_argument('--steps', type=int, default=100)   # Increased steps for better data
     parser.add_argument('--particles', type=int, default=8) # Increased particles for richer dynamics
     parser.add_argument('--super_nodes', type=int, default=4)
@@ -232,7 +235,8 @@ def main():
                                           hidden_dim=64,  # Increased hidden dim for better capacity
                                           hamiltonian=True,
                                           dissipative=True,
-                                          min_active_super_nodes=min_active).to(device)
+                                          min_active_super_nodes=min_active,
+                                          box_size=box_size[0]).to(device)
 
     # Initialize model weights for better convergence
     def init_weights(m):
@@ -381,6 +385,11 @@ def main():
         # NEW: Attempt additional training with energy-focused loss if energy error is high
         if final_energy_error > 0.2:
             print("Attempting energy-focused retraining...")
+            
+            # ROLLBACK MECHANISM: Save model state before starting energy-focused phase
+            pre_energy_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            initial_energy_phase_loss = last_loss
+            
             # Temporarily increase the energy conservation weight in the trainer
             original_energy_weight = getattr(trainer, 'energy_weight', 0.1)
             trainer.energy_weight = min(0.8, original_energy_weight * 1.2)  # NEW: Use 1.2x multiplier instead of 3x
@@ -397,12 +406,20 @@ def main():
 
             # NEW: More targeted energy-focused training with physics-informed loss
             additional_epochs = 50  # Reduced epochs to prevent overfitting
+            diverged = False
             for epoch in range(epochs + additional_epochs, epochs + 2 * additional_epochs):
                 idx = np.random.randint(0, len(dataset) - seq_len)
                 batch_data = dataset[idx : idx + seq_len]
 
                 # NEW: Add physics-informed loss during energy-focused training
                 loss, rec, cons = trainer.train_step(batch_data, sim.dt, epoch=epoch, max_epochs=epochs + 2 * additional_epochs)
+
+                # ROLLBACK CHECK: If total loss increases by more than 15%, abort and restore
+                if loss > initial_energy_phase_loss * 1.15:
+                    print(f"Energy-focused training diverged (Loss: {loss:.4f} > {initial_energy_phase_loss:.4f} * 1.15). Rolling back.")
+                    model.load_state_dict(pre_energy_state)
+                    diverged = True
+                    break
 
                 # NEW: Implement gradient clipping specifically for energy-focused training to prevent divergence
                 if hasattr(trainer, 'optimizer'):
@@ -418,15 +435,14 @@ def main():
 
                 # NEW: Early stopping if energy error starts increasing (indicating divergence)
                 if epoch > (epochs + additional_epochs + 5):  # Allow some initial exploration
-                    prev_energy_errors = []
-                    if 'prev_energy_errors' not in locals():
-                        prev_energy_errors = []
-                    prev_energy_errors.append(current_energy_error)
+                    if 'prev_energy_errors_list' not in locals():
+                        prev_energy_errors_list = []
+                    prev_energy_errors_list.append(current_energy_error)
 
                     # Check if energy error is increasing over recent epochs (sign of divergence)
-                    if len(prev_energy_errors) > 3:
-                        prev_energy_errors = prev_energy_errors[-3:]
-                        if all(prev_energy_errors[i] > prev_energy_errors[i-1] for i in range(1, len(prev_energy_errors))):
+                    if len(prev_energy_errors_list) > 3:
+                        recent_errors = prev_energy_errors_list[-3:]
+                        if all(recent_errors[i] > recent_errors[i-1] for i in range(1, len(recent_errors))):
                             print(f"Energy error consistently increasing, stopping energy-focused training to prevent divergence.")
                             break
 
@@ -434,8 +450,10 @@ def main():
                     print(f"Energy conservation improved to {current_energy_error:.4f}, stopping energy-focused training.")
                     break
 
-            # Restore original energy weight and learning rate
-            trainer.energy_weight = original_energy_weight
+            if not diverged:
+                # Restore original energy weight and learning rate
+                trainer.energy_weight = original_energy_weight
+            
             for param_group in trainer.optimizer.param_groups:
                 param_group['lr'] = original_lr
 
@@ -523,7 +541,7 @@ def main():
         print("No valid latent states for integration. Using original states for visualization.")
         z_simulated = z_states[:len(t_eval)] if 't_eval' in locals() else z_states
     else:
-        dyn_fn = ImprovedSymbolicDynamics(distiller, equations, distiller.feature_masks, is_hamiltonian, n_super_nodes, latent_dim)
+        dyn_fn = ImprovedSymbolicDynamics(distiller, equations, distiller.feature_masks, is_hamiltonian, n_super_nodes, latent_dim, model=model)
 
         # Integrate the discovered equations
         z0 = z_states[0]

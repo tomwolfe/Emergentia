@@ -45,6 +45,12 @@ class OptimizedEquivariantGNNLayer(MessagePassing):
             nn.SiLU(),
             nn.Linear(hidden_dim//2, out_channels)
         )
+        
+        # Shortcut for residual connection when dims don't match
+        if in_channels != out_channels:
+            self.shortcut = nn.Linear(in_channels, out_channels)
+        else:
+            self.shortcut = nn.Identity()
 
     def forward(self, x, pos, vel, edge_index):
         # x: [N, in_channels], pos: [N, 2], vel: [N, 2]
@@ -63,7 +69,7 @@ class OptimizedEquivariantGNNLayer(MessagePassing):
         # Update node features
         h_update = self.phi_h(torch.cat([x, m_h, m_v_norm], dim=-1))
 
-        return h_update
+        return self.shortcut(x) + h_update
 
     def message(self, x_i, x_j, dist_sq, dot_vr, rel_pos):
         # Scalar message
@@ -186,8 +192,9 @@ class OptimizedHamiltonianODEFunc(nn.Module):
 
 
 class OptimizedGNNDecoder(nn.Module):
-    def __init__(self, latent_dim, hidden_dim, out_features):
+    def __init__(self, latent_dim, hidden_dim, out_features, box_size=10.0):
         super(OptimizedGNNDecoder, self).__init__()
+        self.box_size = box_size
         # Reduced hidden dimensions
         self.mlp = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim//2),
@@ -207,11 +214,18 @@ class OptimizedGNNDecoder(nn.Module):
         # Weighted sum: [N_total, n_super_nodes, 1] * [N_total, n_super_nodes, latent_dim]
         node_features_latent = torch.sum(s.unsqueeze(-1) * z_expanded, dim=1)
 
-        return self.mlp(node_features_latent)
+        out = self.mlp(node_features_latent)
+        
+        # Apply Tanh scaled by box size to positions (first 2 features)
+        # to ensure they utilize the full spatial range and prevent collapse.
+        pos_recon = torch.tanh(out[:, :2]) * (self.box_size / 2.0)
+        vel_recon = out[:, 2:]
+        
+        return torch.cat([pos_recon, vel_recon], dim=-1)
 
 
 class OptimizedDiscoveryEngineModel(nn.Module):
-    def __init__(self, n_particles, n_super_nodes, node_features=4, latent_dim=4, hidden_dim=32, hamiltonian=False, dissipative=True, min_active_super_nodes=2):
+    def __init__(self, n_particles, n_super_nodes, node_features=4, latent_dim=4, hidden_dim=32, hamiltonian=False, dissipative=True, min_active_super_nodes=2, box_size=10.0):
         super(OptimizedDiscoveryEngineModel, self).__init__()
         self.encoder = OptimizedGNNEncoder(node_features, hidden_dim, latent_dim, n_super_nodes, min_active_super_nodes=min_active_super_nodes)
 
@@ -222,7 +236,7 @@ class OptimizedDiscoveryEngineModel(nn.Module):
             from model import LatentODEFunc
             self.ode_func = LatentODEFunc(latent_dim, n_super_nodes, hidden_dim//2)
 
-        self.decoder = OptimizedGNNDecoder(latent_dim, hidden_dim, node_features)
+        self.decoder = OptimizedGNNDecoder(latent_dim, hidden_dim, node_features, box_size=box_size)
         self.hamiltonian = hamiltonian
 
         # Simplified MI discriminator with fewer parameters
@@ -238,10 +252,10 @@ class OptimizedDiscoveryEngineModel(nn.Module):
         # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning, 8: sep, 9: conn, 10: sparsity, 11: mi, 12: sym
         lvars = torch.zeros(13)
         lvars[0] = -1.0 # Boost reconstruction
-        lvars[2] = 0.5  # Suppress assignments slightly
+        lvars[2] = -1.1 # Boost assignments/spatial (0.5 - 1.6)
+        lvars[3] = -1.6 # Boost ortho (0.0 - 1.6)
         lvars[6] = 0.5  # Suppress alignment slightly
-        self.log_vars = nn.Parameter(lvars)
-
+        self.log_vars = nn.Parameter(lvars) 
     def get_mi_loss(self, z, mu):
         """
         Simplified mutual information estimation.

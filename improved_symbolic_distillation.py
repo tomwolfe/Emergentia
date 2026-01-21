@@ -838,8 +838,42 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
         self.feature_masks = []
         self.confidences = []
 
+        # Check if we are distilling a Hamiltonian (targets.shape[1] == 1 usually means Hamiltonian)
+        is_hamiltonian_distill = (targets.shape[1] == 1)
+
         for i in range(targets.shape[1]):
             eq, mask, conf = self._distill_single_target(i, X_norm, Y_norm, targets.shape[1], latent_states.shape[1])
+            
+            # PHYSICALITY VALIDATION for Hamiltonian
+            if is_hamiltonian_distill and eq is not None:
+                # Get the set of features used in the equation
+                eq_str = str(eq)
+                import re
+                used_features = [int(f) for f in re.findall(r'X(\d+)', eq_str)]
+                
+                # Check if it contains at least one q and one p from the latent space
+                # q indices: k*D + d where d < D/2
+                # p indices: k*D + d where d >= D/2
+                # Features are indexed by the full_mask/valid_indices in _distill_single_target
+                # But here we just check if any X{i} where i is a q-index or p-index is present
+                
+                half_d = latent_dim // 2
+                q_indices = []
+                p_indices = []
+                for k in range(n_super_nodes):
+                    for d in range(half_d):
+                        q_indices.append(k * latent_dim + d)
+                    for d in range(half_d, latent_dim):
+                        p_indices.append(k * latent_dim + d)
+                
+                has_q = any(f in q_indices for f in used_features)
+                has_p = any(f in p_indices for f in used_features)
+                
+                if not (has_q and has_p):
+                    print(f"  -> WARNING: Discovered Hamiltonian H(z) = {eq_str} lacks physical dependency (needs both q and p). Discarding.")
+                    eq = None
+                    conf = 0.0
+            
             equations.append(eq)
             self.feature_masks.append(mask)
             self.confidences.append(conf)

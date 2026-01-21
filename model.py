@@ -47,6 +47,12 @@ class EquivariantGNNLayer(MessagePassing):
             nn.SiLU(),
             nn.Linear(hidden_dim, out_channels)
         )
+        
+        # Shortcut for residual connection when dims don't match
+        if in_channels != out_channels:
+            self.shortcut = nn.Linear(in_channels, out_channels)
+        else:
+            self.shortcut = nn.Identity()
 
     def forward(self, x, pos, vel, edge_index):
         # x: [N, in_channels], pos: [N, 2], vel: [N, 2]
@@ -67,7 +73,7 @@ class EquivariantGNNLayer(MessagePassing):
         
         # In a full equivariant GNN we would also update velocities, 
         # but here we focus on latent representation h.
-        return h_update
+        return self.shortcut(x) + h_update
 
     def message(self, x_i, x_j, dist_sq, dot_vr, rel_pos):
         # Scalar message
@@ -377,8 +383,9 @@ class HamiltonianODEFunc(nn.Module):
         return torch.cat([dq, dp], dim=-1).view(y.shape[0], -1)
 
 class GNNDecoder(nn.Module):
-    def __init__(self, latent_dim, hidden_dim, out_features):
+    def __init__(self, latent_dim, hidden_dim, out_features, box_size=10.0):
         super(GNNDecoder, self).__init__()
+        self.box_size = box_size
         self.ln1 = nn.LayerNorm(hidden_dim)
         self.ln2 = nn.LayerNorm(hidden_dim)
         self.mlp = nn.Sequential(
@@ -401,7 +408,14 @@ class GNNDecoder(nn.Module):
         # Weighted sum: [N_total, n_super_nodes, 1] * [N_total, n_super_nodes, latent_dim]
         node_features_latent = torch.sum(s.unsqueeze(-1) * z_expanded, dim=1)
         
-        return self.mlp(node_features_latent)
+        out = self.mlp(node_features_latent)
+        
+        # Apply Tanh scaled by box size to positions (first 2 features)
+        # to ensure they utilize the full spatial range and prevent collapse.
+        pos_recon = torch.tanh(out[:, :2]) * (self.box_size / 2.0)
+        vel_recon = out[:, 2:]
+        
+        return torch.cat([pos_recon, vel_recon], dim=-1)
 
 class MIDiscriminator(nn.Module):
     """
@@ -425,7 +439,7 @@ class MIDiscriminator(nn.Module):
         return self.net(zp)
 
 class DiscoveryEngineModel(nn.Module):
-    def __init__(self, n_particles, n_super_nodes, node_features=4, latent_dim=4, hidden_dim=64, hamiltonian=False, dissipative=True, min_active_super_nodes=2):
+    def __init__(self, n_particles, n_super_nodes, node_features=4, latent_dim=4, hidden_dim=64, hamiltonian=False, dissipative=True, min_active_super_nodes=2, box_size=10.0):
         super(DiscoveryEngineModel, self).__init__()
         self.encoder = GNNEncoder(node_features, hidden_dim, latent_dim, n_super_nodes, min_active_super_nodes=min_active_super_nodes)
         
@@ -434,7 +448,7 @@ class DiscoveryEngineModel(nn.Module):
         else:
             self.ode_func = LatentODEFunc(latent_dim, n_super_nodes, hidden_dim)
             
-        self.decoder = GNNDecoder(latent_dim, hidden_dim, node_features)
+        self.decoder = GNNDecoder(latent_dim, hidden_dim, node_features, box_size=box_size)
         self.hamiltonian = hamiltonian
 
         # Mutual Information alignment components
@@ -446,7 +460,8 @@ class DiscoveryEngineModel(nn.Module):
         # Initialize log_vars[0] (rec) to a negative value to give it higher initial weight
         lvars = torch.zeros(13)
         lvars[0] = -1.0 # Boost reconstruction
-        lvars[2] = 0.5  # Suppress assignments slightly
+        lvars[2] = -1.1 # Boost assignments/spatial (0.5 - 1.6)
+        lvars[3] = -1.6 # Boost ortho (0.0 - 1.6)
         lvars[6] = 0.5  # Suppress alignment slightly
         self.log_vars = nn.Parameter(lvars) 
         
