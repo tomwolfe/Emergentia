@@ -125,12 +125,12 @@ class StableHierarchicalPooling(nn.Module):
         if self.training:
             # Moving average update for the mask to avoid rapid flickering
             current_active = (avg_s > self.pruning_threshold).float()
-            
+
             # STOCHASTIC REVIVAL: Occasionally give inactive nodes a chance to revive
             # if they show even minor signs of life (e.g. avg_s > pruning_threshold / 5)
             revival_threshold = self.pruning_threshold / 5.0
             revival_candidate = (avg_s > revival_threshold).float()
-            
+
             # Combine current_active with a small probability of reviving revival_candidates
             revival_mask = (torch.rand_like(self.active_mask) < 0.05).float() * revival_candidate
             effective_active = torch.clamp(current_active + revival_mask, 0, 1)
@@ -140,7 +140,7 @@ class StableHierarchicalPooling(nn.Module):
             ema_rate = 0.02 if self.active_mask.sum() >= self.min_active_super_nodes else 0.05
             if hard:
                 ema_rate *= 0.5 # Slower updates during hard sampling
-                
+
             self.active_mask.copy_((1.0 - ema_rate) * self.active_mask + ema_rate * effective_active)
 
             # Ensure minimum number of super-nodes remain active to prevent total collapse
@@ -150,7 +150,14 @@ class StableHierarchicalPooling(nn.Module):
                 _, most_needed_indices = torch.topk(avg_s, self.min_active_super_nodes, largest=True)
                 new_active = self.active_mask.clone()
                 new_active[most_needed_indices] = 1.0
-                self.active_mask.copy_(0.9 * self.active_mask + 0.1 * new_active)
+                self.active_mask.copy_(new_active)  # Direct assignment instead of EMA to enforce constraint
+
+            # Double-check that the constraint is met after update
+            n_active_final = (self.active_mask > 0.5).sum().item()
+            if n_active_final < self.min_active_super_nodes:
+                # If still below minimum, force activation of top nodes
+                _, forced_indices = torch.topk(avg_s, self.min_active_super_nodes, largest=True)
+                self.active_mask[forced_indices] = 1.0
 
         entropy = -torch.mean(torch.sum(s * torch.log(s + 1e-9), dim=1))
         diversity_loss = torch.sum(avg_s * torch.log(avg_s + 1e-9))

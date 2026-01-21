@@ -259,7 +259,7 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
             mask[top_indices] = True
             return mask
 
-    def _sindy_select(self, X, y, threshold=0.05, max_iter=15):
+    def _sindy_select(self, X, y, threshold=0.005, max_iter=15):  # Reduced default threshold to be less aggressive
         """
         Enhanced Sequential Thresholded Least Squares (STLSQ) for SINDy-style pruning.
         """
@@ -269,7 +269,7 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
 
         # NEW: Make threshold adaptive based on target variance to prevent over-pruning
         y_var = np.var(y)
-        adaptive_base_threshold = max(threshold, 0.001 * np.sqrt(y_var))  # Base threshold adapts to target scale
+        adaptive_base_threshold = max(threshold, 0.0001 * np.sqrt(y_var))  # Base threshold adapts to target scale, reduced to be less aggressive
 
         for iteration in range(max_iter):
             if not np.any(mask):
@@ -291,7 +291,7 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
             # NEW: Adaptive thresholding based on coefficient distribution and target variance
             if len(active_coeffs) > 0:
                 # Use both percentile and variance-adaptive thresholds
-                percentile_threshold = np.percentile(active_coeffs, 60)  # Keep more features (top 40%)
+                percentile_threshold = np.percentile(active_coeffs, 40)  # Keep more features (top 60%)
                 adaptive_threshold = max(adaptive_base_threshold, percentile_threshold)
                 new_mask[mask] = active_coeffs > adaptive_threshold
             else:
@@ -427,22 +427,38 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
                         if X.ndim == 1: X = X.reshape(1, -1)
                         result = self.model.predict(X)
 
-                        # Ensure result has the same number of samples as input
-                        if result.ndim == 0:  # Scalar result
+                        # Ensure result is always a 1D numpy array with same length as input samples
+                        result = np.asarray(result)
+
+                        # If result is a scalar, convert to 1D array with same length as input samples
+                        if result.ndim == 0:
                             result = np.full(X.shape[0], result)
-                        elif result.ndim == 1 and result.shape[0] == 1 and X.shape[0] > 1:
-                            # If we have a single result but multiple input samples, broadcast it
-                            result = np.full(X.shape[0], result[0])
-                        elif result.ndim == 1 and result.shape[0] != X.shape[0]:
-                            # If result has different length than expected, pad or truncate
-                            if result.shape[0] == 1:
-                                result = np.full(X.shape[0], result[0])
-                            else:
-                                # Truncate or pad to match input size
-                                if result.shape[0] < X.shape[0]:
-                                    result = np.pad(result, (0, X.shape[0] - result.shape[0]), mode='edge')
+                        elif result.ndim == 1:
+                            # If result has different length than expected, handle appropriately
+                            if result.shape[0] != X.shape[0]:
+                                if result.shape[0] == 1:
+                                    # If we have a single result but multiple input samples, broadcast it
+                                    result = np.full(X.shape[0], result[0])
                                 else:
+                                    # If result has more elements than expected, truncate
                                     result = result[:X.shape[0]]
+                                    # If result has fewer elements than expected, pad
+                                    if result.shape[0] < X.shape[0]:
+                                        result = np.pad(result, (0, X.shape[0] - result.shape[0]), mode='edge')
+                        else:
+                            # If result is multi-dimensional, flatten to 1D and handle length
+                            # This is important: if result has shape (n_samples, 1), flatten to (n_samples,)
+                            if result.shape[1] == 1 and len(result.shape) == 2:
+                                result = result.flatten()
+                            else:
+                                result = result.flatten()
+                                if result.shape[0] != X.shape[0]:
+                                    if result.shape[0] == 1:
+                                        result = np.full(X.shape[0], result[0])
+                                    else:
+                                        result = result[:X.shape[0]]
+                                        if result.shape[0] < X.shape[0]:
+                                            result = np.pad(result, (0, X.shape[0] - result.shape[0]), mode='edge')
 
                         return result
 
@@ -485,22 +501,38 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
                         if X.ndim == 1: X = X.reshape(1, -1)
                         result = self.model.predict(X)
 
-                        # Ensure result has the same number of samples as input
-                        if result.ndim == 0:  # Scalar result
+                        # Ensure result is always a 1D numpy array with same length as input samples
+                        result = np.asarray(result)
+
+                        # If result is a scalar, convert to 1D array with same length as input samples
+                        if result.ndim == 0:
                             result = np.full(X.shape[0], result)
-                        elif result.ndim == 1 and result.shape[0] == 1 and X.shape[0] > 1:
-                            # If we have a single result but multiple input samples, broadcast it
-                            result = np.full(X.shape[0], result[0])
-                        elif result.ndim == 1 and result.shape[0] != X.shape[0]:
-                            # If result has different length than expected, pad or truncate
-                            if result.shape[0] == 1:
-                                result = np.full(X.shape[0], result[0])
-                            else:
-                                # Truncate or pad to match input size
-                                if result.shape[0] < X.shape[0]:
-                                    result = np.pad(result, (0, X.shape[0] - result.shape[0]), mode='edge')
+                        elif result.ndim == 1:
+                            # If result has different length than expected, handle appropriately
+                            if result.shape[0] != X.shape[0]:
+                                if result.shape[0] == 1:
+                                    # If we have a single result but multiple input samples, broadcast it
+                                    result = np.full(X.shape[0], result[0])
                                 else:
+                                    # If result has more elements than expected, truncate
                                     result = result[:X.shape[0]]
+                                    # If result has fewer elements than expected, pad
+                                    if result.shape[0] < X.shape[0]:
+                                        result = np.pad(result, (0, X.shape[0] - result.shape[0]), mode='edge')
+                        else:
+                            # If result is multi-dimensional, flatten to 1D and handle length
+                            # This is important: if result has shape (n_samples, 1), flatten to (n_samples,)
+                            if result.shape[1] == 1 and len(result.shape) == 2:
+                                result = result.flatten()
+                            else:
+                                result = result.flatten()
+                                if result.shape[0] != X.shape[0]:
+                                    if result.shape[0] == 1:
+                                        result = np.full(X.shape[0], result[0])
+                                    else:
+                                        result = result[:X.shape[0]]
+                                        if result.shape[0] < X.shape[0]:
+                                            result = np.pad(result, (0, X.shape[0] - result.shape[0]), mode='edge')
 
                         return result
 
@@ -803,12 +835,38 @@ class OptimizedExpressionWrapper:
                 # Ensure result is a proper numpy array
                 result = np.asarray(result)
 
+                # Ensure result is always a 1D numpy array with same length as input samples
+                result = np.asarray(result)
+
                 # If result is a scalar, convert to 1D array with same length as input samples
                 if result.ndim == 0:
                     result = np.full(X.shape[0], result)
-                elif result.ndim == 1 and result.shape[0] == 1 and X.shape[0] > 1:
-                    # If we have a single result but multiple input samples, broadcast it
-                    result = np.full(X.shape[0], result[0])
+                elif result.ndim == 1:
+                    # If result has different length than expected, handle appropriately
+                    if result.shape[0] != X.shape[0]:
+                        if result.shape[0] == 1:
+                            # If we have a single result but multiple input samples, broadcast it
+                            result = np.full(X.shape[0], result[0])
+                        else:
+                            # If result has more elements than expected, truncate
+                            result = result[:X.shape[0]]
+                            # If result has fewer elements than expected, pad
+                            if result.shape[0] < X.shape[0]:
+                                result = np.pad(result, (0, X.shape[0] - result.shape[0]), mode='edge')
+                else:
+                    # If result is multi-dimensional, flatten to 1D and handle length
+                    # This is important: if result has shape (n_samples, 1), flatten to (n_samples,)
+                    if result.shape[1] == 1 and len(result.shape) == 2:
+                        result = result.flatten()
+                    else:
+                        result = result.flatten()
+                        if result.shape[0] != X.shape[0]:
+                            if result.shape[0] == 1:
+                                result = np.full(X.shape[0], result[0])
+                            else:
+                                result = result[:X.shape[0]]
+                                if result.shape[0] < X.shape[0]:
+                                    result = np.pad(result, (0, X.shape[0] - result.shape[0]), mode='edge')
 
                 return result
             except Exception as e:

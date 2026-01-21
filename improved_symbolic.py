@@ -199,6 +199,12 @@ class ImprovedSymbolicDynamics:
             try:
                 if feature_mask is not None and np.any(feature_mask):
                     # Use only the selected features
+                    # Ensure X_plus_full and X_minus_full are 2D before indexing
+                    if X_plus_full.ndim == 1:
+                        X_plus_full = X_plus_full.reshape(1, -1)
+                    if X_minus_full.ndim == 1:
+                        X_minus_full = X_minus_full.reshape(1, -1)
+
                     H_plus_raw = self.equations[0].execute(X_plus_full[:, feature_mask])
                     H_minus_raw = self.equations[0].execute(X_minus_full[:, feature_mask])
                 else:
@@ -245,8 +251,12 @@ class ImprovedSymbolicDynamics:
             elif z.ndim == 1 and result.ndim == 1 and result.shape[0] == z.shape[0]:
                 return result
             else:
-                print(f"Hamiltonian derivative shape mismatch: expected {z.shape}, got {result.shape}. Returning zeros.")
-                return np.zeros_like(z)
+                # Ensure result is the same size as input z, but flattened to 1D
+                if result.size == z.size:
+                    return result.flatten()
+                else:
+                    print(f"Hamiltonian derivative shape mismatch: expected {z.shape}, got {result.shape}. Returning zeros.")
+                    return np.zeros_like(z)
 
         return result
 
@@ -275,6 +285,9 @@ class ImprovedSymbolicDynamics:
                     # NEW: Apply feature mask if available
                     if i < len(self.feature_masks) and self.feature_masks[i] is not None:
                         # Use only the relevant features for this equation
+                        # Ensure X_norm is 2D before applying feature mask
+                        if X_norm.ndim == 1:
+                            X_norm = X_norm.reshape(1, -1)
                         relevant_X = X_norm[:, self.feature_masks[i]]
                         if relevant_X.size > 0:
                             result = eq.execute(relevant_X)

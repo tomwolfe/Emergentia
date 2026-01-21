@@ -254,6 +254,9 @@ def main():
                       grad_acc_steps=2,  # Accumulate gradients over fewer steps for more frequent updates
                       enhanced_balancer=enhanced_balancer)  # NEW: Add enhanced balancer
 
+    # Initialize energy weight attribute for energy-focused retraining
+    trainer.energy_weight = 0.1  # Default energy weight
+
     # Better scheduler parameters for improved convergence
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(trainer.optimizer, mode='min',
                                                            factor=0.5, patience=30, min_lr=1e-7)  # More gradual decay
@@ -371,15 +374,15 @@ def main():
             # NEW: Reduce learning rate for more stable energy-focused training
             original_lr = trainer.optimizer.param_groups[0]['lr']
             for param_group in trainer.optimizer.param_groups:
-                param_group['lr'] *= 0.05  # Reduce learning rate by factor of 20 for more stability
+                param_group['lr'] *= 0.02  # Reduce learning rate by factor of 50 for more stability
 
             # NEW: Use a more conservative energy weight to prevent divergence
             original_energy_weight = getattr(trainer, 'energy_weight', 0.1)
             # Reduce the energy weight to be less aggressive and prevent loss explosion
-            trainer.energy_weight = min(0.3, original_energy_weight * 1.5)  # Less aggressive increase
+            trainer.energy_weight = min(0.15, original_energy_weight * 1.2)  # Much less aggressive increase
 
             # NEW: More targeted energy-focused training with physics-informed loss
-            additional_epochs = 100  # Increased epochs for better energy conservation
+            additional_epochs = 50  # Reduced epochs to prevent overfitting
             for epoch in range(epochs + additional_epochs, epochs + 2 * additional_epochs):
                 idx = np.random.randint(0, len(dataset) - seq_len)
                 batch_data = dataset[idx : idx + seq_len]
@@ -390,7 +393,7 @@ def main():
                 # NEW: Implement gradient clipping specifically for energy-focused training to prevent divergence
                 if hasattr(trainer, 'optimizer'):
                     # Clip gradients to prevent explosion during energy-focused training
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)  # More conservative clipping
 
                 if epoch % 10 == 0:
                     current_energy_error = compute_energy_conservation_with_smoothing(model, dataset, sim, device)
@@ -400,20 +403,20 @@ def main():
                 current_energy_error = compute_energy_conservation_with_smoothing(model, dataset, sim, device)
 
                 # NEW: Early stopping if energy error starts increasing (indicating divergence)
-                if epoch > (epochs + additional_epochs + 10):  # Allow some initial exploration
+                if epoch > (epochs + additional_epochs + 5):  # Allow some initial exploration
                     prev_energy_errors = []
                     if 'prev_energy_errors' not in locals():
                         prev_energy_errors = []
                     prev_energy_errors.append(current_energy_error)
 
                     # Check if energy error is increasing over recent epochs (sign of divergence)
-                    if len(prev_energy_errors) > 5:
-                        prev_energy_errors = prev_energy_errors[-5:]
+                    if len(prev_energy_errors) > 3:
+                        prev_energy_errors = prev_energy_errors[-3:]
                         if all(prev_energy_errors[i] > prev_energy_errors[i-1] for i in range(1, len(prev_energy_errors))):
                             print(f"Energy error consistently increasing, stopping energy-focused training to prevent divergence.")
                             break
 
-                if current_energy_error < 0.05:  # More aggressive target
+                if current_energy_error < 0.1:  # Less aggressive target to prevent overfitting
                     print(f"Energy conservation improved to {current_energy_error:.4f}, stopping energy-focused training.")
                     break
 
@@ -642,6 +645,9 @@ def main():
                 feature_mask = distiller.feature_masks[0] if distiller.feature_masks and len(distiller.feature_masks) > 0 else None
 
                 if feature_mask is not None and np.any(feature_mask):
+                    # Ensure X_full is 2D before applying feature mask to prevent "too many indices" error
+                    if X_full.ndim == 1:
+                        X_full = X_full.reshape(1, -1)
                     h_val = equations[0].execute(X_full[:, feature_mask])
                 else:
                     h_val = equations[0].execute(X_full)
