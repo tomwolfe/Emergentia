@@ -152,14 +152,8 @@ class ImprovedFeatureTransformer(FeatureTransformer):
 
         res = np.hstack(poly_features)
 
-        # If the original input was 1D, return 1D result
-        if z_flat.shape[0] == 1:  # batch_size was 1 (original input was 1D)
-            result = np.clip(res[0], -1e6, 1e6)  # Return the single sample as 1D
-        else:
-            result = np.clip(res, -1e6, 1e6)  # Return 2D result
-
-        return result
-
+        # Always return 2D result for consistency with sklearn-like transformers
+        return np.clip(res, -1e6, 1e6)
 
 class ImprovedSymbolicDistiller(SymbolicDistiller):
     """
@@ -693,6 +687,26 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
         candidates.sort(key=lambda x: x['pareto_score'], reverse=True)
         best_candidate = candidates[0]
 
+        # NEW: Triviality check - if H is just a single variable (e.g., H = -X1), 
+        # it's likely a failure to find the true dynamics.
+        best_prog_str = str(best_candidate['prog'])
+        import re
+        is_trivial = len(re.findall(r'X\d+', best_prog_str)) <= 1 and best_candidate['complexity'] < 5
+        
+        if is_trivial and is_hamiltonian:
+            print(f"  -> Detected trivial Hamiltonian: {best_prog_str}. Re-running with high parsimony...")
+            high_parsimony = 0.1 * parsimony_multiplier
+            est = self._get_regressor(scaled_pop, self.max_gen, parsimony=high_parsimony)
+            try:
+                est.fit(X_selected.astype(np.float64), Y_norm[:, i].astype(np.float64))
+                if est._program.length_ > best_candidate['prog'].length_:
+                    print(f"  -> Found better non-trivial alternative: {est._program}")
+                    best_candidate['prog'] = est._program
+                    best_candidate['score'] = r2_score(Y_norm[:, i], est.predict(X_selected))
+                    best_candidate['complexity'] = self.get_complexity(est._program)
+            except:
+                pass
+
         # Apply secondary optimization if enabled
         if self.secondary_optimization:
             optimized_prog = self._optimize_constants(best_candidate['prog'], X_selected, Y_norm[:, i])
@@ -881,35 +895,39 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
         self.confidences = []
 
         # Check if we are distilling a Hamiltonian (targets.shape[1] == 1 usually means Hamiltonian)
-        is_hamiltonian_distill = (targets.shape[1] == 1)
+        # Robust check for Hamiltonian distillation (energy is a scalar)
+        is_hamiltonian_distill = (targets.ndim == 1) or (targets.shape[-1] == 1)
+        if targets.ndim == 1:
+            Y_norm = Y_norm.reshape(-1, 1)
 
-        for i in range(targets.shape[1]):
-            eq, mask, conf = self._distill_single_target(i, X_norm, Y_norm, targets.shape[1], latent_states.shape[1], is_hamiltonian=is_hamiltonian_distill)
+        for i in range(Y_norm.shape[1]):
+            eq, mask, conf = self._distill_single_target(i, X_norm, Y_norm, Y_norm.shape[1], latent_states.shape[1], is_hamiltonian=is_hamiltonian_distill)
             
-            # SOFT PHYSICALITY GATING for Hamiltonian
+            # HARD PHYSICALITY GATING for Hamiltonian
             if is_hamiltonian_distill and eq is not None:
                 # Get the set of features used in the equation
                 eq_str = str(eq)
                 import re
-                used_features = [int(f) for f in re.findall(r'X(\d+)', eq_str)]
+                # Match both X and x prefixes for robustness
+                used_features = [int(f) for f in re.findall(r'[Xx](\d+)', eq_str)]
                 
                 # Check if it contains at least one q and one p from the latent space
                 half_d = latent_dim // 2
-                q_indices = []
-                p_indices = []
+                q_indices = set()
+                p_indices = set()
                 for k in range(n_super_nodes):
                     for d in range(half_d):
-                        q_indices.append(k * latent_dim + d)
+                        q_indices.add(k * latent_dim + d)
                     for d in range(half_d, latent_dim):
-                        p_indices.append(k * latent_dim + d)
+                        p_indices.add(k * latent_dim + d)
                 
                 has_q = any(f in q_indices for f in used_features)
                 has_p = any(f in p_indices for f in used_features)
                 
                 if not (has_q and has_p):
-                    print(f"  -> WARNING: Discovered Hamiltonian H(z) = {eq_str} lacks physical dependency (needs both q and p). Reducing confidence.")
-                    # Soft gating: reduce confidence by 20% instead of 50%
-                    conf *= 0.8
+                    print(f"  -> CRITICAL: Discovered Hamiltonian H(z) = {eq_str} lacks physical dependency (needs both q and p). Invalidating.")
+                    # Hard gating: set confidence to 0.0
+                    conf = 0.0
             
             equations.append(eq)
             self.feature_masks.append(mask)

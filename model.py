@@ -410,8 +410,9 @@ class GNNDecoder(nn.Module):
         
         out = self.mlp(node_features_latent)
         
-        # Output values in [-1, 1] for positions to match normalization
-        pos_recon = torch.tanh(out[:, :2])
+        # Positions and velocities are reconstructed linearly
+        # The tanh was causing a "clump" problem near the origin
+        pos_recon = out[:, :2]
         vel_recon = out[:, 2:]
         
         return torch.cat([pos_recon, vel_recon], dim=-1)
@@ -475,7 +476,9 @@ class DiscoveryEngineModel(nn.Module):
         # Calculate variance across the feature dimension D for each super-node
         # We want the latent space to be utilized, so we penalize low variance
         var = z.var(dim=-1).mean()
-        return -torch.log(var + 1e-6)
+        # Hinge variance loss: only penalize if std < 1.0
+        # This prevents the infinite gradient singularity of -log(var)
+        return torch.relu(1.0 - torch.sqrt(var + 1e-6))
 
     def get_mi_loss(self, z, mu):
         """

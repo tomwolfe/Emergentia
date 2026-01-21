@@ -239,7 +239,7 @@ class SymbolicProxy(torch.nn.Module):
 
 class Trainer:
     def __init__(self, model, lr=5e-4, device='cpu', stats=None, align_anneal_epochs=1000,
-                 warmup_epochs=400, sparsity_scheduler=None, hard_assignment_start=0.7,
+                 warmup_epochs=20, sparsity_scheduler=None, hard_assignment_start=0.7,
                  skip_consistency_freq=2, enable_gradient_accumulation=False, grad_acc_steps=1,
                  enhanced_balancer=None):
         self.model = model.to(device)
@@ -255,6 +255,11 @@ class Trainer:
         self.enable_gradient_accumulation = enable_gradient_accumulation
         self.grad_acc_steps = grad_acc_steps
         self.enhanced_balancer = enhanced_balancer
+
+        # Manually re-balance initial log_vars for stability
+        with torch.no_grad():
+            self.model.log_vars[0].fill_(-5.0)  # High priority for reconstruction
+            self.model.log_vars[13].fill_(2.0)  # Suppress latent variance loss more to prevent explosion
 
         # Symbolic-in-the-loop
         self.symbolic_proxy = None
@@ -298,7 +303,10 @@ class Trainer:
                 self.model.encoder.pooling.apply_hard_revival()
 
         # Determine if we should compute consistency loss based on frequency
-        compute_consistency = (epoch % self.skip_consistency_freq == 0) and (epoch >= self.warmup_epochs)
+        # CRITICAL FIX: Do not skip consistency during the first 50 epochs to prevent early jitter
+        compute_consistency = (epoch >= self.warmup_epochs)
+        if epoch > 50:
+            compute_consistency = compute_consistency and (epoch % self.skip_consistency_freq == 0)
 
         # For gradient accumulation
         if self.enable_gradient_accumulation:
@@ -377,9 +385,12 @@ class Trainer:
 
         # Only do forward dynamics if not in deep warmup
         if not is_warmup:
-            # Optimize ODE solving: reduce solver complexity during early training
-            if progress < 0.3:  # Early training
-                # Use simpler solver or fewer steps
+            for t in range(1, seq_len):
+                if np.random.random() < tf_ratio:
+                    batch_t_prev = Batch.from_data_list([data_list[t-1]]).to(self.device)
+                    z_curr_forced, _, _, _ = self.model.encode(batch_t_prev.x, batch_t_prev.edge_index, batch_t_prev.batch, tau=tau, hard=hard)
+                    z_curr = torch.nan_to_num(z_curr_forced)
+
                 t_span = torch.tensor([0, dt], device=self.device, dtype=torch.float32)
                 try:
                     z_next_seq = self.model.forward_dynamics(z_curr, t_span)
@@ -387,21 +398,7 @@ class Trainer:
                 except Exception as e:
                     # If ODE solver fails, fallback to previous state and add penalty
                     z_curr = z_curr.detach()
-            else:  # Later training - use full solver
-                for t in range(1, seq_len):
-                    if np.random.random() < tf_ratio:
-                        batch_t_prev = Batch.from_data_list([data_list[t-1]]).to(self.device)
-                        z_curr_forced, _, _, _ = self.model.encode(batch_t_prev.x, batch_t_prev.edge_index, batch_t_prev.batch, tau=tau, hard=hard)
-                        z_curr = torch.nan_to_num(z_curr_forced)
-
-                    t_span = torch.tensor([0, dt], device=self.device, dtype=torch.float32)
-                    try:
-                        z_next_seq = self.model.forward_dynamics(z_curr, t_span)
-                        z_curr = torch.nan_to_num(z_next_seq[1], nan=0.0, posinf=1.0, neginf=-1.0)
-                    except Exception as e:
-                        # If ODE solver fails, fallback to previous state and add penalty
-                        z_curr = z_curr.detach()
-                    z_preds.append(z_curr)
+                z_preds.append(z_curr)
         else:
             # During warmup, just use encoded states
             for t in range(1, seq_len):

@@ -6,6 +6,7 @@ from model import DiscoveryEngineModel
 from engine import Trainer, prepare_data
 from symbolic import SymbolicDistiller, extract_latent_data
 from enhanced_symbolic import create_enhanced_distiller
+from improved_symbolic_distillation import ImprovedSymbolicDistiller
 from robust_symbolic import create_robust_symbolic_proxy
 from enhanced_balancer import create_enhanced_loss_balancer
 from learnable_basis import EnhancedFeatureTransformer
@@ -155,23 +156,13 @@ def main():
         print("Error: No valid latent data extracted (all NaN or divergent). Skipping symbolic distillation.")
         return
 
-    # NEW: Use enhanced distiller with learnable basis functions if requested
-    if args.use_learnable_bases:
-        print("Using enhanced feature transformer with learnable basis functions...")
-        distiller = create_enhanced_distiller(secondary_optimization=True)
-        # Replace the default transformer with enhanced one
-        distiller.transformer = EnhancedFeatureTransformer(
-            n_super_nodes, latent_dim, 
-            use_learnable_bases=True, 
-            basis_hidden_dim=64, 
-            num_learnable_bases=8
-        )
-    else:
-        distiller = create_enhanced_distiller(secondary_optimization=True)
+    # NEW: Use ImprovedSymbolicDistiller which includes physicality gates and optimized search
+    distiller = ImprovedSymbolicDistiller(populations=2000, generations=40, secondary_optimization=True)
 
     if is_hamiltonian:
         z_states, dz_states, t_states, h_states = latent_data
         print("Distilling Hamiltonian H(q, p) with secondary optimization...")
+        # ImprovedSymbolicDistiller.distill includes the physicality gate
         equations = distiller.distill(z_states, h_states, n_super_nodes, latent_dim, box_size=box_size)
         confidences = distiller.confidences
         # Update trainer with symbolic laws if confidence is high enough
