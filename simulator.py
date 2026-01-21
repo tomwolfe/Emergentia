@@ -171,14 +171,22 @@ class SpringMassSimulator:
         
         # Check for NaNs or massive values after all sub-steps
         if np.any(np.isnan(self.pos)) or np.any(np.abs(self.pos) > 1e6):
-            print("Warning: Simulation diverged. Re-centering and damping.")
-            # Graceful recovery: Re-center particles in the box and zero velocities
+            print("Warning: Simulation diverged. Applying smooth recovery.")
+            # Smooth recovery: gradually damp velocities and apply position corrections
+            # instead of abruptly zeroing velocities
             if self.box_size:
+                # Apply PBC wrap-around to keep positions in bounds
                 self.pos = self.pos % self.box_size
+                # Gradually damp velocities instead of zeroing them completely
+                damping_factor = 0.5  # Reduce velocity by half
+                self.vel *= damping_factor
             else:
+                # For non-PBC systems, clip positions and damp velocities
                 self.pos = np.nan_to_num(self.pos)
                 self.pos = np.clip(self.pos, -5, 5)
-            self.vel = np.zeros_like(self.vel)
+                # Apply gradual damping instead of zeroing
+                damping_factor = 0.3
+                self.vel *= damping_factor
 
         return self.pos.copy(), self.vel.copy()
 

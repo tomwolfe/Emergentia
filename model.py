@@ -153,17 +153,48 @@ class LatentODEFunc(nn.Module):
         self.input_dim = latent_dim * n_super_nodes
         self.latent_dim = latent_dim
         self.n_super_nodes = n_super_nodes
-        self.net = nn.Sequential(
-            nn.Linear(self.input_dim, hidden_dim),
+        self.hidden_dim = hidden_dim
+
+        # Permutation invariant architecture using Deep Sets
+        # Process each super-node individually (phi network)
+        self.phi = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
             nn.LeakyReLU(0.1),
             nn.Linear(hidden_dim, hidden_dim),
             nn.LeakyReLU(0.1),
-            nn.Linear(hidden_dim, self.input_dim)
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+
+        # Aggregation function (rho network) - mean pooling is permutation invariant
+        # This aggregates information from all super-nodes
+        self.rho = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LeakyReLU(0.1),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LeakyReLU(0.1),
+            nn.Linear(hidden_dim, latent_dim * n_super_nodes)
         )
 
     def forward(self, t, y):
         # y: [batch_size, latent_dim * n_super_nodes]
-        return self.net(y)
+        batch_size = y.size(0)
+
+        # Reshape to [batch_size, n_super_nodes, latent_dim]
+        y_reshaped = y.view(batch_size, self.n_super_nodes, self.latent_dim)
+
+        # Apply phi network to each super-node individually
+        # [batch_size, n_super_nodes, hidden_dim]
+        phi_outputs = self.phi(y_reshaped)
+
+        # Aggregate across super-nodes using mean (permutation invariant)
+        # [batch_size, hidden_dim]
+        aggregated = phi_outputs.mean(dim=1)
+
+        # Apply rho network to get final output
+        # [batch_size, latent_dim * n_super_nodes]
+        output = self.rho(aggregated)
+
+        return output
 
 class HamiltonianODEFunc(nn.Module):
     """

@@ -114,12 +114,12 @@ def main():
     if is_hamiltonian:
         z_states, dz_states, t_states, h_states = latent_data
         print("Distilling Hamiltonian H(q, p)...")
-        equations = distiller.distill(z_states, h_states, n_super_nodes, latent_dim)
+        equations = distiller.distill(z_states, h_states, n_super_nodes, latent_dim, box_size=box_size)
         confidences = distiller.confidences
     else:
         z_states, dz_states, t_states = latent_data
         print("Distilling derivatives dZ/dt...")
-        equations = distiller.distill(z_states, dz_states, n_super_nodes, latent_dim)
+        equations = distiller.distill(z_states, dz_states, n_super_nodes, latent_dim, box_size=box_size)
         confidences = distiller.confidences
     
     print("\nDiscovered Symbolic Laws:")
@@ -141,33 +141,44 @@ def main():
             self.is_hamiltonian = is_hamiltonian
             self.n_super_nodes = n_super_nodes
             self.latent_dim = latent_dim
-            
+
             # Cache transformer for speed
             self.transformer = distiller.transformer
 
         def __call__(self, z, t):
             # z: [n_super_nodes * latent_dim]
             if self.is_hamiltonian:
-                # Optimized vectorized numerical gradient
-                eps = 1e-4
+                # More efficient numerical gradient computation using central differences
+                eps = 1e-6  # Smaller epsilon for better precision
                 n_dims = len(z)
-                # Create a batch of perturbed inputs: [2 * n_dims, n_dims]
-                z_batch = np.tile(z, (2 * n_dims, 1))
+
+                # Pre-allocate arrays for efficiency
+                grad = np.zeros(n_dims)
+
+                # Compute gradient one dimension at a time to save memory
                 for i in range(n_dims):
-                    z_batch[2*i, i] += eps
-                    z_batch[2*i+1, i] -= eps
-                
-                # Transform all at once
-                X_poly = self.transformer.transform(z_batch)
-                X_norm = self.transformer.normalize_x(X_poly)
-                
-                # Execute symbolic H on the batch
-                h_norm = self.equations[0].execute(X_norm[:, self.feature_masks[0]])
-                h_val = self.transformer.denormalize_y(h_norm)
-                
-                # Compute gradients: (H(z+eps) - H(z-eps)) / 2eps
-                grad = (h_val[0::2] - h_val[1::2]) / (2 * eps)
-                
+                    z_plus = z.copy()
+                    z_minus = z.copy()
+                    z_plus[i] += eps
+                    z_minus[i] -= eps
+
+                    # Transform both points
+                    X_poly_plus = self.transformer.transform(z_plus.reshape(1, -1))
+                    X_poly_minus = self.transformer.transform(z_minus.reshape(1, -1))
+
+                    X_norm_plus = self.transformer.normalize_x(X_poly_plus)
+                    X_norm_minus = self.transformer.normalize_x(X_poly_minus)
+
+                    # Execute symbolic H on both points
+                    h_norm_plus = self.equations[0].execute(X_norm_plus[:, self.feature_masks[0]])
+                    h_norm_minus = self.equations[0].execute(X_norm_minus[:, self.feature_masks[0]])
+
+                    h_plus = self.transformer.denormalize_y(h_norm_plus)
+                    h_minus = self.transformer.denormalize_y(h_norm_minus)
+
+                    # Compute gradient: (H(z+eps) - H(z-eps)) / 2eps
+                    grad[i] = (h_plus[0] - h_minus[0]) / (2 * eps)
+
                 dzdt = np.zeros_like(z)
                 d_sub = self.latent_dim // 2
                 for k in range(self.n_super_nodes):
@@ -180,12 +191,12 @@ def main():
                 z_reshaped = z.reshape(1, -1)
                 X_poly = self.transformer.transform(z_reshaped)
                 X_norm = self.transformer.normalize_x(X_poly)
-                
+
                 dzdt_norm = []
                 for i, (eq, mask) in enumerate(zip(self.equations, self.feature_masks)):
                     X_selected = X_norm[:, mask]
                     dzdt_norm.append(eq.execute(X_selected)[0])
-                
+
                 return self.transformer.denormalize_y(np.array(dzdt_norm))
 
     dyn_fn = SymbolicDynamics(distiller, equations, distiller.feature_masks, is_hamiltonian, n_super_nodes, latent_dim)

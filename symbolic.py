@@ -8,14 +8,15 @@ from joblib import Parallel, delayed
 
 class FeatureTransformer:
     """
-    Encapsulates feature engineering logic: polynomial expansions, 
-    relative distances, and normalization. Ensures consistency between 
+    Encapsulates feature engineering logic: polynomial expansions,
+    relative distances, and normalization. Ensures consistency between
     training and inference (integration).
     """
-    def __init__(self, n_super_nodes, latent_dim, include_dists=True):
+    def __init__(self, n_super_nodes, latent_dim, include_dists=True, box_size=None):
         self.n_super_nodes = n_super_nodes
         self.latent_dim = latent_dim
         self.include_dists = include_dists
+        self.box_size = box_size  # Add box_size parameter for PBC handling
         self.z_mean = None
         self.z_std = None
         self.x_poly_mean = None
@@ -42,49 +43,55 @@ class FeatureTransformer:
     def transform(self, z_flat):
         # z_flat: [Batch, n_super_nodes * latent_dim]
         z_nodes = z_flat.reshape(-1, self.n_super_nodes, self.latent_dim)
-        
+
         features = [z_flat]
         if self.include_dists:
             dists = []
             inv_dists = []
             inv_sq_dists = []
-            
+
             for i in range(self.n_super_nodes):
                 for j in range(i + 1, self.n_super_nodes):
                     # Relative distance between super-nodes (using first 2 dims as positions)
                     # This assumes the align_loss worked and z[:, :2] is CoM
                     diff = z_nodes[:, i, :2] - z_nodes[:, j, :2]
+
+                    # Apply Minimum Image Convention for PBC if box_size is provided
+                    if self.box_size is not None:
+                        for dim_idx in range(2):  # Assuming 2D for position coordinates
+                            diff[:, dim_idx] -= self.box_size[dim_idx] * np.round(diff[:, dim_idx] / self.box_size[dim_idx])
+
                     d = np.linalg.norm(diff, axis=1, keepdims=True)
                     dists.append(d)
                     # Physics-informed features: inverse laws
                     inv_dists.append(1.0 / (d + 0.1))
                     inv_sq_dists.append(1.0 / (d**2 + 0.1))
-            
+
             if dists:
                 features.extend([np.hstack(dists), np.hstack(inv_dists), np.hstack(inv_sq_dists)])
-        
+
         X = np.hstack(features)
-        
+
         # Polynomial expansion (Linear + Quadratic)
         poly_features = [X]
         n_latents = self.n_super_nodes * self.latent_dim
-        
+
         # Squares of latent variables
         for i in range(n_latents):
             poly_features.append((X[:, i:i+1]**2))
-            
+
             node_idx = i // self.latent_dim
             dim_idx = i % self.latent_dim
-            
+
             # Cross-terms within same node (e.g. q1*p1)
             for j in range(i + 1, (node_idx + 1) * self.latent_dim):
                 poly_features.append(X[:, i:i+1] * X[:, j:j+1])
-            
+
             # Cross-terms with same dimension in other nodes (e.g. q1*q2)
             for other_node in range(node_idx + 1, self.n_super_nodes):
                 other_idx = other_node * self.latent_dim + dim_idx
                 poly_features.append(X[:, i:i+1] * X[:, other_idx:other_idx+1])
-        
+
         return np.hstack(poly_features)
 
     def normalize_x(self, X_poly):
@@ -249,8 +256,8 @@ class SymbolicDistiller:
             
         return best_candidate['prog'], full_mask, confidence
 
-    def distill(self, latent_states, targets, n_super_nodes, latent_dim):
-        self.transformer = FeatureTransformer(n_super_nodes, latent_dim)
+    def distill(self, latent_states, targets, n_super_nodes, latent_dim, box_size=None):
+        self.transformer = FeatureTransformer(n_super_nodes, latent_dim, box_size=box_size)
         self.transformer.fit(latent_states, targets)
         
         X_poly = self.transformer.transform(latent_states)
