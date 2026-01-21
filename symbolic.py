@@ -61,10 +61,11 @@ class FeatureTransformer:
             inv_sq_dists_flat = 1.0 / (dists_flat**2 + 0.1)
             
             # New physics-informed basis functions
-            screened_coulomb = np.exp(-dists_flat) / (dists_flat + 0.1)
+            exp_dist = np.exp(-dists_flat)
+            screened_coulomb = exp_dist / (dists_flat + 0.1)
             log_dist = np.log(dists_flat + 1.0)
             
-            features.extend([dists_flat, inv_dists_flat, inv_sq_dists_flat, screened_coulomb, log_dist])
+            features.extend([dists_flat, inv_dists_flat, inv_sq_dists_flat, exp_dist, screened_coulomb, log_dist])
 
         X = np.hstack(features)
         poly_features = [X]
@@ -128,7 +129,10 @@ class FeatureTransformer:
                     # d(1/(d^2+0.1))/dz = -2d/(d^2+0.1)^2 * d(d)/dz
                     jacobians.append((-2.0 * d / (d**2 + 0.1)**2 * jd).reshape(1, -1))
 
-                    # d(exp(-d)/(d+0.1))/dz = (-exp(-d)/(d+0.1) - exp(-d)/(d+0.1)^2) * d(d)/dz
+                    # d(exp(-d))/dz = -exp(-d) * d(d)/dz
+                    jacobians.append((-np.exp(-d) * jd).reshape(1, -1))
+
+                    # d(exp(-d)/(d+0.1))/dz = (-exp(-d)/(d+0.1) - np.exp(-d)/(d+0.1)**2) * d(d)/dz
                     j_screened = (-np.exp(-d)/(d + 0.1) - np.exp(-d)/(d + 0.1)**2) * jd
                     jacobians.append(j_screened.reshape(1, -1))
 
@@ -149,6 +153,7 @@ class FeatureTransformer:
                               (0 if self.box_size is None else -np.array(self.box_size) * np.round((z_nodes[i, :2] - z_nodes[j, :2])/np.array(self.box_size)))),
                 1.0 / (np.linalg.norm(z_nodes[i, :2] - z_nodes[j, :2]) + 0.1),
                 1.0 / (np.linalg.norm(z_nodes[i, :2] - z_nodes[j, :2])**2 + 0.1),
+                np.exp(-np.linalg.norm(z_nodes[i, :2] - z_nodes[j, :2])),
                 np.exp(-np.linalg.norm(z_nodes[i, :2] - z_nodes[j, :2])) / (np.linalg.norm(z_nodes[i, :2] - z_nodes[j, :2]) + 0.1),
                 np.log(np.linalg.norm(z_nodes[i, :2] - z_nodes[j, :2]) + 1.0)
             ])

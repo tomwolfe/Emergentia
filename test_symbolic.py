@@ -19,15 +19,13 @@ class TestFeatureTransformer(unittest.TestCase):
         
         # Expected features:
         # raw latents: 2 * 4 = 8
-        # distances: 1 (for 2 super nodes)
-        # inv_dists: 1
-        # inv_sq_dists: 1
-        # Total base: 8 + 3 = 11
+        # distance features: 6 (for 2 super nodes)
+        # Total base: 8 + 6 = 14
         # Squares of latents: 8
         # Cross-terms within same node: 2 * (4 choose 2) = 2 * 6 = 12
         # Cross-node same-dimension terms: (2 choose 2) * 4 = 1 * 4 = 4
-        # Total: 11 + 8 + 12 + 4 = 35
-        self.assertEqual(X_poly.shape, (5, 35))
+        # Total: 14 + 8 + 12 + 4 = 38
+        self.assertEqual(X_poly.shape, (5, 38))
 
     def test_inverse_distance_physics(self):
         # Create two nodes at (0,0) and (1,0)
@@ -39,7 +37,7 @@ class TestFeatureTransformer(unittest.TestCase):
         X_poly = self.transformer.transform(z)
         
         # Find index of distance feature (after raw latents)
-        # raw: 0-7, dist: 8, inv_dist: 9, inv_sq_dist: 10
+        # raw: 0-7, dist: 8, inv_dist: 9, inv_sq_dist: 10, exp_dist: 11, screened: 12, log: 13
         dist = X_poly[0, 8]
         inv_dist = X_poly[0, 9]
         inv_sq_dist = X_poly[0, 10]

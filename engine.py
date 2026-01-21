@@ -212,6 +212,11 @@ class Trainer:
             new_weight = self.sparsity_scheduler.step()
             if hasattr(self.model.encoder.pooling, 'set_sparsity_weight'):
                 self.model.encoder.pooling.set_sparsity_weight(new_weight)
+        
+        # Periodically apply hard revival to prevent resolution collapse
+        if epoch > 0 and epoch % 100 == 0:
+            if hasattr(self.model.encoder.pooling, 'apply_hard_revival'):
+                self.model.encoder.pooling.apply_hard_revival()
 
         self.optimizer.zero_grad()
         seq_len = len(data_list)

@@ -346,12 +346,23 @@ class HamiltonianODEFunc(nn.Module):
             Tensor: Time derivatives [batch_size, latent_dim * n_super_nodes]
         """
         # y: [batch_size, latent_dim * n_super_nodes]
-        training = torch.is_grad_enabled() and self.H_net[0].weight.requires_grad
+        training = torch.is_grad_enabled()
 
+        # We need to compute dH/dy. We use autograd.grad.
+        # create_graph=True is necessary for backpropagating through the ODE solver (especially for adjoint)
         with torch.set_grad_enabled(True):
-            y = y.detach().requires_grad_(True)
-            H = self.H_net(y).sum()
-            dH = torch.autograd.grad(H, y, create_graph=training)[0]
+            y_in = y.detach().requires_grad_(True)
+            H = self.H_net(y_in).sum()
+            dH = torch.autograd.grad(H, y_in, create_graph=training, allow_unused=True)[0]
+            
+            if dH is None:
+                dH = torch.zeros_like(y_in)
+            else:
+                # Handle NaNs and Infs in the gradient
+                dH = torch.nan_to_num(dH, nan=0.0, posinf=1e3, neginf=-1e3)
+
+        # Gradient clipping for stability during ODE integration
+        dH = torch.clamp(dH, -1e3, 1e3)
 
         # dH is [batch_size, n_super_nodes * latent_dim]
         # Reshape to [batch_size, n_super_nodes, 2, latent_dim // 2]
@@ -365,7 +376,7 @@ class HamiltonianODEFunc(nn.Module):
             # y: [B, K * D] -> [B, K, 2, D/2]
             y_view = y.view(-1, self.n_super_nodes, 2, d_sub)
             p = y_view[:, :, 1] # momentum
-            gamma = torch.exp(self.gamma)
+            gamma = torch.exp(torch.clamp(self.gamma, max=2.0)) # Clamp gamma to prevent extreme dissipation
             dp = dp - gamma * p
 
         return torch.cat([dq, dp], dim=-1).view(y.shape[0], -1)

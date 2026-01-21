@@ -36,30 +36,47 @@ class SymPyToTorch(torch.nn.Module):
             sp.Add: torch.add,
             sp.Mul: torch.mul,
             sp.Pow: self._safe_pow,
-            sp.exp: torch.exp,
-            sp.log: lambda x: torch.log(torch.abs(x) + self.eps),
+            sp.exp: self._safe_exp,
+            sp.log: self._safe_log,
             sp.sin: torch.sin,
             sp.cos: torch.cos,
-            sp.tan: torch.tan,
+            sp.tan: self._safe_tan,
             sp.Abs: torch.abs,
             sp.sqrt: lambda x: torch.sqrt(torch.abs(x) + self.eps),
         }
 
     def _safe_pow(self, x, y):
         # Handle division (y < 0) and square roots (y = 0.5) safely
-        # Convert y to float if it's a SymPy object
         try:
             y_val = float(y)
             if abs(y_val - (-1.0)) < 1e-9:
-                return 1.0 / (x + torch.sign(x) * self.eps + (x == 0).float() * self.eps)
+                # 1/x with singularity protection
+                return 1.0 / (x + torch.sign(x + 1e-12) * self.eps + (x == 0).float() * self.eps)
             if abs(y_val - 0.5) < 1e-9:
                 return torch.sqrt(torch.abs(x) + self.eps)
             if y_val < 0:
                 # Safe division for any negative power
                 return 1.0 / (torch.pow(torch.abs(x), abs(y_val)) + self.eps)
         except:
+            # If y is a tensor or complex expression
             pass
-        return torch.pow(x, y)
+        
+        # Standard power with protection for negative bases and non-integer exponents
+        return torch.pow(torch.abs(x) + self.eps, y)
+
+    def _safe_exp(self, x):
+        # Clamp input to prevent overflow before exp
+        return torch.exp(torch.clamp(x, max=15.0))
+
+    def _safe_log(self, x):
+        # Safe log with absolute value and epsilon
+        return torch.log(torch.abs(x) + self.eps)
+
+    def _safe_tan(self, x):
+        # Tan has singularities at (n + 1/2) * pi
+        # We use a safe version that clamps the output
+        res = torch.tan(x)
+        return torch.clamp(res, -1e4, 1e4)
 
     def forward(self, x_inputs):
         """
@@ -67,13 +84,16 @@ class SymPyToTorch(torch.nn.Module):
         """
         try:
             res = self._recursive_eval(self.expr, x_inputs)
-            # Global clamp for stability
+            # Catch any remaining NaNs or Infs and clamp
+            res = torch.nan_to_num(res, nan=0.0, posinf=1e6, neginf=-1e6)
             return torch.clamp(res, -1e6, 1e6)
         except Exception:
             # Fallback for unexpected SymPy structures
             l_func = sp.lambdify(self.symbols, self.expr, modules='torch')
             args = [x_inputs[:, i] for i in range(self.n_inputs)]
-            return torch.clamp(l_func(*args), -1e6, 1e6)
+            res = l_func(*args)
+            res = torch.nan_to_num(res, nan=0.0, posinf=1e6, neginf=-1e6)
+            return torch.clamp(res, -1e6, 1e6)
 
     def _recursive_eval(self, node, x_inputs):
         if node.is_Symbol:
@@ -158,10 +178,11 @@ class TorchFeatureTransformer(torch.nn.Module):
             inv_sq_dists_flat = 1.0 / (dists_flat**2 + 0.1)
             
             # New physics-informed basis functions (Differentiable)
-            screened_coulomb = torch.exp(-dists_flat) / (dists_flat + 0.1)
+            exp_dist = torch.exp(-dists_flat)
+            screened_coulomb = exp_dist / (dists_flat + 0.1)
             log_dist = torch.log(dists_flat + 1.0)
             
-            features.extend([dists_flat, inv_dists_flat, inv_sq_dists_flat, screened_coulomb, log_dist])
+            features.extend([dists_flat, inv_dists_flat, inv_sq_dists_flat, exp_dist, screened_coulomb, log_dist])
 
         X = torch.cat(features, dim=1)
         poly_features = [X]

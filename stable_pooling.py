@@ -217,166 +217,116 @@ class StableHierarchicalPooling(nn.Module):
     def _compute_collapse_prevention_loss(self, avg_assignments):
         """
         Compute loss to prevent all assignments from collapsing to a single super-node.
-
-        Args:
-            avg_assignments: Average assignment probabilities [n_super_nodes]
-
-        Returns:
-            collapse_loss: Scalar loss value
+        Uses a combination of variance and an entropy-based penalty.
         """
-        # Compute variance of assignment probabilities
-        # High variance indicates collapse (one dominates)
+        # Variance penalty: high variance means one node dominates
         variance = torch.var(avg_assignments)
 
-        # Also penalize max probability being too high (indicating dominance)
+        # Maximum probability penalty: prevent any single node from taking too much share
         max_prob = torch.max(avg_assignments)
+        max_penalty = torch.pow(torch.relu(max_prob - 0.8), 2) * 10.0
 
-        # Combine both measures
-        collapse_loss = variance + torch.relu(max_prob - 1.0/self.n_super_nodes)
+        # Entropy of the average assignments: should be high for diversity
+        # Note: avg_assignments is already summed/averaged across batch
+        ent_avg = -torch.sum(avg_assignments * torch.log(avg_assignments + 1e-9))
+        target_ent = torch.log(torch.tensor(float(self.n_super_nodes), device=avg_assignments.device))
+        ent_penalty = torch.pow(torch.relu(0.5 * target_ent - ent_avg), 2)
 
-        return collapse_loss
+        return variance + max_penalty + ent_penalty
 
     def _compute_balance_loss(self, avg_assignments):
         """
-        Compute loss to encourage balanced usage of super-nodes.
-
-        Args:
-            avg_assignments: Average assignment probabilities [n_super_nodes]
-
-        Returns:
-            balance_loss: Scalar loss value
+        Compute loss to encourage balanced usage of super-nodes using KL divergence.
         """
         # Target is uniform distribution
         uniform_prob = 1.0 / self.n_super_nodes
         uniform_dist = torch.full_like(avg_assignments, uniform_prob)
 
         # Use KL divergence to encourage uniform distribution
-        kl_div = torch.sum(avg_assignments * torch.log(avg_assignments / (uniform_dist + 1e-9)))
+        # Higher weight when we are far from uniform
+        kl_div = torch.sum(uniform_dist * torch.log(uniform_dist / (avg_assignments + 1e-9)))
 
         return kl_div
 
-    def update_assignment_history(self, current_assignments):
+    def apply_hard_revival(self):
         """
-        Update the assignment history for temporal consistency.
+        Forcefully revive inactive nodes by perturbing their assignment MLP weights
+        if they have been inactive for too long.
         """
-        avg_current = current_assignments.mean(dim=0)
-        self.assignment_history.copy_(0.9 * self.assignment_history + 0.1 * avg_current)
-        self.history_counter += 1
+        if not self.training:
+            return
 
-    def get_assignment_history(self):
-        """
-        Get the historical average assignments.
-        """
-        return self.assignment_history.clone()
-
-
-class AdaptiveTauScheduler:
-    """
-    Adaptive temperature scheduler for Gumbel-Softmax to improve assignment stability.
-    """
-
-    def __init__(self, initial_tau=1.0, final_tau=0.1, decay_steps=1000,
-                 adaptive_collapse_protection=True):
-        self.initial_tau = initial_tau
-        self.final_tau = final_tau
-        self.decay_steps = decay_steps
-        self.current_step = 0
-        self.adaptive_collapse_protection = adaptive_collapse_protection
-
-    def get_tau(self, progress_ratio=None, assignment_stats=None):
-        """
-        Get the current temperature based on training progress and assignment statistics.
-
-        Args:
-            progress_ratio: Float between 0 and 1 indicating training progress
-            assignment_stats: Dict with assignment statistics for adaptive adjustment
-        """
-        if progress_ratio is None:
-            # Calculate based on internal step counter
-            progress_ratio = min(1.0, self.current_step / self.decay_steps)
-
-        # Cosine annealing schedule with a steeper decay early on
-        import math
-        # Use a power of the progress ratio to shift the decay earlier
-        shifted_progress = progress_ratio ** 0.7 
-        tau = self.final_tau + 0.5 * (self.initial_tau - self.final_tau) * (1 + math.cos(math.pi * shifted_progress))
-
-        # If adaptive collapse protection is enabled and we have assignment stats
-        if self.adaptive_collapse_protection and assignment_stats is not None:
-            # Increase temperature if assignments are becoming too peaked (collapse risk)
-            avg_assignments = assignment_stats.get('avg_assignments', None)
-            if avg_assignments is not None:
-                max_assignment = torch.max(avg_assignments).item()
-                # If max assignment probability is too high, increase temperature to encourage exploration
-                if max_assignment > 0.9:  # Threshold for collapse detection
-                    tau = max(tau, 0.5)  # Force a minimum temperature for exploration
-                elif max_assignment > 0.8:
-                    tau *= 1.2
-
-        return tau
-
-    def step(self):
-        """
-        Increment the step counter.
-        """
-        self.current_step += 1
+        inactive_indices = torch.where(self.active_mask < 0.1)[0]
+        if len(inactive_indices) > 0:
+            # Re-initialize the final layer weights for inactive nodes to encourage new exploration
+            with torch.no_grad():
+                # self.assign_mlp[2] is the Linear(in_channels, n_super_nodes) layer
+                last_layer = self.assign_mlp[2]
+                for idx in inactive_indices:
+                    # Give it a fresh random start for this node's output slice
+                    nn.init.normal_(last_layer.weight[idx], mean=0.0, std=0.02)
+                    nn.init.constant_(last_layer.bias[idx], 0.0)
+                
+                # Also reset the active mask slightly for these nodes to allow them to show up
+                self.active_mask[inactive_indices] = 0.2
 
 
 class DynamicLossBalancer:
     """
-    Dynamic loss balancer that adjusts weights based on training progress and loss magnitudes.
-    This helps prevent resolution collapse by dynamically adjusting the importance of different losses.
+    Enhanced dynamic loss balancer that adjusts weights based on training progress,
+    loss magnitudes, and relative importance of stability vs reconstruction.
     """
 
-    def __init__(self, initial_weights=None, adaptation_rate=0.01):
+    def __init__(self, initial_weights=None, adaptation_rate=0.02, priority_losses=None):
         """
-        Initialize the dynamic loss balancer.
-
         Args:
             initial_weights: Dict of initial loss weights
-            adaptation_rate: Rate at which weights adapt (smaller = slower adaptation)
+            adaptation_rate: Rate at which weights adapt
+            priority_losses: List of losses that should be prioritized if they don't decrease
         """
         self.initial_weights = initial_weights or {}
         self.adaptation_rate = adaptation_rate
+        self.priority_losses = priority_losses or ['collapse_prevention', 'balance', 'entropy']
         self.current_weights = initial_weights.copy() if initial_weights else {}
         self.loss_history = {}
         self.step_count = 0
 
     def update_weights(self, current_losses):
-        """
-        Update loss weights based on current loss values.
-
-        Args:
-            current_losses: Dict of current loss values
-        """
         self.step_count += 1
 
         for loss_name, loss_value in current_losses.items():
-            # Initialize if this is the first time seeing this loss
+            val = loss_value.item()
             if loss_name not in self.loss_history:
                 self.loss_history[loss_name] = []
                 self.current_weights[loss_name] = self.initial_weights.get(loss_name, 1.0)
 
-            # Add current loss to history
-            self.loss_history[loss_name].append(loss_value.item())
+            self.loss_history[loss_name].append(val)
+            if len(self.loss_history[loss_name]) > 50:
+                self.loss_history[loss_name].pop(0)
 
-            # Keep only recent history (last 100 steps)
-            if len(self.loss_history[loss_name]) > 100:
-                self.loss_history[loss_name] = self.loss_history[loss_name][-100:]
-
-            # If we have enough history, adapt the weight
-            if len(self.loss_history[loss_name]) >= 10:
+            # Weight adaptation logic
+            if len(self.loss_history[loss_name]) >= 20:
                 recent_avg = sum(self.loss_history[loss_name][-10:]) / 10
-                initial_avg = sum(self.loss_history[loss_name][:10]) / min(10, len(self.loss_history[loss_name]))
+                older_avg = sum(self.loss_history[loss_name][:10]) / 10
+                
+                if older_avg > 0:
+                    ratio = recent_avg / older_avg
+                    
+                    # If loss is not decreasing (ratio close to 1.0 or higher)
+                    if ratio > 0.95:
+                        # Prioritize stability and structural losses more aggressively
+                        boost = 1.0 + self.adaptation_rate
+                        if loss_name in self.priority_losses:
+                            boost += self.adaptation_rate * 2.0
+                        self.current_weights[loss_name] *= boost
+                    # If loss is decreasing very fast, reduce weight
+                    elif ratio < 0.2:
+                        self.current_weights[loss_name] *= (1.0 - self.adaptation_rate)
 
-                # If this loss is decreasing much slower than others, increase its weight
-                if initial_avg > 0 and recent_avg / initial_avg > 0.9:  # Still high relative to initial
-                    self.current_weights[loss_name] *= (1 + self.adaptation_rate)
-                elif recent_avg < initial_avg * 0.1:  # Decreasing very fast, decrease weight
-                    self.current_weights[loss_name] *= (1 - self.adaptation_rate)
-
-                # Clamp weights to reasonable range
-                self.current_weights[loss_name] = max(0.1, min(10.0, self.current_weights[loss_name]))
+                # Clamp weights
+                min_w = 0.05 if loss_name not in self.priority_losses else 0.5
+                max_w = 20.0
+                self.current_weights[loss_name] = max(min_w, min(max_w, self.current_weights[loss_name]))
 
     def get_balanced_losses(self, raw_losses):
         """
