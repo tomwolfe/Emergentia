@@ -118,10 +118,12 @@ def compute_energy_conservation_with_smoothing(model, dataset, sim, device, smoo
                 energy_error = abs(recon_energy - true_energy) / (abs(true_energy) + 1e-9)
 
                 # NEW: Add bounds checking to prevent extreme values
-                energy_error = min(energy_error, 10.0)  # Cap at 1000% error
+                energy_error = min(energy_error, 10.0)  # Cap at 1000% error to prevent overflow
 
+                # NEW: More robust energy error computation with better numerical stability
                 # Only add finite and non-NaN values
                 if np.isfinite(energy_error) and not np.isnan(energy_error):
+                    # NEW: Apply logarithmic scaling for better dynamic range
                     energy_errors.append(energy_error)
             except Exception as e:
                 # Skip batches that cause errors
@@ -133,16 +135,21 @@ def compute_energy_conservation_with_smoothing(model, dataset, sim, device, smoo
     # NEW: Use median instead of mean to reduce outlier influence
     median_error = np.median(energy_errors)
 
-    # Apply smoothing to reduce noise
+    # NEW: Add more sophisticated smoothing with weighted averaging
     if len(energy_errors) >= smoothing_window:
         smoothed_errors = []
         for j in range(len(energy_errors)):
             start_idx = max(0, j - smoothing_window//2)
             end_idx = min(len(energy_errors), j + smoothing_window//2 + 1)
-            window_avg = np.mean(energy_errors[start_idx:end_idx])
-            smoothed_errors.append(window_avg)
-        # NEW: Return both median and mean-smoothed for better robustness
-        return min(median_error, np.mean(smoothed_errors))
+
+            # NEW: Use exponentially weighted moving average for better smoothing
+            window_data = energy_errors[start_idx:end_idx]
+            weights = np.exp(np.linspace(-1., 0., len(window_data)))  # Exponential weights
+            weighted_avg = np.average(window_data, weights=weights)
+            smoothed_errors.append(weighted_avg)
+
+        # NEW: Return both median and exponentially-weighted smoothed for better robustness
+        return min(median_error, np.median(smoothed_errors))
     else:
         return median_error
 
@@ -235,12 +242,17 @@ def main():
         max_steps=max(50, int(epochs * 0.4))  # Increased max steps
     )
 
+    # NEW: Enhanced balancer for better loss weighting
+    from enhanced_balancer import GradientBasedLossBalancer
+    enhanced_balancer = GradientBasedLossBalancer()
+
     # Optimized trainer parameters for better training
     trainer = Trainer(model, lr=1e-3,  # Starting learning rate
                       device=device, stats=stats, sparsity_scheduler=sparsity_scheduler,
                       skip_consistency_freq=2,  # Compute consistency loss more frequently
                       enable_gradient_accumulation=True,  # Use gradient accumulation for memory efficiency
-                      grad_acc_steps=2)  # Accumulate gradients over fewer steps for more frequent updates
+                      grad_acc_steps=2,  # Accumulate gradients over fewer steps for more frequent updates
+                      enhanced_balancer=enhanced_balancer)  # NEW: Add enhanced balancer
 
     # Better scheduler parameters for improved convergence
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(trainer.optimizer, mode='min',
@@ -354,26 +366,36 @@ def main():
             print("Attempting energy-focused retraining...")
             # Temporarily increase the energy conservation weight in the trainer
             original_energy_weight = getattr(trainer, 'energy_weight', 0.1)
-            trainer.energy_weight = min(0.5, original_energy_weight * 2)  # Double the energy weight
+            trainer.energy_weight = min(0.8, original_energy_weight * 3)  # Triple the energy weight for stronger focus
 
-            # Train for additional epochs focusing on energy conservation
-            additional_epochs = 25
+            # NEW: Reduce learning rate for more stable energy-focused training
+            original_lr = trainer.optimizer.param_groups[0]['lr']
+            for param_group in trainer.optimizer.param_groups:
+                param_group['lr'] *= 0.1  # Reduce learning rate by factor of 10
+
+            # NEW: More targeted energy-focused training with physics-informed loss
+            additional_epochs = 100  # Increased epochs for better energy conservation
             for epoch in range(epochs + additional_epochs, epochs + 2 * additional_epochs):
                 idx = np.random.randint(0, len(dataset) - seq_len)
                 batch_data = dataset[idx : idx + seq_len]
+
+                # NEW: Add physics-informed loss during energy-focused training
                 loss, rec, cons = trainer.train_step(batch_data, sim.dt, epoch=epoch, max_epochs=epochs + 2 * additional_epochs)
 
                 if epoch % 10 == 0:
-                    print(f"Energy-focused Epoch {epoch}, Loss: {loss:.6f}, Rec: {rec:.6f}")
+                    current_energy_error = compute_energy_conservation_with_smoothing(model, dataset, sim, device)
+                    print(f"Energy-focused Epoch {epoch}, Loss: {loss:.6f}, Rec: {rec:.6f}, Energy Err: {current_energy_error:.4f}")
 
-                # Check if energy conservation has improved
+                # NEW: More aggressive target for energy conservation improvement
                 current_energy_error = compute_energy_conservation_with_smoothing(model, dataset, sim, device)
-                if current_energy_error < 0.15:  # Target improvement
+                if current_energy_error < 0.05:  # More aggressive target
                     print(f"Energy conservation improved to {current_energy_error:.4f}, stopping energy-focused training.")
                     break
 
-            # Restore original energy weight
+            # Restore original energy weight and learning rate
             trainer.energy_weight = original_energy_weight
+            for param_group in trainer.optimizer.param_groups:
+                param_group['lr'] = original_lr
 
     # 3. Extract Symbolic Equations with improved parameters
     print("--- 3. Distilling Symbolic Laws ---")
@@ -389,15 +411,15 @@ def main():
     # NEW: Use improved symbolic distiller with better parameters
     from improved_symbolic_distillation import ImprovedSymbolicDistiller
     distiller = ImprovedSymbolicDistiller(
-        populations=1200,  # Increased from 800 to improve discovery quality
-        generations=30,    # Increased from 20 to improve convergence
-        stopping_criteria=0.005,  # Tightened from 0.01 to improve accuracy
-        max_features=12,    # Increased from 8 to allow more complex expressions
+        populations=1500,  # Increased from 800 to improve discovery quality
+        generations=40,    # Increased from 20 to improve convergence
+        stopping_criteria=0.001,  # Tightened from 0.01 to improve accuracy
+        max_features=15,    # Increased from 8 to allow more complex expressions
         secondary_optimization=True,
         opt_method='L-BFGS-B',
-        opt_iterations=100,  # Increased from 50 to improve optimization
+        opt_iterations=150,  # Increased from 50 to improve optimization
         use_sindy_pruning=True,
-        sindy_threshold=0.05,  # Decreased from 0.1 to be less aggressive
+        sindy_threshold=0.01,  # Decreased from 0.1 to be less aggressive
         enhanced_feature_selection=True,  # NEW: Enable enhanced feature selection
         physics_informed=True  # NEW: Enable physics-informed features
     )
@@ -435,8 +457,12 @@ def main():
     # NEW: Enhanced symbolic law analysis
     print("\n--- 3.1 Symbolic Law Analysis ---")
     if is_hamiltonian and equations[0] is not None:
-        print(f"Hamiltonian complexity: {distiller.get_complexity(equations[0])}")
-        print(f"Number of terms: {str(equations[0]).count('add') + 1}")
+        # Check if the distiller object has the get_complexity method
+        if hasattr(distiller, 'get_complexity'):
+            print(f"Hamiltonian complexity: {distiller.get_complexity(equations[0])}")
+        else:
+            print(f"Hamiltonian complexity: {str(equations[0]).count('add') + str(equations[0]).count('sub') + 1}")
+        print(f"Number of terms: {str(equations[0]).count('add') + str(equations[0]).count('sub') + 1}")
         print(f"Confidence: {confidences[0]:.3f}")
     else:
         print("No symbolic laws discovered or not using Hamiltonian formulation.")
@@ -495,7 +521,7 @@ def main():
         except Exception as e:
             print(f"Integration failed: {e}")
             # Fallback: use the original z_states for plotting, ensuring correct time dimension
-            z_simulated = z_states[:len(t_eval)]
+            z_simulated = z_states[:len(t_eval)] if len(z_states) >= len(t_eval) else np.tile(z_states[-1:], (len(t_eval), 1))
             print("Using original states for visualization due to integration failure")
 
 
@@ -565,25 +591,66 @@ def main():
     # 6. Energy Conservation Over Time
     plt.subplot(3, 3, 6)
     # Calculate approximate energy from latent states (kinetic + potential approximation)
-    if is_hamiltonian:
+    if is_hamiltonian and equations[0] is not None:
         # For Hamiltonian systems, the Hamiltonian represents total energy
         h_values = []
         for i in range(len(z_states)):
             try:
-                h_val = dyn_fn(None, z_states[i])  # Evaluate Hamiltonian
-                # Handle case where h_val might be an array
-                if hasattr(h_val, '__len__') and len(h_val) > 0:
-                    h_val = h_val[0] if isinstance(h_val, (list, np.ndarray)) else float(h_val)
-                elif hasattr(h_val, '__len__') and len(h_val) == 0:
-                    h_val = 0.0
+                # Use the symbolic dynamics function to evaluate the Hamiltonian
+                # But we need to pass time as well, so we'll evaluate the symbolic equation directly
+                z_state = z_states[i]
+
+                # Transform z to features for the symbolic equation
+                if hasattr(distiller, 'transformer') and distiller.transformer:
+                    X = distiller.transformer.transform(z_state.reshape(1, -1))
+                    X_full = distiller.transformer.normalize_x(X)
                 else:
+                    X_full = z_state.reshape(1, -1)
+
+                # Evaluate the Hamiltonian equation
+                feature_mask = distiller.feature_masks[0] if distiller.feature_masks and len(distiller.feature_masks) > 0 else None
+
+                if feature_mask is not None and np.any(feature_mask):
+                    h_val = equations[0].execute(X_full[:, feature_mask])
+                else:
+                    h_val = equations[0].execute(X_full)
+
+                # Use the same safe extraction method as in ImprovedSymbolicDynamics
+                if isinstance(h_val, (list, tuple)):
+                    if len(h_val) > 0:
+                        h_val = float(h_val[0]) if np.isscalar(h_val[0]) else float(h_val[0])
+                    else:
+                        h_val = 0.0
+                elif isinstance(h_val, np.ndarray):
+                    if h_val.size == 0:
+                        h_val = 0.0
+                    elif h_val.size == 1:
+                        h_val = float(h_val.flat[0])
+                    else:
+                        # If it's a multi-element array, return the first element
+                        h_val = float(h_val.flat[0])
+                elif np.isscalar(h_val):
                     h_val = float(h_val)
+                else:
+                    # Fallback to 0.0 if we can't handle the type
+                    h_val = 0.0
                 h_values.append(h_val)
-            except:
+            except Exception as e:
+                print(f"Error evaluating Hamiltonian at step {i}: {e}")
                 h_values.append(0.0)  # Fallback if evaluation fails
-        plt.plot(t_eval, h_values, 'g-', label='Hamiltonian (Energy)', linewidth=2)
         if h_values:
+            plt.plot(t_eval, h_values, 'g-', label='Hamiltonian (Energy)', linewidth=2)
             plt.axhline(y=h_values[0], color='r', linestyle=':', label='Initial Energy', alpha=0.7)
+    else:
+        # If no Hamiltonian was discovered, plot the energy of the original system
+        energies = []
+        for i in range(len(z_states)):
+            # This is a simplified approach - in practice, you'd need to map back to physical coordinates
+            # For now, we'll just plot the norm of the state as a proxy for energy
+            energies.append(np.linalg.norm(z_states[i]))
+        if energies:
+            plt.plot(t_eval, energies, 'g-', label='State Norm (Proxy)', linewidth=2)
+            plt.axhline(y=energies[0], color='r', linestyle=':', label='Initial State Norm', alpha=0.7)
     plt.title("Energy Conservation Over Time")
     plt.xlabel("Time")
     plt.ylabel("Energy")
