@@ -110,6 +110,13 @@ class ImprovedFeatureTransformer(FeatureTransformer):
                            exp_dist, screened_coulomb, log_dist,
                            sin_dist, cos_dist, sqrt_dist,
                            dist_times_inv, dist_plus_inv])
+            
+            # NEW: Explicit kinetic energy terms (p^2) for each node
+            # Assuming p is in the second half of the latent dimensions
+            half_d = n_dims // 2
+            p_vars = z_nodes[:, :, half_d:]
+            ke_terms = np.sum(p_vars**2, axis=-1) # [Batch, K]
+            features.append(ke_terms)
 
         X = np.hstack(features)
         # Final clamp of linear features before polynomial expansion
@@ -123,24 +130,25 @@ class ImprovedFeatureTransformer(FeatureTransformer):
         max_features_for_poly = min(20, n_latents)  # Increased limit for better representation
 
         for i in range(max_features_for_poly):
+            valid_idx = i % n_latents
             # Quadratic terms
-            poly_features.append((X[:, i:i+1]**2))
+            poly_features.append((X[:, valid_idx:valid_idx+1]**2))
             
-            node_idx = i // self.latent_dim
-            dim_idx = i % self.latent_dim
+            node_idx = valid_idx // self.latent_dim
+            dim_idx = valid_idx % self.latent_dim
             
             # Cross terms with expanded range
-            for j in range(i + 1, min(i + 6, (node_idx + 1) * self.latent_dim)):  # Increased cross terms per feature
-                poly_features.append(X[:, i:i+1] * X[:, j:j+1])
+            for j in range(valid_idx + 1, min(valid_idx + 6, (node_idx + 1) * self.latent_dim)):  # Increased cross terms per feature
+                poly_features.append(X[:, valid_idx:valid_idx+1] * X[:, j:j+1])
                 
             # Cross terms with other nodes
             for other_node in range(node_idx + 1, min(node_idx + 5, self.n_super_nodes)):  # Increased other nodes
                 other_idx = other_node * self.latent_dim + dim_idx
-                poly_features.append(X[:, i:i+1] * X[:, other_idx:other_idx+1])
+                poly_features.append(X[:, valid_idx:valid_idx+1] * X[:, other_idx:other_idx+1])
                 
             # NEW: Cubic terms for important features
-            if i % 3 == 0:  # Every third feature gets cubic term
-                poly_features.append((X[:, i:i+1]**3))
+            if valid_idx % 3 == 0:  # Every third feature gets cubic term
+                poly_features.append((X[:, valid_idx:valid_idx+1]**3))
 
         res = np.hstack(poly_features)
 
@@ -900,8 +908,8 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
                 
                 if not (has_q and has_p):
                     print(f"  -> WARNING: Discovered Hamiltonian H(z) = {eq_str} lacks physical dependency (needs both q and p). Reducing confidence.")
-                    # Soft gating: reduce confidence by 50% instead of discarding
-                    conf *= 0.5
+                    # Soft gating: reduce confidence by 20% instead of 50%
+                    conf *= 0.8
             
             equations.append(eq)
             self.feature_masks.append(mask)

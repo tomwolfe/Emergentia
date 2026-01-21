@@ -8,11 +8,14 @@ from scipy.spatial import KDTree
 
 def compute_stats(pos, vel):
     # pos, vel: [T, N, 2]
-    pos_mean = pos.mean(axis=(0, 1))
-    pos_std = pos.std(axis=(0, 1)) + 1e-6
+    # Use min-max for positions to keep them in a fixed range
+    pos_min = pos.min(axis=(0, 1))
+    pos_max = pos.max(axis=(0, 1))
+    pos_range = np.maximum(pos_max - pos_min, 1e-6)
+    
     vel_mean = vel.mean(axis=(0, 1))
     vel_std = vel.std(axis=(0, 1)) + 1e-6
-    return {'pos_mean': pos_mean, 'pos_std': pos_std, 
+    return {'pos_min': pos_min, 'pos_max': pos_max, 'pos_range': pos_range,
             'vel_mean': vel_mean, 'vel_std': vel_std}
 
 def prepare_data(pos, vel, radius=1.1, stats=None, device='cpu', cache_edges=True):
@@ -22,7 +25,8 @@ def prepare_data(pos, vel, radius=1.1, stats=None, device='cpu', cache_edges=Tru
     if stats is None:
         stats = compute_stats(pos, vel)
 
-    pos_norm = (pos - stats['pos_mean']) / stats['pos_std']
+    # Map pos to [-1, 1]
+    pos_norm = 2.0 * (pos - stats['pos_min']) / stats['pos_range'] - 1.0
     vel_norm = (vel - stats['vel_mean']) / stats['vel_std']
 
     dataset = []
@@ -321,9 +325,8 @@ class Trainer:
         # 3. Decaying Teacher Forcing Ratio (more aggressive decay)
         tf_ratio = max(0.0, 0.8 * (1.0 - epoch / (0.5 * max_epochs + 1e-9)))  # Faster decay
 
-        # 4. Alignment Annealing - Enhanced to promote better physical mapping
-        # Start with higher weight and anneal more gradually to ensure strong initial alignment
-        align_weight = max(0.3, 1.2 - epoch / (self.align_anneal_epochs * 0.7 + 1e-9))  # Higher initial weight and slower decay
+        # 4. Alignment weight
+        align_weight = 1.0
 
         # 5. Adaptive Entropy Weight: Doubled growth rate to force discrete clusters
         # Point 1: Addressing "Blurry" Meso-scale
@@ -338,10 +341,13 @@ class Trainer:
         if torch.isnan(z_curr).any() or torch.isinf(z_curr).any():
             z_curr = torch.nan_to_num(z_curr, nan=0.0, posinf=1.0, neginf=-1.0)
 
-        loss_rec = torch.tensor(0.0, device=self.device)
+        # Apply high weight for initial reconstruction
+        recon_0 = self.model.decode(z_curr, s_0, batch_0.batch)
+        loss_rec = self.criterion(recon_0, batch_0.x)
+        
         loss_cons = torch.tensor(0.0, device=self.device)
-        # Apply entropy weight
-        loss_assign = entropy_weight * losses_0['entropy'] + losses_0['diversity'] + 0.1 * losses_0['spatial']
+        # Apply entropy weight and boost diversity to prevent collapse
+        loss_assign = entropy_weight * losses_0['entropy'] + 2.0 * losses_0['diversity'] + 0.1 * losses_0['spatial']
         loss_pruning = losses_0['pruning']
         loss_sparsity = losses_0['sparsity']
         loss_sep = losses_0.get('separation', torch.tensor(0.0, device=self.device))
@@ -412,8 +418,8 @@ class Trainer:
         s_stability = 0
         mu_stability = 0
 
-        mu_mean = torch.tensor(self.stats['pos_mean'], device=self.device, dtype=torch.float32) if self.stats else 0
-        mu_std = torch.tensor(self.stats['pos_std'], device=self.device, dtype=torch.float32) if self.stats else 1
+        mu_min = torch.tensor(self.stats['pos_min'], device=self.device, dtype=torch.float32) if self.stats else 0
+        mu_range = torch.tensor(self.stats['pos_range'], device=self.device, dtype=torch.float32) if self.stats else 1
 
         # Optimize the target computation loop - only compute targets when needed
         # Process every other time step to reduce computation
@@ -427,7 +433,7 @@ class Trainer:
             recon_t = self.model.decode(z_preds[t], s_t, batch_t.batch)
 
             loss_rec += self.criterion(recon_t, batch_t.x)
-            loss_assign += entropy_weight * losses_t['entropy'] + losses_t['diversity'] + 0.1 * losses_t['spatial']
+            loss_assign += entropy_weight * losses_t['entropy'] + 2.0 * losses_t['diversity'] + 0.1 * losses_t['spatial']
             loss_pruning += losses_t['pruning']
             loss_sparsity += losses_t['sparsity']
             loss_sep += losses_t.get('separation', torch.tensor(0.0, device=self.device))
@@ -435,7 +441,7 @@ class Trainer:
             loss_ortho += self.model.get_ortho_loss(s_t)
 
             # CoM Position Alignment - Enhanced weight for better physical mapping
-            mu_t_norm = (mu_t - mu_mean) / (mu_std + 1e-6)
+            mu_t_norm = 2.0 * (mu_t - mu_min) / mu_range - 1.0
             d_sub = self.model.encoder.latent_dim // 2 if self.model.hamiltonian else 2
             d_align = min(d_sub, 2)
 
@@ -470,7 +476,7 @@ class Trainer:
         loss_conn /= (seq_len // 2)
 
         # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning, 8: sep, 9: conn, 10: sparsity, 11: mi, 12: sym, 13: var
-        lvars = torch.clamp(self.model.log_vars, min=-0.5, max=5.0)
+        lvars = torch.clamp(self.model.log_vars, min=-0.5, max=3.0)
 
         raw_weights = {
             'rec': torch.exp(-lvars[0]), 'cons': torch.exp(-lvars[1]),
@@ -543,7 +549,7 @@ class Trainer:
                        (weights['lvr'] * 1e-4 * loss_lvr + lvars[5])
 
         # Add L2 regularization on lvars to prevent them from growing indefinitely
-        loss += 0.01 * torch.sum(lvars**2)
+        loss += 0.1 * torch.sum(lvars**2)
 
         if not torch.isfinite(loss):
             # Try to recover by ignoring non-finite components

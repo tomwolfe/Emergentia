@@ -172,8 +172,8 @@ def compute_energy_conservation_with_smoothing(model, dataset, sim, device, smoo
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--epochs', type=int, default=300)  # Increased default epochs for better convergence
-    parser.add_argument('--steps', type=int, default=100)   # Increased steps for better data
+    parser.add_argument('--epochs', type=int, default=600)  # Increased default epochs for better convergence
+    parser.add_argument('--steps', type=int, default=200)   # Increased steps for better data
     parser.add_argument('--particles', type=int, default=8) # Increased particles for richer dynamics
     parser.add_argument('--super_nodes', type=int, default=4)
     parser.add_argument('--device', type=str, default=None, help='Device to use (cpu, cuda, mps)')
@@ -197,18 +197,18 @@ def main():
     # 1. Setup Parameters
     n_particles = args.particles
     n_super_nodes = args.super_nodes
-    latent_dim = 8  # Increased latent dimension for better representation
+    latent_dim = 4  # D/2 = 2 (q, p)
     steps = args.steps
     epochs = args.epochs
-    seq_len = 5  # Increased sequence length for better temporal modeling
+    seq_len = 10  # Reduced sequence length for better stability
     dynamic_radius = 2.0  # Increased radius for better connectivity
     box_size = (15.0, 15.0)  # Larger box size
 
     print("--- 1. Generating Data ---")
-    from simulator import LennardJonesSimulator
-    # Use smaller dt for better simulation accuracy
-    sim = LennardJonesSimulator(n_particles=n_particles, epsilon=1.0, sigma=1.0,
-                                dynamic_radius=dynamic_radius, box_size=box_size, dt=0.001, sub_steps=5)  # Smaller dt and more sub-steps
+    from simulator import SpringMassSimulator
+    # Use SpringMassSimulator for more stable dynamics during verification
+    sim = SpringMassSimulator(n_particles=n_particles, spring_dist=1.0, k=5.0,
+                                dynamic_radius=dynamic_radius, box_size=box_size, dt=0.01)
     pos, vel = sim.generate_trajectory(steps=steps)
     
     # Track energy conservation throughout the trajectory
@@ -280,7 +280,7 @@ def main():
                                                            factor=0.5, patience=30, min_lr=1e-7)  # More gradual decay
 
     # Early stopping setup with better parameters
-    early_stopping = ImprovedEarlyStopping(patience=100, min_delta=1e-5)  # Even longer patience and finer delta
+    early_stopping = ImprovedEarlyStopping(patience=200, min_delta=1e-5)  # Even longer patience and finer delta
 
     last_loss = 1.0
     for epoch in range(epochs):
@@ -391,11 +391,11 @@ def main():
             
             # Temporarily increase the energy conservation weight in the trainer
             original_energy_weight = getattr(trainer, 'energy_weight', 0.1)
-            trainer.energy_weight = min(0.8, original_energy_weight * 1.2)  # NEW: Use 1.2x multiplier instead of 3x
+            trainer.energy_weight = 0.05  # NEW: Much more conservative energy weight
 
-            # NEW: Reduce learning rate to 0.1x for more stable energy-focused training
+            # NEW: Reduce learning rate to 0.01x for more stable energy-focused training
             original_lr = trainer.optimizer.param_groups[0]['lr']
-            new_lr = original_lr * 0.1 
+            new_lr = original_lr * 0.01 
             for param_group in trainer.optimizer.param_groups:
                 param_group['lr'] = new_lr
 

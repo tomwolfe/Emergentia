@@ -129,7 +129,7 @@ class OptimizedHamiltonianODEFunc(nn.Module):
     """
     Optimized Hamiltonian ODE function with reduced computational complexity.
     """
-    def __init__(self, latent_dim, n_super_nodes, hidden_dim=32, dissipative=True):  # Reduced hidden_dim
+    def __init__(self, latent_dim, n_super_nodes, hidden_dim=64, dissipative=True):  # Increased hidden_dim
         super(OptimizedHamiltonianODEFunc, self).__init__()
         assert latent_dim % 2 == 0, "Latent dim must be even for Hamiltonian dynamics (q, p)"
         self.latent_dim = latent_dim
@@ -138,15 +138,13 @@ class OptimizedHamiltonianODEFunc(nn.Module):
 
         # Simplified and more efficient Hamiltonian network
         total_input_dim = latent_dim * n_super_nodes
-        # Use a shallower but wider network for better efficiency
+        # Use a slightly deeper network for better representation
         self.H_net = nn.Sequential(
             nn.Linear(total_input_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim//2),  # Even smaller final layer
-            nn.SiLU(),
-            nn.Linear(hidden_dim//2, 1)
+            nn.Linear(hidden_dim, 1)
         )
 
         if dissipative:
@@ -216,16 +214,15 @@ class OptimizedGNNDecoder(nn.Module):
 
         out = self.mlp(node_features_latent)
         
-        # Apply Tanh scaled by box size to positions (first 2 features)
-        # to ensure they utilize the full spatial range and prevent collapse.
-        pos_recon = torch.tanh(out[:, :2]) * (self.box_size / 2.0)
+        # Output values in [-1, 1] for positions to match normalization
+        pos_recon = torch.tanh(out[:, :2])
         vel_recon = out[:, 2:]
         
         return torch.cat([pos_recon, vel_recon], dim=-1)
 
 
 class OptimizedDiscoveryEngineModel(nn.Module):
-    def __init__(self, n_particles, n_super_nodes, node_features=4, latent_dim=4, hidden_dim=32, hamiltonian=False, dissipative=True, min_active_super_nodes=2, box_size=10.0):
+    def __init__(self, n_particles, n_super_nodes, node_features=4, latent_dim=4, hidden_dim=64, hamiltonian=False, dissipative=True, min_active_super_nodes=2, box_size=10.0):
         super(OptimizedDiscoveryEngineModel, self).__init__()
         self.encoder = OptimizedGNNEncoder(node_features, hidden_dim, latent_dim, n_super_nodes, min_active_super_nodes=min_active_super_nodes)
 
@@ -251,11 +248,13 @@ class OptimizedDiscoveryEngineModel(nn.Module):
         # Maintain the same number of log vars as the original model to be compatible with trainer
         # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning, 8: sep, 9: conn, 10: sparsity, 11: mi, 12: sym, 13: var
         lvars = torch.zeros(14)
-        lvars[0] = -1.0 # Boost reconstruction
-        lvars[2] = -1.1 # Boost assignments/spatial (0.5 - 1.6)
-        lvars[3] = -1.6 # Boost ortho (0.0 - 1.6)
-        lvars[6] = 0.5  # Suppress alignment slightly
-        lvars[13] = -1.0 # Boost latent variance loss to prevent collapse
+        lvars[0] = -2.0 # High priority for reconstruction
+        lvars[1] = 0.5  # Consistency
+        lvars[2] = 0.5  # Assignment
+        lvars[3] = 0.0  # Ortho
+        lvars[6] = 1.0  # Start align sooner
+        lvars[12] = 2.0 # Suppress symbolic significantly initially
+        lvars[13] = 1.0 # Suppress latent variance loss more initially
         self.log_vars = nn.Parameter(lvars) 
         
     def get_latent_variance_loss(self, z):

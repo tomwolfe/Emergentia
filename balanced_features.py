@@ -213,9 +213,10 @@ class BalancedFeatureTransformer:
             diff -= box * np.round(diff / box)
 
         # [Batch, n_pairs]
-        d = np.linalg.norm(diff, axis=2)
+        d = np.linalg.norm(diff, axis=2) + 1e-6
         
-        return [d, 1.0 / (d + 0.1), 1.0 / (d**2 + 0.1), np.exp(-d), np.exp(-d)/(d + 0.1), np.log(d + 1.0)]
+        # Only return 1/r and 1/r^2 as requested for small systems
+        return [1.0 / (d + 0.1), 1.0 / (d**2 + 0.1)]
 
     def _polynomial_expansion(self, X, fit_transformer):
         """
@@ -244,6 +245,10 @@ class BalancedFeatureTransformer:
         # 1. Base features: Raw latents + already computed distance features
         features = [X]
         
+        # For small systems, target < 40 features by skipping higher-order terms
+        if self.n_super_nodes <= 4:
+            return np.concatenate(features, axis=1)
+
         # 2. Squares of raw latents: [Batch, n_raw_latents]
         X_raw = X[:, :n_raw_latents]
         features.append(X_raw**2)

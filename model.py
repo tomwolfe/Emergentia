@@ -410,9 +410,8 @@ class GNNDecoder(nn.Module):
         
         out = self.mlp(node_features_latent)
         
-        # Apply Tanh scaled by box size to positions (first 2 features)
-        # to ensure they utilize the full spatial range and prevent collapse.
-        pos_recon = torch.tanh(out[:, :2]) * (self.box_size / 2.0)
+        # Output values in [-1, 1] for positions to match normalization
+        pos_recon = torch.tanh(out[:, :2])
         vel_recon = out[:, 2:]
         
         return torch.cat([pos_recon, vel_recon], dim=-1)
@@ -457,15 +456,15 @@ class DiscoveryEngineModel(nn.Module):
 
         # Learnable loss log-variances for automatic loss balancing
         # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning, 8: sep, 9: conn, 10: sparsity, 11: mi, 12: sym, 13: var
-        # Initialize log_vars[0] (rec) to a negative value to give it higher initial weight
+        # Initialize log_vars[0] (rec) to a moderate value
         lvars = torch.zeros(14)
-        lvars[0] = -1.0 # Boost reconstruction significantly, but less than -2.0
+        lvars[0] = -2.0 # High priority for reconstruction
         lvars[1] = 0.5  # Consistency
         lvars[2] = 0.5  # Assignment
         lvars[3] = 0.0  # Ortho
-        lvars[6] = 1.0  # Suppress alignment slightly
-        lvars[12] = 1.0 # Suppress symbolic slightly initially
-        lvars[13] = 0.0 # Latent variance loss - prevent it from being too heavy initially
+        lvars[6] = 1.0  # Start align sooner
+        lvars[12] = 2.0 # Suppress symbolic significantly initially
+        lvars[13] = 1.0 # Suppress latent variance loss more initially
         self.log_vars = nn.Parameter(lvars) 
         
     def get_latent_variance_loss(self, z):
