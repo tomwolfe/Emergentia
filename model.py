@@ -292,21 +292,13 @@ class DiscoveryEngineModel(nn.Module):
         t_ode = t.to(ode_device)
 
         # Explicitly use float32 for rtol/atol
-        rtol = torch.tensor(1e-3, dtype=torch.float32, device=ode_device)
-        atol = torch.tensor(1e-4, dtype=torch.float32, device=ode_device)
+        rtol = 1e-4
+        atol = 1e-6
 
-        try:
-            zt_flat = odeint(self.ode_func, y0, t_ode, rtol=rtol, atol=atol)
-        except Exception as e:
-            # Fallback: Simple Euler step if odeint fails (e.g. stiffness or NaN)
-            if len(t_ode) > 1:
-                dt = t_ode[1] - t_ode[0]
-                dy = self.ode_func(t_ode[0], y0)
-                y1 = y0 + dy * dt
-                # Create a tensor of shape [len(t), batch, dim] with y0 and y1
-                zt_flat = torch.stack([y0, y1] + [y1 for _ in range(len(t_ode)-2)])
-            else:
-                zt_flat = y0.unsqueeze(0)
+        # Use dopri5 (default) but with tightened tolerances for stability
+        # We remove the Euler fallback to ensure the symbolic distillation 
+        # phase receives high-fidelity integration data.
+        zt_flat = odeint(self.ode_func, y0, t_ode, rtol=rtol, atol=atol, method='dopri5')
 
         # Move back to original device
         zt_flat = zt_flat.to(original_device)

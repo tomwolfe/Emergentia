@@ -212,23 +212,40 @@ class SymbolicDistiller:
         if not candidates:
             return None, full_mask, 0.0
 
-        # Sort by score, then apply a Pareto-inspired selection
-        candidates.sort(key=lambda x: x['score'], reverse=True)
+        # Pareto Frontier Selection: Aggressively penalize complexity to ensure physical parsimony
+        # We seek to maximize Score while minimizing Complexity.
+        # A common heuristic is the 'knee' of the Pareto front, or a complexity-weighted score.
+        for c in candidates:
+            # Adjusted score: R2 penalized by complexity (length of the expression)
+            # 0.01 is a base penalty per node in the expression tree
+            c['pareto_score'] = c['score'] - 0.015 * c['complexity']
+            
+        candidates.sort(key=lambda x: x['pareto_score'], reverse=True)
         best_candidate = candidates[0]
         
-        # Pareto selection: if a much simpler model is almost as good, prefer it.
-        for c in candidates[1:]:
-            # If the candidate is significantly simpler (e.g. < 50% complexity) 
-            # and within 5% of the best score, choose it.
-            if (best_candidate['score'] - c['score']) < 0.05 and c['complexity'] < 0.5 * best_candidate['complexity']:
-                best_candidate = c
-                
+        # If the best candidate still has a very high complexity (> 20 nodes), 
+        # look for a significantly simpler one that is still reasonably accurate.
+        if best_candidate['complexity'] > 20:
+            for c in candidates[1:]:
+                if c['complexity'] < 10 and (best_candidate['score'] - c['score']) < 0.08:
+                    best_candidate = c
+                    break
+
         if best_candidate['score'] < 0.85:
             print(f"  -> Escalating distillation for target_{i}...")
             est = self._get_regressor(self.max_pop, self.max_gen, parsimony=best_candidate['p'])
             est.fit(X_selected, Y_norm[:, i])
-            best_candidate = {'prog': est._program, 'score': est.score(X_selected, Y_norm[:, i])}
-            confidence = best_candidate['score'] # Simplified update
+            # For the escalated model, we also check if it's better Pareto-wise
+            esc_prog = est._program
+            esc_score = est.score(X_selected, Y_norm[:, i])
+            esc_complexity = self.get_complexity(esc_prog)
+            esc_pareto = esc_score - 0.015 * esc_complexity
+            
+            if esc_pareto > best_candidate['pareto_score']:
+                best_candidate = {'prog': esc_prog, 'score': esc_score, 'complexity': esc_complexity}
+            
+        # Confidence now accounts for both accuracy and parsimony
+        confidence = max(0, best_candidate['score'] - 0.01 * best_candidate['complexity'])
             
         return best_candidate['prog'], full_mask, confidence
 
