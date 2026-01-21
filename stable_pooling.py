@@ -104,7 +104,8 @@ class StableHierarchicalPooling(nn.Module):
         logits = self.assign_mlp(x) * self.scaling
 
         # Apply active_mask to logits (soft mask to allow for revival)
-        mask = self.active_mask.unsqueeze(0)
+        # Use detach() to prevent inplace modification errors during backward pass
+        mask = self.active_mask.detach().unsqueeze(0)
         
         # During training, use a softer mask to allow potential reactivation
         if self.training:

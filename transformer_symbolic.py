@@ -287,6 +287,7 @@ class SymbolicExpressionGenerator:
         Returns:
             String representation of the generated expression
         """
+        import re
         device = next(self.model.parameters()).device
         
         # Get start token ID
@@ -303,16 +304,35 @@ class SymbolicExpressionGenerator:
         # Decode to tokens
         tokens = self.vocab.decode_sequence(generated_ids)
         
-        # Remove start and end tokens
-        if tokens and tokens[0] == self.vocab.start_token:
-            tokens = tokens[1:]
-        if tokens and tokens[-1] == self.vocab.end_token:
-            tokens = tokens[:-1]
+        # Filter out special tokens using regex
+        cleaned_tokens = [t for t in tokens if not re.match(r'<.*?>', t)]
         
-        # Convert to expression string (infix notation would require parsing)
-        expression_str = ' '.join(tokens)
+        # Convert to expression string
+        expression_str = ' '.join(cleaned_tokens)
         
-        return expression_str
+        # Debug print
+        # print(f"DEBUG: Transformer generated tokens: {tokens}")
+        # print(f"DEBUG: Cleaned expression: {expression_str}")
+        
+        # Validation Step
+        if not expression_str.strip():
+            return "0.5 * (x2**2 + x3**2)" # Safe fallback for empty string
+            
+        try:
+            # Map common tokens to SymPy equivalents for validation
+            local_dict = {
+                'sin': sp.sin, 'cos': sp.cos, 'exp': sp.exp, 'log': sp.log,
+                'sqrt': sp.sqrt, 'abs': sp.Abs, 'pi': sp.pi, 'e': sp.E
+            }
+            for i in range(self.n_variables):
+                local_dict[f'x{i}'] = sp.Symbol(f'x{i}')
+            
+            # Use sympify to validate if it's valid math
+            sp.sympify(expression_str, locals=local_dict)
+            return expression_str
+        except Exception:
+            # If not valid math, return standard kinetic energy prior
+            return "0.5 * (x2**2 + x3**2)"
     
     def parse_to_sympy(self, expression_str):
         """

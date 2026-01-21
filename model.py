@@ -354,7 +354,7 @@ class HamiltonianODEFunc(nn.Module):
         with torch.set_grad_enabled(True):
             y_in = y.detach().requires_grad_(True)
             H = self.H_net(y_in).sum()
-            dH = torch.autograd.grad(H, y_in, create_graph=training, allow_unused=True)[0]
+            dH = torch.autograd.grad(H, y_in, create_graph=True, allow_unused=True)[0]
             
             if dH is None:
                 dH = torch.zeros_like(y_in)
@@ -397,8 +397,13 @@ class GNNDecoder(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, out_features)
         )
+        # Final Linear layer initialized to identity for stable reconstruction scale
+        self.identity_projector = nn.Linear(out_features, out_features)
+        with torch.no_grad():
+            self.identity_projector.weight.copy_(torch.eye(out_features))
+            self.identity_projector.bias.zero_()
 
-    def forward(self, z, s, batch):
+    def forward(self, z, s, batch, stats=None):
         # z: [batch_size, n_super_nodes, latent_dim]
         # s: [N_total, n_super_nodes]
         
@@ -409,11 +414,22 @@ class GNNDecoder(nn.Module):
         node_features_latent = torch.sum(s.unsqueeze(-1) * z_expanded, dim=1)
         
         out = self.mlp(node_features_latent)
+        out = self.identity_projector(out)
         
-        # Positions and velocities are reconstructed linearly
-        # The tanh was causing a "clump" problem near the origin
+        # Positions and velocities are reconstructed
         pos_recon = out[:, :2]
         vel_recon = out[:, 2:]
+
+        # Explicit denormalization using stats from trainer
+        if stats is not None:
+            pos_min = torch.tensor(stats['pos_min'], device=pos_recon.device, dtype=pos_recon.dtype)
+            pos_range = torch.tensor(stats['pos_range'], device=pos_recon.device, dtype=pos_recon.dtype)
+            # Map [-1, 1] back to original range
+            pos_recon = 0.5 * (pos_recon + 1.0) * pos_range + pos_min
+            
+            vel_mean = torch.tensor(stats['vel_mean'], device=vel_recon.device, dtype=vel_recon.dtype)
+            vel_std = torch.tensor(stats['vel_std'], device=vel_recon.device, dtype=vel_recon.dtype)
+            vel_recon = vel_recon * vel_std + vel_mean
         
         return torch.cat([pos_recon, vel_recon], dim=-1)
 
@@ -507,8 +523,8 @@ class DiscoveryEngineModel(nn.Module):
     def encode(self, x, edge_index, batch, tau=1.0, hard=False):
         return self.encoder(x, edge_index, batch, tau=tau, hard=hard)
     
-    def decode(self, z, s, batch):
-        return self.decoder(z, s, batch)
+    def decode(self, z, s, batch, stats=None):
+        return self.decoder(z, s, batch, stats=stats)
     
     def get_ortho_loss(self, s):
         # s: [N, n_super_nodes]

@@ -14,6 +14,8 @@ from transformer_symbolic import create_neural_symbolic_hybrid
 import argparse
 
 def main():
+    # Enable anomaly detection for debugging
+    torch.autograd.set_detect_anomaly(True)
     # NOTE: This is the enhanced version of the program with improvements
     # addressing the critical analysis points:
     # 1. Basis function bottleneck - using learnable basis functions
@@ -157,7 +159,7 @@ def main():
         return
 
     # NEW: Use ImprovedSymbolicDistiller which includes physicality gates and optimized search
-    distiller = ImprovedSymbolicDistiller(populations=2000, generations=40, secondary_optimization=True)
+    distiller = ImprovedSymbolicDistiller(populations=3000, generations=50, secondary_optimization=True)
 
     if is_hamiltonian:
         z_states, dz_states, t_states, h_states = latent_data

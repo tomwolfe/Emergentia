@@ -268,10 +268,32 @@ class Trainer:
         self.min_symbolic_confidence = 0.7
 
         # MPS fix: torchdiffeq has issues with MPS (float64 defaults and stability)
+        # But we need to ensure all components are on the same device
         if str(device) == 'mps':
+            # Move the ODE function to CPU but keep track of the device for other operations
             self.model.ode_func.to('cpu')
+            self.mps_ode_on_cpu = True
+        else:
+            self.mps_ode_on_cpu = False
 
-        self.optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+        # Separate H_net parameters to apply specific weight decay
+        h_net_params = []
+        other_params = []
+        
+        if hasattr(self.model.ode_func, 'H_net'):
+            h_net_params = list(self.model.ode_func.H_net.parameters())
+            h_ids = {id(p) for p in h_net_params}
+            other_params = [p for p in self.model.parameters() if id(p) not in h_ids]
+        else:
+            other_params = list(self.model.parameters())
+
+        param_groups = [
+            {'params': other_params, 'weight_decay': 1e-5},
+        ]
+        if h_net_params:
+            param_groups.append({'params': h_net_params, 'weight_decay': 1e-3})
+
+        self.optimizer = optim.Adam(param_groups, lr=lr)
         self.criterion = torch.nn.MSELoss().to(device)
         self.stats = stats
 
@@ -349,8 +371,8 @@ class Trainer:
         if torch.isnan(z_curr).any() or torch.isinf(z_curr).any():
             z_curr = torch.nan_to_num(z_curr, nan=0.0, posinf=1.0, neginf=-1.0)
 
-        # Apply high weight for initial reconstruction
-        recon_0 = self.model.decode(z_curr, s_0, batch_0.batch)
+        # Apply high weight for initial reconstruction - Pass stats for denormalization
+        recon_0 = self.model.decode(z_curr, s_0, batch_0.batch, stats=self.stats)
         loss_rec = self.criterion(recon_0, batch_0.x)
         
         loss_cons = torch.tensor(0.0, device=self.device)
@@ -365,19 +387,54 @@ class Trainer:
         loss_mi = torch.tensor(0.0, device=self.device)
         loss_sym = torch.tensor(0.0, device=self.device)
         loss_var = self.model.get_latent_variance_loss(z_curr)
+        
+        # Add Curvature Penalty for Hamiltonian dynamics - Computed on initial state
+        loss_curv = torch.tensor(0.0, device=self.device)
+        if self.model.hamiltonian:
+            with torch.set_grad_enabled(True):
+                z_in = z_curr.view(z_curr.size(0), -1).detach().requires_grad_(True)
+
+                # Handle MPS device mismatch: if ODE func is on CPU but z_in is on MPS
+                if self.mps_ode_on_cpu:
+                    z_in_cpu = z_in.cpu()
+                    H = self.model.ode_func.H_net(z_in_cpu).sum()
+                    dH = torch.autograd.grad(H, z_in_cpu, create_graph=True)[0]
+                    if dH is not None:
+                        # Move gradient back to original device for loss calculation
+                        dH = dH.to(self.device)
+                        loss_curv = torch.norm(dH, p=2)
+                else:
+                    H = self.model.ode_func.H_net(z_in).sum()
+                    dH = torch.autograd.grad(H, z_in, create_graph=True)[0]
+                    if dH is not None:
+                        loss_curv = torch.norm(dH, p=2)
 
         # Symbolic-in-the-loop loss with FIDELITY GATING
         # Point 3: Addressing Symbolic-Neural Feedback Loop Fragility
         if (self.symbolic_proxy is not None and not is_warmup and
             self.symbolic_confidence >= self.min_symbolic_confidence):
             z0_flat = z_curr.view(z_curr.size(0), -1)
-            # GNN predicted derivative
-            gnn_dz = self.model.ode_func(0, z0_flat)
-            # Symbolic predicted derivative (now differentiable!)
-            sym_dz = self.symbolic_proxy(z0_flat)
 
-            # Use Huber loss for more robustness against "garbage" symbolic laws
-            loss_sym = torch.nn.functional.huber_loss(gnn_dz, sym_dz, delta=1.0)
+            # Handle MPS device mismatch: if ODE func is on CPU but z0_flat is on MPS
+            if self.mps_ode_on_cpu:
+                z0_flat_cpu = z0_flat.cpu()
+                # GNN predicted derivative
+                gnn_dz_cpu = self.model.ode_func(0, z0_flat_cpu)
+                # Symbolic predicted derivative (now differentiable!)
+                sym_dz_cpu = self.symbolic_proxy(z0_flat_cpu)
+
+                # Use Huber loss for more robustness against "garbage" symbolic laws
+                loss_sym_cpu = torch.nn.functional.huber_loss(gnn_dz_cpu, sym_dz_cpu, delta=1.0)
+                # Move loss back to original device
+                loss_sym = loss_sym_cpu.to(self.device)
+            else:
+                # GNN predicted derivative
+                gnn_dz = self.model.ode_func(0, z0_flat)
+                # Symbolic predicted derivative (now differentiable!)
+                sym_dz = self.symbolic_proxy(z0_flat)
+
+                # Use Huber loss for more robustness against "garbage" symbolic laws
+                loss_sym = torch.nn.functional.huber_loss(gnn_dz, sym_dz, delta=1.0)
 
         s_prev = s_0
         mu_prev = mu_0
@@ -426,8 +483,8 @@ class Trainer:
 
             z_t_target = torch.nan_to_num(z_t_target)
 
-            # Use z_preds for reconstruction to force consistency
-            recon_t = self.model.decode(z_preds[t], s_t, batch_t.batch)
+            # Use z_preds for reconstruction to force consistency - Pass stats for denormalization
+            recon_t = self.model.decode(z_preds[t], s_t, batch_t.batch, stats=self.stats)
 
             loss_rec += self.criterion(recon_t, batch_t.x)
             loss_assign += entropy_weight * losses_t['entropy'] + 2.0 * losses_t['diversity'] + 0.1 * losses_t['spatial']
@@ -526,7 +583,8 @@ class Trainer:
                          (weights['sparsity'] * loss_sparsity + lvars[10]) + \
                          (weights['mi'] * loss_mi + lvars[11]) + \
                          (weights['sym'] * self.symbolic_weight * loss_sym + lvars[12]) + \
-                         (weights['var'] * loss_var + lvars[13])
+                         (weights['var'] * loss_var + lvars[13]) + \
+                         (1e-4 * loss_curv)
 
         if is_warmup:
             loss = discovery_loss
@@ -589,6 +647,7 @@ class Trainer:
             'mi': loss_mi,
             'sym': loss_sym,
             'lvar_raw': loss_var,
+            'curv_raw': loss_curv,
             'lvars_mean': lvars.mean()
         }, weights=weights)
 

@@ -80,10 +80,23 @@ class OptimizedSymbolicDynamics:
             
             # Compute gradients with respect to all variables
             self.sympy_grads = [sp.diff(sympy_expr, var) for var in self.sympy_vars]
-            self.lambda_funcs = [sp.lambdify(self.sympy_vars, grad, 'numpy') for grad in self.sympy_grads]
             
-            # Create a mapping from variable name (like 'x5') to its index in the feature vector
-            self.var_to_idx = {var.name: int(var.name[1:]) for var in self.sympy_vars}
+            self.lambda_funcs = []
+            for grad in self.sympy_grads:
+                try:
+                    # Try to lambdify with numpy
+                    self.lambda_funcs.append(sp.lambdify(self.sympy_vars, grad, 'numpy'))
+                except Exception as e:
+                    # If lambdify fails (e.g. contains Derivative), analytical gradient for this var is unavailable
+                    print(f"Warning: Analytical gradient failed for {grad}: {e}. Falling back to numerical.")
+                    self.lambda_funcs = None
+                    break
+            
+            if self.lambda_funcs is not None:
+                # Create a mapping from variable name (like 'x5') to its index in the feature vector
+                self.var_to_idx = {var.name: int(var.name[1:]) for var in self.sympy_vars}
+            else:
+                self.sympy_vars = None
 
     def _convert_to_sympy(self, gp_program):
         """Convert gplearn symbolic expression to SymPy expression with better robustness."""

@@ -180,14 +180,17 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
         from gplearn.genetic import SymbolicRegressor
         from gplearn.functions import make_function
 
-        # Define square function for gplearn
+        # Define square and inv functions for gplearn
         def _square(x):
             return x**2
         square = make_function(function=_square, name='square', arity=1)
+        
+        def _inv(x):
+            return 1.0 / (x + 1e-9)
+        inv = make_function(function=_inv, name='inv', arity=1)
 
-        # Restricted function set: removed tan, sin, cos; added square
-        # Hamiltonians in latent space are rarely periodic.
-        function_set = ('add', 'sub', 'mul', 'div', 'sqrt', 'log', 'abs', 'neg', 'inv', square)
+        # Restricted function set: removed tan, sin, cos; added square and inv
+        function_set = ('add', 'sub', 'mul', 'div', 'sqrt', 'log', 'abs', 'neg', inv, square)
 
         est = SymbolicRegressor(
             population_size=population_size,
@@ -925,9 +928,33 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
                 has_p = any(f in p_indices for f in used_features)
                 
                 if not (has_q and has_p):
-                    print(f"  -> CRITICAL: Discovered Hamiltonian H(z) = {eq_str} lacks physical dependency (needs both q and p). Invalidating.")
-                    # Hard gating: set confidence to 0.0
-                    conf = 0.0
+                    print(f"  -> PHYSICALITY GATE FAILED for Hamiltonian H(z) = {eq_str}. Lacks q or p dependency.")
+                    print(f"  -> TRIGGERING DEEP SEARCH (3x Population, 2x Generations)...")
+                    
+                    # Store original settings
+                    orig_pop = self.max_pop
+                    orig_gen = self.max_gen
+                    
+                    # Increase resources for deep search
+                    self.max_pop = orig_pop * 3
+                    self.max_gen = orig_gen * 2
+                    
+                    # Re-run single target distillation
+                    eq, mask, conf = self._distill_single_target(i, X_norm, Y_norm, Y_norm.shape[1], latent_states.shape[1], is_hamiltonian=is_hamiltonian_distill)
+                    
+                    # Restore original settings
+                    self.max_pop = orig_pop
+                    self.max_gen = orig_gen
+                    
+                    # Final check after deep search
+                    eq_str = str(eq)
+                    used_features = [int(f) for f in re.findall(r'[Xx](\d+)', eq_str)]
+                    has_q = any(f in q_indices for f in used_features)
+                    has_p = any(f in p_indices for f in used_features)
+                    
+                    if not (has_q and has_p):
+                        print(f"  -> DEEP SEARCH also failed physicality gate. Invalidating result.")
+                        conf = 0.0
             
             equations.append(eq)
             self.feature_masks.append(mask)
