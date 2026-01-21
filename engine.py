@@ -182,6 +182,8 @@ class Trainer:
         # Symbolic-in-the-loop
         self.symbolic_proxy = None
         self.symbolic_weight = 0.0
+        self.symbolic_confidence = 0.0
+        self.min_symbolic_confidence = 0.7
         
         # MPS fix: torchdiffeq has issues with MPS (float64 defaults and stability)
         if str(device) == 'mps':
@@ -192,7 +194,7 @@ class Trainer:
         self.criterion = torch.nn.MSELoss().to(device)
         self.stats = stats
 
-    def update_symbolic_proxy(self, equations, transformer, weight=0.1):
+    def update_symbolic_proxy(self, equations, transformer, weight=0.1, confidence=0.0):
         """Update the symbolic proxy model with new discovered equations."""
         self.symbolic_proxy = SymbolicProxy(
             self.model.encoder.n_super_nodes, 
@@ -201,7 +203,8 @@ class Trainer:
             transformer
         )
         self.symbolic_weight = weight
-        print(f"Symbolic proxy updated. Symbolic weight: {weight}")
+        self.symbolic_confidence = confidence
+        print(f"Symbolic proxy updated. Weight: {weight}, Confidence: {confidence:.3f}")
         
     def train_step(self, data_list, dt, epoch=0, max_epochs=2000):
         # Update sparsity weight if scheduler is present
@@ -233,6 +236,10 @@ class Trainer:
         
         # 4. Alignment Annealing
         align_weight = max(0.1, 1.0 - epoch / (self.align_anneal_epochs + 1e-9))
+
+        # 5. Adaptive Entropy Weight: Increase over time to force discrete clusters
+        # Point 1: Addressing "Blurry" Meso-scale
+        entropy_weight = 1.0 + 2.0 * progress 
         
         # Warmup logic
         is_warmup = epoch < self.warmup_epochs
@@ -245,7 +252,8 @@ class Trainer:
 
         loss_rec = torch.tensor(0.0, device=self.device)
         loss_cons = torch.tensor(0.0, device=self.device)
-        loss_assign = losses_0['entropy'] + losses_0['diversity'] + 0.1 * losses_0['spatial']
+        # Apply entropy weight
+        loss_assign = entropy_weight * losses_0['entropy'] + losses_0['diversity'] + 0.1 * losses_0['spatial']
         loss_pruning = losses_0['pruning']
         loss_sparsity = losses_0['sparsity']
         loss_sep = losses_0.get('separation', torch.tensor(0.0, device=self.device))
@@ -255,14 +263,18 @@ class Trainer:
         loss_mi = torch.tensor(0.0, device=self.device)
         loss_sym = torch.tensor(0.0, device=self.device)
         
-        # Symbolic-in-the-loop loss
-        if self.symbolic_proxy is not None and not is_warmup:
+        # Symbolic-in-the-loop loss with FIDELITY GATING
+        # Point 3: Addressing Symbolic-Neural Feedback Loop Fragility
+        if (self.symbolic_proxy is not None and not is_warmup and 
+            self.symbolic_confidence >= self.min_symbolic_confidence):
             z0_flat = z_curr.view(z_curr.size(0), -1)
             # GNN predicted derivative
             gnn_dz = self.model.ode_func(0, z0_flat)
             # Symbolic predicted derivative (now differentiable!)
             sym_dz = self.symbolic_proxy(z0_flat)
-            loss_sym = self.criterion(gnn_dz, sym_dz)
+            
+            # Use Huber loss for more robustness against "garbage" symbolic laws
+            loss_sym = torch.nn.functional.huber_loss(gnn_dz, sym_dz, delta=1.0)
 
         s_prev = s_0
         mu_prev = mu_0
@@ -313,7 +325,7 @@ class Trainer:
             recon_t = self.model.decode(z_preds[t], s_t, batch_t.batch)
             
             loss_rec += self.criterion(recon_t, batch_t.x)
-            loss_assign += losses_t['entropy'] + losses_t['diversity'] + 0.1 * losses_t['spatial']
+            loss_assign += entropy_weight * losses_t['entropy'] + losses_t['diversity'] + 0.1 * losses_t['spatial']
             loss_pruning += losses_t['pruning']
             loss_sparsity += losses_t['sparsity']
             loss_sep += losses_t.get('separation', torch.tensor(0.0, device=self.device))

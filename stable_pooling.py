@@ -295,9 +295,11 @@ class AdaptiveTauScheduler:
             # Calculate based on internal step counter
             progress_ratio = min(1.0, self.current_step / self.decay_steps)
 
-        # Cosine annealing schedule
+        # Cosine annealing schedule with a steeper decay early on
         import math
-        tau = self.final_tau + 0.5 * (self.initial_tau - self.final_tau) * (1 + math.cos(math.pi * progress_ratio))
+        # Use a power of the progress ratio to shift the decay earlier
+        shifted_progress = progress_ratio ** 0.7 
+        tau = self.final_tau + 0.5 * (self.initial_tau - self.final_tau) * (1 + math.cos(math.pi * shifted_progress))
 
         # If adaptive collapse protection is enabled and we have assignment stats
         if self.adaptive_collapse_protection and assignment_stats is not None:
@@ -306,8 +308,10 @@ class AdaptiveTauScheduler:
             if avg_assignments is not None:
                 max_assignment = torch.max(avg_assignments).item()
                 # If max assignment probability is too high, increase temperature to encourage exploration
-                if max_assignment > 0.8:  # Threshold for collapse detection
-                    tau *= 1.5  # Increase temperature to encourage more uniform assignments
+                if max_assignment > 0.9:  # Threshold for collapse detection
+                    tau = max(tau, 0.5)  # Force a minimum temperature for exploration
+                elif max_assignment > 0.8:
+                    tau *= 1.2
 
         return tau
 

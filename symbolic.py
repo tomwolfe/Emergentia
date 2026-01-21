@@ -60,7 +60,11 @@ class FeatureTransformer:
             inv_dists_flat = 1.0 / (dists_flat + 0.1)
             inv_sq_dists_flat = 1.0 / (dists_flat**2 + 0.1)
             
-            features.extend([dists_flat, inv_dists_flat, inv_sq_dists_flat])
+            # New physics-informed basis functions
+            screened_coulomb = np.exp(-dists_flat) / (dists_flat + 0.1)
+            log_dist = np.log(dists_flat + 1.0)
+            
+            features.extend([dists_flat, inv_dists_flat, inv_sq_dists_flat, screened_coulomb, log_dist])
 
         X = np.hstack(features)
         poly_features = [X]
@@ -124,6 +128,14 @@ class FeatureTransformer:
                     # d(1/(d^2+0.1))/dz = -2d/(d^2+0.1)^2 * d(d)/dz
                     jacobians.append((-2.0 * d / (d**2 + 0.1)**2 * jd).reshape(1, -1))
 
+                    # d(exp(-d)/(d+0.1))/dz = (-exp(-d)/(d+0.1) - exp(-d)/(d+0.1)^2) * d(d)/dz
+                    j_screened = (-np.exp(-d)/(d + 0.1) - np.exp(-d)/(d + 0.1)**2) * jd
+                    jacobians.append(j_screened.reshape(1, -1))
+
+                    # d(log(d+1))/dz = 1/(d+1) * d(d)/dz
+                    j_log = (1.0 / (d + 1.0) * jd)
+                    jacobians.append(j_log.reshape(1, -1))
+
         # 3. Polynomial terms (Squares and cross-terms)
         # poly_features.append((X[:, i:i+1]**2))
         # This X here is the [z, dists, ...] vector.
@@ -136,7 +148,9 @@ class FeatureTransformer:
                 np.linalg.norm(z_nodes[i, :2] - z_nodes[j, :2] + 
                               (0 if self.box_size is None else -np.array(self.box_size) * np.round((z_nodes[i, :2] - z_nodes[j, :2])/np.array(self.box_size)))),
                 1.0 / (np.linalg.norm(z_nodes[i, :2] - z_nodes[j, :2]) + 0.1),
-                1.0 / (np.linalg.norm(z_nodes[i, :2] - z_nodes[j, :2])**2 + 0.1)
+                1.0 / (np.linalg.norm(z_nodes[i, :2] - z_nodes[j, :2])**2 + 0.1),
+                np.exp(-np.linalg.norm(z_nodes[i, :2] - z_nodes[j, :2])) / (np.linalg.norm(z_nodes[i, :2] - z_nodes[j, :2]) + 0.1),
+                np.log(np.linalg.norm(z_nodes[i, :2] - z_nodes[j, :2]) + 1.0)
             ])
             for i in range(self.n_super_nodes) for j in range(i + 1, self.n_super_nodes)
         ]) if self.include_dists else z_flat
@@ -286,7 +300,7 @@ class SymbolicDistiller:
         return SymbolicRegressor(population_size=pop,
                                  generations=gen, 
                                  stopping_criteria=self.stopping_criteria,
-                                 function_set=('add', 'sub', 'mul', 'div', 'neg', 'sin', 'cos'),
+                                 function_set=('add', 'sub', 'mul', 'div', 'neg', 'sin', 'cos', 'exp', 'log', 'sqrt', 'abs'),
                                  p_crossover=0.7, p_subtree_mutation=0.1,
                                  p_hoist_mutation=0.05, p_point_mutation=0.1,
                                  max_samples=0.8, verbose=0, 

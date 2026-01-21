@@ -127,11 +127,17 @@ def main():
         print("Distilling Hamiltonian H(q, p) with secondary optimization...")
         equations = distiller.distill(z_states, h_states, n_super_nodes, latent_dim, box_size=box_size)
         confidences = distiller.confidences
+        # Update trainer with symbolic laws if confidence is high enough
+        if confidences[0] > 0.5:
+            trainer.update_symbolic_proxy(equations, distiller.transformer, weight=0.1, confidence=confidences[0])
     else:
         z_states, dz_states, t_states = latent_data
         print("Distilling derivatives dZ/dt with secondary optimization...")
         equations = distiller.distill(z_states, dz_states, n_super_nodes, latent_dim, box_size=box_size)
         confidences = distiller.confidences
+        avg_conf = np.mean(confidences)
+        if avg_conf > 0.5:
+            trainer.update_symbolic_proxy(equations, distiller.transformer, weight=0.1, confidence=avg_conf)
     
     print("\nDiscovered Symbolic Laws:")
     if is_hamiltonian:

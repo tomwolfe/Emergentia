@@ -205,7 +205,7 @@ class BalancedFeatureTransformer:
         # [Batch, n_pairs]
         d = np.linalg.norm(diff, axis=2)
         
-        return [d, 1.0 / (d + 0.1), 1.0 / (d**2 + 0.1), np.exp(-d)]
+        return [d, 1.0 / (d + 0.1), 1.0 / (d**2 + 0.1), np.exp(-d), np.exp(-d)/(d + 0.1), np.log(d + 1.0)]
 
     def _polynomial_expansion(self, X, fit_transformer):
         """
@@ -353,11 +353,13 @@ class BalancedFeatureTransformer:
                 jd[i*self.latent_dim : i*self.latent_dim+2] = diff / d
                 jd[j*self.latent_dim : j*self.latent_dim+2] = -diff / d
                 
-                # d, 1/(d+0.1), 1/(d^2+0.1), exp(-d)
+                # d, 1/(d+0.1), 1/(d^2+0.1), exp(-d), screened, log
                 jac_list.append(jd.reshape(1, -1))
                 jac_list.append((-1.0 / (d + 0.1)**2 * jd).reshape(1, -1))
                 jac_list.append((-2.0 * d / (d**2 + 0.1)**2 * jd).reshape(1, -1))
                 jac_list.append((-np.exp(-d) * jd).reshape(1, -1))
+                jac_list.append(((-np.exp(-d)/(d + 0.1) - np.exp(-d)/(d + 0.1)**2) * jd).reshape(1, -1))
+                jac_list.append((1.0 / (d + 1.0) * jd).reshape(1, -1))
 
         X_base_jac = np.vstack(jac_list)
         

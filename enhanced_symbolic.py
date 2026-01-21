@@ -157,7 +157,11 @@ class TorchFeatureTransformer(torch.nn.Module):
             inv_dists_flat = 1.0 / (dists_flat + 0.1)
             inv_sq_dists_flat = 1.0 / (dists_flat**2 + 0.1)
             
-            features.extend([dists_flat, inv_dists_flat, inv_sq_dists_flat])
+            # New physics-informed basis functions (Differentiable)
+            screened_coulomb = torch.exp(-dists_flat) / (dists_flat + 0.1)
+            log_dist = torch.log(dists_flat + 1.0)
+            
+            features.extend([dists_flat, inv_dists_flat, inv_sq_dists_flat, screened_coulomb, log_dist])
 
         X = torch.cat(features, dim=1)
         poly_features = [X]
