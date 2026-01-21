@@ -97,7 +97,7 @@ def analyze_latent_space(model, dataset, pos_raw, tau=0.1, device='cpu'):
         z_k = z_all[:, k, :]
         com_k = com_all[:, k, :]
         # Correlate each Z dimension with each CoM dimension
-        corrs = np.array([[np.corrcoef(z_k[:, i], com_k[:, j])[0, 1]
+        corrs = np.array([[np.clip(np.corrcoef(z_k[:, i], com_k[:, j])[0, 1], -1.0, 1.0)
                           for j in range(2)] for i in range(z_k.shape[1])])
         avg_corrs.append(np.nan_to_num(corrs))
 
@@ -143,13 +143,14 @@ def enhance_physical_mapping(model, dataset, pos_raw, vel_raw, tau=0.1, device='
         vel_k = vel_com_all[:, k, :]
 
         # Correlate each Z dimension with position and velocity
-        pos_corrs = np.array([[np.corrcoef(z_k[:, i], pos_k[:, j])[0, 1]
+        pos_corrs = np.array([[np.clip(np.corrcoef(z_k[:, i], pos_k[:, j])[0, 1], -1.0, 1.0)
                               for j in range(2)] for i in range(z_k.shape[1])])
-        vel_corrs = np.array([[np.corrcoef(z_k[:, i], vel_k[:, j])[0, 1]
+        vel_corrs = np.array([[np.clip(np.corrcoef(z_k[:, i], vel_k[:, j])[0, 1], -1.0, 1.0)
                               for j in range(2)] for i in range(z_k.shape[1])])
 
         # Combine position and velocity correlations
         combined_corrs = np.sqrt(pos_corrs**2 + vel_corrs**2)  # Magnitude of correlation vector
+        combined_corrs = np.clip(combined_corrs, 0.0, 1.0) # Clip to 1.0 as requested
         all_corrs.append(np.nan_to_num(combined_corrs))
 
     return np.array(all_corrs)

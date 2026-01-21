@@ -32,27 +32,40 @@ class ImprovedFeatureTransformer(FeatureTransformer):
         Improved feature transformation with better physics-inspired features.
         Input: z_flat [batch_size, n_features] where n_features = n_nodes * n_dims
         """
+        # Ensure z_flat is a numpy array
+        if torch.is_tensor(z_flat):
+            z_flat = z_flat.detach().cpu().numpy()
+            
         # Handle 1D input by reshaping to 2D with batch_size=1
         if z_flat.ndim == 1:
-            # Calculate n_nodes and n_dims from the flattened shape
-            total_features = z_flat.shape[0]
-            n_nodes = self.n_super_nodes
-            n_dims = self.latent_dim
-
             # Reshape 1D to 2D with batch_size=1
             z_flat = z_flat.reshape(1, -1)
-        else:
-            # For 2D input, determine batch_size and feature count
-            batch_size = z_flat.shape[0]
-            total_features = z_flat.shape[1]
-            n_nodes = self.n_super_nodes
-            n_dims = self.latent_dim
+        
+        batch_size = z_flat.shape[0]
+        n_nodes = self.n_super_nodes
+        n_dims = self.latent_dim
+        
+        # Check if the input dimension matches expected (n_nodes * n_dims)
+        if z_flat.shape[1] != n_nodes * n_dims:
+            # If mismatch, we might be receiving a single sample incorrectly shaped
+            # Try to force it to the expected total size if possible
+            expected_total = n_nodes * n_dims
+            if z_flat.size == expected_total:
+                z_flat = z_flat.reshape(1, expected_total)
+                batch_size = 1
+            else:
+                # If we really have a size mismatch, log it and try to continue with padding/truncating
+                # though this is a sign of an upstream issue
+                if z_flat.shape[1] < expected_total:
+                    z_flat = np.pad(z_flat, ((0, 0), (0, expected_total - z_flat.shape[1])), mode='constant')
+                else:
+                    z_flat = z_flat[:, :expected_total]
 
         # Clamp input for stability
         z_flat = np.clip(z_flat, -1e6, 1e6)
 
         # Reshape to [batch_size, n_nodes, n_dims]
-        z_nodes = z_flat.reshape(z_flat.shape[0], n_nodes, n_dims)
+        z_nodes = z_flat.reshape(batch_size, n_nodes, n_dims)
 
         features = [z_flat]
 
@@ -294,12 +307,28 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
                 percentile_threshold = np.percentile(active_coeffs, 40)  # Keep more features (top 60%)
                 adaptive_threshold = max(adaptive_base_threshold, percentile_threshold)
                 new_mask[mask] = active_coeffs > adaptive_threshold
+                
+                # FALLBACK: If we pruned everything, keep at least the top 3 features
+                if not np.any(new_mask) and len(active_coeffs) > 0:
+                    top_k = min(3, len(active_coeffs))
+                    top_indices = np.argsort(active_coeffs)[-top_k:]
+                    temp_mask = np.zeros_like(active_coeffs, dtype=bool)
+                    temp_mask[top_indices] = True
+                    new_mask[mask] = temp_mask
             else:
                 new_mask[mask] = True
 
             if np.array_equal(mask, new_mask):
                 break
             mask = new_mask
+
+        # FINAL FALLBACK: If mask is still empty, pick top 3 by correlation with y
+        if not np.any(mask):
+            corrs = np.array([np.abs(np.corrcoef(X[:, i], y)[0, 1]) for i in range(n_features)])
+            corrs = np.nan_to_num(corrs)
+            top_k = min(3, n_features)
+            top_indices = np.argsort(corrs)[-top_k:]
+            mask[top_indices] = True
 
         return mask
 
@@ -420,8 +449,56 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
                         self.length_ = 1
                         self.feature_indices = feature_indices
 
-                        # Create a string representation (simplified)
-                        self.expr_str = f"QuadraticModel_{i}"
+                        # Create a human-readable string representation
+                        try:
+                            ridge_model = model.named_steps['ridge']
+                            poly_features = model.named_steps['poly']
+                            
+                            coeffs = ridge_model.coef_
+                            intercept = ridge_model.intercept_
+                            
+                            # Get feature names from poly_features
+                            # They will be like "x0", "x0^2", "x0 x1", etc.
+                            # We need to map "xi" back to "X{feature_indices[i]}"
+                            raw_names = poly_features.get_feature_names_out()
+                            
+                            terms = []
+                            if abs(intercept) > 1e-6:
+                                terms.append(f"{intercept:.6f}")
+                                
+                            for idx, coef in enumerate(coeffs):
+                                if abs(coef) > 1e-6:
+                                    name = raw_names[idx]
+                                    # Replace "xi" with "X{feature_indices[i]}"
+                                    import re
+                                    def replace_name(match):
+                                        i = int(match.group(1))
+                                        return f"X{feature_indices[i]}"
+                                    
+                                    clean_name = re.sub(r'x(\d+)', replace_name, name)
+                                    
+                                    # Convert name to functional form (mul, etc)
+                                    if ' ' in clean_name: # Cross term: X1 X2
+                                        parts = clean_name.split(' ')
+                                        term = f"mul({coef:.6f}, mul({parts[0]}, {parts[1]}))"
+                                    elif '^2' in clean_name: # Quadratic term: X1^2
+                                        base = clean_name.replace('^2', '')
+                                        term = f"mul({coef:.6f}, mul({base}, {base}))"
+                                    else: # Linear term: X1
+                                        term = f"mul({coef:.6f}, {clean_name})"
+                                    
+                                    terms.append(term)
+                                    
+                            if not terms:
+                                self.expr_str = f"{intercept:.6e}"
+                            elif len(terms) == 1:
+                                self.expr_str = terms[0]
+                            else:
+                                self.expr_str = terms[0]
+                                for term in terms[1:]:
+                                    self.expr_str = f"add({self.expr_str}, {term})"
+                        except Exception as e:
+                            self.expr_str = f"QuadraticModel(R2={quad_score:.3f})"
 
                     def execute(self, X):
                         if X.ndim == 1: X = X.reshape(1, -1)

@@ -68,7 +68,7 @@ def compute_energy_conservation_during_training(model, dataset, sim, device):
                 energy_error = abs(recon_energy - true_energy) / (abs(true_energy) + 1e-9)
 
                 # NEW: Add bounds checking to prevent extreme values
-                energy_error = min(energy_error, 10.0)  # Cap at 1000% error
+                energy_error = min(energy_error, 100.0)  # Cap at 10000% error
 
                 # Only count valid energy computations
                 if np.isfinite(energy_error) and not np.isnan(energy_error):
@@ -118,7 +118,7 @@ def compute_energy_conservation_with_smoothing(model, dataset, sim, device, smoo
                 energy_error = abs(recon_energy - true_energy) / (abs(true_energy) + 1e-9)
 
                 # NEW: Add bounds checking to prevent extreme values
-                energy_error = min(energy_error, 10.0)  # Cap at 1000% error to prevent overflow
+                energy_error = min(energy_error, 100.0)  # Cap at 10000% error to prevent overflow
 
                 # NEW: More robust energy error computation with better numerical stability
                 # Only add finite and non-NaN values
@@ -371,10 +371,10 @@ def main():
             original_energy_weight = getattr(trainer, 'energy_weight', 0.1)
             trainer.energy_weight = min(0.8, original_energy_weight * 3)  # Triple the energy weight for stronger focus
 
-            # NEW: Reduce learning rate for more stable energy-focused training
+            # NEW: Reduce learning rate significantly for more stable energy-focused training
             original_lr = trainer.optimizer.param_groups[0]['lr']
             for param_group in trainer.optimizer.param_groups:
-                param_group['lr'] *= 0.02  # Reduce learning rate by factor of 50 for more stability
+                param_group['lr'] *= 0.001  # Significantly reduce learning rate for more stability
 
             # NEW: Use a more conservative energy weight to prevent divergence
             original_energy_weight = getattr(trainer, 'energy_weight', 0.1)

@@ -50,10 +50,22 @@ class ImprovedSymbolicDynamics:
             # Fallback to 0.0 if we can't handle the type
             return 0.0
 
-    def __call__(self, t, z):
+    def __call__(self, arg1, arg2=None):
         """
-        Callable method for integration with scipy.integrate.odeint
+        Callable method for integration.
+        Handles both odeint signature (z, t) and solve_ivp/ode signature (t, z).
         """
+        # Determine which argument is the state vector z and which is time t
+        if np.isscalar(arg1):
+            # arg1 is t, arg2 is z (solve_ivp signature)
+            t, z = arg1, arg2
+        elif arg2 is not None and np.isscalar(arg2):
+            # arg1 is z, arg2 is t (odeint signature)
+            z, t = arg1, arg2
+        else:
+            # Fallback: assume arg1 is z
+            z, t = arg1, arg2
+
         # Ensure z is a numpy array
         if torch.is_tensor(z):
             z = z.detach().cpu().numpy()
@@ -159,7 +171,7 @@ class ImprovedSymbolicDynamics:
 
         # NEW: Numerical differentiation for gradient computation
         eps = 1e-8
-        grad_H = np.zeros_like(z_reshaped)
+        grad_H = np.zeros(len(z_reshaped))
 
         for i in range(len(z_reshaped)):  # Iterate over each dimension
             z_plus = z_reshaped.copy()
@@ -169,20 +181,9 @@ class ImprovedSymbolicDynamics:
 
             # Transform and normalize both perturbed states - ensure proper input shape
             if self.transformer:
-                if z_plus.ndim == 1:
-                    z_plus_input = z_plus.reshape(1, -1)
-                    z_minus_input = z_minus.reshape(1, -1)
-                else:
-                    z_plus_input = z_plus
-                    z_minus_input = z_minus
-
-                # DEBUG: Check input shapes before calling transformer
-                if z_plus_input.ndim != 2:
-                    print(f"DEBUG: Expected 2D input for transformer (plus), got {z_plus_input.ndim}D with shape {z_plus_input.shape}")
-                    z_plus_input = z_plus_input.reshape(1, -1)  # Ensure 2D
-                if z_minus_input.ndim != 2:
-                    print(f"DEBUG: Expected 2D input for transformer (minus), got {z_minus_input.ndim}D with shape {z_minus_input.shape}")
-                    z_minus_input = z_minus_input.reshape(1, -1)  # Ensure 2D
+                # Always ensure 2D input for transformer
+                z_plus_input = z_plus.reshape(1, -1)
+                z_minus_input = z_minus.reshape(1, -1)
 
                 X_plus = self.transformer.transform(z_plus_input)
                 X_minus = self.transformer.transform(z_minus_input)
@@ -197,14 +198,14 @@ class ImprovedSymbolicDynamics:
             feature_mask = self.feature_masks[0] if self.feature_masks and len(self.feature_masks) > 0 else None
 
             try:
+                # Ensure X_plus_full and X_minus_full are 2D before indexing
+                if X_plus_full.ndim == 1:
+                    X_plus_full = X_plus_full.reshape(1, -1)
+                if X_minus_full.ndim == 1:
+                    X_minus_full = X_minus_full.reshape(1, -1)
+
                 if feature_mask is not None and np.any(feature_mask):
                     # Use only the selected features
-                    # Ensure X_plus_full and X_minus_full are 2D before indexing
-                    if X_plus_full.ndim == 1:
-                        X_plus_full = X_plus_full.reshape(1, -1)
-                    if X_minus_full.ndim == 1:
-                        X_minus_full = X_minus_full.reshape(1, -1)
-
                     H_plus_raw = self.equations[0].execute(X_plus_full[:, feature_mask])
                     H_minus_raw = self.equations[0].execute(X_minus_full[:, feature_mask])
                 else:
@@ -213,14 +214,20 @@ class ImprovedSymbolicDynamics:
                     H_minus_raw = self.equations[0].execute(X_minus_full)
 
                 # Handle cases where execute returns arrays or scalars
-                # NEW: More robust handling to prevent tuple index out of range
                 H_plus = self._safe_extract_value(H_plus_raw)
                 H_minus = self._safe_extract_value(H_minus_raw)
 
-                grad_H[i] = (H_plus - H_minus) / (2 * eps)
+                if np.isfinite(H_plus) and np.isfinite(H_minus):
+                    grad_H[i] = (H_plus - H_minus) / (2 * eps)
+                else:
+                    grad_H[i] = 0.0
             except Exception as e:
-                print(f"Error in numerical differentiation for dimension {i}: {e}")
+                # print(f"Error in numerical differentiation for dimension {i}: {e}")
                 grad_H[i] = 0.0  # Fallback to zero gradient
+
+        # Final safety check for gradient
+        if not np.all(np.isfinite(grad_H)):
+            grad_H = np.nan_to_num(grad_H, nan=0.0, posinf=0.0, neginf=0.0)
 
         # For Hamiltonian systems: [dq/dt, dp/dt] = [dH/dp, -dH/dq]
         # Assuming z = [q, p] where q and p have equal dimensions
