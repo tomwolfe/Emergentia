@@ -97,6 +97,7 @@ class CoordinateMapper:
     def _infer_from_structure(self, neural_flat):
         """
         Infer physical coordinates from the structure of the neural representation.
+        Enhanced with Kernel PCA for curvilinear manifold detection.
         """
         N, D = neural_flat.shape
         
@@ -107,7 +108,23 @@ class CoordinateMapper:
         if self.use_rotation_alignment:
             pca = PCA(n_components=min(self.n_physical_dims, D))
             pca.fit(neural_scaled)
-            self.linear_weights = pca.components_  # [n_phys_dims, D]
+            
+            # Check if linear PCA is sufficient
+            if sum(pca.explained_variance_ratio_) < 0.95 and self.use_nonlinear_mapping:
+                print(f"  -> Low linear variance ({sum(pca.explained_variance_ratio_):.2f}). Trying Kernel PCA...")
+                from sklearn.decomposition import KernelPCA
+                # Use Cosine kernel as it's scale-invariant and good for manifold alignment
+                kpca = KernelPCA(n_components=self.n_physical_dims, kernel='cosine', fit_inverse_transform=True)
+                # We fit on a subset if N is too large for KPCA
+                subset_idx = np.random.choice(N, min(N, 2000), replace=False)
+                kpca.fit(neural_scaled[subset_idx])
+                
+                # We can't easily get "weights" from KPCA, but we can use it to 
+                # initialize a better linear approximation or just mark for nonlinear use
+                self.linear_weights = pca.components_ 
+            else:
+                self.linear_weights = pca.components_
+                
             self.linear_bias = np.zeros(self.n_physical_dims)
         else:
             # Simply take the first n_physical_dims

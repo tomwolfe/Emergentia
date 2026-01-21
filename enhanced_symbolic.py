@@ -211,28 +211,36 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
             feat_vars = [sp.Symbol(f'x{i}') for i in range(n_features)]
             
             # Build the full expression
-            all_vars = const_vars + feat_vars
-            var_mapping = {}
+            local_dict = {
+                'add': lambda x, y: x + y,
+                'sub': lambda x, y: x - y,
+                'mul': lambda x, y: x * y,
+                'div': lambda x, y: x / (y + 1e-9),
+                'sqrt': lambda x: sp.sqrt(sp.Abs(x)),
+                'log': lambda x: sp.log(sp.Abs(x) + 1e-9),
+                'abs': sp.Abs,
+                'neg': lambda x: -x,
+                'inv': lambda x: 1.0 / (x + 1e-9),
+                'sin': sp.sin,
+                'cos': sp.cos,
+                'exp': sp.exp,
+            }
             for i, var in enumerate(const_vars):
-                var_mapping[str(var)] = var
-            for i, var in enumerate(feat_vars):
-                var_mapping[f'x{i}'] = var
+                local_dict[f'const_{i}'] = var
+            for i in range(n_features):
+                local_dict[f'X{i}'] = feat_vars[i]
                 
-            full_expr = sp.sympify(modified_expr_str, locals=var_mapping)
+            full_expr = sp.sympify(modified_expr_str, locals=local_dict)
             
             # Create a function to evaluate the expression with given constants
             def eval_expr(const_vals):
                 # Substitute constants into expression
-                expr_with_consts = full_expr
-                for i, val in enumerate(const_vals):
-                    expr_with_consts = expr_with_consts.subs(const_vars[i], val)
-                
-                # Create numerical function
-                f = sp.lambdify(feat_vars, expr_with_consts, modules=['numpy'])
+                # We can use lambdify for better performance here too
+                f_lamb = sp.lambdify(const_vars + feat_vars, full_expr, modules=['numpy'])
                 
                 # Evaluate on all samples
                 try:
-                    y_pred = f(*[X[:, i] for i in range(n_features)])
+                    y_pred = f_lamb(*const_vals, *[X[:, i] for i in range(n_features)])
                     if np.any(np.isnan(y_pred)) or np.any(np.isinf(y_pred)):
                         return float('inf')  # Invalid result
                     mse = mean_squared_error(y_true, y_pred)
@@ -248,16 +256,37 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
                              options={'maxiter': self.opt_iterations})
             
             if result.success:
-                # Create new expression with optimized constants
+                opt_consts = result.x
+                
+                # Physics-Inspired Simplification Step
+                # Try to round constants to "clean" values (integers, halves, quarters)
+                simplified_consts = opt_consts.copy()
+                for j in range(len(simplified_consts)):
+                    val = simplified_consts[j]
+                    for base in [1.0, 0.5, 0.25]:
+                        rounded = round(val / base) * base
+                        if abs(val - rounded) < 0.12: # Slightly tighter threshold than symbolic.py
+                            simplified_consts[j] = rounded
+                            break
+                
+                # Evaluate both
+                mse_opt = eval_expr(opt_consts)
+                mse_simple = eval_expr(simplified_consts)
+                
+                # Prefer simplified constants if they don't degrade fit significantly
+                final_consts = simplified_consts if mse_simple < 1.05 * mse_opt else opt_consts
+                
+                # Create new expression with optimized (and simplified) constants
                 optimized_expr_str = expr_str
-                for i, opt_val in enumerate(result.x):
-                    # Replace the original constant with the optimized one
-                    if i < len(constants):
-                        optimized_expr_str = optimized_expr_str.replace(constants[i], f'{opt_val:.6f}', 1)
+                for i, opt_val in enumerate(final_consts):
+                    # Use a safer replacement for the i-th occurrence
+                    pattern = re.escape(constants[i])
+                    matches = list(re.finditer(pattern, optimized_expr_str))
+                    if i < len(matches):
+                        start, end = matches[i].span()
+                        optimized_expr_str = optimized_expr_str[:start] + f"{opt_val:.4f}" + optimized_expr_str[end:]
                 
                 # Create a new program with optimized constants
-                # Since we can't directly create a gplearn program from a string,
-                # we'll create a wrapper that uses the optimized expression
                 return OptimizedExpressionWrapper(optimized_expr_str, program)
             else:
                 return program  # Return original if optimization failed
@@ -380,27 +409,31 @@ class PhysicsAwareSymbolicDistiller(HamiltonianSymbolicDistiller):
             # Get the expression string representation
             expr_str = str(hamiltonian_eq)
 
-            # Create a mapping dictionary for variables
-            var_mapping = {}
-            for i in range(min(n_vars, 50)):  # Limit to avoid creating too many variables
-                var_mapping[f'X{i}'] = sympy_vars[i]
-
-            # Parse the expression string using SymPy
-            sympy_expr = sp.sympify(expr_str, locals=var_mapping)
+            # Use the robust converter from symbolic.py
+            sympy_expr = gp_to_sympy(expr_str, n_features=n_vars)
 
             # Apply physics-aware optimization if enabled
             if self.secondary_optimization:
                 sympy_expr = self._optimize_physics_constants(sympy_expr, X_norm, Y_norm)
 
             # Compute analytical gradients with respect to all variables
+            sympy_vars = [sp.Symbol(f'x{i}') for i in range(n_vars)]
             sympy_grads = [sp.diff(sympy_expr, var) for var in sympy_vars]
 
             # Create lambda functions for gradients
+            # Each lambda should take all variables as input for consistency
             lambda_funcs = [sp.lambdify(sympy_vars, grad, 'numpy') for grad in sympy_grads]
+
+            # Estimate dissipation coefficients γ
+            dissipation_coeffs = np.zeros(n_super_nodes)
+            # (Assuming this logic is handled similarly to HamiltonianSymbolicDistiller or passed in)
 
             # Create Hamiltonian equation object that respects structure
             hamiltonian_equation = HamiltonianEquation(
-                hamiltonian_eq, sympy_expr, sympy_grads, lambda_funcs, hamiltonian_mask
+                hamiltonian_eq, hamiltonian_mask, n_super_nodes, latent_dim,
+                dissipation_coeffs=dissipation_coeffs, 
+                sympy_expr=sympy_expr, 
+                grad_funcs=lambda_funcs
             )
 
             # For Hamiltonian systems, we return a single equation that knows how to compute

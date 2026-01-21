@@ -332,7 +332,24 @@ class SymbolicDistiller:
             # gplearn uses X0, X1, etc.
             for i in range(n_features): modified_expr_str = modified_expr_str.replace(f'X{i}', f'x{i}')
             
-            full_expr = sp.sympify(modified_expr_str, locals=var_mapping)
+            # Define local functions for gplearn standard and potential custom functions
+            local_dict = {
+                'add': lambda x, y: x + y,
+                'sub': lambda x, y: x - y,
+                'mul': lambda x, y: x * y,
+                'div': lambda x, y: x / (y + 1e-9),
+                'sqrt': lambda x: sp.sqrt(sp.Abs(x)),
+                'log': lambda x: sp.log(sp.Abs(x) + 1e-9),
+                'abs': sp.Abs,
+                'neg': lambda x: -x,
+                'inv': lambda x: 1.0 / (x + 1e-9),
+                'sin': sp.sin,
+                'cos': sp.cos,
+                'exp': sp.exp,
+            }
+            local_dict.update(var_mapping)
+            
+            full_expr = sp.sympify(modified_expr_str, locals=local_dict)
             f_lamb = sp.lambdify(const_vars + feat_vars, full_expr, modules=['numpy'])
 
             def objective(const_vals):
@@ -343,12 +360,40 @@ class SymbolicDistiller:
 
             res = minimize(objective, [float(c) for c in constants], method='L-BFGS-B')
             if res.success:
-                optimized_expr_str = expr_str
-                for i, val in enumerate(res.x):
-                    optimized_expr_str = optimized_expr_str.replace(constants[i], f'{val:.6f}', 1)
+                opt_consts = res.x
                 
-                # Check if actually improved
-                y_pred_opt = f_lamb(*res.x, *[X[:, i] for i in range(n_features)])
+                # Physics-Inspired Simplification Step
+                # Try to round constants to "clean" values if it doesn't hurt performance too much
+                simplified_consts = opt_consts.copy()
+                for j in range(len(simplified_consts)):
+                    val = simplified_consts[j]
+                    # Try rounding to nearest integer, half, or quarter
+                    for base in [1.0, 0.5, 0.25]:
+                        rounded = round(val / base) * base
+                        if abs(val - rounded) < 0.15: # Threshold for "closeness"
+                            simplified_consts[j] = rounded
+                            break
+                
+                # Evaluate simplified version
+                mse_opt = objective(opt_consts)
+                mse_simple = objective(simplified_consts)
+                
+                # If simplified MSE is within 5% of optimized MSE, prefer simplicity
+                final_consts = simplified_consts if mse_simple < 1.05 * mse_opt else opt_consts
+                
+                optimized_expr_str = expr_str
+                for i, val in enumerate(final_consts):
+                    # Use a regex that matches the exact original constant to avoid partial replacements
+                    # This is tricky with simple string replace. 
+                    # For safety, we'll replace the i-th occurrence.
+                    pattern = re.escape(constants[i])
+                    matches = list(re.finditer(pattern, optimized_expr_str))
+                    if i < len(matches):
+                        start, end = matches[i].span()
+                        optimized_expr_str = optimized_expr_str[:start] + f"{val:.4f}" + optimized_expr_str[end:]
+                
+                # Check if actually improved over original
+                y_pred_opt = f_lamb(*final_consts, *[X[:, i] for i in range(n_features)])
                 opt_score = 1 - np.sum((y_true - y_pred_opt)**2) / (np.sum((y_true - y_true.mean())**2) + 1e-9)
                 
                 if opt_score > original_score:

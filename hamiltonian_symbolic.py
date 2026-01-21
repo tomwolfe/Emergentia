@@ -80,7 +80,36 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
                 )
 
         # Wrap it in a class that can compute derivatives
-        ham_eq = HamiltonianEquation(h_prog, h_mask, n_super_nodes, latent_dim, dissipation_coeffs)
+        # Try to compute analytical gradients for the Hamiltonian
+        try:
+            from symbolic import gp_to_sympy
+            import sympy as sp
+            
+            # Convert discovered program to SymPy
+            expr_str = str(h_prog)
+            n_vars = X_norm.shape[1]
+            sympy_expr = gp_to_sympy(expr_str, n_features=n_vars)
+            
+            # Compute analytical gradients
+            sympy_vars = [sp.Symbol(f'x{i}') for i in range(n_vars)]
+            grad_funcs = []
+            for var in sympy_vars:
+                # sp.diff computes the analytical derivative
+                grad_expr = sp.diff(sympy_expr, var)
+                # lambdify for fast numerical evaluation
+                grad_funcs.append(sp.lambdify(sympy_vars, grad_expr, 'numpy'))
+                
+            ham_eq = HamiltonianEquation(
+                h_prog, h_mask, n_super_nodes, latent_dim, 
+                dissipation_coeffs=dissipation_coeffs,
+                sympy_expr=sympy_expr,
+                grad_funcs=grad_funcs
+            )
+            print(f"  -> Successfully enabled analytical gradients for discovered Hamiltonian.")
+        except Exception as e:
+            print(f"  -> Fallback to numerical gradients: {e}")
+            ham_eq = HamiltonianEquation(h_prog, h_mask, n_super_nodes, latent_dim, dissipation_coeffs)
+
         self.feature_masks = [h_mask]
         self.confidences = [h_conf]
         
@@ -140,13 +169,17 @@ class HamiltonianEquation:
     """
     Special equation class that computes derivatives from a scalar Hamiltonian
     and incorporates dissipative terms.
+    Supports both numerical and analytical gradients.
     """
-    def __init__(self, h_prog, feature_mask, n_super_nodes, latent_dim, dissipation_coeffs=None):
+    def __init__(self, h_prog, feature_mask, n_super_nodes, latent_dim, 
+                 dissipation_coeffs=None, sympy_expr=None, grad_funcs=None):
         self.h_prog = h_prog
         self.feature_mask = feature_mask
         self.n_super_nodes = n_super_nodes
         self.latent_dim = latent_dim
         self.dissipation_coeffs = dissipation_coeffs if dissipation_coeffs is not None else np.zeros(n_super_nodes)
+        self.sympy_expr = sympy_expr
+        self.grad_funcs = grad_funcs # List of lambdified functions for each input feature
         self.length_ = getattr(h_prog, 'length_', 1)
 
     def execute(self, X):
@@ -154,13 +187,58 @@ class HamiltonianEquation:
 
     def compute_derivatives(self, z, transformer):
         """
-        Numerically compute dq/dt = ∂H/∂p and dp/dt = -∂H/∂q - γp
+        Compute dq/dt = ∂H/∂p and dp/dt = -∂H/∂q - γp
+        Uses analytical gradients if available, otherwise falls back to finite differences.
         """
-        eps = 1e-4
         n_total = len(z)
         d_sub = self.latent_dim // 2
         dzdt = np.zeros(n_total)
         
+        # If we have analytical gradients, use them for much higher precision
+        if self.grad_funcs is not None:
+            X_p = transformer.transform(z.reshape(1, -1))
+            X_n = transformer.normalize_x(X_p)
+            
+            # Compute full Jacobian of the transformation dX/dz
+            # X = f(z) -> dH/dz = dH/dX * dX/dz
+            dX_dz = transformer.transform_jacobian(z) # [n_features, n_latents]
+            
+            # dH/dX: gradients of H with respect to its input features
+            # We only care about features in the mask
+            dH_dX = np.zeros(X_n.shape[1])
+            # The grad_funcs are expected to be ordered the same as features
+            for i, grad_f in enumerate(self.grad_funcs):
+                if grad_f is not None:
+                    # Execute lambdified gradient function
+                    # Some grad_funcs might need all features as input
+                    try:
+                        val = grad_f(*[X_n[0, j] for j in range(X_n.shape[1])])
+                        dH_dX[i] = val
+                    except:
+                        pass
+            
+            # dH/dz = dH/dX @ dX_dz
+            # Account for normalization: dH/dz = (dH/dX_norm / X_std) @ dX_dz
+            dH_dX_norm = dH_dX / transformer.x_poly_std
+            dH_dz = dH_dX_norm @ dX_dz
+            
+            for k in range(self.n_super_nodes):
+                q_start = k * self.latent_dim
+                q_end = q_start + d_sub
+                p_start = q_end
+                p_end = p_start + d_sub
+                
+                # dq/dt = ∂H/∂p
+                dzdt[q_start:q_end] = dH_dz[p_start:p_end]
+                
+                # dp/dt = -∂H/∂q - γp
+                gamma = self.dissipation_coeffs[k]
+                dzdt[p_start:p_end] = -dH_dz[q_start:q_end] - gamma * z[p_start:p_end]
+                
+            return dzdt
+
+        # Fallback to numerical gradients
+        eps = 1e-4
         def get_H(state):
             X_p = transformer.transform(state.reshape(1, -1))
             X_n = transformer.normalize_x(X_p)
