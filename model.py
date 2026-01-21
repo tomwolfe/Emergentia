@@ -1,3 +1,16 @@
+"""
+Neural-Symbolic Discovery Pipeline - Model Components
+
+This module implements the core neural network architectures for the
+coarse-graining of particle dynamics using Graph Neural Networks (GNNs)
+and Differentiable Physics (Latent ODEs).
+
+The architecture includes:
+- GNN-based encoder with hierarchical soft-assignment pooling
+- Hamiltonian-constrained ODE dynamics
+- GNN-based decoder for reconstruction
+"""
+
 import torch
 import torch.nn as nn
 from torch_geometric.nn import MessagePassing
@@ -5,6 +18,17 @@ from torch_geometric.utils import scatter
 from torchdiffeq import odeint
 
 class GNNLayer(MessagePassing):
+    """
+    Graph Neural Network Layer implementing message passing.
+
+    This layer computes messages between connected nodes using an MLP,
+    then aggregates them using addition. The message function combines
+    features from source and target nodes before processing through an MLP.
+
+    Args:
+        in_channels (int): Number of input channels per node
+        out_channels (int): Number of output channels per node
+    """
     def __init__(self, in_channels, out_channels):
         super(GNNLayer, self).__init__(aggr='add')
         self.mlp = nn.Sequential(
@@ -24,11 +48,25 @@ class GNNLayer(MessagePassing):
 
 class HierarchicalPooling(nn.Module):
     """
-    Learned soft-assignment pooling to preserve spatial locality 
+    Learned soft-assignment pooling to preserve spatial locality
     by aggregating nodes into a fixed number of super-nodes.
     Uses Gumbel-Softmax for 'harder' assignments and includes pruning.
+
+    This module implements hierarchical soft-assignment pooling that:
+    1. Learns to assign nodes to super-nodes based on their features
+    2. Preserves spatial relationships between nodes
+    3. Dynamically prunes unused super-nodes to find optimal meso-scale resolution
+    4. Computes various regularization losses to encourage meaningful assignments
     """
     def __init__(self, in_channels, n_super_nodes, pruning_threshold=0.01):
+        """
+        Initialize the hierarchical pooling layer.
+
+        Args:
+            in_channels (int): Number of input feature channels per node
+            n_super_nodes (int): Number of super-nodes to pool to
+            pruning_threshold (float): Threshold for pruning super-nodes
+        """
         super(HierarchicalPooling, self).__init__()
         self.n_super_nodes = n_super_nodes
         self.pruning_threshold = pruning_threshold
@@ -42,26 +80,39 @@ class HierarchicalPooling(nn.Module):
         self.register_buffer('active_mask', torch.ones(n_super_nodes))
 
     def forward(self, x, batch, pos=None, tau=1.0, hard=False):
+        """
+        Forward pass of hierarchical pooling.
+
+        Args:
+            x (Tensor): Node features [N, in_channels]
+            batch (Tensor): Batch assignment [N]
+            pos (Tensor, optional): Node positions [N, 2]
+            tau (float): Temperature for Gumbel-Softmax
+            hard (bool): Whether to use hard sampling
+
+        Returns:
+            Tuple of (pooled_features, assignment_matrix, losses, super_node_positions)
+        """
         # x: [N, in_channels], batch: [N], pos: [N, 2]
         if x.size(0) == 0:
             return torch.zeros((0, self.n_super_nodes, x.size(1)), device=x.device), \
                    torch.zeros((0, self.n_super_nodes), device=x.device), \
-                   {'entropy': torch.tensor(0.0, device=x.device), 
+                   {'entropy': torch.tensor(0.0, device=x.device),
                     'diversity': torch.tensor(0.0, device=x.device),
                     'spatial': torch.tensor(0.0, device=x.device),
                     'pruning': torch.tensor(0.0, device=x.device)}, \
                    None
 
         logits = self.assign_mlp(x) * self.scaling
-        
+
         # Apply active_mask to logits (set inactive ones to very low value)
         mask = self.active_mask.unsqueeze(0)
         logits = logits.masked_fill(mask == 0, -1e9)
-        
+
         s = nn.functional.gumbel_softmax(logits, tau=tau, hard=hard, dim=-1)
-        
+
         avg_s = s.mean(dim=0)
-        
+
         # Update active_mask if training and not hard (hard usually for eval)
         if self.training and not hard:
             # Moving average update for the mask to avoid rapid flickering
@@ -74,7 +125,7 @@ class HierarchicalPooling(nn.Module):
         entropy = -torch.mean(torch.sum(s * torch.log(s + 1e-9), dim=1))
         diversity_loss = torch.sum(avg_s * torch.log(avg_s + 1e-9))
         pruning_loss = torch.mean(torch.abs(avg_s * (1 - self.active_mask))) # Penalize usage of "inactive" nodes
-        
+
         # Sparsity loss to encourage finding the minimal scale
         sparsity_loss = torch.sum(self.active_mask) / self.n_super_nodes
 
@@ -95,7 +146,7 @@ class HierarchicalPooling(nn.Module):
             'pruning': pruning_loss,
             'sparsity': sparsity_loss
         }
-        
+
         super_node_mu = None
         if pos is not None:
             s_pos_expanded = pos.unsqueeze(1) * s.unsqueeze(2)
@@ -111,9 +162,9 @@ class HierarchicalPooling(nn.Module):
             separation_loss = (repulsion * (1 - mask_eye)).sum() / (self.n_super_nodes * (self.n_super_nodes - 1) + 1e-9)
             assign_losses['separation'] = separation_loss
 
-        x_expanded = x.unsqueeze(1) * s.unsqueeze(2) 
+        x_expanded = x.unsqueeze(1) * s.unsqueeze(2)
         out = scatter(x_expanded, batch, dim=0, reduce='sum')
-        
+
         return out, s, assign_losses, super_node_mu
 
 class GNNEncoder(nn.Module):
@@ -200,14 +251,28 @@ class HamiltonianODEFunc(nn.Module):
     """
     Enforces Hamiltonian constraints: dq/dt = dH/dp, dp/dt = -dH/dq.
     Optionally includes a learnable dissipation term: dp/dt = -dH/dq - gamma * p.
+
+    This module implements Hamiltonian dynamics by learning a Hamiltonian function H
+    and computing its gradients to determine the time derivatives of position and momentum.
+    The Hamiltonian structure preserves phase-space volume (Liouville's Theorem),
+    which is critical for long-term stability in symbolic integration.
     """
     def __init__(self, latent_dim, n_super_nodes, hidden_dim=64, dissipative=True):
+        """
+        Initialize the Hamiltonian ODE function.
+
+        Args:
+            latent_dim (int): Dimension of latent space (must be even for (q,p) pairs)
+            n_super_nodes (int): Number of super-nodes
+            hidden_dim (int): Hidden dimension for the Hamiltonian network
+            dissipative (bool): Whether to include learnable dissipation terms
+        """
         super(HamiltonianODEFunc, self).__init__()
         assert latent_dim % 2 == 0, "Latent dim must be even for Hamiltonian dynamics (q, p)"
         self.latent_dim = latent_dim
         self.n_super_nodes = n_super_nodes
         self.dissipative = dissipative
-        
+
         self.H_net = nn.Sequential(
             nn.Linear(latent_dim * n_super_nodes, hidden_dim),
             nn.Tanh(), # Tanh ensures second-order differentiability for dH
@@ -215,35 +280,45 @@ class HamiltonianODEFunc(nn.Module):
             nn.Tanh(),
             nn.Linear(hidden_dim, 1)
         )
-        
+
         if dissipative:
             # Small initial dissipation
             self.gamma = nn.Parameter(torch.full((n_super_nodes, 1), -5.0)) # log space
 
     def forward(self, t, y):
+        """
+        Compute time derivatives using Hamiltonian mechanics.
+
+        Args:
+            t (Tensor): Time (unused in autonomous systems)
+            y (Tensor): State vector [batch_size, latent_dim * n_super_nodes]
+
+        Returns:
+            Tensor: Time derivatives [batch_size, latent_dim * n_super_nodes]
+        """
         # y: [batch_size, latent_dim * n_super_nodes]
         training = torch.is_grad_enabled() and self.H_net[0].weight.requires_grad
-        
+
         with torch.set_grad_enabled(True):
             y = y.detach().requires_grad_(True)
             H = self.H_net(y).sum()
             dH = torch.autograd.grad(H, y, create_graph=training)[0]
-        
+
         # dH is [batch_size, n_super_nodes * latent_dim]
         # Reshape to [batch_size, n_super_nodes, 2, latent_dim // 2]
         d_sub = self.latent_dim // 2
         dH_view = dH.view(-1, self.n_super_nodes, 2, d_sub)
-        
+
         dq = dH_view[:, :, 1]  # dH/dp
         dp = -dH_view[:, :, 0] # -dH/dq
-        
+
         if self.dissipative:
             # y: [B, K * D] -> [B, K, 2, D/2]
             y_view = y.view(-1, self.n_super_nodes, 2, d_sub)
             p = y_view[:, :, 1] # momentum
             gamma = torch.exp(self.gamma)
             dp = dp - gamma * p
-        
+
         return torch.cat([dq, dp], dim=-1).view(y.shape[0], -1)
 
 class GNNDecoder(nn.Module):
@@ -318,18 +393,29 @@ class DiscoveryEngineModel(nn.Module):
         # Use the device of the ode_func parameters
         ode_device = next(self.ode_func.parameters()).device
         original_device = z0.device
-        
+
         y0 = z0_flat.to(ode_device)
         t_ode = t.to(ode_device)
 
-        # Explicitly use float32 for rtol/atol
-        rtol = 1e-4
-        atol = 1e-6
+        # Use adaptive tolerance based on training stage to balance accuracy and efficiency
+        # During early training, looser tolerances are acceptable
+        if self.training:
+            # Looser tolerances during training for efficiency
+            rtol = 1e-3
+            atol = 1e-4
+        else:
+            # Tighter tolerances during evaluation for accuracy
+            rtol = 1e-4
+            atol = 1e-6
 
-        # Use dopri5 (default) but with tightened tolerances for stability
-        # We remove the Euler fallback to ensure the symbolic distillation 
-        # phase receives high-fidelity integration data.
-        zt_flat = odeint(self.ode_func, y0, t_ode, rtol=rtol, atol=atol, method='dopri5')
+        # Use a more efficient solver during training, but accurate one for evaluation
+        if self.training:
+            method = 'rk4'  # Faster fixed-step method during training
+        else:
+            method = 'dopri5'  # More accurate adaptive method during evaluation
+
+        # Use the selected solver
+        zt_flat = odeint(self.ode_func, y0, t_ode, rtol=rtol, atol=atol, method=method)
 
         # Move back to original device
         zt_flat = zt_flat.to(original_device)
