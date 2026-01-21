@@ -14,8 +14,9 @@ class SpringMassSimulator:
         
         # Initialize particles in a grid
         side = int(np.ceil(np.sqrt(n_particles)))
-        x = np.linspace(0.1 * spring_dist, side * spring_dist, side)
-        y = np.linspace(0.1 * spring_dist, side * spring_dist, side)
+        # Start at 1.0 * spring_dist to avoid overlap issues with LJ potential
+        x = np.linspace(1.0 * spring_dist, side * spring_dist, side)
+        y = np.linspace(1.0 * spring_dist, side * spring_dist, side)
         xv, yv = np.meshgrid(x, y)
         self.pos = np.stack([xv.flatten()[:n_particles], yv.flatten()[:n_particles]], axis=1)
         # Random initial velocity
@@ -204,7 +205,7 @@ class LennardJonesSimulator(SpringMassSimulator):
     Simulates particles interacting via the Lennard-Jones potential:
     V(r) = 4*epsilon * [(sigma/r)^12 - (sigma/r)^6]
     """
-    def __init__(self, n_particles=64, epsilon=1.0, sigma=1.0, m=1.0, dt=0.005, dynamic_radius=None, box_size=None):
+    def __init__(self, n_particles=64, epsilon=1.0, sigma=1.0, m=1.0, dt=0.002, dynamic_radius=None, box_size=None):
         # LJ needs smaller dt for stability due to 1/r^12 term
         super().__init__(n_particles=n_particles, m=m, dt=dt, spring_dist=sigma, dynamic_radius=dynamic_radius, box_size=box_size)
         self.epsilon = epsilon
@@ -228,8 +229,8 @@ class LennardJonesSimulator(SpringMassSimulator):
                 diff[:, i] -= self.box_size[i] * np.round(diff[:, i] / self.box_size[i])
 
         dist_sq = np.sum(diff**2, axis=1, keepdims=True)
-        # Avoid division by zero and extreme values
-        dist_sq = np.maximum(dist_sq, 0.5 * self.sigma**2)
+        # Avoid division by zero and extreme values: floor at 0.7 * sigma^2 instead of 0.5
+        dist_sq = np.maximum(dist_sq, 0.7 * self.sigma**2)
         
         sr6 = (self.sigma**2 / dist_sq)**3
         sr12 = sr6**2
@@ -257,6 +258,8 @@ class LennardJonesSimulator(SpringMassSimulator):
         pairs = self._compute_pairs(pos)
         if len(pairs) > 0:
             idx1, idx2 = zip(*pairs)
+            idx1 = np.array(idx1)
+            idx2 = np.array(idx2)
             diff = pos[idx2] - pos[idx1]
             if self.box_size:
                 for i in range(2):

@@ -190,7 +190,6 @@ class Trainer:
             self.model.ode_func.to('cpu')
             
         self.optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, patience=50)
         self.criterion = torch.nn.MSELoss().to(device)
         self.stats = stats
 
@@ -371,8 +370,9 @@ class Trainer:
         loss_sep /= seq_len
         loss_conn /= seq_len
         
-        # Adaptive Loss Weighting with tighter clamping
-        lvars = torch.clamp(self.model.log_vars, min=-1.0, max=5.0)
+        # Adaptive Loss Weighting with slightly more conservative clamping
+        # Increasing min from -1.0 to -0.5 to prevent weights from exploding too much
+        lvars = torch.clamp(self.model.log_vars, min=-0.5, max=5.0)
         
         weights = {
             'rec': torch.exp(-lvars[0]), 'cons': torch.exp(-lvars[1]),
@@ -398,21 +398,44 @@ class Trainer:
         if is_warmup:
             loss = discovery_loss
         else:
+            # Check for finiteness of components before adding consistency losses
+            if not torch.isfinite(loss_cons): loss_cons = torch.tensor(0.0, device=self.device)
+            if not torch.isfinite(loss_l2): loss_l2 = torch.tensor(0.0, device=self.device)
+            if not torch.isfinite(loss_lvr): loss_lvr = torch.tensor(0.0, device=self.device)
+            
             loss = discovery_loss + (weights['cons'] * loss_cons + lvars[1]) + \
                    (weights['l2'] * 1e-4 * loss_l2 + lvars[4]) + \
                    (weights['lvr'] * 1e-4 * loss_lvr + lvars[5])
         
+        # Add L2 regularization on lvars to prevent them from growing indefinitely
+        loss += 0.01 * torch.sum(lvars**2)
+
         if not torch.isfinite(loss):
+            # Try to recover by ignoring non-finite components
+            print(f"Warning: Non-finite loss detected at epoch {epoch}. Attempting recovery.")
+            # Final fallback to a very small reconstruction loss to keep training alive
+            loss = loss_rec if torch.isfinite(loss_rec) else torch.tensor(1.0, device=self.device, requires_grad=True)
+            
+        if not torch.isfinite(loss) or loss.grad_fn is None:
             self.optimizer.zero_grad()
             return 0.0, 0.0, 0.0
 
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.1) # Tighter clip
+        # Relaxed gradient clipping for better convergence
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5) 
         self.optimizer.step()
         
-        # Step scheduler
-        if not is_warmup:
-            self.scheduler.step(loss.item())
+        # Update loss tracker for logging
+        self.loss_tracker.update({
+            'total': loss,
+            'rec_raw': loss_rec,
+            'cons_raw': loss_cons,
+            'assign': loss_assign,
+            'align': loss_align,
+            'mi': loss_mi,
+            'sym': loss_sym,
+            'lvars_mean': lvars.mean()
+        }, weights=weights)
         
         return loss.item(), loss_rec.item(), loss_cons.item()
 

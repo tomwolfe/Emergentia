@@ -22,6 +22,10 @@ class RecursiveFeatureSelector:
         self.selected_indices = []
 
     def fit(self, X, y):
+        # 0. Clean input data
+        X = np.nan_to_num(X, nan=0.0, posinf=1e9, neginf=-1e9)
+        y = np.nan_to_num(y, nan=0.0, posinf=1e9, neginf=-1e9)
+
         # 1. Variance filtering to remove constant or near-constant features
         variances = np.var(X, axis=0)
         high_variance_indices = np.where(variances > self.min_variance)[0]
@@ -160,9 +164,11 @@ class BalancedFeatureTransformer:
         Transform latent states to polynomial features.
         """
         # z_flat: [Batch, n_super_nodes * latent_dim]
-        z_nodes = z_flat.reshape(-1, self.n_super_nodes, self.latent_dim)
+        # Robust clipping of input latents to prevent extreme values
+        z_flat_clipped = np.clip(z_flat, -1e3, 1e3)
+        z_nodes = z_flat_clipped.reshape(-1, self.n_super_nodes, self.latent_dim)
 
-        features = [z_flat]
+        features = [z_flat_clipped]
         
         if self.include_dists and self.basis_functions != 'polynomial_only':
             dist_features = self._compute_distance_features(z_nodes)
@@ -170,6 +176,8 @@ class BalancedFeatureTransformer:
                 features.extend(dist_features)
 
         X = np.hstack(features)
+        # Final safety clip before expansion
+        X = np.clip(X, -1e6, 1e6)
 
         # Apply basis function expansion based on configuration
         if self.basis_functions == 'polynomial':
@@ -181,7 +189,9 @@ class BalancedFeatureTransformer:
         else:
             X_expanded = self._physics_informed_expansion(X)
 
-        return X_expanded
+        # Final safety clip and NaN handling
+        X_expanded = np.nan_to_num(X_expanded, nan=0.0, posinf=1e9, neginf=-1e9)
+        return np.clip(X_expanded, -1e12, 1e12)
 
     def _compute_distance_features(self, z_nodes):
         """

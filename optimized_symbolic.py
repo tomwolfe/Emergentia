@@ -175,10 +175,15 @@ class OptimizedSymbolicDynamics:
                 dH_dX = dH_dX_norm / sigma_X
 
                 # 4. dX / dz (Jacobian from transformer)
-                dX_dz = self.transformer.transform_jacobian(z) # [n_features, n_latents]
+                dX_dz_full = self.transformer.transform_jacobian(z) # [n_features, n_latents]
                 
-                # 5. Final gradient: dH / dz = dH / dX * dX / dz
-                grad = dH_dX @ dX_dz
+                # 5. Final gradient: dH / dz = dH / dX * dX_selected_dz
+                if hasattr(self, 'feature_masks') and self.feature_masks:
+                    # Only take the rows of the Jacobian that correspond to the features used in the Hamiltonian
+                    dX_dz = dX_dz_full[self.feature_masks[0], :]
+                    grad = dH_dX @ dX_dz
+                else:
+                    grad = dH_dX @ dX_dz_full
             except Exception as e:
                 # Fallback to numerical gradient if analytical fails
                 grad = self._numerical_gradient(z)

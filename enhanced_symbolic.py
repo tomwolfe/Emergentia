@@ -152,6 +152,8 @@ class TorchFeatureTransformer(torch.nn.Module):
 
     def forward(self, z_flat):
         # z_flat: [Batch, K * D]
+        # Safety clamp
+        z_flat = torch.clamp(z_flat, -1e6, 1e6)
         batch_size = z_flat.size(0)
         z_nodes = z_flat.view(batch_size, self.n_super_nodes, self.latent_dim)
         
@@ -174,17 +176,23 @@ class TorchFeatureTransformer(torch.nn.Module):
             i_idx, j_idx = torch.triu_indices(self.n_super_nodes, self.n_super_nodes, offset=1, device=z_flat.device)
             
             dists_flat = dists_matrix[:, i_idx, j_idx] # [Batch, K*(K-1)/2]
+            # Clamp distances to avoid 1/0
+            dists_flat = torch.clamp(dists_flat, min=1e-3)
+
             inv_dists_flat = 1.0 / (dists_flat + 0.1)
             inv_sq_dists_flat = 1.0 / (dists_flat**2 + 0.1)
             
             # New physics-informed basis functions (Differentiable)
-            exp_dist = torch.exp(-dists_flat)
+            exp_dist = torch.exp(-torch.clamp(dists_flat, max=20.0))
             screened_coulomb = exp_dist / (dists_flat + 0.1)
             log_dist = torch.log(dists_flat + 1.0)
             
             features.extend([dists_flat, inv_dists_flat, inv_sq_dists_flat, exp_dist, screened_coulomb, log_dist])
 
         X = torch.cat(features, dim=1)
+        # Final clamp of linear features before polynomial expansion
+        X = torch.clamp(X, -1e3, 1e3)
+
         poly_features = [X]
         n_latents = self.n_super_nodes * self.latent_dim
 
@@ -199,6 +207,8 @@ class TorchFeatureTransformer(torch.nn.Module):
                 poly_features.append(X[:, i:i+1] * X[:, other_idx:other_idx+1])
 
         X_poly = torch.cat(poly_features, dim=1)
+        # Final safety clamp
+        X_poly = torch.clamp(X_poly, -1e6, 1e6)
         return (X_poly - self.x_poly_mean) / self.x_poly_std
 
     def denormalize_y(self, Y_norm):
@@ -291,7 +301,7 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
         ridge.fit(X_selected, Y_norm[:, i])
         linear_score = ridge.score(X_selected, Y_norm[:, i])
 
-        if linear_score > 0.985:
+        if linear_score > 0.9999:
             print(f"  -> Target_{i}: High linear fit (R2={linear_score:.3f}). Using linear model.")
             class LinearProgram:
                 def __init__(self, model, feature_indices): 
@@ -300,14 +310,21 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
                     self.feature_indices = feature_indices
                     # Create a string representation
                     terms = []
-                    if abs(model.intercept_) > 1e-4:
+                    # Lower threshold for terms to 1e-6
+                    if abs(model.intercept_) > 1e-6:
                         terms.append(f"{model.intercept_:.6f}")
-                    for idx, coef in enumerate(model.coef_):
-                        if abs(coef) > 1e-4:
-                            terms.append(f"mul({coef:.6f}, X{idx})")
+                    
+                    # Sort coefficients to find most important ones if many are small
+                    coeffs = model.coef_
+                    for idx, coef in enumerate(coeffs):
+                        if abs(coef) > 1e-6:
+                            # Map back to original feature index
+                            orig_idx = feature_indices[idx]
+                            terms.append(f"mul({coef:.6f}, X{orig_idx})")
                     
                     if not terms:
-                        self.expr_str = "0.0"
+                        # If everything is extremely small, check if intercept is actually non-zero
+                        self.expr_str = f"{model.intercept_:.6e}"
                     elif len(terms) == 1:
                         self.expr_str = terms[0]
                     else:
@@ -335,13 +352,25 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
         for p_coeff in parsimony_levels:
             est = self._get_regressor(scaled_pop, self.max_gen // 2, parsimony=p_coeff)
             try:
-                est.fit(X_selected, Y_norm[:, i])
+                # Force float64 for stability
+                X_gp = X_selected.astype(np.float64)
+                y_gp = Y_norm[:, i].astype(np.float64)
+                
+                est.fit(X_gp, y_gp)
                 prog = est._program
-                score = est.score(X_selected, Y_norm[:, i])
+                
+                # Robust scoring: check for NaNs in prediction
+                y_pred = est.predict(X_gp)
+                if not np.all(np.isfinite(y_pred)):
+                    # Penalize unstable models
+                    score = -1.0
+                else:
+                    from sklearn.metrics import r2_score
+                    score = r2_score(y_gp, y_pred)
 
                 is_stable = True
                 if targets_shape_1 == latent_states_shape_1:
-                    is_stable = self.validate_stability(prog, X_selected[0])
+                    is_stable = self.validate_stability(prog, X_gp[0])
 
                 if is_stable:
                     candidates.append({'prog': prog, 'score': score, 'complexity': self.get_complexity(prog), 'p': p_coeff})
@@ -504,7 +533,7 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
         Y_norm = self.transformer.normalize_y(targets)
 
         from joblib import Parallel, delayed
-        results = Parallel(n_jobs=-1)(
+        results = Parallel(n_jobs=1)(
             delayed(self._distill_single_target)(i, X_norm, Y_norm, targets.shape[1], latent_states.shape[1])
             for i in range(targets.shape[1])
         )

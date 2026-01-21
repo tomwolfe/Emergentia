@@ -24,8 +24,9 @@ def main():
         device = torch.device('cuda')
         print("CUDA is available")
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        # Use MPS for GNN/Decoder, but Trainer will still move ODE to CPU for stability
         device = torch.device('mps')
-        print("MPS (Apple Silicon) is available")
+        print("MPS is available")
     else:
         device = torch.device('cpu')
         print("GPU not available, falling back to CPU")
@@ -44,8 +45,9 @@ def main():
     
     print("--- 1. Generating Data ---")
     from simulator import LennardJonesSimulator
+    # Reduce dt for better energy conservation in data generation
     sim = LennardJonesSimulator(n_particles=n_particles, epsilon=1.0, sigma=1.0, 
-                                dynamic_radius=dynamic_radius, box_size=box_size)
+                                dynamic_radius=dynamic_radius, box_size=box_size, dt=0.001)
     pos, vel = sim.generate_trajectory(steps=steps)
     initial_energy = sim.energy(pos[0], vel[0])
     final_energy = sim.energy(pos[-1], vel[-1])
@@ -57,12 +59,15 @@ def main():
     # 2. Initialize Model and Trainer
     print("--- 2. Initialize Model and Trainer ---")
     # Using Hamiltonian dynamics with learnable dissipation for improved physics fidelity
+    # NEW: Ensure at least half of super-nodes stay active to prevent resolution collapse
+    min_active = max(1, n_super_nodes // 2)
     model = DiscoveryEngineModel(n_particles=n_particles, 
                                  n_super_nodes=n_super_nodes, 
                                  latent_dim=latent_dim,
                                  hidden_dim=128,
                                  hamiltonian=True,
-                                 dissipative=True).to(device)
+                                 dissipative=True,
+                                 min_active_super_nodes=min_active).to(device)
     
     # NEW: Sparsity Scheduler to prevent resolution collapse
     from stable_pooling import SparsityScheduler
@@ -74,11 +79,11 @@ def main():
     )
 
     # Trainer now uses adaptive loss weighting, manual weights are deprecated
-    trainer = Trainer(model, lr=5e-4, device=device, stats=stats, sparsity_scheduler=sparsity_scheduler)
+    trainer = Trainer(model, lr=2e-4, device=device, stats=stats, sparsity_scheduler=sparsity_scheduler)
     
     # Increased patience and adjusted factor to prevent premature decay
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(trainer.optimizer, mode='min', 
-                                                           factor=0.8, patience=800, min_lr=1e-6)
+                                                           factor=0.5, patience=1000, min_lr=1e-6)
     
     last_loss = 1.0
     for epoch in range(epochs):
@@ -92,10 +97,11 @@ def main():
             progress = (epoch / epochs) * 100
             stats_tracker = trainer.loss_tracker.get_stats()
             active_nodes = int(model.encoder.pooling.active_mask.sum().item())
-            log_str = f"Progress: {progress:3.0f}% | Loss: {loss:.6f} | "
+            log_str = f"Progress: {progress:3.0f}% | Loss: {stats_tracker.get('total', 0):.4f} | "
             log_str += f"Rec: {stats_tracker.get('rec_raw', 0):.4f} | "
-            log_str += f"Active Nodes: {active_nodes} | "
-            log_str += f"W_Rec: {stats_tracker.get('w_rec', 0):.2e} | "
+            log_str += f"Cons: {stats_tracker.get('cons_raw', 0):.4f} | "
+            log_str += f"LVar: {stats_tracker.get('lvars_mean', 0):.2f} | "
+            log_str += f"Active: {active_nodes} | "
             log_str += f"LR: {trainer.optimizer.param_groups[0]['lr']:.2e}"
             print(log_str)
 
@@ -119,6 +125,10 @@ def main():
     is_hamiltonian = model.hamiltonian
     latent_data = extract_latent_data(model, dataset, sim.dt, include_hamiltonian=is_hamiltonian)
     
+    if len(latent_data[0]) == 0:
+        print("Error: No valid latent data extracted (all NaN or divergent). Skipping symbolic distillation.")
+        return
+
     from enhanced_symbolic import create_enhanced_distiller
     distiller = create_enhanced_distiller(secondary_optimization=True)
     
@@ -141,12 +151,22 @@ def main():
     
     print("\nDiscovered Symbolic Laws:")
     if is_hamiltonian:
-        print(f"H(z) = {equations[0]} (Confidence: {confidences[0]:.3f})")
+        if equations[0] is not None:
+            print(f"H(z) = {equations[0]} (Confidence: {confidences[0]:.3f})")
+        else:
+            print("No Hamiltonian discovered.")
     else:
         for i, eq in enumerate(equations):
-            print(f"dZ_{i}/dt = {eq} (Confidence: {confidences[i]:.3f})")
+            if eq is not None:
+                print(f"dZ_{i}/dt = {eq} (Confidence: {confidences[i]:.3f})")
+            else:
+                print(f"dZ_{i}/dt = None")
 
     # 4. Visualization & Integration
+    if is_hamiltonian and equations[0] is None:
+        print("Skipping visualization due to lack of discovered Hamiltonian.")
+        return
+
     print("--- 4. Visualizing Results ---")
     from scipy.integrate import odeint
     from optimized_symbolic import OptimizedSymbolicDynamics

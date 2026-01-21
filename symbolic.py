@@ -36,6 +36,8 @@ class FeatureTransformer:
         self.target_std = targets.std(axis=0) + 1e-6
 
     def transform(self, z_flat):
+        # Clamp input for stability
+        z_flat = np.clip(z_flat, -1e6, 1e6)
         batch_size = z_flat.shape[0]
         z_nodes = z_flat.reshape(batch_size, self.n_super_nodes, self.latent_dim)
         features = [z_flat]
@@ -57,17 +59,23 @@ class FeatureTransformer:
             i_idx, j_idx = np.triu_indices(self.n_super_nodes, k=1)
             
             dists_flat = dists_matrix[:, i_idx, j_idx] # [Batch, K*(K-1)/2]
+            # Clamp distances to avoid 1/0
+            dists_flat = np.maximum(dists_flat, 1e-3)
+            
             inv_dists_flat = 1.0 / (dists_flat + 0.1)
             inv_sq_dists_flat = 1.0 / (dists_flat**2 + 0.1)
             
             # New physics-informed basis functions
-            exp_dist = np.exp(-dists_flat)
+            exp_dist = np.exp(-np.clip(dists_flat, 0, 20))
             screened_coulomb = exp_dist / (dists_flat + 0.1)
             log_dist = np.log(dists_flat + 1.0)
             
             features.extend([dists_flat, inv_dists_flat, inv_sq_dists_flat, exp_dist, screened_coulomb, log_dist])
 
         X = np.hstack(features)
+        # Final clamp of linear features before polynomial expansion
+        X = np.clip(X, -1e3, 1e3) 
+        
         poly_features = [X]
         n_latents = self.n_super_nodes * self.latent_dim
 
@@ -81,7 +89,8 @@ class FeatureTransformer:
                 other_idx = other_node * self.latent_dim + dim_idx
                 poly_features.append(X[:, i:i+1] * X[:, other_idx:other_idx+1])
 
-        return np.hstack(poly_features)
+        res = np.hstack(poly_features)
+        return np.clip(res, -1e6, 1e6) # Final safety clamp
 
     def normalize_x(self, X_poly):
         return (X_poly - self.x_poly_mean) / self.x_poly_std
@@ -302,15 +311,23 @@ class SymbolicDistiller:
         self.confidences = []
 
     def _get_regressor(self, pop, gen, parsimony=0.01):
+        from gplearn.functions import make_function
+        # Define protected exp function to prevent overflow
+        def _protected_exp(x):
+            with np.errstate(over='ignore'):
+                return np.clip(np.exp(np.clip(x, -100, 100)), -1e10, 1e10)
+        
+        exp_func = make_function(function=_protected_exp, name='exp', arity=1)
+        
         return SymbolicRegressor(population_size=pop,
                                  generations=gen, 
                                  stopping_criteria=self.stopping_criteria,
-                                 function_set=('add', 'sub', 'mul', 'div', 'neg', 'sin', 'cos', 'exp', 'log', 'sqrt', 'abs'),
+                                 function_set=('add', 'sub', 'mul', 'div', 'neg', 'sin', 'cos', 'log', 'sqrt', 'abs', exp_func),
                                  p_crossover=0.7, p_subtree_mutation=0.1,
                                  p_hoist_mutation=0.05, p_point_mutation=0.1,
                                  max_samples=0.8, verbose=0, 
                                  parsimony_coefficient=parsimony,
-                                 n_jobs=-1,
+                                 n_jobs=1,
                                  random_state=42)
 
     def get_complexity(self, program):
@@ -427,12 +444,21 @@ class SymbolicDistiller:
             return candidate
 
     def _distill_single_target(self, i, X_norm, Y_norm, targets_shape_1, latent_states_shape_1):
+        # Filter out any rows with NaNs or Infs
+        mask_finite = np.isfinite(X_norm).all(axis=1) & np.isfinite(Y_norm[:, i])
+        if not np.any(mask_finite):
+            print(f"  -> Target_{i}: No finite data points available for distillation.")
+            return None, np.zeros(X_norm.shape[1], dtype=bool), 0.0
+            
+        X_norm = X_norm[mask_finite]
+        Y_norm_i = Y_norm[mask_finite, i]
+
         variances = np.var(X_norm, axis=0)
         valid_indices = np.where(variances > 1e-6)[0]
         X_pruned = X_norm[:, valid_indices]
         
         # Aggressive feature selection
-        mask_pruned = self._select_features(X_pruned, Y_norm[:, i])
+        mask_pruned = self._select_features(X_pruned, Y_norm_i)
         full_mask = np.zeros(X_norm.shape[1], dtype=bool)
         full_mask[valid_indices[mask_pruned]] = True
         X_selected = X_norm[:, full_mask]
@@ -441,22 +467,22 @@ class SymbolicDistiller:
             return np.zeros((X_norm.shape[0], 1)), full_mask, 0.0
 
         # Shortcut 1: Single feature correlation (Physics often has this)
-        corrs = np.array([np.abs(np.corrcoef(X_selected[:, j], Y_norm[:, i])[0, 1]) for j in range(X_selected.shape[1])])
+        corrs = np.array([np.abs(np.corrcoef(X_selected[:, j], Y_norm_i)[0, 1]) for j in range(X_selected.shape[1])])
         if np.any(corrs > 0.99):
             best_feat_idx = np.argmax(corrs)
             from sklearn.linear_model import LinearRegression
-            lr = LinearRegression().fit(X_selected[:, [best_feat_idx]], Y_norm[:, i])
+            lr = LinearRegression().fit(X_selected[:, [best_feat_idx]], Y_norm_i)
             class SingleFeatProg:
                 def __init__(self, m, idx): self.m, self.idx, self.length_ = m, idx, 1
                 def execute(self, X): return self.m.predict(X[:, [self.idx]])
                 def __str__(self): return f"Linear(X{self.idx})"
-            return SingleFeatProg(lr, best_feat_idx), full_mask, lr.score(X_selected[:, [best_feat_idx]], Y_norm[:, i])
+            return SingleFeatProg(lr, best_feat_idx), full_mask, lr.score(X_selected[:, [best_feat_idx]], Y_norm_i)
 
         # Shortcut 2: Linear model (Ridge)
         ridge = RidgeCV(alphas=[1e-4, 1e-3, 1e-2, 1e-1, 1, 10])
-        ridge.fit(X_selected, Y_norm[:, i])
-        r2 = ridge.score(X_selected, Y_norm[:, i])
-        if r2 > 0.95: # Lowered from 0.985
+        ridge.fit(X_selected, Y_norm_i)
+        r2 = ridge.score(X_selected, Y_norm_i)
+        if r2 > 0.9999: # Increased from 0.95 to 0.9999
             class LinearProg:
                 def __init__(self, m): self.m, self.length_ = m, 1
                 def execute(self, X): return self.m.predict(X)
@@ -474,9 +500,9 @@ class SymbolicDistiller:
         for p in [0.01, 0.05]: # Reduced from 3 trials to 2
             est = self._get_regressor(int(self.max_pop * pop_scale), self.max_gen, parsimony=p)
             try:
-                est.fit(X_selected, Y_norm[:, i])
+                est.fit(X_selected, Y_norm_i)
                 prog = est._program
-                score = est.score(X_selected, Y_norm[:, i])
+                score = est.score(X_selected, Y_norm_i)
                 if targets_shape_1 == latent_states_shape_1 and not self.validate_stability(prog, X_selected[0]): 
                     continue
                 candidates.append({'prog': prog, 'score': score, 'complexity': prog.length_, 'p': p, 'pareto': score - 0.02 * prog.length_})
@@ -487,10 +513,22 @@ class SymbolicDistiller:
 
         if not candidates: return None, full_mask, 0.0
         best = sorted(candidates, key=lambda x: x['pareto'], reverse=True)[0]
-        best = self._refine_constants(best, X_selected, Y_norm[:, i])
+        best = self._refine_constants(best, X_selected, Y_norm_i)
         return best['prog'], full_mask, max(0, best['score'] - 0.02 * best['complexity'])
 
     def distill(self, latent_states, targets, n_super_nodes, latent_dim, box_size=None):
+        # Final safety check for NaNs/Infs in raw input
+        finite_mask = np.isfinite(latent_states).all(axis=1) & np.isfinite(targets).all(axis=1)
+        latent_states = latent_states[finite_mask]
+        targets = targets[finite_mask]
+        
+        # Clamp targets to avoid extreme values in GP fitting
+        targets = np.clip(targets, -1e6, 1e6)
+        
+        if len(latent_states) < 10:
+            print("Warning: Insufficient finite data points for symbolic distillation.")
+            return [None] * targets.shape[1]
+
         self.transformer = FeatureTransformer(n_super_nodes, latent_dim, box_size=box_size)
         self.transformer.fit(latent_states, targets)
         X_norm = self.transformer.normalize_x(self.transformer.transform(latent_states))
@@ -508,6 +546,9 @@ class SymbolicDistiller:
         Y_norm = self.transformer.normalize_y(targets)
         scores = []
         for i, (prog, mask) in enumerate(zip(programs, self.feature_masks)):
+            if prog is None:
+                scores.append(0.0)
+                continue
             y_pred = prog.execute(X_norm[:, mask])
             scores.append(1 - np.sum((Y_norm[:, i] - y_pred)**2) / (np.sum((Y_norm[:, i] - Y_norm[:, i].mean())**2) + 1e-9))
         return np.array(scores)
@@ -521,13 +562,33 @@ def extract_latent_data(model, dataset, dt, include_hamiltonian=False):
             x, ei = data.x.to(device), data.edge_index.to(device)
             z, _, _, _ = model.encode(x, ei, torch.zeros(x.size(0), dtype=torch.long, device=device))
             z_flat = z.view(1, -1)
+            
+            # Extract dynamics derivative
             ode_dev = next(model.ode_func.parameters()).device
-            dz = model.ode_func(torch.tensor([i*dt], device=ode_dev), z_flat.to(ode_dev))
-            states.append(z_flat[0].cpu().numpy())
-            derivs.append(dz[0].cpu().numpy())
-            times.append(i*dt)
-            if include_hamiltonian and hasattr(model.ode_func, 'H_net'):
-                hams.append(model.ode_func.H_net(z_flat.to(ode_dev))[0].cpu().numpy())
+            try:
+                dz = model.ode_func(torch.tensor([i*dt], device=ode_dev), z_flat.to(ode_dev))
+                
+                # Check for NaNs or massive values in dz
+                if torch.isnan(dz).any() or torch.isinf(dz).any() or torch.max(torch.abs(dz)) > 1e4:
+                    continue
+                    
+                states.append(z_flat[0].cpu().numpy())
+                derivs.append(dz[0].cpu().numpy())
+                times.append(i*dt)
+                
+                if include_hamiltonian and hasattr(model.ode_func, 'H_net'):
+                    h_val = model.ode_func.H_net(z_flat.to(ode_dev))[0]
+                    hams.append(h_val.cpu().numpy())
+            except Exception as e:
+                # Silently skip integration errors for data extraction
+                continue
+                
+    if len(states) == 0:
+        # Fallback if everything was NaNs
+        return (np.zeros((0, model.encoder.n_super_nodes * model.encoder.latent_dim)), 
+                np.zeros((0, model.encoder.n_super_nodes * model.encoder.latent_dim)), 
+                np.zeros(0))
+                
     res = [np.array(states), np.array(derivs), np.array(times)]
     if include_hamiltonian: res.append(np.array(hams))
     return tuple(res)

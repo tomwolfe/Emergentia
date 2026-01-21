@@ -215,7 +215,7 @@ class HierarchicalPooling(nn.Module):
         return out, s, assign_losses, mu
 
 class GNNEncoder(nn.Module):
-    def __init__(self, node_features, hidden_dim, latent_dim, n_super_nodes):
+    def __init__(self, node_features, hidden_dim, latent_dim, n_super_nodes, min_active_super_nodes=2):
         super(GNNEncoder, self).__init__()
         self.gnn1 = EquivariantGNNLayer(node_features, hidden_dim)
         self.ln1 = nn.LayerNorm(hidden_dim)
@@ -226,7 +226,7 @@ class GNNEncoder(nn.Module):
         
         # Spatially-aware pooling instead of global_mean_pool
         # Use the Enhanced StableHierarchicalPooling
-        self.pooling = StableHierarchicalPooling(hidden_dim, n_super_nodes)
+        self.pooling = StableHierarchicalPooling(hidden_dim, n_super_nodes, min_active_super_nodes=min_active_super_nodes)
         
         self.output_layer = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -384,10 +384,15 @@ class HamiltonianODEFunc(nn.Module):
 class GNNDecoder(nn.Module):
     def __init__(self, latent_dim, hidden_dim, out_features):
         super(GNNDecoder, self).__init__()
-        self.ln = nn.LayerNorm(hidden_dim)
+        self.ln1 = nn.LayerNorm(hidden_dim)
+        self.ln2 = nn.LayerNorm(hidden_dim)
         self.mlp = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
             nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, out_features)
         )
 
@@ -401,9 +406,7 @@ class GNNDecoder(nn.Module):
         # Weighted sum: [N_total, n_super_nodes, 1] * [N_total, n_super_nodes, latent_dim]
         node_features_latent = torch.sum(s.unsqueeze(-1) * z_expanded, dim=1)
         
-        h = torch.relu(self.mlp[0](node_features_latent))
-        h = self.ln(h)
-        return self.mlp[2](h)
+        return self.mlp(node_features_latent)
 
 class MIDiscriminator(nn.Module):
     """
@@ -427,9 +430,9 @@ class MIDiscriminator(nn.Module):
         return self.net(zp)
 
 class DiscoveryEngineModel(nn.Module):
-    def __init__(self, n_particles, n_super_nodes, node_features=4, latent_dim=4, hidden_dim=64, hamiltonian=False, dissipative=True):
+    def __init__(self, n_particles, n_super_nodes, node_features=4, latent_dim=4, hidden_dim=64, hamiltonian=False, dissipative=True, min_active_super_nodes=2):
         super(DiscoveryEngineModel, self).__init__()
-        self.encoder = GNNEncoder(node_features, hidden_dim, latent_dim, n_super_nodes)
+        self.encoder = GNNEncoder(node_features, hidden_dim, latent_dim, n_super_nodes, min_active_super_nodes=min_active_super_nodes)
         
         if hamiltonian:
             self.ode_func = HamiltonianODEFunc(latent_dim, n_super_nodes, hidden_dim, dissipative=dissipative)
@@ -445,7 +448,12 @@ class DiscoveryEngineModel(nn.Module):
 
         # Learnable loss log-variances for automatic loss balancing
         # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning, 8: sep, 9: conn, 10: sparsity, 11: mi, 12: sym
-        self.log_vars = nn.Parameter(torch.zeros(13)) 
+        # Initialize log_vars[0] (rec) to a negative value to give it higher initial weight
+        lvars = torch.zeros(13)
+        lvars[0] = -1.0 # Boost reconstruction
+        lvars[2] = 0.5  # Suppress assignments slightly
+        lvars[6] = 0.5  # Suppress alignment slightly
+        self.log_vars = nn.Parameter(lvars) 
         
     def get_mi_loss(self, z, mu):
         """
