@@ -77,6 +77,22 @@ The optimized version includes:
 - Early stopping to prevent overfitting
 - Edge caching for faster data preparation
 
+### Performance-Optimized Execution
+
+For maximum performance with reduced computational complexity, use the newly optimized version:
+
+```bash
+python optimized_fast_train.py --epochs 200 --steps 50 --particles 4 --super_nodes 2
+```
+
+The performance-optimized version includes:
+- Reduced model complexity with fewer parameters
+- Optimized ODE solver parameters for faster training
+- Reduced symbolic regression complexity (smaller populations and generations)
+- Streamlined feature computation to prevent combinatorial explosion
+- Early stopping and adaptive learning rates for efficiency
+- Memory-efficient operations throughout the pipeline
+
 ### Original Version
 
 The original version is still available for reference:
@@ -248,8 +264,10 @@ python test_implemented_fixes.py
 ## Files Overview
 
 - `model.py`: Core neural network architecture
+- `optimized_model.py`: Performance-optimized neural network architecture with reduced computational complexity
 - `symbolic.py`: Basic symbolic regression implementation
 - `enhanced_symbolic.py`: Enhanced symbolic regression with secondary optimization
+- `optimized_symbolic_distillation.py`: Performance-optimized symbolic regression with streamlined feature computation
 - `coordinate_mapping.py`: Neural-physical coordinate alignment
 - `stable_pooling.py`: Enhanced pooling with collapse prevention
 - `hamiltonian_symbolic.py`: Hamiltonian structure preservation
@@ -261,6 +279,8 @@ python test_implemented_fixes.py
 - `optimized_ode.py`: Optimized ODE functions to reduce adjoint sensitivity complexity
 - `config_manager.py`: Configuration management and hyperparameter auto-tuning
 - `main_enhanced_complete.py`: Complete enhanced pipeline with all improvements
+- `fast_train.py`: Fast training script with performance optimizations
+- `optimized_fast_train.py`: Maximum performance training script with reduced computational complexity
 - `config.yaml`: Configuration file for the enhanced pipeline
 
 ## Contributing
