@@ -512,7 +512,7 @@ class Trainer:
 
         weights = raw_weights
 
-        discovery_loss = (weights['rec'] * loss_rec + lvars[0]) + \
+        discovery_loss = (weights['rec'] * 5.0 * loss_rec + lvars[0]) + \
                          (weights['assign'] * loss_assign + lvars[2]) + \
                          (weights['ortho'] * loss_ortho + lvars[3]) + \
                          (weights['align'] * loss_align + lvars[6]) + \

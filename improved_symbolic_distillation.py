@@ -177,9 +177,9 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
         """
         from gplearn.genetic import SymbolicRegressor
 
-        # NEW: Expanded function set with physics-relevant functions
+        # NEW: Standard gplearn function set
         function_set = ('add', 'sub', 'mul', 'div', 'sqrt', 'log', 'abs', 'neg', 'inv', 
-                        'max', 'min', 'sin', 'cos', 'tan', 'exp', 'square', 'cube')
+                        'sin', 'cos', 'tan')
 
         est = SymbolicRegressor(
             population_size=population_size,
@@ -415,20 +415,20 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
             return np.zeros((X_norm.shape[0], 1)), full_mask, 0.0
 
         # NEW: Enhanced linear fit check with multiple metrics
-        from sklearn.linear_model import RidgeCV, LinearRegression
+        from sklearn.linear_model import LassoCV
         from sklearn.preprocessing import PolynomialFeatures
         from sklearn.pipeline import Pipeline
         
-        # Try both simple linear and polynomial fits
-        ridge = RidgeCV(alphas=[1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1, 10])
-        ridge.fit(X_selected, Y_norm[:, i])
-        linear_score = ridge.score(X_selected, Y_norm[:, i])
+        # Use LassoCV for better parsimony (L1 regularization)
+        lasso = LassoCV(alphas=[1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1], cv=min(5, len(X_selected)))
+        lasso.fit(X_selected, Y_norm[:, i])
+        linear_score = lasso.score(X_selected, Y_norm[:, i])
         
-        # NEW: Try a simple quadratic model as well
+        # NEW: Try a simple quadratic model as well with Lasso
         try:
             quad_model = Pipeline([
                 ('poly', PolynomialFeatures(degree=2, include_bias=False)),
-                ('ridge', RidgeCV(alphas=[1e-6, 1e-4, 1e-2, 1]))
+                ('lasso', LassoCV(alphas=[1e-6, 1e-4, 1e-2, 1], cv=min(5, len(X_selected))))
             ])
             quad_model.fit(X_selected, Y_norm[:, i])
             quad_score = quad_model.score(X_selected, Y_norm[:, i])
@@ -437,29 +437,24 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
 
         best_linear_score = max(linear_score, quad_score)
 
-        # NEW: More flexible threshold for linear models
-        if best_linear_score > 0.90:  # More flexible threshold
-            print(f"  -> Target_{i}: Good linear fit (R2={best_linear_score:.3f}). Using linear model.")
-
-            # NEW: Return the best performing model (linear or quadratic)
+        # NEW: Much more stringent threshold for linear/quadratic shortcuts (0.995)
+        # and enforce parsimony (max 15 terms)
+        if best_linear_score > 0.995:
             if quad_score > linear_score:
                 class QuadraticProgram:
                     def __init__(self, model, feature_indices):
                         self.model = model
-                        self.length_ = 1
                         self.feature_indices = feature_indices
 
                         # Create a human-readable string representation
                         try:
-                            ridge_model = model.named_steps['ridge']
+                            lasso_model = model.named_steps['lasso']
                             poly_features = model.named_steps['poly']
                             
-                            coeffs = ridge_model.coef_
-                            intercept = ridge_model.intercept_
+                            coeffs = lasso_model.coef_
+                            intercept = lasso_model.intercept_
                             
                             # Get feature names from poly_features
-                            # They will be like "x0", "x0^2", "x0 x1", etc.
-                            # We need to map "xi" back to "X{feature_indices[i]}"
                             raw_names = poly_features.get_feature_names_out()
                             
                             terms = []
@@ -469,7 +464,6 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
                             for idx, coef in enumerate(coeffs):
                                 if abs(coef) > 1e-6:
                                     name = raw_names[idx]
-                                    # Replace "xi" with "X{feature_indices[i]}"
                                     import re
                                     def replace_name(match):
                                         i = int(match.group(1))
@@ -477,7 +471,6 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
                                     
                                     clean_name = re.sub(r'x(\d+)', replace_name, name)
                                     
-                                    # Convert name to functional form (mul, etc)
                                     if ' ' in clean_name: # Cross term: X1 X2
                                         parts = clean_name.split(' ')
                                         term = f"mul({coef:.6f}, mul({parts[0]}, {parts[1]}))"
@@ -489,6 +482,7 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
                                     
                                     terms.append(term)
                                     
+                            self.length_ = len(terms)
                             if not terms:
                                 self.expr_str = f"{intercept:.6e}"
                             elif len(terms) == 1:
@@ -499,32 +493,23 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
                                     self.expr_str = f"add({self.expr_str}, {term})"
                         except Exception as e:
                             self.expr_str = f"QuadraticModel(R2={quad_score:.3f})"
+                            self.length_ = 1
 
                     def execute(self, X):
                         if X.ndim == 1: X = X.reshape(1, -1)
                         result = self.model.predict(X)
-
-                        # Ensure result is always a 1D numpy array with same length as input samples
                         result = np.asarray(result)
-
-                        # If result is a scalar, convert to 1D array with same length as input samples
                         if result.ndim == 0:
                             result = np.full(X.shape[0], result)
                         elif result.ndim == 1:
-                            # If result has different length than expected, handle appropriately
                             if result.shape[0] != X.shape[0]:
                                 if result.shape[0] == 1:
-                                    # If we have a single result but multiple input samples, broadcast it
                                     result = np.full(X.shape[0], result[0])
                                 else:
-                                    # If result has more elements than expected, truncate
                                     result = result[:X.shape[0]]
-                                    # If result has fewer elements than expected, pad
                                     if result.shape[0] < X.shape[0]:
                                         result = np.pad(result, (0, X.shape[0] - result.shape[0]), mode='edge')
                         else:
-                            # If result is multi-dimensional, flatten to 1D and handle length
-                            # This is important: if result has shape (n_samples, 1), flatten to (n_samples,)
                             if result.shape[1] == 1 and len(result.shape) == 2:
                                 result = result.flatten()
                             else:
@@ -536,36 +521,35 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
                                         result = result[:X.shape[0]]
                                         if result.shape[0] < X.shape[0]:
                                             result = np.pad(result, (0, X.shape[0] - result.shape[0]), mode='edge')
-
                         return result
 
                     def __str__(self):
                         return self.expr_str
 
                 selected_indices = np.where(full_mask)[0]
-                return QuadraticProgram(quad_model, selected_indices), full_mask, quad_score
+                prog = QuadraticProgram(quad_model, selected_indices)
+                if prog.length_ <= 15:
+                    print(f"  -> Target_{i}: Good quadratic fit (R2={quad_score:.3f}, terms={prog.length_}). Using quadratic model.")
+                    return prog, full_mask, quad_score
+                else:
+                    print(f"  -> Target_{i}: Quadratic fit too complex ({prog.length_} terms). Falling back to GP.")
             else:
                 class LinearProgram:
                     def __init__(self, model, feature_indices):
                         self.model = model
-                        self.length_ = 1
                         self.feature_indices = feature_indices
-                        # Create a string representation
                         terms = []
-                        # Lower threshold for terms to 1e-6
                         if abs(model.intercept_) > 1e-6:
                             terms.append(f"{model.intercept_:.6f}")
 
-                        # Sort coefficients to find most important ones if many are small
                         coeffs = model.coef_
                         for idx, coef in enumerate(coeffs):
                             if abs(coef) > 1e-6:
-                                # Map back to original feature index
                                 orig_idx = feature_indices[idx]
                                 terms.append(f"mul({coef:.6f}, X{orig_idx})")
 
+                        self.length_ = len(terms)
                         if not terms:
-                            # If everything is extremely small, check if intercept is actually non-zero
                             self.expr_str = f"{model.intercept_:.6e}"
                         elif len(terms) == 1:
                             self.expr_str = terms[0]
@@ -577,28 +561,18 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
                     def execute(self, X):
                         if X.ndim == 1: X = X.reshape(1, -1)
                         result = self.model.predict(X)
-
-                        # Ensure result is always a 1D numpy array with same length as input samples
                         result = np.asarray(result)
-
-                        # If result is a scalar, convert to 1D array with same length as input samples
                         if result.ndim == 0:
                             result = np.full(X.shape[0], result)
                         elif result.ndim == 1:
-                            # If result has different length than expected, handle appropriately
                             if result.shape[0] != X.shape[0]:
                                 if result.shape[0] == 1:
-                                    # If we have a single result but multiple input samples, broadcast it
                                     result = np.full(X.shape[0], result[0])
                                 else:
-                                    # If result has more elements than expected, truncate
                                     result = result[:X.shape[0]]
-                                    # If result has fewer elements than expected, pad
                                     if result.shape[0] < X.shape[0]:
                                         result = np.pad(result, (0, X.shape[0] - result.shape[0]), mode='edge')
                         else:
-                            # If result is multi-dimensional, flatten to 1D and handle length
-                            # This is important: if result has shape (n_samples, 1), flatten to (n_samples,)
                             if result.shape[1] == 1 and len(result.shape) == 2:
                                 result = result.flatten()
                             else:
@@ -610,15 +584,18 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
                                         result = result[:X.shape[0]]
                                         if result.shape[0] < X.shape[0]:
                                             result = np.pad(result, (0, X.shape[0] - result.shape[0]), mode='edge')
-
                         return result
 
                     def __str__(self):
                         return self.expr_str
 
-                # Find the indices of selected features from the full_mask
                 selected_indices = np.where(full_mask)[0]
-                return LinearProgram(ridge, selected_indices), full_mask, linear_score
+                prog = LinearProgram(lasso, selected_indices)
+                if prog.length_ <= 15:
+                    print(f"  -> Target_{i}: Good linear fit (R2={linear_score:.3f}, terms={prog.length_}). Using linear model.")
+                    return prog, full_mask, linear_score
+                else:
+                    print(f"  -> Target_{i}: Linear fit too complex ({prog.length_} terms). Falling back to GP.")
 
         # NEW: Enhanced GP search with better parameters
         parsimony_levels = [0.0001, 0.001, 0.01]  # More granular levels
@@ -877,39 +854,51 @@ class OptimizedExpressionWrapper:
     def __init__(self, expr_str, original_program):
         self.expr_str = expr_str
         self.original_program = original_program
-        self.length_ = getattr(original_program, 'length_', len(expr_str.split()))
-        self.depth_ = getattr(original_program, 'depth_', 2)
         
         # Parse the expression for execution
         try:
             import sympy as sp
             self._sympy_expr = sp.sympify(expr_str)
-            self._lambdified = sp.lambdify([sp.Symbol(f'X{i}') for i in range(50)], 
-                                          self._sympy_expr, modules=['numpy'])
-        except:
+            # Dynamically identify all symbols like X0, X1 or x0, x1
+            self._symbols = sorted(list(self._sympy_expr.free_symbols), key=lambda s: str(s))
+            self._lambdified = sp.lambdify(self._symbols, self._sympy_expr, modules=['numpy'])
+            
+            # Count actual terms for length_
+            if hasattr(self._sympy_expr, 'args'):
+                self.length_ = len(self._sympy_expr.args) if self._sympy_expr.is_Add else 1
+            else:
+                self.length_ = 1
+        except Exception as e:
             self._sympy_expr = None
             self._lambdified = None
+            self._symbols = []
+            self.length_ = getattr(original_program, 'length_', 1)
+        
+        self.depth_ = getattr(original_program, 'depth_', 2)
 
     def execute(self, X):
         if self._lambdified is not None:
             try:
-                # Prepare arguments for the lambdified function
-                args = []
-
                 # Ensure X is 2D for consistent processing
                 if X.ndim == 1:
                     X = X.reshape(1, -1)
 
-                for i in range(min(X.shape[1], 50)):  # Up to 50 features
-                    args.append(X[:, i])
-
-                # Pad with zeros if needed
-                for i in range(len(args), 50):
-                    args.append(np.zeros(X.shape[0]))
+                # Map the required symbols to the columns of X
+                # Symbols are expected to be named X{i} or x{i}
+                import re
+                args = []
+                for sym in self._symbols:
+                    match = re.search(r'(\d+)', str(sym))
+                    if match:
+                        idx = int(match.group(1))
+                        if idx < X.shape[1]:
+                            args.append(X[:, idx])
+                        else:
+                            args.append(np.zeros(X.shape[0]))
+                    else:
+                        args.append(np.zeros(X.shape[0]))
 
                 result = self._lambdified(*args)
-
-                # Ensure result is a proper numpy array
                 result = np.asarray(result)
 
                 # Ensure result is always a 1D numpy array with same length as input samples

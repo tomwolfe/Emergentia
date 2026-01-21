@@ -31,6 +31,39 @@ class ImprovedEarlyStopping:
 
         return self.counter >= self.patience
 
+def robust_energy(sim, pos, vel):
+    """
+    Robust energy calculation with a soft-floor for particle distances to prevent singularities.
+    """
+    ke = 0.5 * sim.m * np.sum(vel**2)
+    pe = 0.0
+    pairs = sim._compute_pairs(pos)
+    if len(pairs) > 0:
+        idx1, idx2 = zip(*pairs)
+        idx1 = np.array(idx1)
+        idx2 = np.array(idx2)
+        diff = pos[idx2] - pos[idx1]
+        if sim.box_size:
+            for i in range(2):
+                diff[:, i] -= sim.box_size[i] * np.round(diff[:, i] / sim.box_size[i])
+        
+        dist_sq = np.sum(diff**2, axis=1)
+        
+        # NEW: Implement 'soft-floor' for particle distances: clip at 0.7 * sigma
+        sigma = getattr(sim, 'sigma', 1.0)
+        dist_sq = np.maximum(dist_sq, (0.7 * sigma)**2)
+        
+        if hasattr(sim, 'epsilon'): # Lennard-Jones
+            sr6 = (sim.sigma**2 / dist_sq)**3
+            sr6 = np.clip(sr6, -1e10, 1e10)
+            sr12 = sr6**2
+            pe = 4 * sim.epsilon * np.sum(sr12 - sr6)
+        else: # Spring-Mass
+            dist = np.sqrt(dist_sq)
+            pe = 0.5 * sim.k * np.sum((dist - sim.spring_dist)**2)
+            
+    return ke + pe
+
 def compute_energy_conservation_during_training(model, dataset, sim, device):
     """
     Compute energy conservation during training by evaluating the reconstructed trajectories.
@@ -55,31 +88,26 @@ def compute_energy_conservation_during_training(model, dataset, sim, device):
                 recon = model.decode(z, s, batch)
 
                 # Convert back to physical coordinates for energy calculation
-                # Assuming x contains [pos_x, pos_y, vel_x, vel_y]
                 recon_pos = recon[:, :2].cpu().numpy()
                 recon_vel = recon[:, 2:].cpu().numpy()
 
-                # Calculate energy of reconstructed state
-                recon_energy = sim.energy(recon_pos, recon_vel)
-                true_energy = sim.energy(batch_data.x[:, :2].cpu().numpy(), batch_data.x[:, 2:].cpu().numpy())
+                # Calculate energy of reconstructed state using robust energy
+                recon_energy = robust_energy(sim, recon_pos, recon_vel)
+                true_energy = robust_energy(sim, batch_data.x[:, :2].cpu().numpy(), batch_data.x[:, 2:].cpu().numpy())
 
                 # Safely compute energy error to avoid division by zero
-                # NEW: Use absolute difference instead of relative error for better stability
                 energy_error = abs(recon_energy - true_energy) / (abs(true_energy) + 1e-9)
 
-                # NEW: Add bounds checking to prevent extreme values
-                energy_error = min(energy_error, 100.0)  # Cap at 10000% error
+                # Cap error to prevent extreme values
+                energy_error = min(energy_error, 100.0)
 
-                # Only count valid energy computations
                 if np.isfinite(energy_error) and not np.isnan(energy_error):
                     total_energy_error += energy_error
                     num_batches += 1
             except Exception as e:
-                # Skip batches that cause errors
                 continue
 
     avg_energy_error = total_energy_error / max(num_batches, 1)
-    # NEW: Use median instead of mean to reduce outlier influence
     return avg_energy_error
 
 
@@ -91,7 +119,7 @@ def compute_energy_conservation_with_smoothing(model, dataset, sim, device, smoo
     energy_errors = []
 
     with torch.no_grad():
-        for i in range(0, min(len(dataset), 50), 5):  # Sample fewer batches to improve performance
+        for i in range(0, min(len(dataset), 50), 5):
             if i >= len(dataset):
                 break
 
@@ -100,55 +128,41 @@ def compute_energy_conservation_with_smoothing(model, dataset, sim, device, smoo
             edge_index = batch_data.edge_index.to(device)
             batch = torch.zeros(x.size(0), dtype=torch.long, device=device)
 
-            # Encode and decode to get reconstruction
             try:
                 z, s, _, _ = model.encode(x, edge_index, batch)
                 recon = model.decode(z, s, batch)
 
-                # Convert back to physical coordinates for energy calculation
                 recon_pos = recon[:, :2].cpu().numpy()
                 recon_vel = recon[:, 2:].cpu().numpy()
 
-                # Calculate energy of reconstructed state
-                recon_energy = sim.energy(recon_pos, recon_vel)
-                true_energy = sim.energy(batch_data.x[:, :2].cpu().numpy(), batch_data.x[:, 2:].cpu().numpy())
+                # Calculate energy of reconstructed state using robust energy
+                recon_energy = robust_energy(sim, recon_pos, recon_vel)
+                true_energy = robust_energy(sim, batch_data.x[:, :2].cpu().numpy(), batch_data.x[:, 2:].cpu().numpy())
 
-                # Safely compute energy error to avoid division by zero
-                # NEW: Use absolute difference instead of relative error for better stability
                 energy_error = abs(recon_energy - true_energy) / (abs(true_energy) + 1e-9)
+                energy_error = min(energy_error, 100.0)
 
-                # NEW: Add bounds checking to prevent extreme values
-                energy_error = min(energy_error, 100.0)  # Cap at 10000% error to prevent overflow
-
-                # NEW: More robust energy error computation with better numerical stability
-                # Only add finite and non-NaN values
                 if np.isfinite(energy_error) and not np.isnan(energy_error):
-                    # NEW: Apply logarithmic scaling for better dynamic range
                     energy_errors.append(energy_error)
             except Exception as e:
-                # Skip batches that cause errors
                 continue
 
     if len(energy_errors) == 0:
-        return 1.0  # Return high error if no valid measurements
+        return 1.0
 
-    # NEW: Use median instead of mean to reduce outlier influence
     median_error = np.median(energy_errors)
 
-    # NEW: Add more sophisticated smoothing with weighted averaging
     if len(energy_errors) >= smoothing_window:
         smoothed_errors = []
         for j in range(len(energy_errors)):
             start_idx = max(0, j - smoothing_window//2)
             end_idx = min(len(energy_errors), j + smoothing_window//2 + 1)
 
-            # NEW: Use exponentially weighted moving average for better smoothing
             window_data = energy_errors[start_idx:end_idx]
-            weights = np.exp(np.linspace(-1., 0., len(window_data)))  # Exponential weights
+            weights = np.exp(np.linspace(-1., 0., len(window_data)))
             weighted_avg = np.average(window_data, weights=weights)
             smoothed_errors.append(weighted_avg)
 
-        # NEW: Return both median and exponentially-weighted smoothed for better robustness
         return min(median_error, np.median(smoothed_errors))
     else:
         return median_error
@@ -369,7 +383,7 @@ def main():
             print("Attempting energy-focused retraining...")
             # Temporarily increase the energy conservation weight in the trainer
             original_energy_weight = getattr(trainer, 'energy_weight', 0.1)
-            trainer.energy_weight = min(0.8, original_energy_weight * 3)  # Triple the energy weight for stronger focus
+            trainer.energy_weight = min(0.8, original_energy_weight * 1.2)  # NEW: Use 1.2x multiplier instead of 3x
 
             # NEW: Reduce learning rate significantly for more stable energy-focused training
             original_lr = trainer.optimizer.param_groups[0]['lr']

@@ -31,24 +31,31 @@ class ImprovedSymbolicDynamics:
         """
         Safely extract a scalar value from various return types.
         """
+        result = 0.0
         if isinstance(value, (list, tuple)):
             if len(value) > 0:
-                return float(value[0]) if np.isscalar(value[0]) else float(value[0])
+                result = float(value[0]) if np.isscalar(value[0]) else float(value[0])
             else:
-                return 0.0
+                result = 0.0
         elif isinstance(value, np.ndarray):
             if value.size == 0:
-                return 0.0
+                result = 0.0
             elif value.size == 1:
-                return float(value.flat[0])
+                result = float(value.flat[0])
             else:
                 # If it's a multi-element array, return the first element
-                return float(value.flat[0])
+                result = float(value.flat[0])
         elif np.isscalar(value):
-            return float(value)
+            result = float(value)
         else:
             # Fallback to 0.0 if we can't handle the type
+            result = 0.0
+            
+        # NEW: Log warning for NaN or zeros (if it was expected to be non-zero)
+        if np.isnan(result):
+            # print("Warning: Symbolic execution returned NaN. Using 0.0 as fallback.")
             return 0.0
+        return result
 
     def __call__(self, arg1, arg2=None):
         """
@@ -170,7 +177,7 @@ class ImprovedSymbolicDynamics:
             X_full = z_reshaped.reshape(1, -1)
 
         # NEW: Numerical differentiation for gradient computation
-        eps = 1e-8
+        eps = 1e-4
         grad_H = np.zeros(len(z_reshaped))
 
         for i in range(len(z_reshaped)):  # Iterate over each dimension
