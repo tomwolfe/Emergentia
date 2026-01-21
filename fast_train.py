@@ -7,15 +7,28 @@ from engine import Trainer, prepare_data
 from symbolic import SymbolicDistiller, extract_latent_data
 import argparse
 
+class EarlyStopping:
+    def __init__(self, patience=50, min_delta=1e-4):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_loss = float('inf')
+    
+    def __call__(self, current_loss):
+        if current_loss < self.best_loss - self.min_delta:
+            self.best_loss = current_loss
+            self.counter = 0
+        else:
+            self.counter += 1
+        
+        return self.counter >= self.patience
+
 def main():
-    # NOTE: This is the original version of the program. For faster execution, consider using fast_train.py
-    # which includes performance optimizations like gradient accumulation, selective loss computation,
-    # and more efficient ODE solving.
     parser = argparse.ArgumentParser()
-    parser.add_argument('--epochs', type=int, default=5000)
-    parser.add_argument('--steps', type=int, default=800)
-    parser.add_argument('--particles', type=int, default=16)
-    parser.add_argument('--super_nodes', type=int, default=4)
+    parser.add_argument('--epochs', type=int, default=1000)
+    parser.add_argument('--steps', type=int, default=200)
+    parser.add_argument('--particles', type=int, default=8)
+    parser.add_argument('--super_nodes', type=int, default=2)
     parser.add_argument('--device', type=str, default=None, help='Device to use (cpu, cuda, mps)')
     args = parser.parse_args()
 
@@ -41,56 +54,58 @@ def main():
     latent_dim = 4
     steps = args.steps
     epochs = args.epochs
-    seq_len = 20
+    seq_len = 10  # Reduced sequence length for faster training
     dynamic_radius = 1.5
     # Enable PBC with a reasonable box size
     box_size = (10.0, 10.0)  # Set a reasonable box size for PBC
-    
+
     print("--- 1. Generating Data ---")
     from simulator import LennardJonesSimulator
     # Reduce dt for better energy conservation in data generation
-    sim = LennardJonesSimulator(n_particles=n_particles, epsilon=1.0, sigma=1.0, 
+    sim = LennardJonesSimulator(n_particles=n_particles, epsilon=1.0, sigma=1.0,
                                 dynamic_radius=dynamic_radius, box_size=box_size, dt=0.001)
     pos, vel = sim.generate_trajectory(steps=steps)
     initial_energy = sim.energy(pos[0], vel[0])
     final_energy = sim.energy(pos[-1], vel[-1])
     print(f"Energy conservation: {initial_energy:.2f} -> {final_energy:.2f} ({(final_energy/initial_energy-1)*100:.2f}%)")
-    
+
     # Prepare data with device support and robust normalization
-    dataset, stats = prepare_data(pos, vel, radius=dynamic_radius, device=device)
-    
+    dataset, stats = prepare_data(pos, vel, radius=dynamic_radius, device=device, cache_edges=True)
+
     # 2. Initialize Model and Trainer
     print("--- 2. Initialize Model and Trainer ---")
     # Using Hamiltonian dynamics with learnable dissipation for improved physics fidelity
     # NEW: Ensure at least half of super-nodes stay active to prevent resolution collapse
     min_active = max(1, n_super_nodes // 2)
-    model = DiscoveryEngineModel(n_particles=n_particles, 
-                                 n_super_nodes=n_super_nodes, 
+    model = DiscoveryEngineModel(n_particles=n_particles,
+                                 n_super_nodes=n_super_nodes,
                                  latent_dim=latent_dim,
-                                 hidden_dim=128,
+                                 hidden_dim=64,  # Reduced hidden dim for faster training
                                  hamiltonian=True,
                                  dissipative=True,
                                  min_active_super_nodes=min_active).to(device)
-    
+
     # NEW: Sparsity Scheduler to prevent resolution collapse
     from stable_pooling import SparsityScheduler
     sparsity_scheduler = SparsityScheduler(
-        initial_weight=0.001, 
-        target_weight=0.05, 
-        warmup_steps=int(epochs * 0.1), 
+        initial_weight=0.001,
+        target_weight=0.05,
+        warmup_steps=int(epochs * 0.1),
         max_steps=int(epochs * 0.8)
     )
 
-    # Trainer now uses adaptive loss weighting, manual weights are deprecated
-    # Optimized parameters for faster training
+    # Optimized trainer parameters for faster training
     trainer = Trainer(model, lr=2e-4, device=device, stats=stats, sparsity_scheduler=sparsity_scheduler,
                       skip_consistency_freq=3,  # Compute consistency loss every 3 epochs to save time
                       enable_gradient_accumulation=True,  # Use gradient accumulation for memory efficiency
                       grad_acc_steps=2)  # Accumulate gradients over 2 steps
-    
+
     # Increased patience and adjusted factor to prevent premature decay
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(trainer.optimizer, mode='min', 
-                                                           factor=0.5, patience=1000, min_lr=1e-6)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(trainer.optimizer, mode='min',
+                                                           factor=0.5, patience=200, min_lr=1e-6)
+
+    # Early stopping setup
+    early_stopping = EarlyStopping(patience=100, min_delta=1e-4)
     
     last_loss = 1.0
     for epoch in range(epochs):
@@ -99,8 +114,8 @@ def main():
         loss, rec, cons = trainer.train_step(batch_data, sim.dt, epoch=epoch, max_epochs=epochs)
         last_loss = loss
         scheduler.step(loss)
-        
-        if epoch % 100 == 0:
+
+        if epoch % 50 == 0:  # Less frequent logging
             progress = (epoch / epochs) * 100
             stats_tracker = trainer.loss_tracker.get_stats()
             active_nodes = int(model.encoder.pooling.active_mask.sum().item())
@@ -111,6 +126,11 @@ def main():
             log_str += f"Active: {active_nodes} | "
             log_str += f"LR: {trainer.optimizer.param_groups[0]['lr']:.2e}"
             print(log_str)
+
+        # Check for early stopping
+        if early_stopping(last_loss):
+            print(f"Early stopping triggered at epoch {epoch}")
+            break
 
     # --- Interpretability Check ---
     print("\n--- 2.1 Latent Interpretability Analysis ---")
@@ -131,14 +151,14 @@ def main():
     print("--- 3. Distilling Symbolic Laws ---")
     is_hamiltonian = model.hamiltonian
     latent_data = extract_latent_data(model, dataset, sim.dt, include_hamiltonian=is_hamiltonian)
-    
+
     if len(latent_data[0]) == 0:
         print("Error: No valid latent data extracted (all NaN or divergent). Skipping symbolic distillation.")
         return
 
     from enhanced_symbolic import create_enhanced_distiller
     distiller = create_enhanced_distiller(secondary_optimization=True)
-    
+
     if is_hamiltonian:
         z_states, dz_states, t_states, h_states = latent_data
         print("Distilling Hamiltonian H(q, p) with secondary optimization...")
@@ -155,7 +175,7 @@ def main():
         avg_conf = np.mean(confidences)
         if avg_conf > 0.5:
             trainer.update_symbolic_proxy(equations, distiller.transformer, weight=0.1, confidence=avg_conf)
-    
+
     print("\nDiscovered Symbolic Laws:")
     if is_hamiltonian:
         if equations[0] is not None:
@@ -195,22 +215,22 @@ def main():
         batch = torch.zeros(x.size(0), dtype=torch.long, device=device)
         z, s, _, _ = model.encode(x, edge_index, batch)
         recon = model.decode(z, s, batch).cpu().numpy()
-        
+
     plt.figure(figsize=(18, 5))
-    
+
     # 1. Micro Plot: Reconstruction
     plt.subplot(1, 3, 1)
     plt.scatter(data.x.cpu().numpy()[:, 0], data.x.cpu().numpy()[:, 1], c='blue', alpha=0.5, label='Truth')
     plt.scatter(recon[:, 0], recon[:, 1], c='red', marker='x', label='Recon')
     plt.title("Micro: Reconstruction")
     plt.legend()
-    
+
     # 2. Assignment Plot
     plt.subplot(1, 3, 2)
     assignments = torch.argmax(s, dim=1).cpu().numpy()
     plt.scatter(data.x.cpu().numpy()[:, 0], data.x.cpu().numpy()[:, 1], c=assignments, cmap='viridis')
     plt.title("Hierarchical: Assignments")
-    
+
     # 3. Meso Plot: Symbolic Integration vs Learned Latent
     plt.subplot(1, 3, 3)
     # Plot first few dimensions for clarity
@@ -220,7 +240,7 @@ def main():
         plt.plot(t_eval, z_simulated[:, i], label=f'Symbolic Z_{i}')
     plt.title("Meso: Symbolic Integration")
     plt.legend()
-    
+
     plt.tight_layout()
     plt.savefig("discovery_result.png")
     print("Result saved to discovery_result.png")

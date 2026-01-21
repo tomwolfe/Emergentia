@@ -45,6 +45,31 @@ pip install -r requirements.txt
 
 ## Usage
 
+### Recommended: Fast Execution
+
+For faster execution with performance optimizations, use the optimized version:
+
+```bash
+python fast_train.py --epochs 1000 --steps 200 --particles 8 --super_nodes 2
+```
+
+The optimized version includes:
+- Gradient accumulation for memory efficiency
+- Selective consistency loss computation
+- Efficient ODE solving with looser tolerances during training
+- Early stopping to prevent overfitting
+- Edge caching for faster data preparation
+
+### Original Version
+
+The original version is still available for reference:
+
+```bash
+python main.py --epochs 1000 --steps 200 --particles 8 --super_nodes 2
+```
+
+Note: The original version is significantly slower and may timeout with larger parameters.
+
 ### Basic Example
 
 ```python

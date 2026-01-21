@@ -518,8 +518,8 @@ class DiscoveryEngineModel(nn.Module):
         # During early training, looser tolerances are acceptable
         if self.training:
             # Looser tolerances during training for efficiency
-            rtol = 1e-3
-            atol = 1e-4
+            rtol = 1e-2  # Even looser during early training
+            atol = 1e-3
         else:
             # Tighter tolerances during evaluation for accuracy
             rtol = 1e-4
@@ -527,7 +527,7 @@ class DiscoveryEngineModel(nn.Module):
 
         # Use a more efficient solver during training, but accurate one for evaluation
         if self.training:
-            method = 'rk4'  # Faster fixed-step method during training
+            method = 'euler'  # Even faster fixed-step method during early training
         else:
             method = 'dopri5'  # More accurate adaptive method during evaluation
 

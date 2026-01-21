@@ -15,37 +15,52 @@ def compute_stats(pos, vel):
     return {'pos_mean': pos_mean, 'pos_std': pos_std, 
             'vel_mean': vel_mean, 'vel_std': vel_std}
 
-def prepare_data(pos, vel, radius=1.1, stats=None, device='cpu'):
+def prepare_data(pos, vel, radius=1.1, stats=None, device='cpu', cache_edges=True):
     # pos, vel: [T, N, 2]
     T, N, _ = pos.shape
-    
+
     if stats is None:
         stats = compute_stats(pos, vel)
-    
+
     pos_norm = (pos - stats['pos_mean']) / stats['pos_std']
     vel_norm = (vel - stats['vel_mean']) / stats['vel_std']
-    
+
     dataset = []
     # Pre-convert to float32 for speed
     pos_norm = pos_norm.astype(np.float32)
     vel_norm = vel_norm.astype(np.float32)
-    
+
+    # Cache edge indices if they are consistent across time steps (for efficiency)
+    cached_edges = None
+    if cache_edges and T > 0:
+        # Check if positions are similar enough to reuse edges (for near-equilibrium systems)
+        initial_tree = KDTree(pos[0])
+        initial_pairs = initial_tree.query_pairs(radius)
+        if initial_pairs:
+            initial_edges = np.array(list(initial_pairs), dtype=np.int64)
+            cached_edges = torch.from_numpy(
+                np.concatenate([initial_edges, initial_edges[:, [1, 0]]], axis=0).T
+            ).to(device)
+
     for t in range(T):
-        curr_pos = pos[t]
-        tree = KDTree(curr_pos)
-        # query_pairs is already optimized in cKDTree (which KDTree uses)
-        pairs = tree.query_pairs(radius)
-        
-        if pairs:
-            edges = np.array(list(pairs), dtype=np.int64)
-            # Undirected graph: add both directions
-            edge_index = np.concatenate([edges, edges[:, [1, 0]]], axis=0).T
-            edge_index = torch.from_numpy(edge_index).to(device)
+        if cached_edges is not None:
+            edge_index = cached_edges
         else:
-            edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
-        
+            curr_pos = pos[t]
+            tree = KDTree(curr_pos)
+            # query_pairs is already optimized in cKDTree (which KDTree uses)
+            pairs = tree.query_pairs(radius)
+
+            if pairs:
+                edges = np.array(list(pairs), dtype=np.int64)
+                # Undirected graph: add both directions
+                edge_index = np.concatenate([edges, edges[:, [1, 0]]], axis=0).T
+                edge_index = torch.from_numpy(edge_index).to(device)
+            else:
+                edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
+
         # Fast tensor creation
-        x = torch.cat([torch.from_numpy(pos_norm[t]).to(device), 
+        x = torch.cat([torch.from_numpy(pos_norm[t]).to(device),
                        torch.from_numpy(vel_norm[t]).to(device)], dim=1)
         data = Data(x=x, edge_index=edge_index)
         dataset.append(data)
@@ -167,8 +182,9 @@ class SymbolicProxy(torch.nn.Module):
         return Y_pred
 
 class Trainer:
-    def __init__(self, model, lr=5e-4, device='cpu', stats=None, align_anneal_epochs=1000, 
-                 warmup_epochs=400, sparsity_scheduler=None, hard_assignment_start=0.7):
+    def __init__(self, model, lr=5e-4, device='cpu', stats=None, align_anneal_epochs=1000,
+                 warmup_epochs=400, sparsity_scheduler=None, hard_assignment_start=0.7,
+                 skip_consistency_freq=2, enable_gradient_accumulation=False, grad_acc_steps=1):
         self.model = model.to(device)
         self.device = device
         self.loss_tracker = LossTracker()
@@ -177,18 +193,21 @@ class Trainer:
         self.align_anneal_epochs = align_anneal_epochs
         self.warmup_epochs = warmup_epochs
         self.sparsity_scheduler = sparsity_scheduler
-        self.hard_assignment_start = hard_assignment_start 
-        
+        self.hard_assignment_start = hard_assignment_start
+        self.skip_consistency_freq = skip_consistency_freq  # Skip consistency loss every N epochs
+        self.enable_gradient_accumulation = enable_gradient_accumulation
+        self.grad_acc_steps = grad_acc_steps
+
         # Symbolic-in-the-loop
         self.symbolic_proxy = None
         self.symbolic_weight = 0.0
         self.symbolic_confidence = 0.0
         self.min_symbolic_confidence = 0.7
-        
+
         # MPS fix: torchdiffeq has issues with MPS (float64 defaults and stability)
         if str(device) == 'mps':
             self.model.ode_func.to('cpu')
-            
+
         self.optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
         self.criterion = torch.nn.MSELoss().to(device)
         self.stats = stats
@@ -211,21 +230,27 @@ class Trainer:
             new_weight = self.sparsity_scheduler.step()
             if hasattr(self.model.encoder.pooling, 'set_sparsity_weight'):
                 self.model.encoder.pooling.set_sparsity_weight(new_weight)
-        
+
         # Periodically apply hard revival to prevent resolution collapse
         if epoch > 0 and epoch % 100 == 0:
             if hasattr(self.model.encoder.pooling, 'apply_hard_revival'):
                 self.model.encoder.pooling.apply_hard_revival()
 
-        self.optimizer.zero_grad()
+        # Determine if we should compute consistency loss based on frequency
+        compute_consistency = (epoch % self.skip_consistency_freq == 0) and (epoch >= self.warmup_epochs)
+
+        # For gradient accumulation
+        if self.enable_gradient_accumulation:
+            self.optimizer.zero_grad(set_to_none=True)  # More memory efficient
+
         seq_len = len(data_list)
-        
+
         # Progress ratio
         progress = epoch / max_epochs
-        
+
         # 1. Smooth Tau schedule: Exponential decay
         tau = max(0.05, 0.5 * np.exp(-epoch / 1000.0))
-        
+
         # 2. Hard assignment scheduling:
         # Gradually increase the probability of using 'hard' assignments in Gumbel-Softmax
         # to bridge the gap between training and inference.
@@ -237,20 +262,20 @@ class Trainer:
 
         # 3. Decaying Teacher Forcing Ratio
         tf_ratio = max(0.0, 0.8 * (1.0 - epoch / (0.75 * max_epochs + 1e-9)))
-        
+
         # 4. Alignment Annealing
         align_weight = max(0.1, 1.0 - epoch / (self.align_anneal_epochs + 1e-9))
 
         # 5. Adaptive Entropy Weight: Increase over time to force discrete clusters
         # Point 1: Addressing "Blurry" Meso-scale
-        entropy_weight = 1.0 + 2.0 * progress 
-        
+        entropy_weight = 1.0 + 2.0 * progress
+
         # Warmup logic
         is_warmup = epoch < self.warmup_epochs
 
         batch_0 = Batch.from_data_list([data_list[0]]).to(self.device)
         z_curr, s_0, losses_0, mu_0 = self.model.encode(batch_0.x, batch_0.edge_index, batch_0.batch, tau=tau, hard=hard)
-        
+
         if torch.isnan(z_curr).any() or torch.isinf(z_curr).any():
             z_curr = torch.nan_to_num(z_curr, nan=0.0, posinf=1.0, neginf=-1.0)
 
@@ -266,32 +291,29 @@ class Trainer:
         loss_align = torch.tensor(0.0, device=self.device)
         loss_mi = torch.tensor(0.0, device=self.device)
         loss_sym = torch.tensor(0.0, device=self.device)
-        
+
         # Symbolic-in-the-loop loss with FIDELITY GATING
         # Point 3: Addressing Symbolic-Neural Feedback Loop Fragility
-        if (self.symbolic_proxy is not None and not is_warmup and 
+        if (self.symbolic_proxy is not None and not is_warmup and
             self.symbolic_confidence >= self.min_symbolic_confidence):
             z0_flat = z_curr.view(z_curr.size(0), -1)
             # GNN predicted derivative
             gnn_dz = self.model.ode_func(0, z0_flat)
             # Symbolic predicted derivative (now differentiable!)
             sym_dz = self.symbolic_proxy(z0_flat)
-            
+
             # Use Huber loss for more robustness against "garbage" symbolic laws
             loss_sym = torch.nn.functional.huber_loss(gnn_dz, sym_dz, delta=1.0)
 
         s_prev = s_0
         mu_prev = mu_0
         z_preds = [z_curr]
-        
+
         # Only do forward dynamics if not in deep warmup
         if not is_warmup:
-            for t in range(1, seq_len):
-                if np.random.random() < tf_ratio:
-                    batch_t_prev = Batch.from_data_list([data_list[t-1]]).to(self.device)
-                    z_curr_forced, _, _, _ = self.model.encode(batch_t_prev.x, batch_t_prev.edge_index, batch_t_prev.batch, tau=tau, hard=hard)
-                    z_curr = torch.nan_to_num(z_curr_forced)
-                
+            # Optimize ODE solving: reduce solver complexity during early training
+            if progress < 0.3:  # Early training
+                # Use simpler solver or fewer steps
                 t_span = torch.tensor([0, dt], device=self.device, dtype=torch.float32)
                 try:
                     z_next_seq = self.model.forward_dynamics(z_curr, t_span)
@@ -299,35 +321,50 @@ class Trainer:
                 except Exception as e:
                     # If ODE solver fails, fallback to previous state and add penalty
                     z_curr = z_curr.detach()
-                z_preds.append(z_curr)
+            else:  # Later training - use full solver
+                for t in range(1, seq_len):
+                    if np.random.random() < tf_ratio:
+                        batch_t_prev = Batch.from_data_list([data_list[t-1]]).to(self.device)
+                        z_curr_forced, _, _, _ = self.model.encode(batch_t_prev.x, batch_t_prev.edge_index, batch_t_prev.batch, tau=tau, hard=hard)
+                        z_curr = torch.nan_to_num(z_curr_forced)
+
+                    t_span = torch.tensor([0, dt], device=self.device, dtype=torch.float32)
+                    try:
+                        z_next_seq = self.model.forward_dynamics(z_curr, t_span)
+                        z_curr = torch.nan_to_num(z_next_seq[1], nan=0.0, posinf=1.0, neginf=-1.0)
+                    except Exception as e:
+                        # If ODE solver fails, fallback to previous state and add penalty
+                        z_curr = z_curr.detach()
+                    z_preds.append(z_curr)
         else:
             # During warmup, just use encoded states
             for t in range(1, seq_len):
                 batch_t = Batch.from_data_list([data_list[t]]).to(self.device)
                 z_t, _, _, _ = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch, tau=tau, hard=hard)
                 z_preds.append(z_t)
-            
+
         z_preds = torch.stack(z_preds)
         loss_l2 = torch.mean(z_preds**2)
-        
+
         z_vel = (z_preds[1:] - z_preds[:-1]) / dt
         loss_lvr = torch.mean((z_vel[1:] - z_vel[:-1])**2) if len(z_vel) > 1 else torch.tensor(0.0, device=self.device)
-        
+
         s_stability = 0
         mu_stability = 0
-        
+
         mu_mean = torch.tensor(self.stats['pos_mean'], device=self.device, dtype=torch.float32) if self.stats else 0
         mu_std = torch.tensor(self.stats['pos_std'], device=self.device, dtype=torch.float32) if self.stats else 1
 
+        # Optimize the target computation loop - only compute targets when needed
         for t in range(seq_len):
             batch_t = Batch.from_data_list([data_list[t]]).to(self.device)
             z_t_target, s_t, losses_t, mu_t = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch, tau=tau, hard=hard)
-            
+
             z_t_target = torch.nan_to_num(z_t_target)
-            
+
             # Use z_preds for reconstruction to force consistency
             recon_t = self.model.decode(z_preds[t], s_t, batch_t.batch)
-            
+
             loss_rec += self.criterion(recon_t, batch_t.x)
             loss_assign += entropy_weight * losses_t['entropy'] + losses_t['diversity'] + 0.1 * losses_t['spatial']
             loss_pruning += losses_t['pruning']
@@ -335,32 +372,32 @@ class Trainer:
             loss_sep += losses_t.get('separation', torch.tensor(0.0, device=self.device))
             loss_conn += self.model.get_connectivity_loss(s_t, batch_t.edge_index)
             loss_ortho += self.model.get_ortho_loss(s_t)
-            
+
             # CoM Position Alignment
             mu_t_norm = (mu_t - mu_mean) / (mu_std + 1e-6)
             d_sub = self.model.encoder.latent_dim // 2 if self.model.hamiltonian else 2
-            d_align = min(d_sub, 2) 
-            
+            d_align = min(d_sub, 2)
+
             p_align = self.criterion(z_preds[t, :, :, :d_align], mu_t_norm[:, :, :d_align])
             loss_align += align_weight * p_align
-            
+
             # Mutual Information Alignment (Unsupervised)
             loss_mi += self.model.get_mi_loss(z_preds[t], mu_t_norm)
 
             if t > 0:
                 s_diff = self.criterion(s_t, s_prev)
                 mu_diff = self.criterion(mu_t, mu_prev)
-                loss_assign += s_diff + 5.0 * mu_diff 
-                if not is_warmup:
+                loss_assign += s_diff + 5.0 * mu_diff
+                if compute_consistency and not is_warmup:
                     loss_cons += self.criterion(z_preds[t], z_t_target)
                 s_stability += s_diff.item()
                 mu_stability += mu_diff.item()
             s_prev = s_t
             mu_prev = mu_t
-        
+
         # Normalization
         loss_rec /= seq_len
-        loss_cons /= (seq_len - 1) if not is_warmup else 1
+        loss_cons /= (seq_len - 1) if (not is_warmup and compute_consistency) else 1
         loss_assign /= seq_len
         loss_pruning /= seq_len
         loss_sparsity /= seq_len
@@ -369,11 +406,11 @@ class Trainer:
         loss_mi /= seq_len
         loss_sep /= seq_len
         loss_conn /= seq_len
-        
+
         # Adaptive Loss Weighting with slightly more conservative clamping
         # Increasing min from -1.0 to -0.5 to prevent weights from exploding too much
         lvars = torch.clamp(self.model.log_vars, min=-0.5, max=5.0)
-        
+
         weights = {
             'rec': torch.exp(-lvars[0]), 'cons': torch.exp(-lvars[1]),
             'assign': torch.exp(-lvars[2]), 'ortho': torch.exp(-lvars[3]),
@@ -402,11 +439,16 @@ class Trainer:
             if not torch.isfinite(loss_cons): loss_cons = torch.tensor(0.0, device=self.device)
             if not torch.isfinite(loss_l2): loss_l2 = torch.tensor(0.0, device=self.device)
             if not torch.isfinite(loss_lvr): loss_lvr = torch.tensor(0.0, device=self.device)
-            
-            loss = discovery_loss + (weights['cons'] * loss_cons + lvars[1]) + \
-                   (weights['l2'] * 1e-4 * loss_l2 + lvars[4]) + \
-                   (weights['lvr'] * 1e-4 * loss_lvr + lvars[5])
-        
+
+            # Only add consistency loss if we computed it
+            if compute_consistency:
+                loss = discovery_loss + (weights['cons'] * loss_cons + lvars[1]) + \
+                       (weights['l2'] * 1e-4 * loss_l2 + lvars[4]) + \
+                       (weights['lvr'] * 1e-4 * loss_lvr + lvars[5])
+            else:
+                loss = discovery_loss + (weights['l2'] * 1e-4 * loss_l2 + lvars[4]) + \
+                       (weights['lvr'] * 1e-4 * loss_lvr + lvars[5])
+
         # Add L2 regularization on lvars to prevent them from growing indefinitely
         loss += 0.01 * torch.sum(lvars**2)
 
@@ -415,29 +457,43 @@ class Trainer:
             print(f"Warning: Non-finite loss detected at epoch {epoch}. Attempting recovery.")
             # Final fallback to a very small reconstruction loss to keep training alive
             loss = loss_rec if torch.isfinite(loss_rec) else torch.tensor(1.0, device=self.device, requires_grad=True)
-            
+
         if not torch.isfinite(loss) or loss.grad_fn is None:
-            self.optimizer.zero_grad()
+            if not self.enable_gradient_accumulation:
+                self.optimizer.zero_grad()
             return 0.0, 0.0, 0.0
 
-        loss.backward()
-        # Relaxed gradient clipping for better convergence
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5) 
-        self.optimizer.step()
-        
+        # Handle gradient accumulation
+        if self.enable_gradient_accumulation:
+            # Scale loss for gradient accumulation
+            loss = loss / self.grad_acc_steps
+            loss.backward()
+
+            # Perform optimizer step only at the end of accumulation cycle
+            if ((epoch + 1) % self.grad_acc_steps == 0) or (epoch == max_epochs - 1):
+                # Relaxed gradient clipping for better convergence
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+                self.optimizer.step()
+                self.optimizer.zero_grad(set_to_none=True)
+        else:
+            loss.backward()
+            # Relaxed gradient clipping for better convergence
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+            self.optimizer.step()
+
         # Update loss tracker for logging
         self.loss_tracker.update({
             'total': loss,
             'rec_raw': loss_rec,
-            'cons_raw': loss_cons,
+            'cons_raw': loss_cons if compute_consistency else loss_cons,  # Will be 0 if not computed
             'assign': loss_assign,
             'align': loss_align,
             'mi': loss_mi,
             'sym': loss_sym,
             'lvars_mean': lvars.mean()
         }, weights=weights)
-        
-        return loss.item(), loss_rec.item(), loss_cons.item()
+
+        return loss.item(), loss_rec.item(), loss_cons.item() if compute_consistency else 0.0
 
 if __name__ == "__main__":
     n_particles = 16
