@@ -45,7 +45,9 @@ class RecursiveFeatureSelector:
         try:
             # LassoLars is often more stable for feature selection than OMP
             lasso = LassoLarsCV(cv=3, max_iter=500)
-            lasso.fit(X_filtered, y.ravel() if y.ndim > 1 else y)
+            # Use the first output for feature selection if multi-output is provided
+            y_selection = y[:, 0] if y.ndim > 1 else y
+            lasso.fit(X_filtered, y_selection)
             
             # Get indices of non-zero coefficients
             nonzero = np.where(np.abs(lasso.coef_) > 1e-10)[0]
@@ -60,12 +62,13 @@ class RecursiveFeatureSelector:
             else:
                 # Fallback to OMP if Lasso selected nothing
                 omp = OrthogonalMatchingPursuit(n_nonzero_coefs=n_to_select, tol=self.tolerance)
-                omp.fit(X_filtered, y.ravel() if y.ndim > 1 else y)
+                omp.fit(X_filtered, y_selection)
                 selected_filtered_indices = np.where(omp.coef_ != 0)[0]
         except:
             # Fallback to simple univariate selection
             from sklearn.feature_selection import f_regression
-            scores, _ = f_regression(X_filtered, y.ravel() if y.ndim > 1 else y)
+            y_selection = y[:, 0] if y.ndim > 1 else y
+            scores, _ = f_regression(X_filtered, y_selection)
             selected_filtered_indices = np.argsort(np.nan_to_num(scores))[-n_to_select:]
             
         self.selected_indices = high_variance_indices[selected_filtered_indices]
@@ -298,13 +301,15 @@ class BalancedFeatureTransformer:
             self.selected_feature_indices = self.recursive_selector.selected_indices
         elif self.feature_selection_method == 'lasso':
             lasso = LassoCV(cv=3, max_iter=2000)
-            lasso.fit(X, y.ravel() if y.ndim > 1 else y)
+            y_selection = y[:, 0] if y.ndim > 1 else y
+            lasso.fit(X, y_selection)
             self.selected_feature_indices = np.where(np.abs(lasso.coef_) > 1e-5)[0]
         else:
             # Fallback to mutual info
             max_f = min(200, n_features)
             selector = SelectKBest(score_func=f_regression, k=max_f)
-            selector.fit(X, y.ravel() if y.ndim > 1 else y)
+            y_selection = y[:, 0] if y.ndim > 1 else y
+            selector.fit(X, y_selection)
             self.selected_feature_indices = selector.get_support(indices=True)
             
         self.n_selected_features = len(self.selected_feature_indices)

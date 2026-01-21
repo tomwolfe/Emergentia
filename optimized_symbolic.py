@@ -60,8 +60,8 @@ class OptimizedSymbolicDynamics:
             expr_str = str(gp_program)
             
             # 1. Pre-process the string for better SymPy compatibility
-            # Replace prefix notation 'add(x, y)' with infix '(x + y)' if needed,
-            # but SymPy's sympify can actually handle 'add(x, y)' if 'add' is in locals.
+            # Handle gplearn's potentially weird naming if it occurs
+            expr_str = expr_str.replace('add(', 'Add(').replace('sub(', 'Sub(').replace('mul(', 'Mul(').replace('div(', 'Div(')
             
             # 2. Identify all variables X0, X1, ...
             import re
@@ -71,55 +71,58 @@ class OptimizedSymbolicDynamics:
             var_mapping = {f'X{i}': sp.Symbol(f'x{i}') for i in feat_indices}
             
             # 3. Define local functions for gplearn standard and potentially custom functions
+            # SymPy is case-sensitive for some things but sympify can be flexible
             local_dict = {
                 'add': lambda x, y: x + y,
+                'Add': lambda x, y: x + y,
                 'sub': lambda x, y: x - y,
+                'Sub': lambda x, y: x - y,
                 'mul': lambda x, y: x * y,
-                'div': lambda x, y: x / y,
-                'sqrt': lambda x: sp.sqrt(sp.Abs(x)), # More robust sqrt
-                'log': lambda x: sp.log(sp.Abs(x) + 1e-6), # More robust log
+                'Mul': lambda x, y: x * y,
+                'div': lambda x, y: x / (y + 1e-6),
+                'Div': lambda x, y: x / (y + 1e-6),
+                'sqrt': lambda x: sp.sqrt(sp.Abs(x)),
+                'log': lambda x: sp.log(sp.Abs(x) + 1e-6),
                 'abs': sp.Abs,
                 'neg': lambda x: -x,
-                'inv': lambda x: 1.0 / (x + 1e-6), # More robust inv
+                'inv': lambda x: 1.0 / (x + 1e-6),
                 'sin': sp.sin,
                 'cos': sp.cos,
                 'tan': sp.tan,
                 'sig': lambda x: 1 / (1 + sp.exp(-x)),
+                'sigmoid': lambda x: 1 / (1 + sp.exp(-x)),
                 'gauss': lambda x: sp.exp(-x**2),
+                'exp': sp.exp,
+                'pow': lambda x, y: sp.Pow(x, y),
+                'max': lambda x, y: sp.Max(x, y),
+                'min': lambda x, y: sp.Min(x, y),
             }
             local_dict.update(var_mapping)
 
             # 4. Parse the expression string using SymPy
             # Using evaluate=False can sometimes help with complex nested structures
-            sympy_expr = sp.sympify(expr_str, locals=local_dict)
+            try:
+                sympy_expr = sp.sympify(expr_str, locals=local_dict)
+            except (sp.SympifyError, TypeError, SyntaxError):
+                # Fallback: if it's a prefix notation that sympify didn't like, 
+                # try to clean it up or use evaluate=False
+                sympy_expr = sp.sympify(expr_str, locals=local_dict, evaluate=False)
             
-            # Simplify to clean up the expression
-            sympy_expr = sp.simplify(sympy_expr)
+            # Simplify to clean up the expression, but with a timeout-like protection
+            # (SymPy's simplify can be slow for massive expressions)
+            if sympy_expr.count_ops() < 200:
+                sympy_expr = sp.simplify(sympy_expr)
             
             return sympy_expr
         except Exception as e:
             # More detailed fallback for Robustness
             print(f"SymPy conversion failed: {e}")
-            if hasattr(gp_program, 'expr_str'):
-                try:
-                    import re
-                    # Re-run the same logic on the internal expr_str
-                    internal_str = gp_program.expr_str
-                    feat_indices = sorted(list(set([int(m) for m in re.findall(r'X(\d+)', internal_str)])))
-                    var_mapping = {f'X{i}': sp.Symbol(f'x{i}') for i in feat_indices}
-                    local_dict = {
-                        'add': lambda x, y: x + y, 'sub': lambda x, y: x - y,
-                        'mul': lambda x, y: x * y, 'div': lambda x, y: x / y,
-                        'sqrt': lambda x: sp.sqrt(sp.Abs(x)), 'log': lambda x: sp.log(sp.Abs(x) + 1e-6),
-                        'abs': sp.Abs, 'neg': lambda x: -x, 'inv': lambda x: 1.0 / (x + 1e-6),
-                        'sin': sp.sin, 'cos': sp.cos, 'tan': sp.tan,
-                        'sig': lambda x: 1 / (1 + sp.exp(-x)), 'gauss': lambda x: sp.exp(-x**2),
-                    }
-                    local_dict.update(var_mapping)
-                    return sp.simplify(sp.sympify(internal_str, locals=local_dict))
-                except:
-                    pass
-            return sp.Float(0.0)
+            # Last resort: try to return a constant if we can't parse it
+            try:
+                val = float(str(gp_program))
+                return sp.Float(val)
+            except:
+                return sp.Float(0.0)
 
     def _get_cached_transformation(self, z_tuple):
         """
@@ -169,25 +172,19 @@ class OptimizedSymbolicDynamics:
 
     def _compute_hamiltonian_derivatives(self, z, X_norm):
         """
-        Compute Hamiltonian derivatives: dq/dt = ∂H/∂p, dp/dt = -∂H/∂q
+        Compute Hamiltonian derivatives: dq/dt = ∂H/∂p, dp/dt = -∂H/∂q - γp
         """
         # Use analytical gradients if available
         if hasattr(self, 'lambda_funcs') and self.lambda_funcs is not None and self.sympy_vars is not None:
             try:
                 # Prepare arguments for lambda functions
-                # X_norm is [1, n_features]
                 X_flat = X_norm.flatten()
-                
-                # We need to provide the values for the variables in the order they appear in self.sympy_vars
                 args = [X_flat[self.var_to_idx[var.name]] for var in self.sympy_vars]
                 
                 # Compute analytical gradients of H with respect to features X
-                # grad_wrt_features is a vector of ∂H/∂X_i for used features
                 grad_wrt_features = np.array([float(grad_func(*args)) for grad_func in self.lambda_funcs])
                 
-                # To get ∂H/∂z, we'd need the Jacobian ∂X/∂z. 
-                # For now, we'll use the numerical gradient as it's more general for complex features,
-                # but we've improved the underlying H expression via secondary optimization.
+                # Fallback to numerical gradient for now as it handles complex feature mappings ∂X/∂z
                 grad = self._numerical_gradient(z)
             except Exception as e:
                 print(f"Analytical gradient computation failed: {e}")
@@ -199,21 +196,30 @@ class OptimizedSymbolicDynamics:
         dzdt = np.zeros_like(z)
         d_sub = self.latent_dim // 2
         
+        # Check if the equation has dissipation coefficients
+        dissipation_coeffs = None
+        if hasattr(self.equations[0], 'dissipation_coeffs'):
+            dissipation_coeffs = self.equations[0].dissipation_coeffs
+
         # Map the gradient to Hamiltonian structure
-        # z = [q1, q2, ..., p1, p2, ...] where q and p each have d_sub dimensions per super-node
+        # z = [q1, p1, q2, p2, ...] based on latent_dim blocks
         for k in range(self.n_super_nodes):
-            # Position indices: [k*d_sub : (k+1)*d_sub]
-            # Momentum indices: [n_super_nodes*d_sub + k*d_sub : n_super_nodes*d_sub + (k+1)*d_sub]
             q_start = k * self.latent_dim
             q_end = q_start + d_sub
             p_start = q_end
-            p_end = p_start + d_sub
+            p_end = (k + 1) * self.latent_dim
             
-            # dq/dt = ∂H/∂p (gradient w.r.t. momentum components)
+            # dq/dt = ∂H/∂p
             dq_dt = grad[p_start:p_end]
             
-            # dp/dt = -∂H/∂q (negative gradient w.r.t. position components)
+            # dp/dt = -∂H/∂q
             dp_dt = -grad[q_start:q_end]
+            
+            # Add dissipation if available: dp/dt = -∂H/∂q - γp
+            if dissipation_coeffs is not None and k < len(dissipation_coeffs):
+                gamma = dissipation_coeffs[k]
+                p = z[p_start:p_end]
+                dp_dt = dp_dt - gamma * p
             
             dzdt[q_start:q_end] = dq_dt
             dzdt[p_start:p_end] = dp_dt

@@ -108,8 +108,10 @@ class StableHierarchicalPooling(nn.Module):
         
         # During training, use a softer mask to allow potential reactivation
         if self.training:
-            # -10.0 is small enough to suppress but large enough to allow gradient flow
-            logits = logits + (mask - 1.0) * 10.0
+            # -5.0 is enough to suppress but allows much more gradient flow than -10.0
+            # Also add a small random exploration factor to logits of inactive nodes
+            exploration = torch.randn_like(logits) * 0.01
+            logits = logits + (mask - 1.0) * 5.0 + exploration
         else:
             # Harder mask during inference
             logits = logits.masked_fill(mask == 0, -1e9)
@@ -122,16 +124,28 @@ class StableHierarchicalPooling(nn.Module):
         if self.training and not hard:
             # Moving average update for the mask to avoid rapid flickering
             current_active = (avg_s > self.pruning_threshold).float()
-            self.active_mask.copy_(0.98 * self.active_mask + 0.02 * current_active)
+            
+            # STOCHASTIC REVIVAL: Occasionally give inactive nodes a chance to revive
+            # if they show even minor signs of life (e.g. avg_s > pruning_threshold / 5)
+            revival_threshold = self.pruning_threshold / 5.0
+            revival_candidate = (avg_s > revival_threshold).float()
+            
+            # Combine current_active with a small probability of reviving revival_candidates
+            revival_mask = (torch.rand_like(self.active_mask) < 0.05).float() * revival_candidate
+            effective_active = torch.clamp(current_active + revival_mask, 0, 1)
+
+            # Use a slightly faster EMA for revival (0.05 vs 0.02) if we are below minimum
+            ema_rate = 0.02 if self.active_mask.sum() >= self.min_active_super_nodes else 0.05
+            self.active_mask.copy_((1.0 - ema_rate) * self.active_mask + ema_rate * effective_active)
 
             # Ensure minimum number of super-nodes remain active to prevent total collapse
-            n_active_now = current_active.sum().item()
+            n_active_now = (self.active_mask > 0.5).sum().item()
             if n_active_now < self.min_active_super_nodes:
-                # Activate the least used super-nodes to meet minimum requirement
-                _, least_used_indices = torch.topk(avg_s, self.min_active_super_nodes, largest=False)
-                new_active = current_active.clone()
-                new_active[least_used_indices] = 1.0
-                self.active_mask.copy_(0.98 * self.active_mask + 0.02 * new_active)
+                # Activate the nodes with highest average assignment to meet minimum requirement
+                _, most_needed_indices = torch.topk(avg_s, self.min_active_super_nodes, largest=True)
+                new_active = self.active_mask.clone()
+                new_active[most_needed_indices] = 1.0
+                self.active_mask.copy_(0.9 * self.active_mask + 0.1 * new_active)
 
         entropy = -torch.mean(torch.sum(s * torch.log(s + 1e-9), dim=1))
         diversity_loss = torch.sum(avg_s * torch.log(avg_s + 1e-9))
