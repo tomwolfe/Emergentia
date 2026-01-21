@@ -17,34 +17,44 @@ from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import scatter
 from torchdiffeq import odeint
 
-class GNNLayer(MessagePassing):
+class EquivariantGNNLayer(MessagePassing):
     """
-    Graph Neural Network Layer implementing message passing.
-
-    This layer computes messages between connected nodes using an MLP,
-    then aggregates them using addition. The message function combines
-    features from source and target nodes before processing through an MLP.
-
-    Args:
-        in_channels (int): Number of input channels per node
-        out_channels (int): Number of output channels per node
+    E(n)-equivariant GNN Layer.
+    Uses relative distances and vectors to ensure rotation and translation invariance
+    for scalar features and equivariance for vector features.
     """
-    def __init__(self, in_channels, out_channels):
-        super(GNNLayer, self).__init__(aggr='add')
-        self.mlp = nn.Sequential(
-            nn.Linear(2 * in_channels, out_channels),
-            nn.ReLU(),
-            nn.Linear(out_channels, out_channels),
-            nn.ReLU(),
-            nn.Linear(out_channels, out_channels)
+    def __init__(self, in_channels, out_channels, hidden_dim=64):
+        super(EquivariantGNNLayer, self).__init__(aggr='add')
+        self.phi_e = nn.Sequential(
+            nn.Linear(2 * in_channels + 1, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        self.phi_h = nn.Sequential(
+            nn.Linear(in_channels + hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, out_channels)
         )
 
-    def forward(self, x, edge_index):
-        return self.propagate(edge_index, x=x)
+    def forward(self, x, pos, edge_index):
+        # x: [N, in_channels], pos: [N, 2]
+        rel_pos = pos[edge_index[0]] - pos[edge_index[1]]
+        dist_sq = torch.sum(rel_pos**2, dim=-1, keepdim=True)
+        
+        # Propagate messages
+        messages = self.propagate(edge_index, x=x, dist_sq=dist_sq)
+        
+        # Update node features
+        h_update = self.phi_h(torch.cat([x, messages], dim=-1))
+        
+        return h_update
 
-    def message(self, x_i, x_j):
-        tmp = torch.cat([x_i, x_j], dim=1)
-        return self.mlp(tmp)
+    def message(self, x_i, x_j, dist_sq):
+        # Compute message using concatenated features and squared distance
+        tmp = torch.cat([x_i, x_j, dist_sq], dim=1)
+        return self.phi_e(tmp)
 
 class HierarchicalPooling(nn.Module):
     """
@@ -165,14 +175,14 @@ class HierarchicalPooling(nn.Module):
         x_expanded = x.unsqueeze(1) * s.unsqueeze(2)
         out = scatter(x_expanded, batch, dim=0, reduce='sum')
 
-        return out, s, assign_losses, super_node_mu
+        return out, s, assign_losses, mu
 
 class GNNEncoder(nn.Module):
     def __init__(self, node_features, hidden_dim, latent_dim, n_super_nodes):
         super(GNNEncoder, self).__init__()
-        self.gnn1 = GNNLayer(node_features, hidden_dim)
+        self.gnn1 = EquivariantGNNLayer(node_features, hidden_dim)
         self.ln1 = nn.LayerNorm(hidden_dim)
-        self.gnn2 = GNNLayer(hidden_dim, hidden_dim)
+        self.gnn2 = EquivariantGNNLayer(hidden_dim, hidden_dim)
         self.ln2 = nn.LayerNorm(hidden_dim)
         self.n_super_nodes = n_super_nodes
         self.latent_dim = latent_dim
@@ -190,8 +200,8 @@ class GNNEncoder(nn.Module):
         # Store initial positions for spatial pooling
         pos = x[:, :2] 
         
-        x = self.ln1(torch.relu(self.gnn1(x, edge_index)))
-        x = self.ln2(torch.relu(self.gnn2(x, edge_index)))
+        x = self.ln1(torch.relu(self.gnn1(x, pos, edge_index)))
+        x = self.ln2(torch.relu(self.gnn2(x, pos, edge_index)))
         
         # Pool to K super-nodes preserving spatial features
         pooled, s, assign_losses, mu = self.pooling(x, batch, pos=pos, tau=tau) # [batch_size, n_super_nodes, hidden_dim], [N, n_super_nodes], mu: [B, K, 2]

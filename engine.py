@@ -115,13 +115,14 @@ class LossTracker:
         return {**self.history, **{f"w_{k}": v for k, v in self.weights.items()}}
 
 class Trainer:
-    def __init__(self, model, lr=5e-4, device='cpu', stats=None, align_anneal_epochs=1000):
+    def __init__(self, model, lr=5e-4, device='cpu', stats=None, align_anneal_epochs=1000, warmup_epochs=400):
         self.model = model.to(device)
         self.device = device
         self.loss_tracker = LossTracker()
         self.s_history = []
         self.max_s_history = 10
         self.align_anneal_epochs = align_anneal_epochs
+        self.warmup_epochs = warmup_epochs
         
         # MPS fix: torchdiffeq has issues with MPS (float64 defaults and stability)
         if str(device) == 'mps':
@@ -144,6 +145,10 @@ class Trainer:
         # 3. Alignment Annealing
         align_weight = max(0.0, 1.0 - epoch / self.align_anneal_epochs)
         
+        # Warmup logic: Before warmup_epochs, we focus on reconstruction and pooling
+        # only. After that, we introduce ODE consistency and alignment.
+        is_warmup = epoch < self.warmup_epochs
+
         batch_0 = Batch.from_data_list([data_list[0]]).to(self.device)
         z_curr, s_0, losses_0, mu_0 = self.model.encode(batch_0.x, batch_0.edge_index, batch_0.batch, tau=tau)
         
@@ -163,16 +168,24 @@ class Trainer:
         mu_prev = mu_0
         z_preds = [z_curr]
         
-        for t in range(1, seq_len):
-            if np.random.random() < tf_ratio:
-                batch_t_prev = Batch.from_data_list([data_list[t-1]]).to(self.device)
-                z_curr_forced, _, _, _ = self.model.encode(batch_t_prev.x, batch_t_prev.edge_index, batch_t_prev.batch, tau=tau)
-                z_curr = torch.nan_to_num(z_curr_forced)
-            
-            t_span = torch.tensor([0, dt], device=self.device, dtype=torch.float32)
-            z_next_seq = self.model.forward_dynamics(z_curr, t_span)
-            z_curr = torch.nan_to_num(z_next_seq[1])
-            z_preds.append(z_curr)
+        # Only do forward dynamics if not in deep warmup
+        if not is_warmup:
+            for t in range(1, seq_len):
+                if np.random.random() < tf_ratio:
+                    batch_t_prev = Batch.from_data_list([data_list[t-1]]).to(self.device)
+                    z_curr_forced, _, _, _ = self.model.encode(batch_t_prev.x, batch_t_prev.edge_index, batch_t_prev.batch, tau=tau)
+                    z_curr = torch.nan_to_num(z_curr_forced)
+                
+                t_span = torch.tensor([0, dt], device=self.device, dtype=torch.float32)
+                z_next_seq = self.model.forward_dynamics(z_curr, t_span)
+                z_curr = torch.nan_to_num(z_next_seq[1])
+                z_preds.append(z_curr)
+        else:
+            # During warmup, just use encoded states
+            for t in range(1, seq_len):
+                batch_t = Batch.from_data_list([data_list[t]]).to(self.device)
+                z_t, _, _, _ = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch, tau=tau)
+                z_preds.append(z_t)
             
         z_preds = torch.stack(z_preds)
         loss_l2 = torch.mean(z_preds**2)
@@ -189,11 +202,6 @@ class Trainer:
         vel_mean = torch.tensor(self.stats['vel_mean'], device=self.device, dtype=torch.float32) if self.stats else 0
         vel_std = torch.tensor(self.stats['vel_std'], device=self.device, dtype=torch.float32) if self.stats else 1
 
-        # Heuristic for assignment stability: average change in S over time
-        # If assignments are shifting rapidly, we shouldn't trust the ODE dynamics yet.
-        avg_s_stability = np.mean(self.s_history) if self.s_history else 1.0
-        is_stable = avg_s_stability < 0.05 
-
         for t in range(seq_len):
             batch_t = Batch.from_data_list([data_list[t]]).to(self.device)
             z_t_target, s_t, losses_t, mu_t = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch, tau=tau)
@@ -201,13 +209,8 @@ class Trainer:
             if torch.isnan(z_t_target).any():
                 z_t_target = torch.nan_to_num(z_t_target)
             
-            # Reconstruction check for stability
-            if epoch < 400:
-                z_for_recon = z_t_target
-            else:
-                z_for_recon = z_preds[t]
-                
-            recon_t = self.model.decode(z_for_recon, s_t, batch_t.batch)
+            # Use z_preds for reconstruction to force consistency
+            recon_t = self.model.decode(z_preds[t], s_t, batch_t.batch)
             
             loss_rec += self.criterion(recon_t, batch_t.x)
             loss_assign += losses_t['entropy'] + losses_t['diversity'] + 0.1 * losses_t['spatial']
@@ -222,31 +225,15 @@ class Trainer:
             d_sub = self.model.encoder.latent_dim // 2 if self.model.hamiltonian else 2
             d_align = min(d_sub, 2) 
             
-            # z_preds is [T, B, K, D]
-            # mu_t_norm is [B, K, 2]
             p_align = self.criterion(z_preds[t, :, :, :d_align], mu_t_norm[:, :, :d_align])
-            
-            # CoM Velocity Alignment (Optional but helps robustness)
-            v_align = torch.tensor(0.0, device=self.device)
-            if t < seq_len - 1:
-                # Approximate CoM velocity from consecutive assignments
-                batch_t_next = Batch.from_data_list([data_list[t+1]]).to(self.device)
-                _, s_t_next, _, mu_t_next = self.model.encode(batch_t_next.x, batch_t_next.edge_index, batch_t_next.batch, tau=tau)
-                mu_vel = (mu_t_next - mu_t) / dt
-                mu_vel_norm = (mu_vel - vel_mean) / (vel_std + 1e-6)
-                
-                # If Hamiltonian, z[:, :, d_sub:] are momenta (p). 
-                # p should align with velocity if mass is assumed constant (normalized).
-                v_start = d_sub
-                v_align = self.criterion(z_preds[t, :, :, v_start:v_start+d_align], mu_vel_norm[:, :, :d_align])
-
-            loss_align += align_weight * (p_align + 0.5 * v_align)
+            loss_align += align_weight * p_align
 
             if t > 0:
                 s_diff = self.criterion(s_t, s_prev)
                 mu_diff = self.criterion(mu_t, mu_prev)
                 loss_assign += s_diff + 5.0 * mu_diff 
-                loss_cons += self.criterion(z_preds[t], z_t_target)
+                if not is_warmup:
+                    loss_cons += self.criterion(z_preds[t], z_t_target)
                 s_stability += s_diff.item()
                 mu_stability += mu_diff.item()
             s_prev = s_t
@@ -254,7 +241,7 @@ class Trainer:
         
         # Normalization
         loss_rec /= seq_len
-        loss_cons /= (seq_len - 1)
+        loss_cons /= (seq_len - 1) if not is_warmup else 1
         loss_assign /= seq_len
         loss_pruning /= seq_len
         loss_sparsity /= seq_len
@@ -267,52 +254,36 @@ class Trainer:
         self.s_history.append(s_stability)
         if len(self.s_history) > self.max_s_history:
             self.s_history.pop(0)
-        avg_s_stability = np.mean(self.s_history)
         
-        # Adaptive Loss Weighting with clamping for stability
+        # Adaptive Loss Weighting
         lvars = torch.clamp(self.model.log_vars, min=-2.0, max=10.0)
         
-        self.loss_tracker.update({
-            'rec_raw': loss_rec, 'cons_raw': loss_cons, 
-            'assign_raw': loss_assign, 'ortho_raw': loss_ortho, 
-            'l2_raw': loss_l2, 'lvr_raw': loss_lvr,
-            'mu_stability': mu_stability, 'align_raw': loss_align,
-            'pruning_raw': loss_pruning, 'sep_raw': loss_sep, 
-            'conn_raw': loss_conn, 'sparsity_raw': loss_sparsity
-        }, weights={
+        weights = {
             'rec': torch.exp(-lvars[0]), 'cons': torch.exp(-lvars[1]),
             'assign': torch.exp(-lvars[2]), 'ortho': torch.exp(-lvars[3]),
             'l2': torch.exp(-lvars[4]), 'lvr': torch.exp(-lvars[5]),
             'align': torch.exp(-lvars[6]), 'pruning': torch.exp(-lvars[7]),
             'sep': torch.exp(-lvars[8]), 'conn': torch.exp(-lvars[9]),
             'sparsity': torch.exp(-lvars[10])
-        })
+        }
 
-        weighted_rec = torch.exp(-lvars[0]) * loss_rec + lvars[0]
-        weighted_cons = torch.exp(-lvars[1]) * loss_cons + lvars[1]
-        weighted_assign = torch.exp(-lvars[2]) * loss_assign + lvars[2]
-        weighted_ortho = torch.exp(-lvars[3]) * loss_ortho + lvars[3]
-        weighted_l2 = torch.exp(-lvars[4]) * loss_l2 + lvars[4]
-        weighted_lvr = torch.exp(-lvars[5]) * loss_lvr + lvars[5]
-        weighted_align = torch.exp(-lvars[6]) * loss_align + lvars[6]
-        weighted_pruning = torch.exp(-lvars[7]) * loss_pruning + lvars[7]
-        weighted_sep = torch.exp(-lvars[8]) * loss_sep + lvars[8]
-        weighted_conn = torch.exp(-lvars[9]) * loss_conn + lvars[9]
-        weighted_sparsity = torch.exp(-lvars[10]) * loss_sparsity + lvars[10]
+        discovery_loss = (weights['rec'] * loss_rec + lvars[0]) + \
+                         (weights['assign'] * loss_assign + lvars[2]) + \
+                         (weights['ortho'] * loss_ortho + lvars[3]) + \
+                         (weights['align'] * loss_align + lvars[6]) + \
+                         (weights['pruning'] * loss_pruning + lvars[7]) + \
+                         (weights['sep'] * loss_sep + lvars[8]) + \
+                         (weights['conn'] * loss_conn + lvars[9]) + \
+                         (weights['sparsity'] * loss_sparsity + lvars[10])
 
-        discovery_loss = weighted_rec + weighted_assign + weighted_ortho + weighted_align + \
-                         weighted_pruning + weighted_sep + weighted_conn + weighted_sparsity
-
-        if epoch < 400 or not is_stable:
+        if is_warmup:
             loss = discovery_loss
         else:
-            anneal_start = 400
-            anneal_duration = 1000.0
-            anneal = min(1.0, (epoch - anneal_start) / anneal_duration)
-            loss = discovery_loss + anneal * (weighted_cons + weighted_l2 + weighted_lvr)
+            loss = discovery_loss + (weights['cons'] * loss_cons + lvars[1]) + \
+                   (weights['l2'] * loss_l2 + lvars[4]) + \
+                   (weights['lvr'] * loss_lvr + lvars[5])
         
         if not torch.isfinite(loss):
-            print(f"Warning: Non-finite loss encountered at epoch {epoch}. Skipping step.")
             self.optimizer.zero_grad()
             return 0.0, 0.0, 0.0
 

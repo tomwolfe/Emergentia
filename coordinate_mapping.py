@@ -24,7 +24,7 @@ class CoordinateMapper:
     """
     
     def __init__(self, n_latent_dims, n_physical_dims=2, use_rotation_alignment=True, 
-                 use_nonlinear_mapping=False, max_degree=2):
+                 use_nonlinear_mapping=True, max_degree=2):
         """
         Initialize the coordinate mapper.
         
@@ -41,20 +41,15 @@ class CoordinateMapper:
         self.use_nonlinear_mapping = use_nonlinear_mapping
         self.max_degree = max_degree
         
-        # Transformation matrices/components
-        self.rotation_matrix = None
-        self.scaling_factors = None
-        self.translation = None
-        self.nonlinear_params = None
+        # Transformation models
+        self.linear_mapper = LinearRegression()
+        self.nonlinear_mapper = None
+        self.neural_scaler = StandardScaler()
+        self.physical_scaler = StandardScaler()
         
-        # Fitted statistics
-        self.neural_mean = None
-        self.neural_std = None
-        self.physical_mean = None
-        self.physical_std = None
-        
-        # For nonlinear mapping
-        self.feature_indices = None  # Which latent dims correspond to physical coords
+        # Transformation parameters
+        self.linear_weights = None
+        self.linear_bias = None
         
     def fit(self, neural_coords, physical_coords=None):
         """
@@ -73,60 +68,55 @@ class CoordinateMapper:
             physical_flat = physical_coords.reshape(-1, self.n_physical_dims)
             
             # Standardize neural coordinates
-            self.neural_scaler = StandardScaler()
             neural_scaled = self.neural_scaler.fit_transform(neural_flat)
             
             # Standardize physical coordinates
-            self.physical_scaler = StandardScaler()
             physical_scaled = self.physical_scaler.fit_transform(physical_flat)
             
-            # Learn linear mapping using least squares
-            self.linear_mapper = LinearRegression()
+            # 1. Fit linear mapping as base
             self.linear_mapper.fit(neural_scaled, physical_scaled)
+            self.linear_weights = self.linear_mapper.coef_
+            self.linear_bias = self.linear_mapper.intercept_
             
-            # Store transformation parameters
-            self.linear_weights = self.linear_mapper.coef_  # [n_physical_dims, n_latent_dims]
-            self.linear_bias = self.linear_mapper.intercept_  # [n_physical_dims]
+            # 2. Fit nonlinear mapping if requested (using a small MLP or symbolic-friendly model)
+            if self.use_nonlinear_mapping:
+                from sklearn.neural_network import MLPRegressor
+                # Small MLP to capture non-linear residuals or complex mappings
+                self.nonlinear_mapper = MLPRegressor(
+                    hidden_layer_sizes=(16, 16), 
+                    max_iter=500, 
+                    alpha=0.1, # Strong regularization to stay "near-linear"
+                    random_state=42
+                )
+                self.nonlinear_mapper.fit(neural_scaled, physical_scaled)
             
         else:
             # If no ground truth, try to infer physical coordinates from structure
-            # Assume the first n_physical_dims are position-like
             self._infer_from_structure(neural_flat)
     
     def _infer_from_structure(self, neural_flat):
         """
         Infer physical coordinates from the structure of the neural representation.
-        This is a heuristic approach when ground truth is not available.
         """
         N, D = neural_flat.shape
         
         # Standardize neural coordinates
-        self.neural_scaler = StandardScaler()
         neural_scaled = self.neural_scaler.fit_transform(neural_flat)
         
         # If using rotation alignment, try to find principal directions
         if self.use_rotation_alignment:
             pca = PCA(n_components=min(self.n_physical_dims, D))
             pca.fit(neural_scaled)
-            
-            # Get the first few principal components as potential physical directions
-            # Weights shape: [n_latent_dims, n_physical_dims]
-            self.linear_weights = pca.components_.T  # Transpose to get [D, n_phys_dims]
+            self.linear_weights = pca.components_  # [n_phys_dims, D]
             self.linear_bias = np.zeros(self.n_physical_dims)
         else:
-            # Simply take the first n_physical_dims as physical coordinates
-            self.linear_weights = np.eye(D)[:self.n_physical_dims, :]  # [n_phys_dims, D]
+            # Simply take the first n_physical_dims
+            self.linear_weights = np.eye(self.n_physical_dims, D)
             self.linear_bias = np.zeros(self.n_physical_dims)
     
     def neural_to_physical(self, neural_coords):
         """
         Transform neural coordinates to physical coordinates.
-        
-        Args:
-            neural_coords: [N, n_super_nodes, n_latent_dims] or [n_latent_dims,]
-            
-        Returns:
-            physical_coords: [N, n_super_nodes, n_physical_dims] or [n_physical_dims,]
         """
         original_shape = neural_coords.shape
         is_single = len(original_shape) == 1
@@ -140,8 +130,11 @@ class CoordinateMapper:
         # Standardize
         neural_scaled = self.neural_scaler.transform(neural_flat)
         
-        # Apply linear transformation
-        physical_scaled = neural_scaled @ self.linear_weights.T + self.linear_bias
+        # Apply transformation
+        if self.nonlinear_mapper is not None:
+            physical_scaled = self.nonlinear_mapper.predict(neural_scaled)
+        else:
+            physical_scaled = neural_scaled @ self.linear_weights.T + self.linear_bias
         
         # Reshape back
         if is_single:
@@ -152,8 +145,12 @@ class CoordinateMapper:
     def physical_to_neural(self, physical_coords):
         """
         Transform physical coordinates back to neural coordinates.
-        This is the inverse transformation (approximate).
         """
+        # Linear inverse is well-defined, non-linear might be harder
+        # For symbolic purposes, the neural->physical mapping is the most important
+        if self.linear_weights is None:
+            return physical_coords
+            
         original_shape = physical_coords.shape
         is_single = len(original_shape) == 1
         
@@ -163,19 +160,16 @@ class CoordinateMapper:
         N, K, D_phys = physical_coords.shape
         physical_flat = physical_coords.reshape(-1, D_phys)
         
-        # This is an approximate inverse - in practice, the mapping might not be perfectly invertible
-        # For now, we'll use the pseudo-inverse of the linear transformation
-        weights_pinv = np.linalg.pinv(self.linear_weights.T)  # [n_latent_dims, n_physical_dims]
-        bias_inv = -weights_pinv @ self.linear_bias  # [n_latent_dims]
+        # Use pseudo-inverse of linear weights
+        weights_pinv = np.linalg.pinv(self.linear_weights) # [D, n_phys_dims]
         
-        neural_scaled = physical_flat @ weights_pinv.T + bias_inv
+        neural_scaled = (physical_flat - self.linear_bias) @ weights_pinv.T
         neural_flat = self.neural_scaler.inverse_transform(neural_scaled)
         
         if is_single:
             return neural_flat[0]
         else:
-            D_neural = self.n_latent_dims
-            return neural_flat.reshape(N, K, D_neural)
+            return neural_flat.reshape(N, K, self.n_latent_dims)
 
 
 class AlignedHamiltonianSymbolicDistiller:
