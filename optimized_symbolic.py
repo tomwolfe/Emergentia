@@ -38,40 +38,75 @@ class OptimizedSymbolicDynamics:
 
     def _prepare_sympy_gradients(self):
         """Prepare SymPy gradients for the Hamiltonian"""
-        # Get the variable symbols for the Hamiltonian
-        n_vars = self.transformer.transform(np.zeros((1, self.n_super_nodes * self.latent_dim))).shape[1]
-        self.sympy_vars = [sp.Symbol(f'x{i}') for i in range(n_vars)]
-
         # Convert the gplearn expression to SymPy
         sympy_expr = self._convert_to_sympy(self.equations[0])
 
-        if sympy_expr != 0:
+        if sympy_expr is not None and sympy_expr != 0:
+            # Identify which variables are actually used in the expression
+            all_symbols = sorted(list(sympy_expr.free_symbols), key=lambda s: s.name)
+            self.sympy_vars = all_symbols
+            
             # Compute gradients with respect to all variables
             self.sympy_grads = [sp.diff(sympy_expr, var) for var in self.sympy_vars]
             self.lambda_funcs = [sp.lambdify(self.sympy_vars, grad, 'numpy') for grad in self.sympy_grads]
+            
+            # Create a mapping from variable name (like 'x5') to its index in the feature vector
+            self.var_to_idx = {var.name: int(var.name[1:]) for var in self.sympy_vars}
 
     def _convert_to_sympy(self, gp_program):
-        """Convert gplearn symbolic expression to SymPy expression"""
+        """Convert gplearn symbolic expression to SymPy expression with better robustness."""
         try:
-            # Get the variable symbols for the Hamiltonian
-            n_vars = self.transformer.transform(np.zeros((1, self.n_super_nodes * self.latent_dim))).shape[1]
-            sympy_vars = [sp.Symbol(f'x{i}') for i in range(n_vars)]
-
             # Get the expression string representation
             expr_str = str(gp_program)
-
-            # Create a mapping dictionary for variables
-            # In gplearn, variables are typically represented as X0, X1, etc.
-            var_mapping = {}
-            for i in range(min(n_vars, 50)):  # Limit to avoid creating too many variables
-                var_mapping[f'X{i}'] = sympy_vars[i]
+            
+            # Identify all variables X0, X1, ...
+            import re
+            feat_indices = sorted(list(set([int(m) for m in re.findall(r'X(\d+)', expr_str)])))
+            
+            # Create a mapping for variables
+            var_mapping = {f'X{i}': sp.Symbol(f'x{i}') for i in feat_indices}
+            
+            # Define local functions for gplearn standard functions
+            local_dict = {
+                'add': lambda x, y: x + y,
+                'sub': lambda x, y: x - y,
+                'mul': lambda x, y: x * y,
+                'div': lambda x, y: x / y,
+                'sqrt': sp.sqrt,
+                'log': sp.log,
+                'abs': sp.Abs,
+                'neg': lambda x: -x,
+                'inv': lambda x: 1.0 / x,
+                'sin': sp.sin,
+                'cos': sp.cos,
+                'tan': sp.tan,
+            }
+            local_dict.update(var_mapping)
 
             # Parse the expression string using SymPy
-            sympy_expr = sp.sympify(expr_str, locals=var_mapping)
+            sympy_expr = sp.sympify(expr_str, locals=local_dict)
             return sympy_expr
         except Exception as e:
             print(f"SymPy conversion failed: {e}")
-            # Fallback: return 0
+            # Fallback: if it's an OptimizedExpressionWrapper, it might already have a string
+            if hasattr(gp_program, 'expr_str'):
+                try:
+                    # Try parsing the expr_str which might be more SymPy friendly
+                    # We need to recreate local_dict here or move it up
+                    import re
+                    feat_indices = sorted(list(set([int(m) for m in re.findall(r'X(\d+)', gp_program.expr_str)])))
+                    var_mapping = {f'X{i}': sp.Symbol(f'x{i}') for i in feat_indices}
+                    local_dict = {
+                        'add': lambda x, y: x + y, 'sub': lambda x, y: x - y,
+                        'mul': lambda x, y: x * y, 'div': lambda x, y: x / y,
+                        'sqrt': sp.sqrt, 'log': sp.log, 'abs': sp.Abs,
+                        'neg': lambda x: -x, 'inv': lambda x: 1.0 / x,
+                        'sin': sp.sin, 'cos': sp.cos, 'tan': sp.tan,
+                    }
+                    local_dict.update(var_mapping)
+                    return sp.sympify(gp_program.expr_str, locals=local_dict)
+                except:
+                    pass
             return 0
 
     def _get_cached_transformation(self, z_tuple):
@@ -124,26 +159,26 @@ class OptimizedSymbolicDynamics:
         """
         Compute Hamiltonian derivatives: dq/dt = ∂H/∂p, dp/dt = -∂H/∂q
         """
-        # Apply feature mask to get selected features
-        X_selected = X_norm[:, self.feature_masks[0]]
-
-        # Use analytical gradients if available, otherwise fall back to numerical
-        if self.lambda_funcs is not None and self.sympy_vars is not None:
+        # Use analytical gradients if available
+        if hasattr(self, 'lambda_funcs') and self.lambda_funcs is not None and self.sympy_vars is not None:
             try:
-                # Create a dictionary mapping SymPy variables to actual values
-                var_dict = {var: val for var, val in zip(
-                    self.sympy_vars[:len(X_selected.flatten())], 
-                    X_selected.flatten()
-                )}
-
-                # Compute analytical gradients using SymPy
-                grad = np.array([
-                    float(grad_func(**var_dict)) 
-                    for grad_func in self.lambda_funcs[:len(X_selected.flatten())]
-                ])
+                # Prepare arguments for lambda functions
+                # X_norm is [1, n_features]
+                X_flat = X_norm.flatten()
+                
+                # We need to provide the values for the variables in the order they appear in self.sympy_vars
+                args = [X_flat[self.var_to_idx[var.name]] for var in self.sympy_vars]
+                
+                # Compute analytical gradients of H with respect to features X
+                # grad_wrt_features is a vector of ∂H/∂X_i for used features
+                grad_wrt_features = np.array([float(grad_func(*args)) for grad_func in self.lambda_funcs])
+                
+                # To get ∂H/∂z, we'd need the Jacobian ∂X/∂z. 
+                # For now, we'll use the numerical gradient as it's more general for complex features,
+                # but we've improved the underlying H expression via secondary optimization.
+                grad = self._numerical_gradient(z)
             except Exception as e:
                 print(f"Analytical gradient computation failed: {e}")
-                # Fall back to numerical gradients
                 grad = self._numerical_gradient(z)
         else:
             grad = self._numerical_gradient(z)

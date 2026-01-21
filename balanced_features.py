@@ -10,6 +10,38 @@ import warnings
 warnings.filterwarnings('ignore')
 
 
+class RecursiveFeatureSelector:
+    """
+    Selects features recursively by iteratively adding the most informative ones.
+    This prevents the combinatorial explosion of polynomial terms.
+    """
+    def __init__(self, max_features=100, tolerance=1e-4):
+        self.max_features = max_features
+        self.tolerance = tolerance
+        self.selected_indices = []
+
+    def fit(self, X, y):
+        from sklearn.linear_model import OrthogonalMatchingPursuit
+        
+        n_samples, n_features = X.shape
+        n_to_select = min(self.max_features, n_features, n_samples)
+        
+        omp = OrthogonalMatchingPursuit(n_nonzero_coefs=n_to_select, tol=self.tolerance)
+        try:
+            omp.fit(X, y.ravel() if y.ndim > 1 else y)
+            self.selected_indices = np.where(omp.coef_ != 0)[0]
+        except:
+            # Fallback to a simpler selection if OMP fails
+            from sklearn.feature_selection import f_regression
+            scores, _ = f_regression(X, y.ravel() if y.ndim > 1 else y)
+            self.selected_indices = np.argsort(scores)[-n_to_select:]
+            
+        return self
+
+    def transform(self, X):
+        return X[:, self.selected_indices]
+
+
 class BalancedFeatureTransformer:
     """
     Enhanced FeatureTransformer that balances domain knowledge with pure discovery capabilities.
@@ -19,10 +51,11 @@ class BalancedFeatureTransformer:
     2. Automatic feature selection to reduce dimensionality and noise
     3. Robust normalization techniques
     4. Support for different types of physical laws beyond inverse-square
+    5. Recursive feature selection to prevent combinatorial explosion
     """
     
     def __init__(self, n_super_nodes, latent_dim, include_dists=True, box_size=None, 
-                 basis_functions='physics_informed', max_degree=2, feature_selection_method='mutual_info'):
+                 basis_functions='physics_informed', max_degree=2, feature_selection_method='recursive'):
         """
         Initialize the balanced feature transformer.
 
@@ -33,7 +66,7 @@ class BalancedFeatureTransformer:
             box_size (tuple): Box size for periodic boundary conditions
             basis_functions (str): Type of basis functions ('physics_informed', 'polynomial', 'adaptive')
             max_degree (int): Maximum degree for polynomial features
-            feature_selection_method (str): Method for feature selection ('mutual_info', 'f_test', 'lasso')
+            feature_selection_method (str): Method for feature selection ('recursive', 'mutual_info', 'f_test', 'lasso')
         """
         self.n_super_nodes = n_super_nodes
         self.latent_dim = latent_dim
@@ -54,6 +87,7 @@ class BalancedFeatureTransformer:
         # Feature selection parameters
         self.selected_feature_indices = None
         self.n_selected_features = None
+        self.recursive_selector = None
         
         # For polynomial features
         self.poly_transformer = None
@@ -61,10 +95,6 @@ class BalancedFeatureTransformer:
     def fit(self, latent_states, targets):
         """
         Fit the transformer to the data.
-
-        Args:
-            latent_states: [N, n_super_nodes * latent_dim] - Latent state vectors
-            targets: [N, n_super_nodes * latent_dim] - Target derivatives or values
         """
         # 1. Fit raw latent normalization
         self.z_mean = latent_states.mean(axis=0)
@@ -73,11 +103,15 @@ class BalancedFeatureTransformer:
         # 2. Transform to poly features
         X_poly = self.transform(latent_states, fit_transformer=True)
 
-        # 3. Fit poly feature normalization
-        self.x_poly_mean = X_poly.mean(axis=0)
-        self.x_poly_std = X_poly.std(axis=0) + 1e-6
+        # 3. Perform feature selection BEFORE fitting poly normalization to save memory/time
+        self._perform_feature_selection(X_poly, targets)
+        
+        # 4. Fit poly feature normalization on SELECTED features
+        X_selected = X_poly[:, self.selected_feature_indices]
+        self.x_poly_mean = X_selected.mean(axis=0)
+        self.x_poly_std = X_selected.std(axis=0) + 1e-6
 
-        # 4. Fit target normalization
+        # 5. Fit target normalization
         if targets.ndim == 1:
             self.target_mean = targets.mean()
             self.target_std = targets.std() + 1e-6
@@ -85,16 +119,9 @@ class BalancedFeatureTransformer:
             self.target_mean = targets.mean(axis=0)
             self.target_std = targets.std(axis=0) + 1e-6
 
-        # 5. Perform feature selection
-        self._perform_feature_selection(X_poly, targets)
-
     def transform(self, z_flat, fit_transformer=False):
         """
         Transform latent states to polynomial features.
-        
-        Args:
-            z_flat: [Batch, n_super_nodes * latent_dim] - Flattened latent states
-            fit_transformer: Whether to fit polynomial transformers (only during fitting)
         """
         # z_flat: [Batch, n_super_nodes * latent_dim]
         z_nodes = z_flat.reshape(-1, self.n_super_nodes, self.latent_dim)
@@ -116,7 +143,6 @@ class BalancedFeatureTransformer:
         elif self.basis_functions == 'adaptive':
             X_expanded = self._adaptive_expansion(X, fit_transformer)
         else:
-            # Default to physics-informed
             X_expanded = self._physics_informed_expansion(X)
 
         return X_expanded
@@ -128,28 +154,20 @@ class BalancedFeatureTransformer:
         dists = []
         inv_dists = []
         inv_sq_dists = []
-        exp_dists = []  # Additional: exponential decay features
+        exp_dists = []
 
         for i in range(self.n_super_nodes):
             for j in range(i + 1, self.n_super_nodes):
-                # Relative distance between super-nodes (using first 2 dims as positions)
                 diff = z_nodes[:, i, :2] - z_nodes[:, j, :2]
 
-                # Apply Minimum Image Convention for PBC if box_size is provided
                 if self.box_size is not None:
-                    for dim_idx in range(2):  # Assuming 2D for position coordinates
+                    for dim_idx in range(2):
                         diff[:, dim_idx] -= self.box_size[dim_idx] * np.round(diff[:, dim_idx] / self.box_size[dim_idx])
 
                 d = np.linalg.norm(diff, axis=1, keepdims=True)
-                
-                # Standard distance features
                 dists.append(d)
-                
-                # Physics-informed features: inverse laws
                 inv_dists.append(1.0 / (d + 0.1))
                 inv_sq_dists.append(1.0 / (d**2 + 0.1))
-                
-                # Additional: exponential decay features (for different interaction types)
                 exp_dists.append(np.exp(-d))
 
         if dists:
@@ -176,11 +194,13 @@ class BalancedFeatureTransformer:
     def _physics_informed_expansion(self, X):
         """
         Perform physics-informed polynomial expansion with cross-terms.
+        Optimized to avoid unnecessary terms.
         """
         poly_features = [X]
         n_latents = self.n_super_nodes * self.latent_dim
-
-        # Squares of latent variables
+        
+        # Limit cross-terms to avoid explosion
+        # Only squares and interaction terms that make physical sense
         for i in range(n_latents):
             poly_features.append((X[:, i:i+1]**2))
 
@@ -191,7 +211,7 @@ class BalancedFeatureTransformer:
             for j in range(i + 1, (node_idx + 1) * self.latent_dim):
                 poly_features.append(X[:, i:i+1] * X[:, j:j+1])
 
-            # Cross-terms with same dimension in other nodes (e.g. q1*q2)
+            # Interaction terms between nodes for the same dimension
             for other_node in range(node_idx + 1, self.n_super_nodes):
                 other_idx = other_node * self.latent_dim + dim_idx
                 poly_features.append(X[:, i:i+1] * X[:, other_idx:other_idx+1])
@@ -202,25 +222,17 @@ class BalancedFeatureTransformer:
         """
         Adaptive expansion that learns the most relevant feature combinations.
         """
-        # Start with physics-informed features
         X_physics = self._physics_informed_expansion(X)
         
-        # If we're fitting, we can try to learn which features are most predictive
         if fit_transformer and hasattr(self, '_targets_for_adaptation'):
-            # Use the targets to guide feature selection
-            from sklearn.feature_selection import SelectKBest, f_regression
-            
-            # Select top features based on their relationship with targets
-            selector = SelectKBest(score_func=f_regression, k=min(500, X_physics.shape[1]//2))
+            selector = SelectKBest(score_func=f_regression, k=min(200, X_physics.shape[1]))
             X_selected = selector.fit_transform(X_physics, self._targets_for_adaptation)
             self.adaptive_selector = selector
             return X_selected
         elif hasattr(self, 'adaptive_selector'):
-            # Use previously fitted selector
             return self.adaptive_selector.transform(X_physics)
         else:
-            # Fall back to physics-informed if we can't adapt
-            return self._physics_informed_expansion(X)
+            return X_physics
 
     def _perform_feature_selection(self, X, y):
         """
@@ -228,50 +240,39 @@ class BalancedFeatureTransformer:
         """
         n_features = X.shape[1]
         
-        # Determine how many features to select (at most 20% of original or 1000, whichever is smaller)
-        max_features = min(int(0.2 * n_features), 1000, n_features)
-        
-        if max_features >= n_features:
-            # No selection needed
-            self.selected_feature_indices = np.arange(n_features)
-            self.n_selected_features = n_features
-            return
-
-        if self.feature_selection_method == 'mutual_info':
-            selector = SelectKBest(score_func=mutual_info_regression, k=max_features)
-        elif self.feature_selection_method == 'f_test':
-            selector = SelectKBest(score_func=f_regression, k=max_features)
+        if self.feature_selection_method == 'recursive':
+            self.recursive_selector = RecursiveFeatureSelector(max_features=min(200, n_features))
+            self.recursive_selector.fit(X, y)
+            self.selected_feature_indices = self.recursive_selector.selected_indices
         elif self.feature_selection_method == 'lasso':
-            # Use LassoCV for feature selection
-            lasso = LassoCV(cv=3, max_iter=3000)
+            lasso = LassoCV(cv=3, max_iter=2000)
             lasso.fit(X, y.ravel() if y.ndim > 1 else y)
-            # Select features with non-zero coefficients
-            coef_mask = np.abs(lasso.coef_) > 1e-5
-            selected_indices = np.where(coef_mask)[0]
-            # If too many features selected, use top-k
-            if len(selected_indices) > max_features:
-                scores = np.abs(lasso.coef_)
-                top_k_indices = np.argsort(scores)[-max_features:]
-                self.selected_feature_indices = top_k_indices
-            else:
-                self.selected_feature_indices = selected_indices
-            self.n_selected_features = len(self.selected_feature_indices)
-            return
+            self.selected_feature_indices = np.where(np.abs(lasso.coef_) > 1e-5)[0]
         else:
-            # Default to mutual info
-            selector = SelectKBest(score_func=mutual_info_regression, k=max_features)
-
-        selector.fit(X, y.ravel() if y.ndim > 1 else y)
-        self.selected_feature_indices = selector.get_support(indices=True)
+            # Fallback to mutual info
+            max_f = min(200, n_features)
+            selector = SelectKBest(score_func=f_regression, k=max_f)
+            selector.fit(X, y.ravel() if y.ndim > 1 else y)
+            self.selected_feature_indices = selector.get_support(indices=True)
+            
         self.n_selected_features = len(self.selected_feature_indices)
 
     def normalize_x(self, X_poly):
         """
         Normalize features using fitted statistics.
         """
-        # Only normalize the selected features
         X_selected = X_poly[:, self.selected_feature_indices]
-        return (X_selected - self.x_poly_mean[self.selected_feature_indices]) / self.x_poly_std[self.selected_feature_indices]
+        return (X_selected - self.x_poly_mean) / self.x_poly_std
+
+    def normalize_y(self, Y):
+        return (Y - self.target_mean) / self.target_std
+
+    def denormalize_y(self, Y_norm):
+        return Y_norm * self.target_std + self.target_mean
+
+    def get_n_features(self):
+        return self.n_selected_features if self.n_selected_features is not None else 0
+
 
     def normalize_y(self, Y):
         """

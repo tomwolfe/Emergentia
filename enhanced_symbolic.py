@@ -63,11 +63,37 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
         if linear_score > 0.985:
             print(f"  -> Target_{i}: High linear fit (R2={linear_score:.3f}). Using linear model.")
             class LinearProgram:
-                def __init__(self, model): self.model = model; self.length_ = 1
+                def __init__(self, model, feature_indices): 
+                    self.model = model
+                    self.length_ = 1
+                    self.feature_indices = feature_indices
+                    # Create a string representation
+                    terms = []
+                    if abs(model.intercept_) > 1e-4:
+                        terms.append(f"{model.intercept_:.6f}")
+                    for idx, coef in enumerate(model.coef_):
+                        if abs(coef) > 1e-4:
+                            terms.append(f"mul({coef:.6f}, X{idx})")
+                    
+                    if not terms:
+                        self.expr_str = "0.0"
+                    elif len(terms) == 1:
+                        self.expr_str = terms[0]
+                    else:
+                        self.expr_str = terms[0]
+                        for term in terms[1:]:
+                            self.expr_str = f"add({self.expr_str}, {term})"
+
                 def execute(self, X):
                     if X.ndim == 1: X = X.reshape(1, -1)
                     return self.model.predict(X)
-            return LinearProgram(ridge), full_mask, linear_score
+                
+                def __str__(self):
+                    return self.expr_str
+            
+            # Find the indices of selected features from the full_mask
+            selected_indices = np.where(full_mask)[0]
+            return LinearProgram(ridge, selected_indices), full_mask, linear_score
 
         parsimony_levels = [0.001, 0.01, 0.05, 0.1]
         complexity_factor = max(1.0, 3.0 * (1.0 - linear_score))
@@ -267,32 +293,85 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
 class OptimizedExpressionWrapper:
     """
     Wrapper for expressions with optimized constants.
+    Ensures that refined constants are used during execution.
     """
     def __init__(self, expr_str, original_program):
         self.expr_str = expr_str
         self.original_program = original_program
         self.length_ = original_program.length_
+        self._lambda_func = None
+        self._feat_indices = None
         
         # Parse the expression to create a numerical evaluator
         try:
             import re
-            # Extract feature indices from the expression
-            feat_indices = [int(x) for x in re.findall(r'X(\d+)', expr_str)]
-            self.max_feat_idx = max(feat_indices) if feat_indices else 0
-        except:
-            self.max_feat_idx = 0
+            # Extract feature indices from the expression (e.g., X0, X1, ...)
+            matches = re.findall(r'X(\d+)', expr_str)
+            self._feat_indices = sorted(list(set([int(m) for m in matches])))
+            
+            # Create a SymPy-compatible expression
+            # Replace X0 with x0, X1 with x1, etc. for SymPy
+            sympy_compatible_expr = expr_str
+            for idx in self._feat_indices:
+                # Use word boundaries to avoid replacing X10 with x10 when we want to replace X1
+                sympy_compatible_expr = re.sub(rf'\bX{idx}\b', f'x{idx}', sympy_compatible_expr)
+            
+            # Map gplearn functions to SymPy functions
+            # gplearn uses 'add', 'sub', 'mul', 'div', 'sqrt', 'log', 'abs', 'neg', 'inv', 'sin', 'cos', 'tan'
+            func_map = {
+                'add': '(', 'sub': '(', 'mul': '(', 'div': '(',
+                # This is tricky because gplearn uses prefix notation in str(program)
+                # But wait, str(program) for gplearn is actually infix-ish or at least readable
+            }
+            
+            # Actually gplearn's str(program) is already mostly SymPy compatible for standard ops
+            # but it uses some names like 'add(X0, X1)'. 
+            # Let's use SymPy's sympify with a custom local_dict
+            
+            feat_vars = {f'x{idx}': sp.Symbol(f'x{idx}') for idx in self._feat_indices}
+            
+            # Common gplearn functions mapping to sympy
+            local_dict = {
+                'add': lambda x, y: x + y,
+                'sub': lambda x, y: x - y,
+                'mul': lambda x, y: x * y,
+                'div': lambda x, y: x / y,
+                'sqrt': sp.sqrt,
+                'log': sp.log,
+                'abs': sp.Abs,
+                'neg': lambda x: -x,
+                'inv': lambda x: 1.0 / x,
+                'sin': sp.sin,
+                'cos': sp.cos,
+                'tan': sp.tan,
+            }
+            local_dict.update(feat_vars)
+            
+            sympy_expr = sp.sympify(sympy_compatible_expr, locals=local_dict)
+            
+            # Lambdify for performance
+            # Ensure we use the correct arguments in order
+            arg_names = [f'x{idx}' for idx in self._feat_indices]
+            self._lambda_func = sp.lambdify([feat_vars[name] for name in arg_names], sympy_expr, modules=['numpy'])
+            
+        except Exception as e:
+            print(f"Warning: Could not compile optimized expression '{expr_str}': {e}")
+            self._lambda_func = None
     
     def execute(self, X):
         """
         Execute the optimized expression.
         """
-        try:
-            # For now, we'll use the original program's execution
-            # In a more advanced implementation, we would parse and execute the optimized expression
-            return self.original_program.execute(X)
-        except:
-            # Fallback to original program
-            return self.original_program.execute(X)
+        if self._lambda_func is not None:
+            try:
+                # Extract only the needed features
+                args = [X[:, idx] for idx in self._feat_indices]
+                return self._lambda_func(*args)
+            except Exception as e:
+                # Fallback to original program if execution fails
+                return self.original_program.execute(X)
+        
+        return self.original_program.execute(X)
 
 
 class PhysicsAwareSymbolicDistiller(HamiltonianSymbolicDistiller):

@@ -110,16 +110,17 @@ def main():
     is_hamiltonian = model.hamiltonian
     latent_data = extract_latent_data(model, dataset, sim.dt, include_hamiltonian=is_hamiltonian)
     
-    distiller = SymbolicDistiller(populations=2000, generations=50) 
+    from enhanced_symbolic import create_enhanced_distiller
+    distiller = create_enhanced_distiller(secondary_optimization=True)
     
     if is_hamiltonian:
         z_states, dz_states, t_states, h_states = latent_data
-        print("Distilling Hamiltonian H(q, p)...")
+        print("Distilling Hamiltonian H(q, p) with secondary optimization...")
         equations = distiller.distill(z_states, h_states, n_super_nodes, latent_dim, box_size=box_size)
         confidences = distiller.confidences
     else:
         z_states, dz_states, t_states = latent_data
-        print("Distilling derivatives dZ/dt...")
+        print("Distilling derivatives dZ/dt with secondary optimization...")
         equations = distiller.distill(z_states, dz_states, n_super_nodes, latent_dim, box_size=box_size)
         confidences = distiller.confidences
     
@@ -133,138 +134,9 @@ def main():
     # 4. Visualization & Integration
     print("--- 4. Visualizing Results ---")
     from scipy.integrate import odeint
-    import sympy as sp
+    from optimized_symbolic import OptimizedSymbolicDynamics
 
-    class SymbolicDynamics:
-        def __init__(self, distiller, equations, feature_masks, is_hamiltonian, n_super_nodes, latent_dim):
-            self.distiller = distiller
-            self.equations = equations
-            self.feature_masks = feature_masks
-            self.is_hamiltonian = is_hamiltonian
-            self.n_super_nodes = n_super_nodes
-            self.latent_dim = latent_dim
-
-            # Cache transformer for speed
-            self.transformer = distiller.transformer
-
-            # Convert symbolic expressions to analytical gradients using SymPy
-            if self.is_hamiltonian:
-                self.sympy_vars = None
-                self.lambda_funcs = None
-                self._prepare_sympy_gradients()
-
-        def _prepare_sympy_gradients(self):
-            """Prepare SymPy gradients for the Hamiltonian"""
-            # Get the variable symbols for the Hamiltonian
-            n_vars = self.transformer.transform(np.zeros((1, self.n_super_nodes * self.latent_dim))).shape[1]
-            self.sympy_vars = [sp.Symbol(f'x{i}') for i in range(n_vars)]
-
-            # Convert the gplearn expression to SymPy
-            sympy_expr = self._convert_to_sympy(self.equations[0])
-
-            if sympy_expr != 0:
-                # Compute gradients with respect to all variables
-                self.sympy_grads = [sp.diff(sympy_expr, var) for var in self.sympy_vars]
-                self.lambda_funcs = [sp.lambdify(self.sympy_vars, grad, 'numpy') for grad in self.sympy_grads]
-
-        def _convert_to_sympy(self, gp_program):
-            """Convert gplearn symbolic expression to SymPy expression"""
-            try:
-                # Get the variable symbols for the Hamiltonian
-                n_vars = self.transformer.transform(np.zeros((1, self.n_super_nodes * self.latent_dim))).shape[1]
-                sympy_vars = [sp.Symbol(f'x{i}') for i in range(n_vars)]
-
-                # Get the expression string representation
-                expr_str = str(gp_program)
-
-                # Create a mapping dictionary for variables
-                # In gplearn, variables are typically represented as X0, X1, etc.
-                var_mapping = {}
-                for i in range(min(n_vars, 50)):  # Limit to avoid creating too many variables
-                    var_mapping[f'X{i}'] = sympy_vars[i]
-
-                # Parse the expression string using SymPy
-                sympy_expr = sp.sympify(expr_str, locals=var_mapping)
-                return sympy_expr
-            except Exception as e:
-                print(f"SymPy conversion failed: {e}")
-                # Fallback: return 0
-                return 0
-
-        def __call__(self, z, t):
-            # z: [n_super_nodes * latent_dim]
-            if self.is_hamiltonian:
-                # Use analytical gradients computed with SymPy
-                # Transform z to feature space
-                X_poly = self.transformer.transform(z.reshape(1, -1))
-                X_norm = self.transformer.normalize_x(X_poly)
-
-                # Apply feature mask to get selected features
-                X_selected = X_norm[:, self.feature_masks[0]]
-
-                # Use analytical gradients if available, otherwise fall back to numerical
-                if self.lambda_funcs is not None and self.sympy_vars is not None:
-                    try:
-                        # Create a dictionary mapping SymPy variables to actual values
-                        var_dict = {var: val for var, val in zip(self.sympy_vars[:len(X_selected.flatten())], X_selected.flatten())}
-
-                        # Compute analytical gradients using SymPy
-                        grad = np.array([float(grad_func(**var_dict)) for grad_func in self.lambda_funcs[:len(X_selected.flatten())]])
-                    except Exception as e:
-                        print(f"Analytical gradient computation failed: {e}")
-                        # Fall back to numerical gradients
-                        grad = self._numerical_gradient(z)
-                else:
-                    grad = self._numerical_gradient(z)
-
-                dzdt = np.zeros_like(z)
-                d_sub = self.latent_dim // 2
-                for k in range(self.n_super_nodes):
-                    dq_idx = k * self.latent_dim + np.arange(d_sub)
-                    dp_idx = k * self.latent_dim + d_sub + np.arange(d_sub)
-                    dzdt[dq_idx] = grad[dp_idx]
-                    dzdt[dp_idx] = -grad[dq_idx]
-                return dzdt
-            else:
-                z_reshaped = z.reshape(1, -1)
-                X_poly = self.transformer.transform(z_reshaped)
-                X_norm = self.transformer.normalize_x(X_poly)
-
-                dzdt_norm = []
-                for i, (eq, mask) in enumerate(zip(self.equations, self.feature_masks)):
-                    X_selected = X_norm[:, mask]
-                    dzdt_norm.append(eq.execute(X_selected)[0])
-
-                return self.transformer.denormalize_y(np.array(dzdt_norm))
-
-        def _numerical_gradient(self, z):
-            """Compute numerical gradient as fallback"""
-            eps = 1e-6
-            n_dims = len(z)
-            grad = np.zeros(n_dims)
-
-            for i in range(n_dims):
-                z_plus = z.copy()
-                z_minus = z.copy()
-                z_plus[i] += eps
-                z_minus[i] -= eps
-
-                X_poly_plus = self.transformer.transform(z_plus.reshape(1, -1))
-                X_poly_minus = self.transformer.transform(z_minus.reshape(1, -1))
-
-                X_norm_plus = self.transformer.normalize_x(X_poly_plus)
-                X_norm_minus = self.transformer.normalize_x(X_poly_minus)
-
-                h_norm_plus = self.equations[0].execute(X_norm_plus[:, self.feature_masks[0]])
-                h_norm_minus = self.equations[0].execute(X_norm_minus[:, self.feature_masks[0]])
-
-                h_plus = self.transformer.denormalize_y(h_norm_plus)
-                h_minus = self.transformer.denormalize_y(h_norm_minus)
-
-                grad[i] = (h_plus[0] - h_minus[0]) / (2 * eps)
-            return grad
-
-    dyn_fn = SymbolicDynamics(distiller, equations, distiller.feature_masks, is_hamiltonian, n_super_nodes, latent_dim)
+    dyn_fn = OptimizedSymbolicDynamics(distiller, equations, distiller.feature_masks, is_hamiltonian, n_super_nodes, latent_dim)
 
     # Integrate the discovered equations
     z0 = z_states[0]
