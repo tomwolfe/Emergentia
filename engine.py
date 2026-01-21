@@ -185,6 +185,7 @@ class Trainer:
         loss_conn = self.model.get_connectivity_loss(s_0, batch_0.edge_index)
         loss_ortho = self.model.get_ortho_loss(s_0)
         loss_align = torch.tensor(0.0, device=self.device)
+        loss_mi = torch.tensor(0.0, device=self.device)
         
         s_prev = s_0
         mu_prev = mu_0
@@ -249,6 +250,9 @@ class Trainer:
             
             p_align = self.criterion(z_preds[t, :, :, :d_align], mu_t_norm[:, :, :d_align])
             loss_align += align_weight * p_align
+            
+            # Mutual Information Alignment (Unsupervised)
+            loss_mi += self.model.get_mi_loss(z_preds[t], mu_t_norm)
 
             if t > 0:
                 s_diff = self.criterion(s_t, s_prev)
@@ -269,6 +273,7 @@ class Trainer:
         loss_sparsity /= seq_len
         loss_ortho /= seq_len
         loss_align /= seq_len
+        loss_mi /= seq_len
         loss_sep /= seq_len
         loss_conn /= seq_len
         
@@ -281,7 +286,7 @@ class Trainer:
             'l2': torch.exp(-lvars[4]), 'lvr': torch.exp(-lvars[5]),
             'align': torch.exp(-lvars[6]), 'pruning': torch.exp(-lvars[7]),
             'sep': torch.exp(-lvars[8]), 'conn': torch.exp(-lvars[9]),
-            'sparsity': torch.exp(-lvars[10])
+            'sparsity': torch.exp(-lvars[10]), 'mi': torch.exp(-lvars[11])
         }
 
         discovery_loss = (weights['rec'] * loss_rec + lvars[0]) + \
@@ -291,7 +296,8 @@ class Trainer:
                          (weights['pruning'] * loss_pruning + lvars[7]) + \
                          (weights['sep'] * loss_sep + lvars[8]) + \
                          (weights['conn'] * loss_conn + lvars[9]) + \
-                         (weights['sparsity'] * loss_sparsity + lvars[10])
+                         (weights['sparsity'] * loss_sparsity + lvars[10]) + \
+                         (weights['mi'] * loss_mi + lvars[11])
 
         if is_warmup:
             loss = discovery_loss

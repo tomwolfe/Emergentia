@@ -4,7 +4,9 @@ polynomial expansion out of the ODE integration loop.
 """
 
 import numpy as np
-from scipy.integrate import odeint
+import torch
+from scipy.integrate import odeint as scipy_odeint
+from torchdiffeq import odeint as torch_odeint
 import sympy as sp
 from symbolic import SymbolicDistiller, gp_to_sympy
 
@@ -13,15 +15,18 @@ class OptimizedSymbolicDynamics:
     """
     Optimized version of SymbolicDynamics that addresses the computational bottleneck
     by pre-computing polynomial expansions and caching transformations.
+    
+    Now supports both scipy (CPU/LSODA) and torchdiffeq solvers for consistency.
     """
     
-    def __init__(self, distiller, equations, feature_masks, is_hamiltonian, n_super_nodes, latent_dim):
+    def __init__(self, distiller, equations, feature_masks, is_hamiltonian, n_super_nodes, latent_dim, solver='scipy'):
         self.distiller = distiller
         self.equations = equations
         self.feature_masks = feature_masks
         self.is_hamiltonian = is_hamiltonian
         self.n_super_nodes = n_super_nodes
         self.latent_dim = latent_dim
+        self.solver = solver # 'scipy' or 'torch'
 
         # Cache transformer for speed
         self.transformer = distiller.transformer
@@ -35,6 +40,33 @@ class OptimizedSymbolicDynamics:
         # Caching mechanism to avoid repeated computations
         self._cached_transformations = {}
         self._cache_max_size = 1000  # Maximum number of cached transformations
+
+    def integrate(self, z0, t, method='dopri5', rtol=1e-4, atol=1e-6):
+        """
+        Integrate the dynamics using the selected solver.
+        """
+        if self.solver == 'scipy':
+            return scipy_odeint(self, z0, t)
+        else:
+            # torchdiffeq expected t and z0 to be tensors
+            z0_t = torch.tensor(z0, dtype=torch.float32)
+            t_t = torch.tensor(t, dtype=torch.float32)
+            
+            # We need to wrap self into a torch.nn.Module or a callable that handles tensors
+            class TorchODEFunc(torch.nn.Module):
+                def __init__(self, parent):
+                    super().__init__()
+                    self.parent = parent
+                def forward(self, t, z):
+                    # Convert to numpy for the parent call (which handles caching/sympy)
+                    z_np = z.detach().cpu().numpy().flatten()
+                    dzdt = self.parent(z_np, t.item())
+                    return torch.tensor(dzdt, dtype=torch.float32, device=z.device)
+            
+            func = TorchODEFunc(self)
+            with torch.no_grad():
+                sol = torch_odeint(func, z0_t, t_t, method=method, rtol=rtol, atol=atol)
+            return sol.cpu().numpy()
 
     def _prepare_sympy_gradients(self):
         """Prepare SymPy gradients for the Hamiltonian"""

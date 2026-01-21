@@ -315,24 +315,12 @@ class SymbolicDistiller:
             program = candidate['prog']
             original_score = candidate['score']
             expr_str = str(program)
-            constants = re.findall(r'\d+\.\d+', expr_str)
-            if not constants: constants = re.findall(r'\b\d+\b', expr_str)
-            if not constants: return candidate
-
-            const_vars = [sp.Symbol(f'c{i}') for i in range(len(constants))]
-            modified_expr_str = expr_str
-            for i, c in enumerate(constants):
-                modified_expr_str = modified_expr_str.replace(c, f'c{i}', 1)
-
-            n_features = X.shape[1]
-            feat_vars = [sp.Symbol(f'x{i}') for i in range(n_features)]
-            var_mapping = {f'c{i}': v for i, v in enumerate(const_vars)}
-            for i in range(n_features): var_mapping[f'x{i}'] = feat_vars[i]
             
             # gplearn uses X0, X1, etc.
-            for i in range(n_features): modified_expr_str = modified_expr_str.replace(f'X{i}', f'x{i}')
+            n_features = X.shape[1]
+            feat_vars = [sp.Symbol(f'x{i}') for i in range(n_features)]
             
-            # Define local functions for gplearn standard and potential custom functions
+            # Define local functions for gplearn standard
             local_dict = {
                 'add': lambda x, y: x + y,
                 'sub': lambda x, y: x - y,
@@ -347,10 +335,27 @@ class SymbolicDistiller:
                 'cos': sp.cos,
                 'exp': sp.exp,
             }
-            local_dict.update(var_mapping)
+            for i in range(n_features):
+                local_dict[f'X{i}'] = feat_vars[i]
             
-            full_expr = sp.sympify(modified_expr_str, locals=local_dict)
-            f_lamb = sp.lambdify(const_vars + feat_vars, full_expr, modules=['numpy'])
+            # 1. Parse into SymPy
+            full_expr = sp.sympify(expr_str, locals=local_dict)
+            
+            # 2. Extract all numeric constants using SymPy's atoms
+            all_atoms = full_expr.atoms(sp.Number)
+            # Filter out small integers and powers that might be structural (like in x**2)
+            # Actually, gplearn puts constants as separate nodes.
+            constants = sorted([float(a) for a in all_atoms if not a.is_Integer or abs(a) > 5])
+            
+            if not constants: return candidate
+
+            # 3. Create a map from constants to parameters
+            const_vars = [sp.Symbol(f'c{i}') for i in range(len(constants))]
+            subs_map = {sp.Float(c): cv for c, cv in zip(constants, const_vars)}
+            
+            # Parametrized expression for optimization
+            param_expr = full_expr.subs(subs_map)
+            f_lamb = sp.lambdify(const_vars + feat_vars, param_expr, modules=['numpy'])
 
             def objective(const_vals):
                 try:
@@ -358,48 +363,41 @@ class SymbolicDistiller:
                     return np.mean((y_true - y_pred)**2)
                 except: return 1e10
 
-            res = minimize(objective, [float(c) for c in constants], method='L-BFGS-B')
+            res = minimize(objective, constants, method='L-BFGS-B')
             if res.success:
                 opt_consts = res.x
                 
                 # Physics-Inspired Simplification Step
-                # Try to round constants to "clean" values if it doesn't hurt performance too much
                 simplified_consts = opt_consts.copy()
                 for j in range(len(simplified_consts)):
                     val = simplified_consts[j]
-                    # Try rounding to nearest integer, half, or quarter
                     for base in [1.0, 0.5, 0.25]:
                         rounded = round(val / base) * base
-                        if abs(val - rounded) < 0.15: # Threshold for "closeness"
+                        if abs(val - rounded) < 0.15:
                             simplified_consts[j] = rounded
                             break
                 
-                # Evaluate simplified version
                 mse_opt = objective(opt_consts)
                 mse_simple = objective(simplified_consts)
-                
-                # If simplified MSE is within 5% of optimized MSE, prefer simplicity
                 final_consts = simplified_consts if mse_simple < 1.05 * mse_opt else opt_consts
                 
-                optimized_expr_str = expr_str
-                for i, val in enumerate(final_consts):
-                    # Use a regex that matches the exact original constant to avoid partial replacements
-                    # This is tricky with simple string replace. 
-                    # For safety, we'll replace the i-th occurrence.
-                    pattern = re.escape(constants[i])
-                    matches = list(re.finditer(pattern, optimized_expr_str))
-                    if i < len(matches):
-                        start, end = matches[i].span()
-                        optimized_expr_str = optimized_expr_str[:start] + f"{val:.4f}" + optimized_expr_str[end:]
+                # Create final optimized expression
+                final_subs = {cv: sp.Float(val) for cv, val in zip(const_vars, final_consts)}
+                optimized_expr = param_expr.subs(final_subs)
                 
-                # Check if actually improved over original
+                # Evaluate and update if improved
                 y_pred_opt = f_lamb(*final_consts, *[X[:, i] for i in range(n_features)])
                 opt_score = 1 - np.sum((y_true - y_pred_opt)**2) / (np.sum((y_true - y_true.mean())**2) + 1e-9)
                 
                 if opt_score > original_score:
-                    candidate.update({'prog': OptimizedExpressionProgram(optimized_expr_str, program), 'score': opt_score})
+                    # Convert back to gplearn-style string if possible, or use the OptimizedExpressionProgram
+                    # OptimizedExpressionProgram takes an expr_str
+                    # We can use sp.srepr or just str() and then fix it up
+                    # But actually OptimizedExpressionProgram uses gp_to_sympy, so we can just pass the SymPy string
+                    candidate.update({'prog': OptimizedExpressionProgram(str(optimized_expr), program), 'score': opt_score})
             return candidate
-        except: return candidate
+        except Exception as e:
+            return candidate
 
     def _distill_single_target(self, i, X_norm, Y_norm, targets_shape_1, latent_states_shape_1):
         variances = np.var(X_norm, axis=0)

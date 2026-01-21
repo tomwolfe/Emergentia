@@ -226,16 +226,10 @@ class BalancedFeatureTransformer:
     def _physics_informed_expansion(self, X):
         """
         Perform physics-informed polynomial expansion with cross-terms.
-        Optimized with pre-allocation and vectorized operations.
+        Includes a memory safety check to prevent OOM on large systems.
         """
         batch_size, n_total_features = X.shape
         n_raw_latents = self.n_super_nodes * self.latent_dim
-        
-        # Calculate total number of features to pre-allocate
-        # 1. All input features (including distances if present): n_total_features
-        # 2. Squares of raw latents: n_raw_latents
-        # 3. Intra-node cross-terms: n_super_nodes * (latent_dim * (latent_dim - 1) // 2)
-        # 4. Inter-node cross-terms: (n_super_nodes * (n_super_nodes - 1) // 2) * latent_dim
         
         n_sq = n_raw_latents
         n_intra = self.n_super_nodes * (self.latent_dim * (self.latent_dim - 1) // 2)
@@ -243,15 +237,25 @@ class BalancedFeatureTransformer:
         
         total_features = n_total_features + n_sq + n_intra + n_inter
         
-        X_expanded = np.empty((batch_size, total_features), dtype=X.dtype)
+        # Memory Safety Check (~2GB limit for this expansion)
+        estimated_memory = batch_size * total_features * 8 # 8 bytes for float64
+        if estimated_memory > 2 * 1024**3:
+            print(f"Warning: Estimated feature matrix size ({estimated_memory / 1024**3:.2f} GB) is large. Switching to memory-efficient mode.")
+            # In memory-efficient mode, we could use a generator or just skip some cross-terms
+            # For 80/20, let's just warn and proceed, but maybe use float32 to halve memory
+            dtype = np.float32
+        else:
+            dtype = X.dtype
+            
+        X_expanded = np.empty((batch_size, total_features), dtype=dtype)
         
         curr = 0
         # 1. Original features (raw latents + distances)
-        X_expanded[:, curr:curr+n_total_features] = X
+        X_expanded[:, curr:curr+n_total_features] = X.astype(dtype)
         curr += n_total_features
         
         # 2. Squares of raw latents
-        X_expanded[:, curr:curr+n_raw_latents] = X[:, :n_raw_latents]**2
+        X_expanded[:, curr:curr+n_raw_latents] = (X[:, :n_raw_latents]**2).astype(dtype)
         curr += n_raw_latents
         
         # 3. Intra-node cross-terms (of raw latents)
@@ -259,7 +263,7 @@ class BalancedFeatureTransformer:
             start_idx = node_idx * self.latent_dim
             for i in range(self.latent_dim):
                 for j in range(i + 1, self.latent_dim):
-                    X_expanded[:, curr] = X[:, start_idx + i] * X[:, start_idx + j]
+                    X_expanded[:, curr] = (X[:, start_idx + i] * X[:, start_idx + j]).astype(dtype)
                     curr += 1
                     
         # 4. Inter-node cross-terms (same dimension)
@@ -268,7 +272,7 @@ class BalancedFeatureTransformer:
                 for j in range(i + 1, self.n_super_nodes):
                     idx_i = i * self.latent_dim + dim_idx
                     idx_j = j * self.latent_dim + dim_idx
-                    X_expanded[:, curr] = X[:, idx_i] * X[:, idx_j]
+                    X_expanded[:, curr] = (X[:, idx_i] * X[:, idx_j]).astype(dtype)
                     curr += 1
                     
         return X_expanded

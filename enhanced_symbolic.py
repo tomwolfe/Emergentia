@@ -175,42 +175,14 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
     def _optimize_constants(self, program, X, y_true):
         """
         Apply secondary optimization to refine constants in the symbolic expression.
-        
-        Args:
-            program: gplearn symbolic program
-            X: Input features [n_samples, n_features]
-            y_true: True target values [n_samples,]
-            
-        Returns:
-            Optimized program with refined constants, or None if optimization fails
+        Uses SymPy tree traversal for robust constant identification.
         """
         try:
-            # Convert the gplearn program to a SymPy expression for manipulation
             expr_str = str(program)
-            
-            # Find all floating point numbers in the expression (these are the constants to optimize)
-            import re
-            constants = re.findall(r'\d+\.\d+', expr_str)
-            if not constants:
-                # If no decimal constants found, look for integers too
-                constants = re.findall(r'\d+', expr_str)
-            
-            if not constants:
-                return program  # No constants to optimize
-            
-            # Create unique variable names for constants
-            const_vars = [sp.Symbol(f'const_{i}') for i in range(len(constants))]
-            
-            # Replace constants in expression with symbolic variables
-            modified_expr_str = expr_str
-            for i, const_val in enumerate(constants):
-                modified_expr_str = modified_expr_str.replace(const_val, f'const_{i}', 1)
-            
-            # Create SymPy expression with symbolic constants
             n_features = X.shape[1]
             feat_vars = [sp.Symbol(f'x{i}') for i in range(n_features)]
             
-            # Build the full expression
+            # gplearn uses X0, X1, etc.
             local_dict = {
                 'add': lambda x, y: x + y,
                 'sub': lambda x, y: x - y,
@@ -225,71 +197,65 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
                 'cos': sp.cos,
                 'exp': sp.exp,
             }
-            for i, var in enumerate(const_vars):
-                local_dict[f'const_{i}'] = var
             for i in range(n_features):
                 local_dict[f'X{i}'] = feat_vars[i]
                 
-            full_expr = sp.sympify(modified_expr_str, locals=local_dict)
+            # 1. Parse into SymPy
+            full_expr = sp.sympify(expr_str, locals=local_dict)
             
-            # Create a function to evaluate the expression with given constants
+            # 2. Extract numeric constants
+            all_atoms = full_expr.atoms(sp.Number)
+            # Filter constants that are likely parameters and not indices/small integers
+            constants = sorted([float(a) for a in all_atoms if not a.is_Integer or abs(a) > 5])
+            
+            if not constants:
+                return program
+            
+            # 3. Parametrize constants
+            const_vars = [sp.Symbol(f'c{i}') for i in range(len(constants))]
+            subs_map = {sp.Float(c): cv for c, cv in zip(constants, const_vars)}
+            param_expr = full_expr.subs(subs_map)
+            
+            # 4. Lambdify for optimization
+            f_lamb = sp.lambdify(const_vars + feat_vars, param_expr, modules=['numpy'])
+            
             def eval_expr(const_vals):
-                # Substitute constants into expression
-                # We can use lambdify for better performance here too
-                f_lamb = sp.lambdify(const_vars + feat_vars, full_expr, modules=['numpy'])
-                
-                # Evaluate on all samples
                 try:
                     y_pred = f_lamb(*const_vals, *[X[:, i] for i in range(n_features)])
                     if np.any(np.isnan(y_pred)) or np.any(np.isinf(y_pred)):
-                        return float('inf')  # Invalid result
-                    mse = mean_squared_error(y_true, y_pred)
-                    return mse
+                        return float('inf')
+                    return mean_squared_error(y_true, y_pred)
                 except:
-                    return float('inf')  # Error in evaluation
-            
-            # Initial guess for constants (use the original values)
-            initial_consts = [float(c) for c in constants]
+                    return float('inf')
             
             # Perform optimization
-            result = minimize(eval_expr, initial_consts, method=self.opt_method, 
+            result = minimize(eval_expr, constants, method=self.opt_method, 
                              options={'maxiter': self.opt_iterations})
             
             if result.success:
                 opt_consts = result.x
                 
-                # Physics-Inspired Simplification Step
-                # Try to round constants to "clean" values (integers, halves, quarters)
+                # Physics-Inspired Simplification
                 simplified_consts = opt_consts.copy()
                 for j in range(len(simplified_consts)):
                     val = simplified_consts[j]
                     for base in [1.0, 0.5, 0.25]:
                         rounded = round(val / base) * base
-                        if abs(val - rounded) < 0.12: # Slightly tighter threshold than symbolic.py
+                        if abs(val - rounded) < 0.12:
                             simplified_consts[j] = rounded
                             break
                 
-                # Evaluate both
                 mse_opt = eval_expr(opt_consts)
                 mse_simple = eval_expr(simplified_consts)
-                
-                # Prefer simplified constants if they don't degrade fit significantly
                 final_consts = simplified_consts if mse_simple < 1.05 * mse_opt else opt_consts
                 
-                # Create new expression with optimized (and simplified) constants
-                optimized_expr_str = expr_str
-                for i, opt_val in enumerate(final_consts):
-                    # Use a safer replacement for the i-th occurrence
-                    pattern = re.escape(constants[i])
-                    matches = list(re.finditer(pattern, optimized_expr_str))
-                    if i < len(matches):
-                        start, end = matches[i].span()
-                        optimized_expr_str = optimized_expr_str[:start] + f"{opt_val:.4f}" + optimized_expr_str[end:]
+                # Create final optimized expression
+                final_subs = {cv: sp.Float(val) for cv, val in zip(const_vars, final_consts)}
+                optimized_expr = param_expr.subs(final_subs)
                 
-                # Create a new program with optimized constants
-                return OptimizedExpressionWrapper(optimized_expr_str, program)
+                return OptimizedExpressionWrapper(str(optimized_expr), program)
             else:
-                return program  # Return original if optimization failed
+                return program
                 
         except Exception as e:
             print(f"  -> Secondary optimization failed: {e}")
@@ -333,19 +299,16 @@ class OptimizedExpressionWrapper:
         
         # Parse the expression to create a numerical evaluator using robust gp_to_sympy
         try:
-            import re
-            # Extract feature indices from the expression (e.g., X0, X1, ...)
-            matches = re.findall(r'X(\d+)', expr_str)
-            self._feat_indices = sorted(list(set([int(m) for m in matches])))
-            
             # Use robust converter
+            # gp_to_sympy handles the mapping of X0, X1 to x0, x1
             sympy_expr = gp_to_sympy(expr_str)
             
-            # Lambdify for performance
-            # Identify which variables are actually used in the expression (e.g. x0, x1...)
+            # Identify all used features
             all_symbols = sorted(list(sympy_expr.free_symbols), key=lambda s: s.name)
+            self._feat_indices = [int(s.name[1:]) for s in all_symbols if s.name.startswith('x')]
             
-            # We must lambdify with all features if we want to pass them by index
+            # Lambdify for performance
+            # We must provide all features up to max_idx to ensure correct indexing
             max_idx = max(self._feat_indices) if self._feat_indices else 0
             feat_vars = [sp.Symbol(f'x{i}') for i in range(max_idx + 1)]
             self._lambda_func = sp.lambdify(feat_vars, sympy_expr, modules=['numpy'])
@@ -361,12 +324,18 @@ class OptimizedExpressionWrapper:
         if self._lambda_func is not None:
             try:
                 if X.ndim == 1: X = X.reshape(1, -1)
-                # Prepare arguments for lambdified function
-                # If we have X with 10 features but the expression only uses X0 and X1, 
-                # we still need to provide up to the max index used.
-                max_used_idx = len(self._lambda_func.__code__.co_varnames)
-                args = [X[:, i] for i in range(max_used_idx)]
-                return self._lambda_func(*args)
+                # Ensure X has enough features
+                n_req = len(self._lambda_func.__code__.co_varnames)
+                if X.shape[1] < n_req:
+                    X_padded = np.pad(X, ((0, 0), (0, n_req - X.shape[1])), mode='constant')
+                    args = [X_padded[:, i] for i in range(n_req)]
+                else:
+                    args = [X[:, i] for i in range(n_req)]
+                
+                result = self._lambda_func(*args)
+                if np.isscalar(result):
+                    return np.full(X.shape[0], result)
+                return np.asarray(result).flatten()
             except Exception as e:
                 # Fallback to original program if execution fails
                 return self.original_program.execute(X)

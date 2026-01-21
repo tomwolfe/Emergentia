@@ -394,6 +394,27 @@ class GNNDecoder(nn.Module):
         h = self.ln(h)
         return self.mlp[2](h)
 
+class MIDiscriminator(nn.Module):
+    """
+    Discriminator for Mutual Information Estimation (MINE-style).
+    Distinguishes between (latent, physical) pairs and shuffled ones.
+    """
+    def __init__(self, latent_dim, physical_dim, hidden_dim=64):
+        super(MIDiscriminator, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim + physical_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, z, p):
+        # z: [B, K, D], p: [B, K, 2]
+        # Cat along last dim
+        zp = torch.cat([z, p], dim=-1)
+        return self.net(zp)
+
 class DiscoveryEngineModel(nn.Module):
     def __init__(self, n_particles, n_super_nodes, node_features=4, latent_dim=4, hidden_dim=64, hamiltonian=False, dissipative=True):
         super(DiscoveryEngineModel, self).__init__()
@@ -407,10 +428,38 @@ class DiscoveryEngineModel(nn.Module):
         self.decoder = GNNDecoder(latent_dim, hidden_dim, node_features)
         self.hamiltonian = hamiltonian
 
+        # Mutual Information alignment components
+        # Align first 2 dims of latent to mu (physical CoM)
+        self.mi_discriminator = MIDiscriminator(min(latent_dim, 2), 2, hidden_dim)
+
         # Learnable loss log-variances for automatic loss balancing
-        # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning, 8: sep, 9: conn, 10: sparsity
-        self.log_vars = nn.Parameter(torch.zeros(11)) 
+        # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning, 8: sep, 9: conn, 10: sparsity, 11: mi
+        self.log_vars = nn.Parameter(torch.zeros(12)) 
         
+    def get_mi_loss(self, z, mu):
+        """
+        Unsupervised alignment loss via Mutual Information Maximization (MINE).
+        z: [B, K, D], mu: [B, K, 2]
+        """
+        # Take first 2 dims of z for spatial alignment
+        z_spatial = z[:, :, :2]
+        
+        # Joint distribution
+        joint = self.mi_discriminator(z_spatial, mu)
+        
+        # Marginal distribution (shuffle mu across batch and super-nodes)
+        batch_size, n_k, _ = mu.shape
+        mu_shuffled = mu[torch.randperm(batch_size)]
+        # Also shuffle super-nodes to break local correlation
+        mu_shuffled = mu_shuffled[:, torch.randperm(n_k)]
+        
+        marginal = self.mi_discriminator(z_spatial, mu_shuffled)
+        
+        # MINE objective: I(Z; MU) >= E[joint] - log(E[exp(marginal)])
+        # We want to maximize this, so we minimize the negative
+        mi_est = torch.mean(joint) - torch.log(torch.mean(torch.exp(marginal)) + 1e-9)
+        return -mi_est
+
     def encode(self, x, edge_index, batch, tau=1.0, hard=False):
         return self.encoder(x, edge_index, batch, tau=tau, hard=hard)
     
