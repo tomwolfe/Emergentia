@@ -255,24 +255,20 @@ class LatentODEFunc(nn.Module):
         self.n_super_nodes = n_super_nodes
         self.hidden_dim = hidden_dim
 
-        # Permutation invariant architecture using Deep Sets
+        # Simplified and faster architecture
         # Process each super-node individually (phi network)
         self.phi = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),
-            nn.LeakyReLU(0.1),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LeakyReLU(0.1),
-            nn.Linear(hidden_dim, hidden_dim)
+            nn.Linear(latent_dim, hidden_dim//2),  # Reduced hidden size
+            nn.SiLU(),  # Faster activation
+            nn.Linear(hidden_dim//2, hidden_dim//2)
         )
 
         # Aggregation function (rho network) - mean pooling is permutation invariant
         # This aggregates information from all super-nodes
         self.rho = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LeakyReLU(0.1),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LeakyReLU(0.1),
-            nn.Linear(hidden_dim, latent_dim * n_super_nodes)
+            nn.Linear(hidden_dim//2, hidden_dim//2),
+            nn.SiLU(),  # Faster activation
+            nn.Linear(hidden_dim//2, latent_dim * n_super_nodes)
         )
 
     def forward(self, t, y):
@@ -322,12 +318,11 @@ class HamiltonianODEFunc(nn.Module):
         self.n_super_nodes = n_super_nodes
         self.dissipative = dissipative
 
+        # Simplified and faster Hamiltonian network
         self.H_net = nn.Sequential(
-            nn.Linear(latent_dim * n_super_nodes, hidden_dim),
-            nn.Tanh(), # Tanh ensures second-order differentiability for dH
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, 1)
+            nn.Linear(latent_dim * n_super_nodes, hidden_dim//2),  # Reduced hidden size
+            nn.SiLU(), # Faster activation function
+            nn.Linear(hidden_dim//2, 1)
         )
 
         if dissipative:
@@ -518,18 +513,18 @@ class DiscoveryEngineModel(nn.Module):
         # During early training, looser tolerances are acceptable
         if self.training:
             # Looser tolerances during training for efficiency
-            rtol = 1e-2  # Even looser during early training
-            atol = 1e-3
+            rtol = 1e-1  # Much looser during early training for speed
+            atol = 1e-2
         else:
             # Tighter tolerances during evaluation for accuracy
-            rtol = 1e-4
-            atol = 1e-6
+            rtol = 1e-3
+            atol = 1e-5
 
         # Use a more efficient solver during training, but accurate one for evaluation
         if self.training:
-            method = 'euler'  # Even faster fixed-step method during early training
+            method = 'euler'  # Fastest fixed-step method during early training
         else:
-            method = 'dopri5'  # More accurate adaptive method during evaluation
+            method = 'rk4'  # Faster than dopri5 but still reasonably accurate
 
         # Use the selected solver
         if self.hamiltonian and self.training:

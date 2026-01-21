@@ -232,7 +232,7 @@ class Trainer:
                 self.model.encoder.pooling.set_sparsity_weight(new_weight)
 
         # Periodically apply hard revival to prevent resolution collapse
-        if epoch > 0 and epoch % 100 == 0:
+        if epoch > 0 and epoch % 50 == 0:  # More frequent revival
             if hasattr(self.model.encoder.pooling, 'apply_hard_revival'):
                 self.model.encoder.pooling.apply_hard_revival()
 
@@ -248,8 +248,8 @@ class Trainer:
         # Progress ratio
         progress = epoch / max_epochs
 
-        # 1. Smooth Tau schedule: Exponential decay
-        tau = max(0.05, 0.5 * np.exp(-epoch / 1000.0))
+        # 1. Smooth Tau schedule: Exponential decay (faster annealing)
+        tau = max(0.1, 0.5 * np.exp(-epoch / 500.0))  # Faster decay
 
         # 2. Hard assignment scheduling:
         # Gradually increase the probability of using 'hard' assignments in Gumbel-Softmax
@@ -260,15 +260,15 @@ class Trainer:
             hard_prob = min(1.0, (progress - self.hard_assignment_start) / (1.0 - self.hard_assignment_start))
             hard = np.random.random() < hard_prob
 
-        # 3. Decaying Teacher Forcing Ratio
-        tf_ratio = max(0.0, 0.8 * (1.0 - epoch / (0.75 * max_epochs + 1e-9)))
+        # 3. Decaying Teacher Forcing Ratio (more aggressive decay)
+        tf_ratio = max(0.0, 0.8 * (1.0 - epoch / (0.5 * max_epochs + 1e-9)))  # Faster decay
 
         # 4. Alignment Annealing
         align_weight = max(0.1, 1.0 - epoch / (self.align_anneal_epochs + 1e-9))
 
         # 5. Adaptive Entropy Weight: Increase over time to force discrete clusters
         # Point 1: Addressing "Blurry" Meso-scale
-        entropy_weight = 1.0 + 2.0 * progress
+        entropy_weight = 1.0 + 1.5 * progress  # Reduced growth rate
 
         # Warmup logic
         is_warmup = epoch < self.warmup_epochs
@@ -356,7 +356,8 @@ class Trainer:
         mu_std = torch.tensor(self.stats['pos_std'], device=self.device, dtype=torch.float32) if self.stats else 1
 
         # Optimize the target computation loop - only compute targets when needed
-        for t in range(seq_len):
+        # Process every other time step to reduce computation
+        for t in range(0, seq_len, 2):  # Process every other time step
             batch_t = Batch.from_data_list([data_list[t]]).to(self.device)
             z_t_target, s_t, losses_t, mu_t = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch, tau=tau, hard=hard)
 
@@ -388,24 +389,24 @@ class Trainer:
                 s_diff = self.criterion(s_t, s_prev)
                 mu_diff = self.criterion(mu_t, mu_prev)
                 loss_assign += s_diff + 5.0 * mu_diff
-                if compute_consistency and not is_warmup:
+                if compute_consistency and not is_warmup and t % 2 == 0:  # Only compute consistency every other step
                     loss_cons += self.criterion(z_preds[t], z_t_target)
                 s_stability += s_diff.item()
                 mu_stability += mu_diff.item()
             s_prev = s_t
             mu_prev = mu_t
 
-        # Normalization
-        loss_rec /= seq_len
-        loss_cons /= (seq_len - 1) if (not is_warmup and compute_consistency) else 1
-        loss_assign /= seq_len
-        loss_pruning /= seq_len
-        loss_sparsity /= seq_len
-        loss_ortho /= seq_len
-        loss_align /= seq_len
-        loss_mi /= seq_len
-        loss_sep /= seq_len
-        loss_conn /= seq_len
+        # Normalization - account for sampling every other step
+        loss_rec /= (seq_len // 2)
+        loss_cons /= ((seq_len // 2) - 1) if (not is_warmup and compute_consistency) else 1
+        loss_assign /= (seq_len // 2)
+        loss_pruning /= (seq_len // 2)
+        loss_sparsity /= (seq_len // 2)
+        loss_ortho /= (seq_len // 2)
+        loss_align /= (seq_len // 2)
+        loss_mi /= (seq_len // 2)
+        loss_sep /= (seq_len // 2)
+        loss_conn /= (seq_len // 2)
 
         # Adaptive Loss Weighting with slightly more conservative clamping
         # Increasing min from -1.0 to -0.5 to prevent weights from exploding too much
@@ -471,14 +472,14 @@ class Trainer:
 
             # Perform optimizer step only at the end of accumulation cycle
             if ((epoch + 1) % self.grad_acc_steps == 0) or (epoch == max_epochs - 1):
-                # Relaxed gradient clipping for better convergence
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+                # Increased gradient clipping for better stability
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
         else:
             loss.backward()
-            # Relaxed gradient clipping for better convergence
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+            # Increased gradient clipping for better stability
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
 
         # Update loss tracker for logging

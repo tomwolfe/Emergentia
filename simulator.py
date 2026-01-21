@@ -140,22 +140,22 @@ class SpringMassSimulator:
             
         return ke + pe
 
-    def step(self, sub_steps=4):
+    def step(self, sub_steps=2):  # Reduced sub_steps for faster simulation
         dt_sub = self.dt / sub_steps
         for _ in range(sub_steps):
             # Velocity Verlet:
             forces_t = self.compute_forces(self.pos)
             v_half = self.vel + (forces_t / self.m) * (dt_sub / 2.0)
-            
+
             self.pos += v_half * dt_sub
-            
+
             # Apply PBC wrap-around
             if self.box_size:
                 self.pos = self.pos % self.box_size
-            
+
             forces_next = self.compute_forces(self.pos)
             self.vel = v_half + (forces_next / self.m) * (dt_sub / 2.0)
-            
+
             # 1. Global Energy Clamping (Proactive)
             # Prevent runaway kinetic energy which leads to divergence
             ke = 0.5 * self.m * np.sum(self.vel**2)
@@ -164,12 +164,12 @@ class SpringMassSimulator:
                 self.vel *= np.sqrt(max_ke / ke)
 
             # 2. Individual Particle Velocity Clamping
-            max_v = 30.0
+            max_v = 20.0  # Reduced max velocity for stability
             v_norm = np.linalg.norm(self.vel, axis=1, keepdims=True)
             if np.any(v_norm > max_v):
                 scale = np.where(v_norm > max_v, max_v / v_norm, 1.0)
                 self.vel *= scale
-        
+
         # Check for NaNs or massive values after all sub-steps
         if np.any(np.isnan(self.pos)) or np.any(np.abs(self.pos) > 1e6):
             print("Warning: Simulation diverged. Applying smooth recovery.")
@@ -179,14 +179,14 @@ class SpringMassSimulator:
                 # Apply PBC wrap-around to keep positions in bounds
                 self.pos = self.pos % self.box_size
                 # Gradually damp velocities instead of zeroing them completely
-                damping_factor = 0.5  # Reduce velocity by half
+                damping_factor = 0.7  # Reduced damping for better dynamics
                 self.vel *= damping_factor
             else:
                 # For non-PBC systems, clip positions and damp velocities
                 self.pos = np.nan_to_num(self.pos)
                 self.pos = np.clip(self.pos, -5, 5)
                 # Apply gradual damping instead of zeroing
-                damping_factor = 0.3
+                damping_factor = 0.5  # Reduced damping
                 self.vel *= damping_factor
 
         return self.pos.copy(), self.vel.copy()
@@ -215,14 +215,14 @@ class LennardJonesSimulator(SpringMassSimulator):
     def compute_forces(self, pos):
         forces = np.zeros_like(pos)
         pairs = self._compute_pairs(pos)
-        
+
         if len(pairs) == 0:
             return forces
 
         idx1, idx2 = zip(*pairs)
         idx1 = np.array(idx1)
         idx2 = np.array(idx2)
-        
+
         diff = pos[idx2] - pos[idx1]
         if self.box_size:
             for i in range(2):
@@ -231,22 +231,22 @@ class LennardJonesSimulator(SpringMassSimulator):
         dist_sq = np.sum(diff**2, axis=1, keepdims=True)
         # Avoid division by zero and extreme values: floor at 0.7 * sigma^2 instead of 0.5
         dist_sq = np.maximum(dist_sq, 0.7 * self.sigma**2)
-        
+
         sr6 = (self.sigma**2 / dist_sq)**3
         sr12 = sr6**2
-        
+
         # F = 24 * epsilon / r^2 * [2*(sigma/r)^12 - (sigma/r)^6] * vec_r
         f_mag = (24 * self.epsilon / dist_sq) * (2 * sr12 - sr6)
-        
+
         force_vec = f_mag * diff
-        
-        # Stability clamping
-        max_f = 1000.0
+
+        # Stability clamping - reduced max force for better stability
+        max_f = 500.0  # Reduced max force for better stability
         force_vec = np.clip(force_vec, -max_f, max_f)
-        
+
         np.add.at(forces, idx1, -force_vec)
         np.add.at(forces, idx2, force_vec)
-        
+
         return forces
 
     def energy(self, pos=None, vel=None):

@@ -25,9 +25,9 @@ class EarlyStopping:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--epochs', type=int, default=1000)
-    parser.add_argument('--steps', type=int, default=200)
-    parser.add_argument('--particles', type=int, default=8)
+    parser.add_argument('--epochs', type=int, default=500)  # Reduced epochs for faster training
+    parser.add_argument('--steps', type=int, default=100)   # Reduced steps for faster training
+    parser.add_argument('--particles', type=int, default=6) # Reduced particles for faster training
     parser.add_argument('--super_nodes', type=int, default=2)
     parser.add_argument('--device', type=str, default=None, help='Device to use (cpu, cuda, mps)')
     args = parser.parse_args()
@@ -54,16 +54,16 @@ def main():
     latent_dim = 4
     steps = args.steps
     epochs = args.epochs
-    seq_len = 10  # Reduced sequence length for faster training
+    seq_len = 5  # Further reduced sequence length for faster training
     dynamic_radius = 1.5
     # Enable PBC with a reasonable box size
     box_size = (10.0, 10.0)  # Set a reasonable box size for PBC
 
     print("--- 1. Generating Data ---")
     from simulator import LennardJonesSimulator
-    # Reduce dt for better energy conservation in data generation
+    # Use larger dt for faster simulation (was 0.001)
     sim = LennardJonesSimulator(n_particles=n_particles, epsilon=1.0, sigma=1.0,
-                                dynamic_radius=dynamic_radius, box_size=box_size, dt=0.001)
+                                dynamic_radius=dynamic_radius, box_size=box_size, dt=0.005)
     pos, vel = sim.generate_trajectory(steps=steps)
     initial_energy = sim.energy(pos[0], vel[0])
     final_energy = sim.energy(pos[-1], vel[-1])
@@ -80,7 +80,7 @@ def main():
     model = DiscoveryEngineModel(n_particles=n_particles,
                                  n_super_nodes=n_super_nodes,
                                  latent_dim=latent_dim,
-                                 hidden_dim=64,  # Reduced hidden dim for faster training
+                                 hidden_dim=32,  # Further reduced hidden dim for faster training
                                  hamiltonian=True,
                                  dissipative=True,
                                  min_active_super_nodes=min_active).to(device)
@@ -90,22 +90,22 @@ def main():
     sparsity_scheduler = SparsityScheduler(
         initial_weight=0.001,
         target_weight=0.05,
-        warmup_steps=int(epochs * 0.1),
-        max_steps=int(epochs * 0.8)
+        warmup_steps=max(10, int(epochs * 0.1)),
+        max_steps=max(50, int(epochs * 0.8))
     )
 
     # Optimized trainer parameters for faster training
     trainer = Trainer(model, lr=2e-4, device=device, stats=stats, sparsity_scheduler=sparsity_scheduler,
-                      skip_consistency_freq=3,  # Compute consistency loss every 3 epochs to save time
+                      skip_consistency_freq=2,  # Compute consistency loss every 2 epochs to save time
                       enable_gradient_accumulation=True,  # Use gradient accumulation for memory efficiency
                       grad_acc_steps=2)  # Accumulate gradients over 2 steps
 
     # Increased patience and adjusted factor to prevent premature decay
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(trainer.optimizer, mode='min',
-                                                           factor=0.5, patience=200, min_lr=1e-6)
+                                                           factor=0.5, patience=50, min_lr=1e-6)  # Reduced patience
 
     # Early stopping setup
-    early_stopping = EarlyStopping(patience=100, min_delta=1e-4)
+    early_stopping = EarlyStopping(patience=50, min_delta=1e-3)  # Reduced patience and increased min_delta
     
     last_loss = 1.0
     for epoch in range(epochs):
@@ -115,7 +115,7 @@ def main():
         last_loss = loss
         scheduler.step(loss)
 
-        if epoch % 50 == 0:  # Less frequent logging
+        if epoch % 25 == 0:  # Adjusted logging frequency for better monitoring
             progress = (epoch / epochs) * 100
             stats_tracker = trainer.loss_tracker.get_stats()
             active_nodes = int(model.encoder.pooling.active_mask.sum().item())
