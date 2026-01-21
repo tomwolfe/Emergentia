@@ -17,6 +17,129 @@ from sklearn.metrics import mean_squared_error
 import warnings
 warnings.filterwarnings('ignore')
 
+class SymPyToTorch(torch.nn.Module):
+    """
+    A lightweight, robust converter from SymPy expressions to PyTorch modules.
+    Handles standard gplearn and physics-informed functions.
+    """
+    def __init__(self, sympy_expr, n_inputs):
+        super().__init__()
+        self.n_inputs = n_inputs
+        # Map SymPy symbols to input indices
+        self.symbols = [sp.Symbol(f'x{i}') for i in range(n_inputs)]
+        self.expr = sympy_expr
+        
+        # Mapping SymPy ops to Torch ops
+        self.op_map = {
+            sp.Add: torch.add,
+            sp.Mul: torch.mul,
+            sp.Pow: torch.pow,
+            sp.exp: torch.exp,
+            sp.log: lambda x: torch.log(torch.abs(x) + 1e-9),
+            sp.sin: torch.sin,
+            sp.cos: torch.cos,
+            sp.Abs: torch.abs,
+            sp.sqrt: lambda x: torch.sqrt(torch.abs(x) + 1e-9),
+        }
+
+    def forward(self, x_inputs):
+        """
+        x_inputs: [Batch, n_inputs] tensor
+        """
+        return self._recursive_eval(self.expr, x_inputs)
+
+    def _recursive_eval(self, node, x_inputs):
+        if node.is_Symbol:
+            # Extract index from 'xi'
+            idx = int(node.name[1:])
+            return x_inputs[:, idx]
+        if node.is_Number:
+            return torch.tensor(float(node), device=x_inputs.device, dtype=x_inputs.dtype)
+        
+        # Handle functions
+        op = node.func
+        if op in self.op_map:
+            args = [self._recursive_eval(arg, x_inputs) for arg in node.args]
+            if len(args) == 1:
+                return self.op_map[op](args[0])
+            # For Add and Mul, handle multiple arguments
+            res = args[0]
+            for i in range(1, len(args)):
+                res = self.op_map[op](res, args[i])
+            return res
+        
+        # Fallback for complex ops or unknown ones
+        # Use lambdify with torch as last resort
+        l_func = sp.lambdify(self.symbols, node, modules='torch')
+        args = [x_inputs[:, i] for i in range(self.n_inputs)]
+        return l_func(*args)
+
+class TorchFeatureTransformer(torch.nn.Module):
+    """
+    PyTorch implementation of FeatureTransformer for differentiable symbolic proxy.
+    """
+    def __init__(self, transformer):
+        super().__init__()
+        self.n_super_nodes = transformer.n_super_nodes
+        self.latent_dim = transformer.latent_dim
+        self.include_dists = transformer.include_dists
+        self.box_size = transformer.box_size
+        
+        # Register buffers for normalization parameters
+        self.register_buffer('x_poly_mean', torch.from_numpy(transformer.x_poly_mean).float())
+        self.register_buffer('x_poly_std', torch.from_numpy(transformer.x_poly_std).float())
+        self.register_buffer('target_mean', torch.from_numpy(transformer.target_mean).float())
+        self.register_buffer('target_std', torch.from_numpy(transformer.target_std).float())
+
+    def forward(self, z_flat):
+        # z_flat: [Batch, K * D]
+        batch_size = z_flat.size(0)
+        z_nodes = z_flat.view(batch_size, self.n_super_nodes, self.latent_dim)
+        
+        features = [z_flat]
+        
+        if self.include_dists:
+            dists = []
+            inv_dists = []
+            inv_sq_dists = []
+
+            for i in range(self.n_super_nodes):
+                for j in range(i + 1, self.n_super_nodes):
+                    diff = z_nodes[:, i, :2] - z_nodes[:, j, :2]
+                    if self.box_size is not None:
+                        box = torch.tensor(self.box_size, device=z_flat.device, dtype=z_flat.dtype)
+                        diff = diff - box * torch.round(diff / box)
+
+                    d = torch.norm(diff, dim=1, keepdim=True)
+                    dists.append(d)
+                    inv_dists.append(1.0 / (d + 0.1))
+                    inv_sq_dists.append(1.0 / (d**2 + 0.1))
+
+            if dists:
+                features.extend([torch.cat(dists, dim=1), 
+                                torch.cat(inv_dists, dim=1), 
+                                torch.cat(inv_sq_dists, dim=1)])
+
+        X = torch.cat(features, dim=1)
+        poly_features = [X]
+        n_latents = self.n_super_nodes * self.latent_dim
+
+        for i in range(n_latents):
+            poly_features.append(X[:, i:i+1]**2)
+            node_idx = i // self.latent_dim
+            dim_idx = i % self.latent_dim
+            for j in range(i + 1, (node_idx + 1) * self.latent_dim):
+                poly_features.append(X[:, i:i+1] * X[:, j:j+1])
+            for other_node in range(node_idx + 1, self.n_super_nodes):
+                other_idx = other_node * self.latent_dim + dim_idx
+                poly_features.append(X[:, i:i+1] * X[:, other_idx:other_idx+1])
+
+        X_poly = torch.cat(poly_features, dim=1)
+        return (X_poly - self.x_poly_mean) / self.x_poly_std
+
+    def denormalize_y(self, Y_norm):
+        return Y_norm * self.target_std + self.target_mean
+
 
 class EnhancedSymbolicDistiller(SymbolicDistiller):
     """
@@ -31,11 +154,40 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
     """
 
     def __init__(self, populations=2000, generations=40, stopping_criteria=0.001, max_features=12,
-                 secondary_optimization=True, opt_method='L-BFGS-B', opt_iterations=100):
+                 secondary_optimization=True, opt_method='L-BFGS-B', opt_iterations=100,
+                 use_sindy_pruning=True, sindy_threshold=0.05):
         super().__init__(populations, generations, stopping_criteria, max_features)
         self.secondary_optimization = secondary_optimization
         self.opt_method = opt_method
         self.opt_iterations = opt_iterations
+        self.use_sindy_pruning = use_sindy_pruning
+        self.sindy_threshold = sindy_threshold
+
+    def _sindy_select(self, X, y, threshold=0.05, max_iter=10):
+        """
+        Sequential Thresholded Least Squares (STLSQ) for SINDy-style pruning.
+        """
+        from sklearn.linear_model import Ridge
+        n_features = X.shape[1]
+        mask = np.ones(n_features, dtype=bool)
+        
+        for _ in range(max_iter):
+            if not np.any(mask): break
+            # Solve least squares on active features
+            model = Ridge(alpha=1e-5)
+            model.fit(X[:, mask], y)
+            
+            # Update mask: threshold coefficients
+            new_mask = np.zeros(n_features, dtype=bool)
+            active_coeffs = np.abs(model.coef_)
+            # Normalize coeffs by their max to make threshold relative or use absolute
+            # Absolute threshold is more standard in SINDy
+            new_mask[mask] = active_coeffs > threshold
+            
+            if np.array_equal(mask, new_mask): break
+            mask = new_mask
+            
+        return mask
 
     def _distill_single_target(self, i, X_norm, Y_norm, targets_shape_1, latent_states_shape_1):
         print(f"Selecting features for target_{i} (Input dim: {X_norm.shape[1]})...")
@@ -44,7 +196,22 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
         valid_indices = np.where(variances > 1e-6)[0]
         X_pruned = X_norm[:, valid_indices]
 
-        mask_pruned = self._select_features(X_pruned, Y_norm[:, i])
+        # Use SINDy-style pruning if enabled
+        if self.use_sindy_pruning:
+            sindy_mask = self._sindy_select(X_pruned, Y_norm[:, i], threshold=self.sindy_threshold)
+            print(f"  -> SINDy pruned {len(valid_indices)} to {np.sum(sindy_mask)} features.")
+            # If SINDy was too aggressive, fall back to variance-based valid_indices
+            if np.sum(sindy_mask) < 2:
+                print("  -> SINDy too aggressive, using standard selection.")
+                mask_pruned = self._select_features(X_pruned, Y_norm[:, i])
+            else:
+                X_sindy = X_pruned[:, sindy_mask]
+                # Further refine with standard feature selector to reach max_features
+                refinement_mask = self._select_features(X_sindy, Y_norm[:, i])
+                mask_pruned = np.zeros(len(valid_indices), dtype=bool)
+                mask_pruned[np.where(sindy_mask)[0][refinement_mask]] = True
+        else:
+            mask_pruned = self._select_features(X_pruned, Y_norm[:, i])
 
         full_mask = np.zeros(X_norm.shape[1], dtype=bool)
         full_mask[valid_indices[mask_pruned]] = True
@@ -443,7 +610,7 @@ class PhysicsAwareSymbolicDistiller(HamiltonianSymbolicDistiller):
             return expr
 
 
-def create_enhanced_distiller(physics_constants=None, secondary_optimization=True):
+def create_enhanced_distiller(physics_constants=None, secondary_optimization=True, use_sindy_pruning=True):
     """
     Factory function to create an enhanced symbolic distiller based on requirements.
     """
@@ -451,4 +618,5 @@ def create_enhanced_distiller(physics_constants=None, secondary_optimization=Tru
         return PhysicsAwareSymbolicDistiller(secondary_optimization=secondary_optimization, 
                                            physics_constants=physics_constants)
     else:
-        return EnhancedSymbolicDistiller(secondary_optimization=secondary_optimization)
+        return EnhancedSymbolicDistiller(secondary_optimization=secondary_optimization,
+                                       use_sindy_pruning=use_sindy_pruning)

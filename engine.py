@@ -117,43 +117,48 @@ class LossTracker:
 class SymbolicProxy(torch.nn.Module):
     """
     A differentiable proxy for the discovered symbolic laws.
-    Used to guide the GNN training towards interpretable dynamics.
+    Allows end-to-end gradient flow from symbolic equations back to the GNN.
     """
     def __init__(self, n_super_nodes, latent_dim, equations, transformer):
         super().__init__()
         self.n_super_nodes = n_super_nodes
         self.latent_dim = latent_dim
-        self.equations = equations
-        self.transformer = transformer
+        
+        # 1. Initialize differentiable feature transformer
+        from enhanced_symbolic import TorchFeatureTransformer, SymPyToTorch
+        self.torch_transformer = TorchFeatureTransformer(transformer)
+        
+        # 2. Initialize differentiable symbolic modules
+        self.sym_modules = torch.nn.ModuleList()
+        for eq in equations:
+            if eq is not None:
+                # Convert equation to SymPy and then to Torch
+                from symbolic import gp_to_sympy
+                sympy_expr = gp_to_sympy(str(eq))
+                n_inputs = self.torch_transformer.x_poly_mean.size(0)
+                self.sym_modules.append(SymPyToTorch(sympy_expr, n_inputs))
+            else:
+                self.sym_modules.append(None)
         
     def forward(self, z_flat):
         # z_flat: [Batch, K * D]
-        # We need to execute the symbolic equations on the latent states
-        # Since equations are numpy-based, we use a simple wrapper or 
-        # convert them to torch-compatible expressions if possible.
-        # For 80/20, we'll use them as targets (non-differentiable)
+        # 1. Differentiable feature transformation
+        X_norm = self.torch_transformer(z_flat)
         
-        device = z_flat.device
-        z_np = z_flat.detach().cpu().numpy()
-        
-        # 1. Transform features
-        X_poly = self.transformer.transform(z_np)
-        X_norm = self.transformer.normalize_x(X_poly)
-        
-        # 2. Execute each equation
+        # 2. Execute each symbolic equation
         y_preds = []
-        for eq in self.equations:
-            if eq is not None:
-                y_preds.append(eq.execute(X_norm))
+        for sym_mod in self.sym_modules:
+            if sym_mod is not None:
+                y_preds.append(sym_mod(X_norm))
             else:
-                y_preds.append(np.zeros(z_np.shape[0]))
+                y_preds.append(torch.zeros(z_flat.size(0), device=z_flat.device))
         
-        Y_norm_pred = np.stack(y_preds, axis=1)
+        Y_norm_pred = torch.stack(y_preds, dim=1)
         
         # 3. Denormalize
-        Y_pred = self.transformer.denormalize_y(Y_norm_pred)
+        Y_pred = self.torch_transformer.denormalize_y(Y_norm_pred)
         
-        return torch.from_numpy(Y_pred).to(device).to(torch.float32)
+        return Y_pred
 
 class Trainer:
     def __init__(self, model, lr=5e-4, device='cpu', stats=None, align_anneal_epochs=1000, 
@@ -249,9 +254,8 @@ class Trainer:
             z0_flat = z_curr.view(z_curr.size(0), -1)
             # GNN predicted derivative
             gnn_dz = self.model.ode_func(0, z0_flat)
-            # Symbolic predicted derivative
-            with torch.no_grad():
-                sym_dz = self.symbolic_proxy(z0_flat)
+            # Symbolic predicted derivative (now differentiable!)
+            sym_dz = self.symbolic_proxy(z0_flat)
             loss_sym = self.criterion(gnn_dz, sym_dz)
 
         s_prev = s_0
