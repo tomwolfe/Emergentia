@@ -433,8 +433,8 @@ class DiscoveryEngineModel(nn.Module):
         self.mi_discriminator = MIDiscriminator(min(latent_dim, 2), 2, hidden_dim)
 
         # Learnable loss log-variances for automatic loss balancing
-        # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning, 8: sep, 9: conn, 10: sparsity, 11: mi
-        self.log_vars = nn.Parameter(torch.zeros(12)) 
+        # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning, 8: sep, 9: conn, 10: sparsity, 11: mi, 12: sym
+        self.log_vars = nn.Parameter(torch.zeros(13)) 
         
     def get_mi_loss(self, z, mu):
         """

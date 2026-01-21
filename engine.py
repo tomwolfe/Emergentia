@@ -114,6 +114,47 @@ class LossTracker:
     def get_stats(self):
         return {**self.history, **{f"w_{k}": v for k, v in self.weights.items()}}
 
+class SymbolicProxy(torch.nn.Module):
+    """
+    A differentiable proxy for the discovered symbolic laws.
+    Used to guide the GNN training towards interpretable dynamics.
+    """
+    def __init__(self, n_super_nodes, latent_dim, equations, transformer):
+        super().__init__()
+        self.n_super_nodes = n_super_nodes
+        self.latent_dim = latent_dim
+        self.equations = equations
+        self.transformer = transformer
+        
+    def forward(self, z_flat):
+        # z_flat: [Batch, K * D]
+        # We need to execute the symbolic equations on the latent states
+        # Since equations are numpy-based, we use a simple wrapper or 
+        # convert them to torch-compatible expressions if possible.
+        # For 80/20, we'll use them as targets (non-differentiable)
+        
+        device = z_flat.device
+        z_np = z_flat.detach().cpu().numpy()
+        
+        # 1. Transform features
+        X_poly = self.transformer.transform(z_np)
+        X_norm = self.transformer.normalize_x(X_poly)
+        
+        # 2. Execute each equation
+        y_preds = []
+        for eq in self.equations:
+            if eq is not None:
+                y_preds.append(eq.execute(X_norm))
+            else:
+                y_preds.append(np.zeros(z_np.shape[0]))
+        
+        Y_norm_pred = np.stack(y_preds, axis=1)
+        
+        # 3. Denormalize
+        Y_pred = self.transformer.denormalize_y(Y_norm_pred)
+        
+        return torch.from_numpy(Y_pred).to(device).to(torch.float32)
+
 class Trainer:
     def __init__(self, model, lr=5e-4, device='cpu', stats=None, align_anneal_epochs=1000, 
                  warmup_epochs=400, sparsity_scheduler=None, hard_assignment_start=0.7):
@@ -125,16 +166,31 @@ class Trainer:
         self.align_anneal_epochs = align_anneal_epochs
         self.warmup_epochs = warmup_epochs
         self.sparsity_scheduler = sparsity_scheduler
-        self.hard_assignment_start = hard_assignment_start # Fraction of training when to start using hard assignments
+        self.hard_assignment_start = hard_assignment_start 
+        
+        # Symbolic-in-the-loop
+        self.symbolic_proxy = None
+        self.symbolic_weight = 0.0
         
         # MPS fix: torchdiffeq has issues with MPS (float64 defaults and stability)
         if str(device) == 'mps':
             self.model.ode_func.to('cpu')
             
         self.optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, patience=50, verbose=True)
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, patience=50)
         self.criterion = torch.nn.MSELoss().to(device)
         self.stats = stats
+
+    def update_symbolic_proxy(self, equations, transformer, weight=0.1):
+        """Update the symbolic proxy model with new discovered equations."""
+        self.symbolic_proxy = SymbolicProxy(
+            self.model.encoder.n_super_nodes, 
+            self.model.encoder.latent_dim, 
+            equations, 
+            transformer
+        )
+        self.symbolic_weight = weight
+        print(f"Symbolic proxy updated. Symbolic weight: {weight}")
         
     def train_step(self, data_list, dt, epoch=0, max_epochs=2000):
         # Update sparsity weight if scheduler is present
@@ -186,7 +242,18 @@ class Trainer:
         loss_ortho = self.model.get_ortho_loss(s_0)
         loss_align = torch.tensor(0.0, device=self.device)
         loss_mi = torch.tensor(0.0, device=self.device)
+        loss_sym = torch.tensor(0.0, device=self.device)
         
+        # Symbolic-in-the-loop loss
+        if self.symbolic_proxy is not None and not is_warmup:
+            z0_flat = z_curr.view(z_curr.size(0), -1)
+            # GNN predicted derivative
+            gnn_dz = self.model.ode_func(0, z0_flat)
+            # Symbolic predicted derivative
+            with torch.no_grad():
+                sym_dz = self.symbolic_proxy(z0_flat)
+            loss_sym = self.criterion(gnn_dz, sym_dz)
+
         s_prev = s_0
         mu_prev = mu_0
         z_preds = [z_curr]
@@ -286,7 +353,8 @@ class Trainer:
             'l2': torch.exp(-lvars[4]), 'lvr': torch.exp(-lvars[5]),
             'align': torch.exp(-lvars[6]), 'pruning': torch.exp(-lvars[7]),
             'sep': torch.exp(-lvars[8]), 'conn': torch.exp(-lvars[9]),
-            'sparsity': torch.exp(-lvars[10]), 'mi': torch.exp(-lvars[11])
+            'sparsity': torch.exp(-lvars[10]), 'mi': torch.exp(-lvars[11]),
+            'sym': torch.exp(-lvars[12])
         }
 
         discovery_loss = (weights['rec'] * loss_rec + lvars[0]) + \
@@ -297,7 +365,8 @@ class Trainer:
                          (weights['sep'] * loss_sep + lvars[8]) + \
                          (weights['conn'] * loss_conn + lvars[9]) + \
                          (weights['sparsity'] * loss_sparsity + lvars[10]) + \
-                         (weights['mi'] * loss_mi + lvars[11])
+                         (weights['mi'] * loss_mi + lvars[11]) + \
+                         (weights['sym'] * self.symbolic_weight * loss_sym + lvars[12])
 
         if is_warmup:
             loss = discovery_loss

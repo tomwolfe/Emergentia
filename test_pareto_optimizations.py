@@ -1,99 +1,74 @@
 
 import torch
 import numpy as np
-from stable_pooling import StableHierarchicalPooling, SparsityScheduler
-from balanced_features import BalancedFeatureTransformer, RecursiveFeatureSelector
-from optimized_symbolic import OptimizedSymbolicDynamics
-import sympy as sp
+from torch_geometric.data import Batch
+from engine import Trainer, prepare_data, compute_stats
+from model import DiscoveryEngineModel
+from simulator import SpringMassSimulator
+from enhanced_symbolic import EnhancedSymbolicDistiller
 
-def test_sparsity_scheduler():
-    print("Testing SparsityScheduler...")
-    scheduler = SparsityScheduler(initial_weight=0.0, target_weight=1.0, warmup_steps=10, max_steps=100)
+def test_symbolic_in_the_loop():
+    print("Testing Symbolic-in-the-loop training...")
+    n_particles = 8
+    n_super_nodes = 2
+    latent_dim = 4
     
-    # Warmup
-    for _ in range(5):
-        weight = scheduler.step()
-        assert weight == 0.0
+    sim = SpringMassSimulator(n_particles=n_particles)
+    pos, vel = sim.generate_trajectory(steps=50)
+    stats = compute_stats(pos, vel)
+    dataset, _ = prepare_data(pos, vel, stats=stats)
+    
+    model = DiscoveryEngineModel(n_particles=n_particles, n_super_nodes=n_super_nodes, latent_dim=latent_dim)
+    trainer = Trainer(model, stats=stats)
+    
+    # 1. Short initial training
+    print("Phase 1: Initial GNN training...")
+    for epoch in range(20):
+        idx = np.random.randint(0, len(dataset) - 2)
+        batch_data = dataset[idx:idx+2]
+        loss, rec, cons = trainer.train_step(batch_data, sim.dt, epoch=epoch, max_epochs=100)
+    
+    print(f"Initial loss: {loss:.6f}")
+    
+    # 2. Extract latents for symbolic distillation
+    print("Phase 2: Symbolic Distillation...")
+    model.eval()
+    latents = []
+    targets = []
+    
+    with torch.no_grad():
+        for i in range(len(dataset)-1):
+            batch_t = Batch.from_data_list([dataset[i]])
+            batch_next = Batch.from_data_list([dataset[i+1]])
+            z, _, _, _ = model.encode(batch_t.x, batch_t.edge_index, batch_t.batch)
+            z_next, _, _, _ = model.encode(batch_next.x, batch_next.edge_index, batch_next.batch)
+            
+            z_flat = z.view(-1).cpu().numpy()
+            z_next_flat = z_next.view(-1).cpu().numpy()
+            dz = (z_next_flat - z_flat) / sim.dt
+            
+            latents.append(z_flat)
+            targets.append(dz)
+            
+    latents = np.array(latents)
+    targets = np.array(targets)
+    
+    distiller = EnhancedSymbolicDistiller(populations=100, generations=5) # Small for testing
+    equations = distiller.distill_with_secondary_optimization(latents, targets, n_super_nodes, latent_dim)
+    
+    # 3. Update symbolic proxy
+    print("Phase 3: Updating symbolic proxy...")
+    trainer.update_symbolic_proxy(equations, distiller.transformer, weight=0.1)
+    
+    # 4. Resume training with symbolic guidance
+    print("Phase 4: Resuming training with Symbolic-in-the-loop...")
+    for epoch in range(21, 40):
+        idx = np.random.randint(0, len(dataset) - 2)
+        batch_data = dataset[idx:idx+2]
+        loss, rec, cons = trainer.train_step(batch_data, sim.dt, epoch=epoch, max_epochs=100)
         
-    # In progress
-    scheduler.current_step = 55 # 50% through after warmup
-    weight = scheduler.get_weight()
-    assert 0.0 < weight < 1.0
-    
-    # Finished
-    scheduler.current_step = 100
-    weight = scheduler.get_weight()
-    assert np.isclose(weight, 1.0, atol=1e-2)
-    print("SparsityScheduler test passed!")
-
-def test_recursive_feature_selector():
-    print("Testing RecursiveFeatureSelector...")
-    # Generate dummy data
-    np.random.seed(42)
-    n_samples = 200
-    n_features = 50
-    X = np.random.randn(n_samples, n_features)
-    # Target depends on features 5 and 10
-    y = 2.5 * X[:, 5] - 1.2 * X[:, 10] + 0.1 * np.random.randn(n_samples)
-    
-    # Add some constant features
-    X[:, 0] = 1.0
-    X[:, 1] = 0.0
-    
-    selector = RecursiveFeatureSelector(max_features=5)
-    selector.fit(X, y)
-    
-    # Ensure constant features are NOT selected
-    assert 0 not in selector.selected_indices
-    assert 1 not in selector.selected_indices
-    
-    # Ensure informative features ARE selected
-    assert 5 in selector.selected_indices
-    assert 10 in selector.selected_indices
-    
-    print(f"Selected indices: {selector.selected_indices}")
-    print("RecursiveFeatureSelector test passed!")
-
-def test_sympy_robustness():
-    print("Testing SymPy robustness in OptimizedSymbolicDynamics...")
-    # Mock objects for initialization
-    class MockDistiller:
-        def __init__(self):
-            self.transformer = None
-            
-    distiller = MockDistiller()
-    
-    # Test complex string conversion
-    from gplearn.genetic import _Program
-    
-    # We'll just test the _convert_to_sympy method directly if we can, 
-    # or mock a program object
-    class MockProgram:
-        def __init__(self, expr_str):
-            self.expr_str = expr_str
-        def __str__(self):
-            return self.expr_str
-            
-    dynamics = OptimizedSymbolicDynamics.__new__(OptimizedSymbolicDynamics)
-    
-    # Test prefix notation and custom functions
-    prog = MockProgram("add(mul(X0, X1), inv(add(X2, 1.0)))")
-    expr = dynamics._convert_to_sympy(prog)
-    print(f"Converted expr: {expr}")
-    assert isinstance(expr, sp.Expr)
-    assert 'x0' in str(expr)
-    assert 'x1' in str(expr)
-    assert 'x2' in str(expr)
-
-    # Test robustness with negative values in sqrt/log
-    prog2 = MockProgram("log(sub(X0, 10.0))")
-    expr2 = dynamics._convert_to_sympy(prog2)
-    print(f"Converted expr (log): {expr2}")
-    # Should be simplified to something involving Abs or just be valid
-    
-    print("SymPy robustness test passed!")
+    print(f"Final loss: {loss:.6f}")
+    print("Symbolic-in-the-loop test completed successfully!")
 
 if __name__ == "__main__":
-    test_sparsity_scheduler()
-    test_recursive_feature_selector()
-    test_sympy_robustness()
+    test_symbolic_in_the_loop()

@@ -226,55 +226,52 @@ class BalancedFeatureTransformer:
     def _physics_informed_expansion(self, X):
         """
         Perform physics-informed polynomial expansion with cross-terms.
-        Includes a memory safety check to prevent OOM on large systems.
+        Includes a memory safety check and vectorization for performance.
         """
         batch_size, n_total_features = X.shape
         n_raw_latents = self.n_super_nodes * self.latent_dim
         
-        n_sq = n_raw_latents
-        n_intra = self.n_super_nodes * (self.latent_dim * (self.latent_dim - 1) // 2)
-        n_inter = (self.n_super_nodes * (self.n_super_nodes - 1) // 2) * self.latent_dim
+        # 1. Base features: Raw latents + already computed distance features
+        features = [X]
         
-        total_features = n_total_features + n_sq + n_intra + n_inter
+        # 2. Squares of raw latents: [Batch, n_raw_latents]
+        X_raw = X[:, :n_raw_latents]
+        features.append(X_raw**2)
         
-        # Memory Safety Check (~2GB limit for this expansion)
-        estimated_memory = batch_size * total_features * 8 # 8 bytes for float64
-        if estimated_memory > 2 * 1024**3:
-            print(f"Warning: Estimated feature matrix size ({estimated_memory / 1024**3:.2f} GB) is large. Switching to memory-efficient mode.")
-            # In memory-efficient mode, we could use a generator or just skip some cross-terms
-            # For 80/20, let's just warn and proceed, but maybe use float32 to halve memory
-            dtype = np.float32
-        else:
-            dtype = X.dtype
+        # 3. Intra-node cross-terms: O(K * D^2)
+        # Using vectorized outer product per node
+        X_nodes = X_raw.reshape(batch_size, self.n_super_nodes, self.latent_dim)
+        intra_terms = []
+        for i in range(self.latent_dim):
+            for j in range(i + 1, self.latent_dim):
+                intra_terms.append(X_nodes[:, :, i] * X_nodes[:, :, j])
+        
+        if intra_terms:
+            features.append(np.stack(intra_terms, axis=-1).reshape(batch_size, -1))
+                    
+        # 4. Inter-node cross-terms (same dimension): O(D * K^2)
+        # We only consider pairs of nodes here.
+        inter_terms = []
+        for d in range(self.latent_dim):
+            # Vectorized pair-wise multiplication for this dimension
+            # [Batch, K]
+            val_d = X_nodes[:, :, d]
+            i_idx, j_idx = np.triu_indices(self.n_super_nodes, k=1)
+            inter_terms.append(val_d[:, i_idx] * val_d[:, j_idx])
             
-        X_expanded = np.empty((batch_size, total_features), dtype=dtype)
+        if inter_terms:
+            features.append(np.stack(inter_terms, axis=-1).reshape(batch_size, -1))
+            
+        # Combine all features
+        X_expanded = np.concatenate(features, axis=1)
         
-        curr = 0
-        # 1. Original features (raw latents + distances)
-        X_expanded[:, curr:curr+n_total_features] = X.astype(dtype)
-        curr += n_total_features
-        
-        # 2. Squares of raw latents
-        X_expanded[:, curr:curr+n_raw_latents] = (X[:, :n_raw_latents]**2).astype(dtype)
-        curr += n_raw_latents
-        
-        # 3. Intra-node cross-terms (of raw latents)
-        for node_idx in range(self.n_super_nodes):
-            start_idx = node_idx * self.latent_dim
-            for i in range(self.latent_dim):
-                for j in range(i + 1, self.latent_dim):
-                    X_expanded[:, curr] = (X[:, start_idx + i] * X[:, start_idx + j]).astype(dtype)
-                    curr += 1
-                    
-        # 4. Inter-node cross-terms (same dimension)
-        for dim_idx in range(self.latent_dim):
-            for i in range(self.n_super_nodes):
-                for j in range(i + 1, self.n_super_nodes):
-                    idx_i = i * self.latent_dim + dim_idx
-                    idx_j = j * self.latent_dim + dim_idx
-                    X_expanded[:, curr] = (X[:, idx_i] * X[:, idx_j]).astype(dtype)
-                    curr += 1
-                    
+        # Memory Safety: If the number of features is still too large, 
+        # we can perform a quick variance-based pruning here
+        if X_expanded.shape[1] > 1000:
+            variances = np.var(X_expanded, axis=0)
+            top_indices = np.argsort(variances)[-1000:]
+            X_expanded = X_expanded[:, top_indices]
+            
         return X_expanded
 
     def _adaptive_expansion(self, X, fit_transformer):
