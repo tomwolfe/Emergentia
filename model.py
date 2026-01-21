@@ -16,6 +16,8 @@ import torch.nn as nn
 from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import scatter
 from torchdiffeq import odeint, odeint_adjoint
+from stable_pooling import StableHierarchicalPooling
+
 
 class EquivariantGNNLayer(MessagePassing):
     """
@@ -194,7 +196,8 @@ class GNNEncoder(nn.Module):
         self.latent_dim = latent_dim
         
         # Spatially-aware pooling instead of global_mean_pool
-        self.pooling = HierarchicalPooling(hidden_dim, n_super_nodes)
+        # Use the Enhanced StableHierarchicalPooling
+        self.pooling = StableHierarchicalPooling(hidden_dim, n_super_nodes)
         
         self.output_layer = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -202,7 +205,7 @@ class GNNEncoder(nn.Module):
             nn.Linear(hidden_dim, latent_dim)
         )
 
-    def forward(self, x, edge_index, batch, tau=1.0):
+    def forward(self, x, edge_index, batch, tau=1.0, hard=False):
         # Store initial positions for spatial pooling
         pos = x[:, :2] 
         
@@ -210,7 +213,7 @@ class GNNEncoder(nn.Module):
         x = self.ln2(torch.relu(self.gnn2(x, pos, edge_index)))
         
         # Pool to K super-nodes preserving spatial features
-        pooled, s, assign_losses, mu = self.pooling(x, batch, pos=pos, tau=tau) # [batch_size, n_super_nodes, hidden_dim], [N, n_super_nodes], mu: [B, K, 2]
+        pooled, s, assign_losses, mu = self.pooling(x, batch, pos=pos, tau=tau, hard=hard) # [batch_size, n_super_nodes, hidden_dim], [N, n_super_nodes], mu: [B, K, 2]
         latent = self.output_layer(pooled) # [batch_size, n_super_nodes, latent_dim]
         return latent, s, assign_losses, mu
 
@@ -378,8 +381,8 @@ class DiscoveryEngineModel(nn.Module):
         # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning, 8: sep, 9: conn, 10: sparsity
         self.log_vars = nn.Parameter(torch.zeros(11)) 
         
-    def encode(self, x, edge_index, batch, tau=1.0):
-        return self.encoder(x, edge_index, batch, tau=tau)
+    def encode(self, x, edge_index, batch, tau=1.0, hard=False):
+        return self.encoder(x, edge_index, batch, tau=tau, hard=hard)
     
     def decode(self, z, s, batch):
         return self.decoder(z, s, batch)

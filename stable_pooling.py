@@ -121,7 +121,8 @@ class StableHierarchicalPooling(nn.Module):
         avg_s = s.mean(dim=0)
 
         # Update active_mask with exponential moving average for smoother updates
-        if self.training and not hard:
+        # We allow updates during both soft and hard training to maintain consistency
+        if self.training:
             # Moving average update for the mask to avoid rapid flickering
             current_active = (avg_s > self.pruning_threshold).float()
             
@@ -135,7 +136,11 @@ class StableHierarchicalPooling(nn.Module):
             effective_active = torch.clamp(current_active + revival_mask, 0, 1)
 
             # Use a slightly faster EMA for revival (0.05 vs 0.02) if we are below minimum
+            # If we are using hard assignments, we slow down the EMA to filter sampling noise
             ema_rate = 0.02 if self.active_mask.sum() >= self.min_active_super_nodes else 0.05
+            if hard:
+                ema_rate *= 0.5 # Slower updates during hard sampling
+                
             self.active_mask.copy_((1.0 - ema_rate) * self.active_mask + ema_rate * effective_active)
 
             # Ensure minimum number of super-nodes remain active to prevent total collapse

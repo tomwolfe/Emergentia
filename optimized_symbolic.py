@@ -6,7 +6,7 @@ polynomial expansion out of the ODE integration loop.
 import numpy as np
 from scipy.integrate import odeint
 import sympy as sp
-from symbolic import SymbolicDistiller
+from symbolic import SymbolicDistiller, gp_to_sympy
 
 
 class OptimizedSymbolicDynamics:
@@ -38,7 +38,7 @@ class OptimizedSymbolicDynamics:
 
     def _prepare_sympy_gradients(self):
         """Prepare SymPy gradients for the Hamiltonian"""
-        # Convert the gplearn expression to SymPy
+        # Convert the gplearn expression to SymPy using the robust converter
         sympy_expr = self._convert_to_sympy(self.equations[0])
 
         if sympy_expr is not None and sympy_expr != 0:
@@ -55,74 +55,7 @@ class OptimizedSymbolicDynamics:
 
     def _convert_to_sympy(self, gp_program):
         """Convert gplearn symbolic expression to SymPy expression with better robustness."""
-        try:
-            # Get the expression string representation
-            expr_str = str(gp_program)
-            
-            # 1. Pre-process the string for better SymPy compatibility
-            # Handle gplearn's potentially weird naming if it occurs
-            expr_str = expr_str.replace('add(', 'Add(').replace('sub(', 'Sub(').replace('mul(', 'Mul(').replace('div(', 'Div(')
-            
-            # 2. Identify all variables X0, X1, ...
-            import re
-            feat_indices = sorted(list(set([int(m) for m in re.findall(r'X(\d+)', expr_str)])))
-            
-            # Create a mapping for variables
-            var_mapping = {f'X{i}': sp.Symbol(f'x{i}') for i in feat_indices}
-            
-            # 3. Define local functions for gplearn standard and potentially custom functions
-            # SymPy is case-sensitive for some things but sympify can be flexible
-            local_dict = {
-                'add': lambda x, y: x + y,
-                'Add': lambda x, y: x + y,
-                'sub': lambda x, y: x - y,
-                'Sub': lambda x, y: x - y,
-                'mul': lambda x, y: x * y,
-                'Mul': lambda x, y: x * y,
-                'div': lambda x, y: x / (y + 1e-6),
-                'Div': lambda x, y: x / (y + 1e-6),
-                'sqrt': lambda x: sp.sqrt(sp.Abs(x)),
-                'log': lambda x: sp.log(sp.Abs(x) + 1e-6),
-                'abs': sp.Abs,
-                'neg': lambda x: -x,
-                'inv': lambda x: 1.0 / (x + 1e-6),
-                'sin': sp.sin,
-                'cos': sp.cos,
-                'tan': sp.tan,
-                'sig': lambda x: 1 / (1 + sp.exp(-x)),
-                'sigmoid': lambda x: 1 / (1 + sp.exp(-x)),
-                'gauss': lambda x: sp.exp(-x**2),
-                'exp': sp.exp,
-                'pow': lambda x, y: sp.Pow(x, y),
-                'max': lambda x, y: sp.Max(x, y),
-                'min': lambda x, y: sp.Min(x, y),
-            }
-            local_dict.update(var_mapping)
-
-            # 4. Parse the expression string using SymPy
-            # Using evaluate=False can sometimes help with complex nested structures
-            try:
-                sympy_expr = sp.sympify(expr_str, locals=local_dict)
-            except (sp.SympifyError, TypeError, SyntaxError):
-                # Fallback: if it's a prefix notation that sympify didn't like, 
-                # try to clean it up or use evaluate=False
-                sympy_expr = sp.sympify(expr_str, locals=local_dict, evaluate=False)
-            
-            # Simplify to clean up the expression, but with a timeout-like protection
-            # (SymPy's simplify can be slow for massive expressions)
-            if sympy_expr.count_ops() < 200:
-                sympy_expr = sp.simplify(sympy_expr)
-            
-            return sympy_expr
-        except Exception as e:
-            # More detailed fallback for Robustness
-            print(f"SymPy conversion failed: {e}")
-            # Last resort: try to return a constant if we can't parse it
-            try:
-                val = float(str(gp_program))
-                return sp.Float(val)
-            except:
-                return sp.Float(0.0)
+        return gp_to_sympy(str(gp_program))
 
     def _get_cached_transformation(self, z_tuple):
         """

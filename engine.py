@@ -116,7 +116,7 @@ class LossTracker:
 
 class Trainer:
     def __init__(self, model, lr=5e-4, device='cpu', stats=None, align_anneal_epochs=1000, 
-                 warmup_epochs=400, sparsity_scheduler=None):
+                 warmup_epochs=400, sparsity_scheduler=None, hard_assignment_start=0.7):
         self.model = model.to(device)
         self.device = device
         self.loss_tracker = LossTracker()
@@ -125,6 +125,7 @@ class Trainer:
         self.align_anneal_epochs = align_anneal_epochs
         self.warmup_epochs = warmup_epochs
         self.sparsity_scheduler = sparsity_scheduler
+        self.hard_assignment_start = hard_assignment_start # Fraction of training when to start using hard assignments
         
         # MPS fix: torchdiffeq has issues with MPS (float64 defaults and stability)
         if str(device) == 'mps':
@@ -144,33 +145,45 @@ class Trainer:
         self.optimizer.zero_grad()
         seq_len = len(data_list)
         
-        # 1. Smooth Tau schedule: Exponential decay
-        tau = max(0.1, np.exp(-epoch / 500.0))
+        # Progress ratio
+        progress = epoch / max_epochs
         
-        # 2. Decaying Teacher Forcing Ratio
+        # 1. Smooth Tau schedule: Exponential decay
+        tau = max(0.05, np.exp(-epoch / 500.0))
+        
+        # 2. Hard assignment scheduling:
+        # Gradually increase the probability of using 'hard' assignments in Gumbel-Softmax
+        # to bridge the gap between training and inference.
+        hard = False
+        if progress > self.hard_assignment_start:
+            # Probability of hard assignment increases linearly after start threshold
+            hard_prob = (progress - self.hard_assignment_start) / (1.0 - self.hard_assignment_start)
+            hard = np.random.random() < hard_prob
+
+        # 3. Decaying Teacher Forcing Ratio
         tf_ratio = max(0.0, 0.8 * (1.0 - epoch / (0.75 * max_epochs)))
         
-        # 3. Alignment Annealing
+        # 4. Alignment Annealing
         align_weight = max(0.0, 1.0 - epoch / self.align_anneal_epochs)
         
-        # Warmup logic: Before warmup_epochs, we focus on reconstruction and pooling
-        # only. After that, we introduce ODE consistency and alignment.
+        # Warmup logic
         is_warmup = epoch < self.warmup_epochs
 
         batch_0 = Batch.from_data_list([data_list[0]]).to(self.device)
-        z_curr, s_0, losses_0, mu_0 = self.model.encode(batch_0.x, batch_0.edge_index, batch_0.batch, tau=tau)
+        z_curr, s_0, losses_0, mu_0 = self.model.encode(batch_0.x, batch_0.edge_index, batch_0.batch, tau=tau, hard=hard)
         
         if torch.isnan(z_curr).any():
             z_curr = torch.nan_to_num(z_curr)
 
-        loss_rec = 0
-        loss_cons = 0
+        loss_rec = torch.tensor(0.0, device=self.device)
+        loss_cons = torch.tensor(0.0, device=self.device)
         loss_assign = losses_0['entropy'] + losses_0['diversity'] + 0.1 * losses_0['spatial']
         loss_pruning = losses_0['pruning']
         loss_sparsity = losses_0['sparsity']
         loss_sep = losses_0.get('separation', torch.tensor(0.0, device=self.device))
         loss_conn = self.model.get_connectivity_loss(s_0, batch_0.edge_index)
         loss_ortho = self.model.get_ortho_loss(s_0)
+        loss_align = torch.tensor(0.0, device=self.device)
         
         s_prev = s_0
         mu_prev = mu_0
@@ -181,7 +194,7 @@ class Trainer:
             for t in range(1, seq_len):
                 if np.random.random() < tf_ratio:
                     batch_t_prev = Batch.from_data_list([data_list[t-1]]).to(self.device)
-                    z_curr_forced, _, _, _ = self.model.encode(batch_t_prev.x, batch_t_prev.edge_index, batch_t_prev.batch, tau=tau)
+                    z_curr_forced, _, _, _ = self.model.encode(batch_t_prev.x, batch_t_prev.edge_index, batch_t_prev.batch, tau=tau, hard=hard)
                     z_curr = torch.nan_to_num(z_curr_forced)
                 
                 t_span = torch.tensor([0, dt], device=self.device, dtype=torch.float32)
@@ -192,7 +205,7 @@ class Trainer:
             # During warmup, just use encoded states
             for t in range(1, seq_len):
                 batch_t = Batch.from_data_list([data_list[t]]).to(self.device)
-                z_t, _, _, _ = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch, tau=tau)
+                z_t, _, _, _ = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch, tau=tau, hard=hard)
                 z_preds.append(z_t)
             
         z_preds = torch.stack(z_preds)
@@ -203,7 +216,6 @@ class Trainer:
         
         s_stability = 0
         mu_stability = 0
-        loss_align = 0
         
         mu_mean = torch.tensor(self.stats['pos_mean'], device=self.device, dtype=torch.float32) if self.stats else 0
         mu_std = torch.tensor(self.stats['pos_std'], device=self.device, dtype=torch.float32) if self.stats else 1
@@ -212,7 +224,7 @@ class Trainer:
 
         for t in range(seq_len):
             batch_t = Batch.from_data_list([data_list[t]]).to(self.device)
-            z_t_target, s_t, losses_t, mu_t = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch, tau=tau)
+            z_t_target, s_t, losses_t, mu_t = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch, tau=tau, hard=hard)
             
             if torch.isnan(z_t_target).any():
                 z_t_target = torch.nan_to_num(z_t_target)

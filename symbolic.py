@@ -84,6 +84,62 @@ class FeatureTransformer:
     def denormalize_y(self, Y_norm):
         return Y_norm * self.target_std + self.target_mean
 
+def gp_to_sympy(expr_str, n_features=None):
+    """
+    Robustly converts a gplearn expression string to a SymPy expression.
+    Handles prefix notation, custom functions, and variable mapping.
+    """
+    if expr_str is None:
+        return sp.Float(0.0)
+    
+    try:
+        # 1. Identify all variables X0, X1, ...
+        import re
+        feat_indices = sorted(list(set([int(m) for m in re.findall(r'X(\d+)', expr_str)])))
+        if n_features is not None:
+            feat_indices = sorted(list(set(feat_indices + list(range(n_features)))))
+        
+        # Create a mapping for variables
+        var_mapping = {f'X{i}': sp.Symbol(f'x{i}') for i in feat_indices}
+        
+        # 2. Define local functions for gplearn standard and potential custom functions
+        local_dict = {
+            'add': lambda x, y: x + y,
+            'sub': lambda x, y: x - y,
+            'mul': lambda x, y: x * y,
+            'div': lambda x, y: x / (y + 1e-9),
+            'sqrt': lambda x: sp.sqrt(sp.Abs(x)),
+            'log': lambda x: sp.log(sp.Abs(x) + 1e-9),
+            'abs': sp.Abs,
+            'neg': lambda x: -x,
+            'inv': lambda x: 1.0 / (x + 1e-9),
+            'sin': sp.sin,
+            'cos': sp.cos,
+            'tan': sp.tan,
+            'sig': lambda x: 1 / (1 + sp.exp(-x)),
+            'sigmoid': lambda x: 1 / (1 + sp.exp(-x)),
+            'gauss': lambda x: sp.exp(-x**2),
+            'exp': sp.exp,
+        }
+        local_dict.update(var_mapping)
+
+        # 3. Parse using sympify
+        # Handle potential prefix notation by making it case-insensitive if needed
+        # but gplearn is usually lowercase.
+        expr = sp.sympify(expr_str, locals=local_dict)
+        
+        # Simplify if not too complex
+        if expr.count_ops() < 100:
+            expr = sp.simplify(expr)
+            
+        return expr
+    except Exception as e:
+        # Fallback for simple numeric strings
+        try:
+            return sp.Float(float(expr_str))
+        except:
+            return sp.Float(0.0)
+
 class OptimizedExpressionProgram:
     """
     Wrapper for expressions with optimized constants.
@@ -93,30 +149,39 @@ class OptimizedExpressionProgram:
         self.original_program = original_program
         self.length_ = getattr(original_program, 'length_', 1)
         try:
+            import re
             feat_indices = [int(x) for x in re.findall(r'X(\d+)', expr_str)]
             self.max_feat_idx = max(feat_indices) if feat_indices else 0
-            n_features = self.max_feat_idx + 1
-            feat_vars = [sp.Symbol(f'x{i}') for i in range(n_features)]
-            var_mapping = {f'x{i}': var for i, var in enumerate(feat_vars)}
-            sympy_expr_str = expr_str
-            for i in range(n_features):
-                sympy_expr_str = sympy_expr_str.replace(f'X{i}', f'x{i}')
-            self.sympy_expr = sp.sympify(sympy_expr_str, locals=var_mapping)
+            
+            # Use the robust converter
+            self.sympy_expr = gp_to_sympy(expr_str, n_features=self.max_feat_idx + 1)
+            
+            # Identify which variables are actually used
+            all_symbols = sorted(list(self.sympy_expr.free_symbols), key=lambda s: s.name)
+            self.used_feat_indices = [int(s.name[1:]) for s in all_symbols if s.name.startswith('x')]
+            
+            # Lambdify for performance
+            feat_vars = [sp.Symbol(f'x{i}') for i in range(self.max_feat_idx + 1)]
             self.func = sp.lambdify(feat_vars, self.sympy_expr, modules=['numpy'])
-        except:
+        except Exception as e:
+            print(f"Warning: OptimizedExpressionProgram compilation failed: {e}")
             self.func = None
 
     def execute(self, X):
-        try:
-            if self.func is not None:
+        if self.func is not None:
+            try:
                 if X.ndim == 1: X = X.reshape(1, -1)
-                args = [X[:, i] if i < X.shape[1] else np.zeros(X.shape[0]) for i in range(self.max_feat_idx + 1)]
+                # Prepare arguments (only up to what the function expects)
+                args = [X[:, i] if i < X.shape[1] else np.zeros(X.shape[0]) 
+                        for i in range(self.max_feat_idx + 1)]
                 result = self.func(*args)
-                if np.isscalar(result): return np.full(X.shape[0], result)
-                return np.asarray(result).flatten() if result.ndim > 1 else np.asarray(result)
-            return self.original_program.execute(X)
-        except:
-            return self.original_program.execute(X)
+                
+                if np.isscalar(result):
+                    return np.full(X.shape[0], result)
+                return np.asarray(result).flatten()
+            except:
+                return self.original_program.execute(X)
+        return self.original_program.execute(X)
 
     def __str__(self):
         return self.expr_str

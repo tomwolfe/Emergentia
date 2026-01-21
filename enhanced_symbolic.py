@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from gplearn.genetic import SymbolicRegressor
 from gplearn.functions import make_function
-from symbolic import SymbolicDistiller, FeatureTransformer
+from symbolic import SymbolicDistiller, FeatureTransformer, gp_to_sympy
 from balanced_features import BalancedFeatureTransformer
 from hamiltonian_symbolic import HamiltonianSymbolicDistiller
 import sympy as sp
@@ -302,57 +302,24 @@ class OptimizedExpressionWrapper:
         self._lambda_func = None
         self._feat_indices = None
         
-        # Parse the expression to create a numerical evaluator
+        # Parse the expression to create a numerical evaluator using robust gp_to_sympy
         try:
             import re
             # Extract feature indices from the expression (e.g., X0, X1, ...)
             matches = re.findall(r'X(\d+)', expr_str)
             self._feat_indices = sorted(list(set([int(m) for m in matches])))
             
-            # Create a SymPy-compatible expression
-            # Replace X0 with x0, X1 with x1, etc. for SymPy
-            sympy_compatible_expr = expr_str
-            for idx in self._feat_indices:
-                # Use word boundaries to avoid replacing X10 with x10 when we want to replace X1
-                sympy_compatible_expr = re.sub(rf'\bX{idx}\b', f'x{idx}', sympy_compatible_expr)
-            
-            # Map gplearn functions to SymPy functions
-            # gplearn uses 'add', 'sub', 'mul', 'div', 'sqrt', 'log', 'abs', 'neg', 'inv', 'sin', 'cos', 'tan'
-            func_map = {
-                'add': '(', 'sub': '(', 'mul': '(', 'div': '(',
-                # This is tricky because gplearn uses prefix notation in str(program)
-                # But wait, str(program) for gplearn is actually infix-ish or at least readable
-            }
-            
-            # Actually gplearn's str(program) is already mostly SymPy compatible for standard ops
-            # but it uses some names like 'add(X0, X1)'. 
-            # Let's use SymPy's sympify with a custom local_dict
-            
-            feat_vars = {f'x{idx}': sp.Symbol(f'x{idx}') for idx in self._feat_indices}
-            
-            # Common gplearn functions mapping to sympy
-            local_dict = {
-                'add': lambda x, y: x + y,
-                'sub': lambda x, y: x - y,
-                'mul': lambda x, y: x * y,
-                'div': lambda x, y: x / y,
-                'sqrt': sp.sqrt,
-                'log': sp.log,
-                'abs': sp.Abs,
-                'neg': lambda x: -x,
-                'inv': lambda x: 1.0 / x,
-                'sin': sp.sin,
-                'cos': sp.cos,
-                'tan': sp.tan,
-            }
-            local_dict.update(feat_vars)
-            
-            sympy_expr = sp.sympify(sympy_compatible_expr, locals=local_dict)
+            # Use robust converter
+            sympy_expr = gp_to_sympy(expr_str)
             
             # Lambdify for performance
-            # Ensure we use the correct arguments in order
-            arg_names = [f'x{idx}' for idx in self._feat_indices]
-            self._lambda_func = sp.lambdify([feat_vars[name] for name in arg_names], sympy_expr, modules=['numpy'])
+            # Identify which variables are actually used in the expression (e.g. x0, x1...)
+            all_symbols = sorted(list(sympy_expr.free_symbols), key=lambda s: s.name)
+            
+            # We must lambdify with all features if we want to pass them by index
+            max_idx = max(self._feat_indices) if self._feat_indices else 0
+            feat_vars = [sp.Symbol(f'x{i}') for i in range(max_idx + 1)]
+            self._lambda_func = sp.lambdify(feat_vars, sympy_expr, modules=['numpy'])
             
         except Exception as e:
             print(f"Warning: Could not compile optimized expression '{expr_str}': {e}")
@@ -364,8 +331,12 @@ class OptimizedExpressionWrapper:
         """
         if self._lambda_func is not None:
             try:
-                # Extract only the needed features
-                args = [X[:, idx] for idx in self._feat_indices]
+                if X.ndim == 1: X = X.reshape(1, -1)
+                # Prepare arguments for lambdified function
+                # If we have X with 10 features but the expression only uses X0 and X1, 
+                # we still need to provide up to the max index used.
+                max_used_idx = len(self._lambda_func.__code__.co_varnames)
+                args = [X[:, i] for i in range(max_used_idx)]
                 return self._lambda_func(*args)
             except Exception as e:
                 # Fallback to original program if execution fails
