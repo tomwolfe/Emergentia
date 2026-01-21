@@ -184,7 +184,8 @@ class SymbolicProxy(torch.nn.Module):
 class Trainer:
     def __init__(self, model, lr=5e-4, device='cpu', stats=None, align_anneal_epochs=1000,
                  warmup_epochs=400, sparsity_scheduler=None, hard_assignment_start=0.7,
-                 skip_consistency_freq=2, enable_gradient_accumulation=False, grad_acc_steps=1):
+                 skip_consistency_freq=2, enable_gradient_accumulation=False, grad_acc_steps=1,
+                 enhanced_balancer=None):
         self.model = model.to(device)
         self.device = device
         self.loss_tracker = LossTracker()
@@ -197,6 +198,7 @@ class Trainer:
         self.skip_consistency_freq = skip_consistency_freq  # Skip consistency loss every N epochs
         self.enable_gradient_accumulation = enable_gradient_accumulation
         self.grad_acc_steps = grad_acc_steps
+        self.enhanced_balancer = enhanced_balancer
 
         # Symbolic-in-the-loop
         self.symbolic_proxy = None
@@ -212,14 +214,17 @@ class Trainer:
         self.criterion = torch.nn.MSELoss().to(device)
         self.stats = stats
 
-    def update_symbolic_proxy(self, equations, transformer, weight=0.1, confidence=0.0):
+    def update_symbolic_proxy(self, symbolic_proxy_or_equations, transformer=None, weight=0.1, confidence=0.0):
         """Update the symbolic proxy model with new discovered equations."""
-        self.symbolic_proxy = SymbolicProxy(
-            self.model.encoder.n_super_nodes, 
-            self.model.encoder.latent_dim, 
-            equations, 
-            transformer
-        )
+        if hasattr(symbolic_proxy_or_equations, 'forward'):  # It's already a proxy module
+            self.symbolic_proxy = symbolic_proxy_or_equations
+        else:  # It's a list of equations
+            self.symbolic_proxy = SymbolicProxy(
+                self.model.encoder.n_super_nodes,
+                self.model.encoder.latent_dim,
+                symbolic_proxy_or_equations,
+                transformer
+            )
         self.symbolic_weight = weight
         self.symbolic_confidence = confidence
         print(f"Symbolic proxy updated. Weight: {weight}, Confidence: {confidence:.3f}")
@@ -412,7 +417,7 @@ class Trainer:
         # Increasing min from -1.0 to -0.5 to prevent weights from exploding too much
         lvars = torch.clamp(self.model.log_vars, min=-0.5, max=5.0)
 
-        weights = {
+        raw_weights = {
             'rec': torch.exp(-lvars[0]), 'cons': torch.exp(-lvars[1]),
             'assign': torch.exp(-lvars[2]), 'ortho': torch.exp(-lvars[3]),
             'l2': torch.exp(-lvars[4]), 'lvr': torch.exp(-lvars[5]),
@@ -421,6 +426,37 @@ class Trainer:
             'sparsity': torch.exp(-lvars[10]), 'mi': torch.exp(-lvars[11]),
             'sym': torch.exp(-lvars[12])
         }
+
+        # NEW: Use enhanced loss balancer if available
+        if self.enhanced_balancer is not None:
+            # Prepare raw losses for the balancer
+            raw_losses = {
+                'rec': loss_rec, 'cons': loss_cons,
+                'assign': loss_assign, 'ortho': loss_ortho,
+                'l2': loss_l2, 'lvr': loss_lvr,
+                'align': loss_align, 'pruning': loss_pruning,
+                'sep': loss_sep, 'conn': loss_conn,
+                'sparsity': loss_sparsity, 'mi': loss_mi,
+                'sym': loss_sym
+            }
+
+            # Update weights using enhanced balancer
+            if hasattr(self.enhanced_balancer, 'get_balanced_losses'):
+                # Pass model parameters for gradient-based balancing
+                balanced_losses = self.enhanced_balancer.get_balanced_losses(
+                    raw_losses, self.model.parameters()
+                )
+
+                # Extract updated weights from balanced losses
+                for key in raw_weights:
+                    if key in balanced_losses:
+                        # Calculate new weight as balanced_loss / raw_loss
+                        if raw_losses[key].item() != 0:
+                            raw_weights[key] = balanced_losses[key] / raw_losses[key]
+                        else:
+                            raw_weights[key] = raw_weights[key]  # Keep original weight
+
+        weights = raw_weights
 
         discovery_loss = (weights['rec'] * loss_rec + lvars[0]) + \
                          (weights['assign'] * loss_assign + lvars[2]) + \
