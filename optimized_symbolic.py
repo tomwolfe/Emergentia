@@ -325,33 +325,31 @@ class CachedFeatureTransformer:
         Actual computation of the transformation (without caching).
         """
         # z_flat: [Batch, n_super_nodes * latent_dim]
-        z_nodes = z_flat.reshape(-1, self.n_super_nodes, self.latent_dim)
+        batch_size = z_flat.shape[0]
+        z_nodes = z_flat.reshape(batch_size, self.n_super_nodes, self.latent_dim)
 
         features = [z_flat]
         if self.include_dists:
-            dists = []
-            inv_dists = []
-            inv_sq_dists = []
-
-            for i in range(self.n_super_nodes):
-                for j in range(i + 1, self.n_super_nodes):
-                    # Relative distance between super-nodes (using first 2 dims as positions)
-                    # This assumes the align_loss worked and z[:, :2] is CoM
-                    diff = z_nodes[:, i, :2] - z_nodes[:, j, :2]
-
-                    # Apply Minimum Image Convention for PBC if box_size is provided
-                    if self.box_size is not None:
-                        for dim_idx in range(2):  # Assuming 2D for position coordinates
-                            diff[:, dim_idx] -= self.box_size[dim_idx] * np.round(diff[:, dim_idx] / self.box_size[dim_idx])
-
-                    d = np.linalg.norm(diff, axis=1, keepdims=True)
-                    dists.append(d)
-                    # Physics-informed features: inverse laws
-                    inv_dists.append(1.0 / (d + 0.1))
-                    inv_sq_dists.append(1.0 / (d**2 + 0.1))
-
-            if dists:
-                features.extend([np.hstack(dists), np.hstack(inv_dists), np.hstack(inv_sq_dists)])
+            # Vectorized distance calculation
+            pos = z_nodes[:, :, :2] # [Batch, K, 2]
+            # Expansion to [Batch, K, K, 2]
+            diffs = pos[:, :, None, :] - pos[:, None, :, :]
+            
+            if self.box_size is not None:
+                box = np.array(self.box_size)
+                diffs = diffs - box * np.round(diffs / box)
+            
+            # Compute norms [Batch, K, K]
+            dists_matrix = np.linalg.norm(diffs, axis=-1)
+            
+            # Extract upper triangle indices (i < j)
+            i_idx, j_idx = np.triu_indices(self.n_super_nodes, k=1)
+            
+            dists_flat = dists_matrix[:, i_idx, j_idx] # [Batch, K*(K-1)/2]
+            inv_dists_flat = 1.0 / (dists_flat + 0.1)
+            inv_sq_dists_flat = 1.0 / (dists_flat**2 + 0.1)
+            
+            features.extend([dists_flat, inv_dists_flat, inv_sq_dists_flat])
 
         X = np.hstack(features)
 

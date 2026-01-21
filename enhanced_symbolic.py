@@ -20,7 +20,7 @@ warnings.filterwarnings('ignore')
 class SymPyToTorch(torch.nn.Module):
     """
     A lightweight, robust converter from SymPy expressions to PyTorch modules.
-    Handles standard gplearn and physics-informed functions.
+    Handles standard gplearn and physics-informed functions with focus on differentiability.
     """
     def __init__(self, sympy_expr, n_inputs):
         super().__init__()
@@ -30,29 +30,62 @@ class SymPyToTorch(torch.nn.Module):
         self.expr = sympy_expr
         
         # Mapping SymPy ops to Torch ops
+        # We use epsilons for stability and to prevent NaN gradients near singularities
+        self.eps = 1e-8
         self.op_map = {
             sp.Add: torch.add,
             sp.Mul: torch.mul,
-            sp.Pow: torch.pow,
+            sp.Pow: self._safe_pow,
             sp.exp: torch.exp,
-            sp.log: lambda x: torch.log(torch.abs(x) + 1e-9),
+            sp.log: lambda x: torch.log(torch.abs(x) + self.eps),
             sp.sin: torch.sin,
             sp.cos: torch.cos,
+            sp.tan: torch.tan,
             sp.Abs: torch.abs,
-            sp.sqrt: lambda x: torch.sqrt(torch.abs(x) + 1e-9),
+            sp.sqrt: lambda x: torch.sqrt(torch.abs(x) + self.eps),
         }
+
+    def _safe_pow(self, x, y):
+        # Handle division (y < 0) and square roots (y = 0.5) safely
+        # Convert y to float if it's a SymPy object
+        try:
+            y_val = float(y)
+            if abs(y_val - (-1.0)) < 1e-9:
+                return 1.0 / (x + torch.sign(x) * self.eps + (x == 0).float() * self.eps)
+            if abs(y_val - 0.5) < 1e-9:
+                return torch.sqrt(torch.abs(x) + self.eps)
+            if y_val < 0:
+                # Safe division for any negative power
+                return 1.0 / (torch.pow(torch.abs(x), abs(y_val)) + self.eps)
+        except:
+            pass
+        return torch.pow(x, y)
 
     def forward(self, x_inputs):
         """
         x_inputs: [Batch, n_inputs] tensor
         """
-        return self._recursive_eval(self.expr, x_inputs)
+        try:
+            res = self._recursive_eval(self.expr, x_inputs)
+            # Global clamp for stability
+            return torch.clamp(res, -1e6, 1e6)
+        except Exception:
+            # Fallback for unexpected SymPy structures
+            l_func = sp.lambdify(self.symbols, self.expr, modules='torch')
+            args = [x_inputs[:, i] for i in range(self.n_inputs)]
+            return torch.clamp(l_func(*args), -1e6, 1e6)
 
     def _recursive_eval(self, node, x_inputs):
         if node.is_Symbol:
             # Extract index from 'xi'
-            idx = int(node.name[1:])
-            return x_inputs[:, idx]
+            try:
+                idx = int(node.name[1:])
+                if idx < self.n_inputs:
+                    return x_inputs[:, idx]
+                return torch.zeros(x_inputs.size(0), device=x_inputs.device)
+            except:
+                return torch.zeros(x_inputs.size(0), device=x_inputs.device)
+        
         if node.is_Number:
             return torch.tensor(float(node), device=x_inputs.device, dtype=x_inputs.dtype)
         
@@ -67,6 +100,12 @@ class SymPyToTorch(torch.nn.Module):
             for i in range(1, len(args)):
                 res = self.op_map[op](res, args[i])
             return res
+        
+        # Special case for gplearn-style functions if they appear as SymPy functions
+        if hasattr(op, '__name__'):
+            name = op.__name__.lower()
+            if name == 'sig' or name == 'sigmoid':
+                return torch.sigmoid(self._recursive_eval(node.args[0], x_inputs))
         
         # Fallback for complex ops or unknown ones
         # Use lambdify with torch as last resort
@@ -99,26 +138,26 @@ class TorchFeatureTransformer(torch.nn.Module):
         features = [z_flat]
         
         if self.include_dists:
-            dists = []
-            inv_dists = []
-            inv_sq_dists = []
-
-            for i in range(self.n_super_nodes):
-                for j in range(i + 1, self.n_super_nodes):
-                    diff = z_nodes[:, i, :2] - z_nodes[:, j, :2]
-                    if self.box_size is not None:
-                        box = torch.tensor(self.box_size, device=z_flat.device, dtype=z_flat.dtype)
-                        diff = diff - box * torch.round(diff / box)
-
-                    d = torch.norm(diff, dim=1, keepdim=True)
-                    dists.append(d)
-                    inv_dists.append(1.0 / (d + 0.1))
-                    inv_sq_dists.append(1.0 / (d**2 + 0.1))
-
-            if dists:
-                features.extend([torch.cat(dists, dim=1), 
-                                torch.cat(inv_dists, dim=1), 
-                                torch.cat(inv_sq_dists, dim=1)])
+            # Vectorized distance calculation
+            pos = z_nodes[:, :, :2] # [Batch, K, 2]
+            # Expansion to [Batch, K, K, 2]
+            diffs = pos[:, :, None, :] - pos[:, None, :, :]
+            
+            if self.box_size is not None:
+                box = torch.tensor(self.box_size, device=z_flat.device, dtype=z_flat.dtype)
+                diffs = diffs - box * torch.round(diffs / box)
+            
+            # Compute norms [Batch, K, K]
+            dists_matrix = torch.norm(diffs, dim=-1)
+            
+            # Extract upper triangle indices (i < j)
+            i_idx, j_idx = torch.triu_indices(self.n_super_nodes, self.n_super_nodes, offset=1, device=z_flat.device)
+            
+            dists_flat = dists_matrix[:, i_idx, j_idx] # [Batch, K*(K-1)/2]
+            inv_dists_flat = 1.0 / (dists_flat + 0.1)
+            inv_sq_dists_flat = 1.0 / (dists_flat**2 + 0.1)
+            
+            features.extend([dists_flat, inv_dists_flat, inv_sq_dists_flat])
 
         X = torch.cat(features, dim=1)
         poly_features = [X]

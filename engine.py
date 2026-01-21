@@ -130,12 +130,18 @@ class SymbolicProxy(torch.nn.Module):
         
         # 2. Initialize differentiable symbolic modules
         self.sym_modules = torch.nn.ModuleList()
+        from symbolic import gp_to_sympy
+        
+        n_inputs = self.torch_transformer.x_poly_mean.size(0)
+        
         for eq in equations:
             if eq is not None:
-                # Convert equation to SymPy and then to Torch
-                from symbolic import gp_to_sympy
-                sympy_expr = gp_to_sympy(str(eq))
-                n_inputs = self.torch_transformer.x_poly_mean.size(0)
+                # Check if it's already a wrapped program with a sympy expression
+                if hasattr(eq, 'sympy_expr'):
+                    sympy_expr = eq.sympy_expr
+                else:
+                    sympy_expr = gp_to_sympy(str(eq))
+                
                 self.sym_modules.append(SymPyToTorch(sympy_expr, n_inputs))
             else:
                 self.sym_modules.append(None)

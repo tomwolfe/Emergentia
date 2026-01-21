@@ -36,28 +36,31 @@ class FeatureTransformer:
         self.target_std = targets.std(axis=0) + 1e-6
 
     def transform(self, z_flat):
-        z_nodes = z_flat.reshape(-1, self.n_super_nodes, self.latent_dim)
+        batch_size = z_flat.shape[0]
+        z_nodes = z_flat.reshape(batch_size, self.n_super_nodes, self.latent_dim)
         features = [z_flat]
         
         if self.include_dists:
-            dists = []
-            inv_dists = []
-            inv_sq_dists = []
-
-            for i in range(self.n_super_nodes):
-                for j in range(i + 1, self.n_super_nodes):
-                    diff = z_nodes[:, i, :2] - z_nodes[:, j, :2]
-                    if self.box_size is not None:
-                        for dim_idx in range(2):
-                            diff[:, dim_idx] -= self.box_size[dim_idx] * np.round(diff[:, dim_idx] / self.box_size[dim_idx])
-
-                    d = np.linalg.norm(diff, axis=1, keepdims=True)
-                    dists.append(d)
-                    inv_dists.append(1.0 / (d + 0.1))
-                    inv_sq_dists.append(1.0 / (d**2 + 0.1))
-
-            if dists:
-                features.extend([np.hstack(dists), np.hstack(inv_dists), np.hstack(inv_sq_dists)])
+            # Vectorized distance calculation
+            pos = z_nodes[:, :, :2] # [Batch, K, 2]
+            # Expansion to [Batch, K, K, 2]
+            diffs = pos[:, :, None, :] - pos[:, None, :, :]
+            
+            if self.box_size is not None:
+                box = np.array(self.box_size)
+                diffs = diffs - box * np.round(diffs / box)
+            
+            # Compute norms [Batch, K, K]
+            dists_matrix = np.linalg.norm(diffs, axis=-1)
+            
+            # Extract upper triangle indices (i < j)
+            i_idx, j_idx = np.triu_indices(self.n_super_nodes, k=1)
+            
+            dists_flat = dists_matrix[:, i_idx, j_idx] # [Batch, K*(K-1)/2]
+            inv_dists_flat = 1.0 / (dists_flat + 0.1)
+            inv_sq_dists_flat = 1.0 / (dists_flat**2 + 0.1)
+            
+            features.extend([dists_flat, inv_dists_flat, inv_sq_dists_flat])
 
         X = np.hstack(features)
         poly_features = [X]
@@ -165,23 +168,30 @@ class FeatureTransformer:
 def gp_to_sympy(expr_str, n_features=None):
     """
     Robustly converts a gplearn expression string to a SymPy expression.
-    Handles prefix notation, custom functions, and variable mapping.
+    Handles prefix notation, custom functions, and variable mapping without brittle regex.
     """
     if expr_str is None:
         return sp.Float(0.0)
     
+    # If it's already a SymPy expression, return it
+    if isinstance(expr_str, sp.Expr):
+        return expr_str
+
     try:
-        # 1. Identify all variables X0, X1, ...
-        import re
-        feat_indices = sorted(list(set([int(m) for m in re.findall(r'X(\d+)', expr_str)])))
-        if n_features is not None:
-            feat_indices = sorted(list(set(feat_indices + list(range(n_features)))))
-        
-        # Create a mapping for variables
-        var_mapping = {f'X{i}': sp.Symbol(f'x{i}') for i in feat_indices}
-        
-        # 2. Define local functions for gplearn standard and potential custom functions
-        local_dict = {
+        # Define local functions for gplearn standard and potential custom functions
+        # Use a lambda that handles the 'X' variables dynamically
+        class VariableMapper(dict):
+            def __getitem__(self, key):
+                if key.startswith('X') and key[1:].isdigit():
+                    return sp.Symbol(f'x{key[1:]}')
+                return super().__getitem__(key)
+            
+            def __contains__(self, key):
+                if key.startswith('X') and key[1:].isdigit():
+                    return True
+                return super().__contains__(key)
+
+        local_dict = VariableMapper({
             'add': lambda x, y: x + y,
             'sub': lambda x, y: x - y,
             'mul': lambda x, y: x * y,
@@ -198,16 +208,14 @@ def gp_to_sympy(expr_str, n_features=None):
             'sigmoid': lambda x: 1 / (1 + sp.exp(-x)),
             'gauss': lambda x: sp.exp(-x**2),
             'exp': sp.exp,
-        }
-        local_dict.update(var_mapping)
+        })
 
         # 3. Parse using sympify
-        # Handle potential prefix notation by making it case-insensitive if needed
-        # but gplearn is usually lowercase.
+        # We use evaluate=False to avoid premature simplification that might hide variables
         expr = sp.sympify(expr_str, locals=local_dict)
         
         # Simplify if not too complex
-        if expr.count_ops() < 100:
+        if expr.count_ops() < 200:
             expr = sp.simplify(expr)
             
         return expr
