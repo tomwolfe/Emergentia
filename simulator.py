@@ -205,12 +205,18 @@ class LennardJonesSimulator(SpringMassSimulator):
     Simulates particles interacting via the Lennard-Jones potential:
     V(r) = 4*epsilon * [(sigma/r)^12 - (sigma/r)^6]
     """
-    def __init__(self, n_particles=64, epsilon=1.0, sigma=1.0, m=1.0, dt=0.002, dynamic_radius=None, box_size=None):
+    def __init__(self, n_particles=64, epsilon=1.0, sigma=1.0, m=1.0, dt=0.002, dynamic_radius=None, box_size=None, sub_steps=5):
         # LJ needs smaller dt for stability due to 1/r^12 term
         super().__init__(n_particles=n_particles, m=m, dt=dt, spring_dist=sigma, dynamic_radius=dynamic_radius, box_size=box_size)
         self.epsilon = epsilon
         self.sigma = sigma
         self.radius = 2.5 * sigma if not dynamic_radius else dynamic_radius
+        self.sub_steps = sub_steps
+
+    def step(self, sub_steps=None):
+        if sub_steps is None:
+            sub_steps = self.sub_steps
+        return super().step(sub_steps=sub_steps)
 
     def compute_forces(self, pos):
         forces = np.zeros_like(pos)
@@ -243,7 +249,7 @@ class LennardJonesSimulator(SpringMassSimulator):
         force_vec = f_mag * diff
 
         # Stability clamping - reduced max force for better stability
-        max_f = 500.0  # Reduced max force for better stability
+        max_f = 100.0  # Reduced max force for better stability
         force_vec = np.clip(force_vec, -max_f, max_f)
 
         np.add.at(forces, idx1, -force_vec)

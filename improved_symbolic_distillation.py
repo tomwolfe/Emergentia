@@ -176,10 +176,16 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
         Create an improved symbolic regressor with better function sets and parameters.
         """
         from gplearn.genetic import SymbolicRegressor
+        from gplearn.functions import make_function
 
-        # NEW: Standard gplearn function set
-        function_set = ('add', 'sub', 'mul', 'div', 'sqrt', 'log', 'abs', 'neg', 'inv', 
-                        'sin', 'cos', 'tan')
+        # Define square function for gplearn
+        def _square(x):
+            return x**2
+        square = make_function(function=_square, name='square', arity=1)
+
+        # Restricted function set: removed tan, sin, cos; added square
+        # Hamiltonians in latent space are rarely periodic.
+        function_set = ('add', 'sub', 'mul', 'div', 'sqrt', 'log', 'abs', 'neg', 'inv', square)
 
         est = SymbolicRegressor(
             population_size=population_size,
@@ -275,62 +281,57 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
     def _sindy_select(self, X, y, threshold=0.005, max_iter=15):  # Reduced default threshold to be less aggressive
         """
         Enhanced Sequential Thresholded Least Squares (STLSQ) for SINDy-style pruning.
+        With adaptive threshold fallback to prevent over-pruning.
         """
-        from sklearn.linear_model import Ridge, ElasticNet
+        from sklearn.linear_model import ElasticNet
         n_features = X.shape[1]
-        mask = np.ones(n_features, dtype=bool)
+        
+        curr_threshold = threshold
+        best_mask = np.ones(n_features, dtype=bool)
+        
+        # Adaptive loop: if we prune too much, try again with smaller threshold
+        for attempt in range(5): # Up to 5 attempts with decreasing threshold
+            mask = np.ones(n_features, dtype=bool)
+            y_var = np.var(y)
+            adaptive_base_threshold = max(curr_threshold, 0.0001 * np.sqrt(y_var))
 
-        # NEW: Make threshold adaptive based on target variance to prevent over-pruning
-        y_var = np.var(y)
-        adaptive_base_threshold = max(threshold, 0.0001 * np.sqrt(y_var))  # Base threshold adapts to target scale, reduced to be less aggressive
+            for iteration in range(max_iter):
+                if not np.any(mask):
+                    break
 
-        for iteration in range(max_iter):
-            if not np.any(mask):
+                model = ElasticNet(alpha=1e-5, l1_ratio=0.9, max_iter=1000)
+                X_active = X[:, mask]
+
+                if X_active.shape[1] == 0:
+                    break
+
+                model.fit(X_active, y)
+
+                new_mask = np.zeros(n_features, dtype=bool)
+                active_coeffs = np.abs(model.coef_)
+
+                if len(active_coeffs) > 0:
+                    percentile_threshold = np.percentile(active_coeffs, 40)
+                    adaptive_threshold = max(adaptive_base_threshold, percentile_threshold)
+                    new_mask[mask] = active_coeffs > adaptive_threshold
+                else:
+                    new_mask[mask] = True
+
+                if np.array_equal(mask, new_mask):
+                    break
+                mask = new_mask
+            
+            # Check if we have enough features
+            num_selected = np.sum(mask)
+            if num_selected >= 5 or (attempt > 0 and num_selected >= 2):
+                best_mask = mask
                 break
-
-            # NEW: Use ElasticNet instead of Ridge for better sparsity
-            model = ElasticNet(alpha=1e-5, l1_ratio=0.9, max_iter=1000)
-            X_active = X[:, mask]
-
-            if X_active.shape[1] == 0:
-                break
-
-            model.fit(X_active, y)
-
-            # Update mask: threshold coefficients
-            new_mask = np.zeros(n_features, dtype=bool)
-            active_coeffs = np.abs(model.coef_)
-
-            # NEW: Adaptive thresholding based on coefficient distribution and target variance
-            if len(active_coeffs) > 0:
-                # Use both percentile and variance-adaptive thresholds
-                percentile_threshold = np.percentile(active_coeffs, 40)  # Keep more features (top 60%)
-                adaptive_threshold = max(adaptive_base_threshold, percentile_threshold)
-                new_mask[mask] = active_coeffs > adaptive_threshold
-                
-                # FALLBACK: If we pruned everything, keep at least the top 3 features
-                if not np.any(new_mask) and len(active_coeffs) > 0:
-                    top_k = min(3, len(active_coeffs))
-                    top_indices = np.argsort(active_coeffs)[-top_k:]
-                    temp_mask = np.zeros_like(active_coeffs, dtype=bool)
-                    temp_mask[top_indices] = True
-                    new_mask[mask] = temp_mask
-            else:
-                new_mask[mask] = True
-
-            if np.array_equal(mask, new_mask):
-                break
-            mask = new_mask
-
-        # FINAL FALLBACK: If mask is still empty, pick top 3 by correlation with y
-        if not np.any(mask):
-            corrs = np.array([np.abs(np.corrcoef(X[:, i], y)[0, 1]) for i in range(n_features)])
-            corrs = np.nan_to_num(corrs)
-            top_k = min(3, n_features)
-            top_indices = np.argsort(corrs)[-top_k:]
-            mask[top_indices] = True
-
-        return mask
+            
+            # If not enough features, reduce threshold and try again
+            curr_threshold *= 0.5
+            best_mask = mask # Keep the best so far just in case
+            
+        return best_mask
 
     def _validate_physics_consistency(self, program, X_sample):
         """
@@ -354,11 +355,32 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
         except:
             return False
 
-    def _distill_single_target(self, i, X_norm, Y_norm, targets_shape_1, latent_states_shape_1):
+    def get_complexity(self, program):
+        """
+        Custom complexity measure with higher penalty for transcendental functions.
+        """
+        expr_str = str(program)
+        # Base complexity is the number of nodes (length)
+        base_complexity = getattr(program, 'length_', len(expr_str.split('(')))
+        
+        # Additional penalty for transcendental functions (Parsimony Boost)
+        # Polynomial terms are preferred for Hamiltonians
+        transcendental_penalty = 0.0
+        transcendental_penalty += expr_str.count('log') * 3.0
+        transcendental_penalty += expr_str.count('sqrt') * 2.0
+        transcendental_penalty += expr_str.count('abs') * 1.0
+        transcendental_penalty += expr_str.count('inv') * 1.0
+        
+        return base_complexity + transcendental_penalty
+
+    def _distill_single_target(self, i, X_norm, Y_norm, targets_shape_1, latent_states_shape_1, is_hamiltonian=False):
         """
         Improved single target distillation with enhanced validation and selection.
         """
         print(f"Selecting features for target_{i} (Input dim: {X_norm.shape[1]})...")
+        
+        # Increase parsimony if we are distilling a Hamiltonian
+        parsimony_multiplier = 10.0 if is_hamiltonian else 1.0
 
         # NEW: Advanced variance-based filtering
         variances = np.var(X_norm, axis=0)
@@ -598,7 +620,7 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
                     print(f"  -> Target_{i}: Linear fit too complex ({prog.length_} terms). Falling back to GP.")
 
         # NEW: Enhanced GP search with better parameters
-        parsimony_levels = [0.0001, 0.001, 0.01]  # More granular levels
+        parsimony_levels = [0.0001 * parsimony_multiplier, 0.001 * parsimony_multiplier, 0.01 * parsimony_multiplier]
         complexity_factor = max(1.0, 3.0 * (1.0 - best_linear_score))  # Increased factor
         scaled_pop = int(self.max_pop * complexity_factor)
         scaled_pop = min(scaled_pop, 8000)  # Increased max population
@@ -842,7 +864,7 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
         is_hamiltonian_distill = (targets.shape[1] == 1)
 
         for i in range(targets.shape[1]):
-            eq, mask, conf = self._distill_single_target(i, X_norm, Y_norm, targets.shape[1], latent_states.shape[1])
+            eq, mask, conf = self._distill_single_target(i, X_norm, Y_norm, targets.shape[1], latent_states.shape[1], is_hamiltonian=is_hamiltonian_distill)
             
             # PHYSICALITY VALIDATION for Hamiltonian
             if is_hamiltonian_distill and eq is not None:

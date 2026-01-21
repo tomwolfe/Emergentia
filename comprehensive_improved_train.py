@@ -88,12 +88,12 @@ def compute_energy_conservation_during_training(model, dataset, sim, device):
                 recon = model.decode(z, s, batch)
 
                 # Convert back to physical coordinates for energy calculation
-                recon_pos = recon[:, :2].cpu().numpy()
-                recon_vel = recon[:, 2:].cpu().numpy()
+                recon_pos = recon[:, :2].to(torch.float64).cpu().numpy()
+                recon_vel = recon[:, 2:].to(torch.float64).cpu().numpy()
 
                 # Calculate energy of reconstructed state using robust energy
                 recon_energy = robust_energy(sim, recon_pos, recon_vel)
-                true_energy = robust_energy(sim, batch_data.x[:, :2].cpu().numpy(), batch_data.x[:, 2:].cpu().numpy())
+                true_energy = robust_energy(sim, batch_data.x[:, :2].to(torch.float64).cpu().numpy(), batch_data.x[:, 2:].to(torch.float64).cpu().numpy())
 
                 # Safely compute energy error to avoid division by zero
                 # Use log1p to compress the range without losing the gradient signal
@@ -208,7 +208,7 @@ def main():
     from simulator import LennardJonesSimulator
     # Use smaller dt for better simulation accuracy
     sim = LennardJonesSimulator(n_particles=n_particles, epsilon=1.0, sigma=1.0,
-                                dynamic_radius=dynamic_radius, box_size=box_size, dt=0.005)  # Smaller dt
+                                dynamic_radius=dynamic_radius, box_size=box_size, dt=0.001, sub_steps=5)  # Smaller dt and more sub-steps
     pos, vel = sim.generate_trajectory(steps=steps)
     
     # Track energy conservation throughout the trajectory
@@ -353,11 +353,10 @@ def main():
         print(f"WARNING: Model may not have converged fully (Rec Loss: {rec:.6f}).")
         # If the reconstruction loss is still high, try a few more training epochs with a lower learning rate
         if rec > 0.3:
-            print("Attempting additional training with reduced learning rate...")
-            # Reduce learning rate and continue training
-            original_lr = trainer.optimizer.param_groups[0]['lr']
-            for param_group in trainer.optimizer.param_groups:
-                param_group['lr'] *= 0.1
+            print("Attempting additional training with reduced learning rate and optimizer reset...")
+            # Reduce learning rate and re-initialize optimizer to clear momentum buffers
+            new_lr = trainer.optimizer.param_groups[0]['lr'] * 0.1
+            trainer.optimizer = torch.optim.Adam(model.parameters(), lr=new_lr, weight_decay=1e-5)
 
             # Train for additional epochs
             additional_epochs = 50  # Reduced additional epochs to prevent overfitting
@@ -372,10 +371,6 @@ def main():
                 if rec < 0.2:  # Break if we achieve reasonable reconstruction
                     print(f"Additional training achieved rec loss of {rec:.6f}, stopping.")
                     break
-
-            # Restore original learning rate
-            for param_group in trainer.optimizer.param_groups:
-                param_group['lr'] = original_lr
 
     # NEW: Compute final energy conservation with smoothing
     final_energy_error = compute_energy_conservation_with_smoothing(model, dataset, sim, device)
@@ -394,10 +389,10 @@ def main():
             original_energy_weight = getattr(trainer, 'energy_weight', 0.1)
             trainer.energy_weight = min(0.8, original_energy_weight * 1.2)  # NEW: Use 1.2x multiplier instead of 3x
 
-            # NEW: Reduce learning rate significantly for more stable energy-focused training
+            # NEW: Reduce learning rate significantly and RESET optimizer for more stable energy-focused training
             original_lr = trainer.optimizer.param_groups[0]['lr']
-            for param_group in trainer.optimizer.param_groups:
-                param_group['lr'] *= 0.001  # Significantly reduce learning rate for more stability
+            new_lr = original_lr * 0.001
+            trainer.optimizer = torch.optim.Adam(model.parameters(), lr=new_lr, weight_decay=1e-5)
 
             # NEW: Use a more conservative energy weight to prevent divergence
             original_energy_weight = getattr(trainer, 'energy_weight', 0.1)
