@@ -45,7 +45,24 @@ pip install -r requirements.txt
 
 ## Usage
 
-### Recommended: Fast Execution
+### Recommended: Enhanced Execution
+
+For the most advanced execution with all improvements, use the enhanced version:
+
+```bash
+python main_enhanced_complete.py --config config.yaml --problem_type physics
+```
+
+The enhanced version includes:
+- Learnable basis functions to address the basis function bottleneck
+- Optimized ODE functions to reduce adjoint sensitivity complexity
+- Improved hyperparameter management with auto-tuning
+- Enhanced symbolic distillation with secondary optimization
+- Robust symbolic proxy with validation
+- Multi-scale loss balancing
+- Configurable problem type optimization
+
+### Alternative: Fast Execution
 
 For faster execution with performance optimizations, use the optimized version:
 
@@ -177,6 +194,21 @@ coord_distiller = AlignedHamiltonianSymbolicDistiller(
 - **Minimum Active Nodes**: Ensures sufficient super-nodes remain active
 - **Balance Loss**: Encourages uniform usage of super-nodes
 
+### 4. Learnable Basis Functions
+- **Adaptive Feature Generation**: Learns novel functional forms beyond predefined primitives
+- **Attention Mechanisms**: Dynamically selects relevant basis functions based on input
+- **Residual Connections**: Maintains information flow through the basis expansion
+
+### 5. Optimized ODE Computation
+- **Reduced Adjoint Complexity**: Efficient gradient computation for Hamiltonian systems
+- **Memory-Efficient Solvers**: Trade accuracy for reduced memory usage when needed
+- **Adaptive Integration**: Chooses appropriate solver based on system properties
+
+### 6. Hyperparameter Auto-Tuning
+- **Configurable Problem Types**: Optimizes for small, large, physics, or chaotic systems
+- **Automatic Parameter Search**: Finds optimal hyperparameters for specific problems
+- **Validation-Based Selection**: Uses held-out data to select best configurations
+
 ## Mathematical Foundation
 
 ### Hamiltonian Mechanics
@@ -225,6 +257,11 @@ python test_implemented_fixes.py
 - `optimized_symbolic.py`: Optimized symbolic dynamics with caching
 - `simulator.py`: Particle dynamics simulators
 - `engine.py`: Main discovery engine
+- `learnable_basis.py`: Learnable basis functions to address basis function bottleneck
+- `optimized_ode.py`: Optimized ODE functions to reduce adjoint sensitivity complexity
+- `config_manager.py`: Configuration management and hyperparameter auto-tuning
+- `main_enhanced_complete.py`: Complete enhanced pipeline with all improvements
+- `config.yaml`: Configuration file for the enhanced pipeline
 
 ## Contributing
 

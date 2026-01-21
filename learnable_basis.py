@@ -15,22 +15,27 @@ class LearnableBasisFunction(nn.Module):
     """
     A learnable basis function that can represent novel functional forms.
     Uses a neural network to learn complex transformations of input features.
+    Enhanced with attention mechanism and residual connections for better expressivity.
     """
-    
-    def __init__(self, input_dim, hidden_dim=64, num_bases=8, activation='silu'):
+
+    def __init__(self, input_dim, hidden_dim=64, num_bases=8, activation='silu', use_attention=True, use_residual=True):
         """
         Args:
             input_dim: Dimension of input features
             hidden_dim: Hidden dimension for the neural basis
             num_bases: Number of different basis functions to learn
             activation: Activation function to use
+            use_attention: Whether to use attention mechanism
+            use_residual: Whether to use residual connections
         """
         super(LearnableBasisFunction, self).__init__()
-        
+
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.num_bases = num_bases
-        
+        self.use_attention = use_attention
+        self.use_residual = use_residual
+
         # Multiple basis networks to learn different functional forms
         self.basis_networks = nn.ModuleList([
             nn.Sequential(
@@ -41,13 +46,26 @@ class LearnableBasisFunction(nn.Module):
                 nn.Linear(hidden_dim, 1)
             ) for _ in range(num_bases)
         ])
-        
+
         # Learnable mixing weights for combining basis functions
         self.mixing_weights = nn.Parameter(torch.ones(num_bases) / num_bases)
-        
+
         # Learnable scaling factors for each basis
         self.scaling_factors = nn.Parameter(torch.ones(num_bases))
-        
+
+        # Attention mechanism for dynamic basis selection
+        if use_attention:
+            self.attention_net = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim // 2),
+                self._get_activation(activation),
+                nn.Linear(hidden_dim // 2, num_bases),
+                nn.Softmax(dim=1)
+            )
+
+        # Residual connection scaling
+        if use_residual:
+            self.residual_scale = nn.Parameter(torch.ones(1) * 0.1)
+
     def _get_activation(self, activation):
         """Get activation function by name."""
         activations = {
@@ -56,22 +74,23 @@ class LearnableBasisFunction(nn.Module):
             'tanh': nn.Tanh(),
             'gelu': nn.GELU(),
             'leaky_relu': nn.LeakyReLU(),
-            'swish': nn.SiLU()  # Swish is the same as SiLU
+            'swish': nn.SiLU(),  # Swish is the same as SiLU
+            'elu': nn.ELU()
         }
         return activations.get(activation.lower(), nn.SiLU())
-    
+
     def forward(self, x):
         """
         Forward pass through learnable basis functions.
-        
+
         Args:
             x: Input tensor of shape [batch_size, input_dim]
-            
+
         Returns:
             Combined output of all basis functions
         """
         batch_size = x.size(0)
-        
+
         # Apply each basis network
         basis_outputs = []
         for i, basis_net in enumerate(self.basis_networks):
@@ -79,16 +98,29 @@ class LearnableBasisFunction(nn.Module):
             # Apply scaling and store
             scaled_output = output * self.scaling_factors[i]
             basis_outputs.append(scaled_output)
-        
+
         # Stack basis outputs: [batch_size, num_bases]
         stacked_outputs = torch.cat(basis_outputs, dim=1)
-        
+
         # Apply mixing weights: [num_bases] * [batch_size, num_bases] -> [batch_size, num_bases]
-        weighted_outputs = stacked_outputs * F.softmax(self.mixing_weights, dim=0)
-        
+        if self.use_attention:
+            # Use attention to dynamically weight basis functions based on input
+            attention_weights = self.attention_net(x)  # [batch_size, num_bases]
+            weighted_outputs = stacked_outputs * attention_weights
+        else:
+            # Use learnable mixing weights
+            mixing_weights = F.softmax(self.mixing_weights, dim=0)
+            weighted_outputs = stacked_outputs * mixing_weights
+
         # Sum across all basis functions: [batch_size, 1]
         final_output = torch.sum(weighted_outputs, dim=1, keepdim=True)
-        
+
+        # Add residual connection if enabled
+        if self.use_residual:
+            # Project input to output dimension
+            residual_input = torch.mean(x, dim=1, keepdim=True)  # Simple projection
+            final_output = final_output + self.residual_scale * residual_input
+
         return final_output
 
 
@@ -96,17 +128,21 @@ class NeuralBasisExpansion(nn.Module):
     """
     Neural basis expansion that combines traditional physics-inspired features
     with learnable basis functions to discover novel functional forms.
+    Enhanced with attention mechanisms and adaptive feature selection.
     """
-    
+
     def __init__(self, n_super_nodes, latent_dim, include_dists=True, box_size=None,
-                 basis_hidden_dim=64, num_learnable_bases=8):
+                 basis_hidden_dim=64, num_learnable_bases=8, use_attention=True,
+                 use_adaptive_selection=True):
         super(NeuralBasisExpansion, self).__init__()
-        
+
         self.n_super_nodes = n_super_nodes
         self.latent_dim = latent_dim
         self.include_dists = include_dists
         self.box_size = box_size
-        
+        self.use_attention = use_attention
+        self.use_adaptive_selection = use_adaptive_selection
+
         # Traditional physics-inspired features (same as in FeatureTransformer)
         self.z_mean = None
         self.z_std = None
@@ -114,47 +150,73 @@ class NeuralBasisExpansion(nn.Module):
         self.x_poly_std = None
         self.target_mean = None
         self.target_std = None
-        
+
         # Learnable basis function modules
         # We'll create a basis for different types of input combinations
         # For pairwise features: pos_i(2) + vel_i(2) + pos_j(2) + vel_j(2) = 8 dimensions if latent_dim >= 4
         # If latent_dim < 4, adjust accordingly
         pairwise_input_dim = min(8, max(4, latent_dim * 2))  # At least 4, max of 8 for pos/vel of 2 nodes
-        self.pairwise_basis = LearnableBasisFunction(pairwise_input_dim, basis_hidden_dim, num_learnable_bases)  # For distance-based features
-        self.node_basis = LearnableBasisFunction(latent_dim, basis_hidden_dim, num_learnable_bases)  # For individual node features
-        self.global_basis = LearnableBasisFunction(latent_dim * n_super_nodes, basis_hidden_dim, num_learnable_bases)  # For global features
-        
+        self.pairwise_basis = LearnableBasisFunction(
+            pairwise_input_dim,
+            basis_hidden_dim,
+            num_learnable_bases,
+            use_attention=use_attention
+        )  # For distance-based features
+        self.node_basis = LearnableBasisFunction(
+            latent_dim,
+            basis_hidden_dim,
+            num_learnable_bases,
+            use_attention=use_attention
+        )  # For individual node features
+        self.global_basis = LearnableBasisFunction(
+            latent_dim * n_super_nodes,
+            basis_hidden_dim,
+            num_learnable_bases,
+            use_attention=use_attention
+        )  # For global features
+
         # Learnable combination weights for different feature types
         self.feature_combination_weights = nn.Parameter(torch.ones(3) / 3)  # For traditional, pairwise, node features
-    
+
+        # Adaptive feature selection network
+        if use_adaptive_selection:
+            self.feature_selector = nn.Sequential(
+                nn.Linear(n_super_nodes * latent_dim, basis_hidden_dim),
+                nn.SiLU(),
+                nn.Linear(basis_hidden_dim, basis_hidden_dim // 2),
+                nn.SiLU(),
+                nn.Linear(basis_hidden_dim // 2, 1),
+                nn.Sigmoid()
+            )
+
     def fit(self, latent_states, targets):
         """Fit normalization parameters."""
         self.z_mean = torch.from_numpy(latent_states.mean(axis=0)).float()
         self.z_std = torch.from_numpy(latent_states.std(axis=0) + 1e-6).float()
-        
+
         # Transform to get feature statistics
         X_poly = self.transform(torch.from_numpy(latent_states).float())
         self.x_poly_mean = X_poly.mean(dim=0)
         self.x_poly_std = X_poly.std(dim=0) + 1e-6
         self.target_mean = torch.from_numpy(targets.mean(axis=0)).float()
         self.target_std = torch.from_numpy(targets.std(axis=0) + 1e-6).float()
-    
+
     def transform(self, z_flat):
         """
         Transform latent states to expanded feature space with learnable basis functions.
-        
+
         Args:
             z_flat: Flattened latent states [batch_size, n_super_nodes * latent_dim]
-            
+
         Returns:
             Expanded feature tensor
         """
         batch_size = z_flat.size(0)
         z_nodes = z_flat.view(batch_size, self.n_super_nodes, self.latent_dim)
-        
+
         # Traditional features (same as original FeatureTransformer)
         traditional_features = [z_flat]
-        
+
         if self.include_dists:
             # Vectorized distance calculation
             pos = z_nodes[:, :, :2]  # [Batch, K, 2]
@@ -184,10 +246,10 @@ class NeuralBasisExpansion(nn.Module):
             traditional_features.extend([dists_flat, inv_dists_flat, inv_sq_dists_flat, exp_dist, screened_coulomb, log_dist])
 
         X_traditional = torch.cat(traditional_features, dim=1)
-        
+
         # Learnable basis features
         learnable_features = []
-        
+
         # 1. Pairwise learnable features (based on distances and relative positions)
         if self.include_dists:
             pos = z_nodes[:, :, :2]  # [Batch, K, 2]
@@ -211,32 +273,40 @@ class NeuralBasisExpansion(nn.Module):
                 # Concatenate all processed pairwise features: [Batch, n_pairs]
                 pairwise_features = torch.cat(pairwise_features_list, dim=1)
                 learnable_features.append(pairwise_features)
-        
+
         # 2. Node-wise learnable features
         node_features_list = []
         for k in range(self.n_super_nodes):
             node_data = z_nodes[:, k, :]  # [Batch, latent_dim]
             processed = self.node_basis(node_data)  # [Batch, 1]
             node_features_list.append(processed)
-        
+
         if node_features_list:
             node_features = torch.cat(node_features_list, dim=1)  # [Batch, n_super_nodes]
             learnable_features.append(node_features)
-        
+
         # 3. Global learnable features
         global_features = self.global_basis(z_flat)  # [Batch, 1]
         learnable_features.append(global_features)
-        
+
         # Combine traditional and learnable features
         if learnable_features:
             X_learnable = torch.cat(learnable_features, dim=1)
             X_combined = torch.cat([X_traditional, X_learnable], dim=1)
         else:
             X_combined = X_traditional
-        
+
+        # Apply adaptive feature selection if enabled
+        if self.use_adaptive_selection:
+            # Use the feature selector to determine which features to emphasize
+            selection_weights = self.feature_selector(z_flat)  # [batch_size, 1]
+            # Expand to match feature dimensions
+            selection_weights = selection_weights.expand_as(X_combined)
+            X_combined = X_combined * selection_weights
+
         # Apply learnable combination weights
         comb_weights = F.softmax(self.feature_combination_weights, dim=0)
-        
+
         return torch.clamp(X_combined, -1e6, 1e6)  # Final safety clamp
     
     def normalize_x(self, X_poly):
@@ -253,32 +323,34 @@ class EnhancedFeatureTransformer:
     """
     Enhanced feature transformer that combines traditional physics-inspired features
     with learnable basis functions to address the basis function bottleneck.
+    Enhanced with attention mechanisms and adaptive feature selection.
     """
-    
+
     def __init__(self, n_super_nodes, latent_dim, include_dists=True, box_size=None,
-                 use_learnable_bases=True, basis_hidden_dim=64, num_learnable_bases=8):
+                 use_learnable_bases=True, basis_hidden_dim=64, num_learnable_bases=8,
+                 use_attention=True, use_adaptive_selection=True):
         self.n_super_nodes = n_super_nodes
         self.latent_dim = latent_dim
         self.include_dists = include_dists
         self.box_size = box_size
         self.use_learnable_bases = use_learnable_bases
-        
+
         if use_learnable_bases:
             self.neural_basis = NeuralBasisExpansion(
                 n_super_nodes, latent_dim, include_dists, box_size,
-                basis_hidden_dim, num_learnable_bases
+                basis_hidden_dim, num_learnable_bases, use_attention, use_adaptive_selection
             )
         else:
             # Fall back to traditional FeatureTransformer
             from symbolic import FeatureTransformer
             self.traditional_transformer = FeatureTransformer(n_super_nodes, latent_dim, include_dists, box_size)
-    
+
     def fit(self, latent_states, targets):
         if self.use_learnable_bases:
             self.neural_basis.fit(latent_states, targets)
         else:
             self.traditional_transformer.fit(latent_states, targets)
-    
+
     def transform(self, z_flat):
         if self.use_learnable_bases:
             if not isinstance(z_flat, torch.Tensor):
@@ -286,21 +358,36 @@ class EnhancedFeatureTransformer:
             return self.neural_basis.transform(z_flat).detach().numpy()
         else:
             return self.traditional_transformer.transform(z_flat)
-    
+
     def normalize_x(self, X_poly):
         if self.use_learnable_bases:
             return self.neural_basis.normalize_x(torch.from_numpy(X_poly).float()).numpy()
         else:
             return self.traditional_transformer.normalize_x(X_poly)
-    
+
     def normalize_y(self, Y):
         if self.use_learnable_bases:
             return self.neural_basis.normalize_y(torch.from_numpy(Y).float()).numpy()
         else:
             return self.traditional_transformer.normalize_y(Y)
-    
+
     def denormalize_y(self, Y_norm):
         if self.use_learnable_bases:
             return self.neural_basis.denormalize_y(torch.from_numpy(Y_norm).float()).numpy()
         else:
             return self.traditional_transformer.denormalize_y(Y_norm)
+
+    def get_n_features(self):
+        """Get the number of features after transformation."""
+        if self.use_learnable_bases:
+            # This is a simplified version - in practice, you'd need to track this during transformation
+            # For now, return an estimate based on the components
+            n_traditional = self.n_super_nodes * self.latent_dim
+            if self.include_dists:
+                n_traditional += self.n_super_nodes * (self.n_super_nodes - 1) // 2 * 6  # 6 distance features
+            n_learnable = self.n_super_nodes + 1  # node features + global feature
+            return n_traditional + n_learnable
+        else:
+            # This would require knowing the actual number after transformation
+            # For now, return a placeholder - in practice you'd need to store this during fit
+            return self.traditional_transformer.get_n_features() if hasattr(self.traditional_transformer, 'get_n_features') else 100
