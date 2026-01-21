@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import scatter
-from torchdiffeq import odeint
+from torchdiffeq import odeint, odeint_adjoint
 
 class EquivariantGNNLayer(MessagePassing):
     """
@@ -115,9 +115,15 @@ class HierarchicalPooling(nn.Module):
 
         logits = self.assign_mlp(x) * self.scaling
 
-        # Apply active_mask to logits (set inactive ones to very low value)
+        # Apply active_mask to logits (soft mask to allow for revival)
         mask = self.active_mask.unsqueeze(0)
-        logits = logits.masked_fill(mask == 0, -1e9)
+        
+        if self.training:
+            # Softer mask during training to allow reactivation
+            logits = logits + (mask - 1.0) * 10.0
+        else:
+            # Hard mask during inference
+            logits = logits.masked_fill(mask == 0, -1e9)
 
         s = nn.functional.gumbel_softmax(logits, tau=tau, hard=hard, dim=-1)
 
@@ -425,7 +431,12 @@ class DiscoveryEngineModel(nn.Module):
             method = 'dopri5'  # More accurate adaptive method during evaluation
 
         # Use the selected solver
-        zt_flat = odeint(self.ode_func, y0, t_ode, rtol=rtol, atol=atol, method=method)
+        if self.hamiltonian and self.training:
+            # Use adjoint method to save memory when training Hamiltonian
+            # The adjoint method is more memory efficient for backpropagating through ODEs
+            zt_flat = odeint_adjoint(self.ode_func, y0, t_ode, rtol=rtol, atol=atol, method=method)
+        else:
+            zt_flat = odeint(self.ode_func, y0, t_ode, rtol=rtol, atol=atol, method=method)
 
         # Move back to original device
         zt_flat = zt_flat.to(original_device)

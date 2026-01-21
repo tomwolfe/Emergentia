@@ -149,31 +149,27 @@ class BalancedFeatureTransformer:
 
     def _compute_distance_features(self, z_nodes):
         """
-        Compute distance-based features between super-nodes.
+        Compute distance-based features between super-nodes using vectorized operations.
         """
-        dists = []
-        inv_dists = []
-        inv_sq_dists = []
-        exp_dists = []
-
-        for i in range(self.n_super_nodes):
-            for j in range(i + 1, self.n_super_nodes):
-                diff = z_nodes[:, i, :2] - z_nodes[:, j, :2]
-
-                if self.box_size is not None:
-                    for dim_idx in range(2):
-                        diff[:, dim_idx] -= self.box_size[dim_idx] * np.round(diff[:, dim_idx] / self.box_size[dim_idx])
-
-                d = np.linalg.norm(diff, axis=1, keepdims=True)
-                dists.append(d)
-                inv_dists.append(1.0 / (d + 0.1))
-                inv_sq_dists.append(1.0 / (d**2 + 0.1))
-                exp_dists.append(np.exp(-d))
-
-        if dists:
-            return [np.hstack(dists), np.hstack(inv_dists), np.hstack(inv_sq_dists), np.hstack(exp_dists)]
-        else:
+        n_batch = z_nodes.shape[0]
+        if self.n_super_nodes < 2:
             return []
+
+        # Get all pairs of indices
+        i_idx, j_idx = np.triu_indices(self.n_super_nodes, k=1)
+        
+        # [Batch, n_pairs, 2]
+        diff = z_nodes[:, i_idx, :2] - z_nodes[:, j_idx, :2]
+
+        if self.box_size is not None:
+            # Minimum Image Convention
+            box = np.array(self.box_size)
+            diff -= box * np.round(diff / box)
+
+        # [Batch, n_pairs]
+        d = np.linalg.norm(diff, axis=2)
+        
+        return [d, 1.0 / (d + 0.1), 1.0 / (d**2 + 0.1), np.exp(-d)]
 
     def _polynomial_expansion(self, X, fit_transformer):
         """
@@ -194,29 +190,52 @@ class BalancedFeatureTransformer:
     def _physics_informed_expansion(self, X):
         """
         Perform physics-informed polynomial expansion with cross-terms.
-        Optimized to avoid unnecessary terms.
+        Optimized with pre-allocation and vectorized operations.
         """
-        poly_features = [X]
-        n_latents = self.n_super_nodes * self.latent_dim
+        batch_size, n_total_features = X.shape
+        n_raw_latents = self.n_super_nodes * self.latent_dim
         
-        # Limit cross-terms to avoid explosion
-        # Only squares and interaction terms that make physical sense
-        for i in range(n_latents):
-            poly_features.append((X[:, i:i+1]**2))
-
-            node_idx = i // self.latent_dim
-            dim_idx = i % self.latent_dim
-
-            # Cross-terms within same node (e.g. q1*p1)
-            for j in range(i + 1, (node_idx + 1) * self.latent_dim):
-                poly_features.append(X[:, i:i+1] * X[:, j:j+1])
-
-            # Interaction terms between nodes for the same dimension
-            for other_node in range(node_idx + 1, self.n_super_nodes):
-                other_idx = other_node * self.latent_dim + dim_idx
-                poly_features.append(X[:, i:i+1] * X[:, other_idx:other_idx+1])
-
-        return np.hstack(poly_features)
+        # Calculate total number of features to pre-allocate
+        # 1. All input features (including distances if present): n_total_features
+        # 2. Squares of raw latents: n_raw_latents
+        # 3. Intra-node cross-terms: n_super_nodes * (latent_dim * (latent_dim - 1) // 2)
+        # 4. Inter-node cross-terms: (n_super_nodes * (n_super_nodes - 1) // 2) * latent_dim
+        
+        n_sq = n_raw_latents
+        n_intra = self.n_super_nodes * (self.latent_dim * (self.latent_dim - 1) // 2)
+        n_inter = (self.n_super_nodes * (self.n_super_nodes - 1) // 2) * self.latent_dim
+        
+        total_features = n_total_features + n_sq + n_intra + n_inter
+        
+        X_expanded = np.empty((batch_size, total_features), dtype=X.dtype)
+        
+        curr = 0
+        # 1. Original features (raw latents + distances)
+        X_expanded[:, curr:curr+n_total_features] = X
+        curr += n_total_features
+        
+        # 2. Squares of raw latents
+        X_expanded[:, curr:curr+n_raw_latents] = X[:, :n_raw_latents]**2
+        curr += n_raw_latents
+        
+        # 3. Intra-node cross-terms (of raw latents)
+        for node_idx in range(self.n_super_nodes):
+            start_idx = node_idx * self.latent_dim
+            for i in range(self.latent_dim):
+                for j in range(i + 1, self.latent_dim):
+                    X_expanded[:, curr] = X[:, start_idx + i] * X[:, start_idx + j]
+                    curr += 1
+                    
+        # 4. Inter-node cross-terms (same dimension)
+        for dim_idx in range(self.latent_dim):
+            for i in range(self.n_super_nodes):
+                for j in range(i + 1, self.n_super_nodes):
+                    idx_i = i * self.latent_dim + dim_idx
+                    idx_j = j * self.latent_dim + dim_idx
+                    X_expanded[:, curr] = X[:, idx_i] * X[:, idx_j]
+                    curr += 1
+                    
+        return X_expanded
 
     def _adaptive_expansion(self, X, fit_transformer):
         """

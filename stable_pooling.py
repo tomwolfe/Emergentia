@@ -94,9 +94,16 @@ class StableHierarchicalPooling(nn.Module):
 
         logits = self.assign_mlp(x) * self.scaling
 
-        # Apply active_mask to logits (set inactive ones to very low value)
+        # Apply active_mask to logits (soft mask to allow for revival)
         mask = self.active_mask.unsqueeze(0)
-        logits = logits.masked_fill(mask == 0, -1e9)
+        
+        # During training, use a softer mask to allow potential reactivation
+        if self.training:
+            # -10.0 is small enough to suppress but large enough to allow gradient flow
+            logits = logits + (mask - 1.0) * 10.0
+        else:
+            # Harder mask during inference
+            logits = logits.masked_fill(mask == 0, -1e9)
 
         s = F.gumbel_softmax(logits, tau=tau, hard=hard, dim=-1)
 
