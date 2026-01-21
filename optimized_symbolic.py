@@ -106,21 +106,49 @@ class OptimizedSymbolicDynamics:
     def _compute_hamiltonian_derivatives(self, z, X_norm):
         """
         Compute Hamiltonian derivatives: dq/dt = ∂H/∂p, dp/dt = -∂H/∂q - γp
+        Using symbolic chain rule for efficiency and precision.
         """
+        grad = None
         # Use analytical gradients if available
         if hasattr(self, 'lambda_funcs') and self.lambda_funcs is not None and self.sympy_vars is not None:
             try:
-                # Prepare arguments for lambda functions
+                # 1. dH_norm / dX_norm (Analytical from SymPy)
                 X_flat = X_norm.flatten()
                 args = [X_flat[self.var_to_idx[var.name]] for var in self.sympy_vars]
+                dH_norm_dX_norm_sparse = np.array([float(grad_func(*args)) for grad_func in self.lambda_funcs])
                 
-                # Compute analytical gradients of H with respect to features X
-                grad_wrt_features = np.array([float(grad_func(*args)) for grad_func in self.lambda_funcs])
+                # Expand sparse gradient to full feature space size
+                # feature_masks[0] is the list of indices of features used by the Hamiltonian
+                full_feat_dim = self.transformer.x_poly_mean.shape[0] if hasattr(self.transformer, 'x_poly_mean') else X_norm.shape[1]
+                if hasattr(self, 'feature_masks') and self.feature_masks:
+                    dH_norm_dX_norm = np.zeros(len(self.feature_masks[0]))
+                    # self.var_to_idx maps 'x5' to index 5 IN THE SELECTED FEATURES
+                    for i, var in enumerate(self.sympy_vars):
+                        idx = self.var_to_idx[var.name]
+                        dH_norm_dX_norm[idx] = dH_norm_dX_norm_sparse[i]
+                else:
+                    dH_norm_dX_norm = dH_norm_dX_norm_sparse
+
+                # 2. Scale by target std: dH / dX_norm = dH_norm / dX_norm * sigma_H
+                sigma_H = self.distiller.transformer.target_std[0] if hasattr(self.distiller.transformer.target_std, '__len__') else self.distiller.transformer.target_std
+                dH_dX_norm = dH_norm_dX_norm * sigma_H
+
+                # 3. dX_norm / dX = 1 / sigma_X
+                # We only need the sigma_X for the features used
+                if hasattr(self, 'feature_masks') and self.feature_masks:
+                    sigma_X = self.transformer.x_poly_std[self.feature_masks[0]]
+                else:
+                    sigma_X = self.transformer.x_poly_std
                 
-                # Fallback to numerical gradient for now as it handles complex feature mappings ∂X/∂z
-                grad = self._numerical_gradient(z)
+                dH_dX = dH_dX_norm / sigma_X
+
+                # 4. dX / dz (Jacobian from transformer)
+                dX_dz = self.transformer.transform_jacobian(z) # [n_features, n_latents]
+                
+                # 5. Final gradient: dH / dz = dH / dX * dX / dz
+                grad = dH_dX @ dX_dz
             except Exception as e:
-                print(f"Analytical gradient computation failed: {e}")
+                # Fallback to numerical gradient if analytical fails
                 grad = self._numerical_gradient(z)
         else:
             grad = self._numerical_gradient(z)

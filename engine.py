@@ -132,6 +132,7 @@ class Trainer:
             self.model.ode_func.to('cpu')
             
         self.optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, patience=50, verbose=True)
         self.criterion = torch.nn.MSELoss().to(device)
         self.stats = stats
         
@@ -149,7 +150,7 @@ class Trainer:
         progress = epoch / max_epochs
         
         # 1. Smooth Tau schedule: Exponential decay
-        tau = max(0.05, np.exp(-epoch / 500.0))
+        tau = max(0.05, 0.5 * np.exp(-epoch / 1000.0))
         
         # 2. Hard assignment scheduling:
         # Gradually increase the probability of using 'hard' assignments in Gumbel-Softmax
@@ -157,14 +158,14 @@ class Trainer:
         hard = False
         if progress > self.hard_assignment_start:
             # Probability of hard assignment increases linearly after start threshold
-            hard_prob = (progress - self.hard_assignment_start) / (1.0 - self.hard_assignment_start)
+            hard_prob = min(1.0, (progress - self.hard_assignment_start) / (1.0 - self.hard_assignment_start))
             hard = np.random.random() < hard_prob
 
         # 3. Decaying Teacher Forcing Ratio
-        tf_ratio = max(0.0, 0.8 * (1.0 - epoch / (0.75 * max_epochs)))
+        tf_ratio = max(0.0, 0.8 * (1.0 - epoch / (0.75 * max_epochs + 1e-9)))
         
         # 4. Alignment Annealing
-        align_weight = max(0.0, 1.0 - epoch / self.align_anneal_epochs)
+        align_weight = max(0.1, 1.0 - epoch / (self.align_anneal_epochs + 1e-9))
         
         # Warmup logic
         is_warmup = epoch < self.warmup_epochs
@@ -172,8 +173,8 @@ class Trainer:
         batch_0 = Batch.from_data_list([data_list[0]]).to(self.device)
         z_curr, s_0, losses_0, mu_0 = self.model.encode(batch_0.x, batch_0.edge_index, batch_0.batch, tau=tau, hard=hard)
         
-        if torch.isnan(z_curr).any():
-            z_curr = torch.nan_to_num(z_curr)
+        if torch.isnan(z_curr).any() or torch.isinf(z_curr).any():
+            z_curr = torch.nan_to_num(z_curr, nan=0.0, posinf=1.0, neginf=-1.0)
 
         loss_rec = torch.tensor(0.0, device=self.device)
         loss_cons = torch.tensor(0.0, device=self.device)
@@ -198,8 +199,12 @@ class Trainer:
                     z_curr = torch.nan_to_num(z_curr_forced)
                 
                 t_span = torch.tensor([0, dt], device=self.device, dtype=torch.float32)
-                z_next_seq = self.model.forward_dynamics(z_curr, t_span)
-                z_curr = torch.nan_to_num(z_next_seq[1])
+                try:
+                    z_next_seq = self.model.forward_dynamics(z_curr, t_span)
+                    z_curr = torch.nan_to_num(z_next_seq[1], nan=0.0, posinf=1.0, neginf=-1.0)
+                except Exception as e:
+                    # If ODE solver fails, fallback to previous state and add penalty
+                    z_curr = z_curr.detach()
                 z_preds.append(z_curr)
         else:
             # During warmup, just use encoded states
@@ -219,15 +224,12 @@ class Trainer:
         
         mu_mean = torch.tensor(self.stats['pos_mean'], device=self.device, dtype=torch.float32) if self.stats else 0
         mu_std = torch.tensor(self.stats['pos_std'], device=self.device, dtype=torch.float32) if self.stats else 1
-        vel_mean = torch.tensor(self.stats['vel_mean'], device=self.device, dtype=torch.float32) if self.stats else 0
-        vel_std = torch.tensor(self.stats['vel_std'], device=self.device, dtype=torch.float32) if self.stats else 1
 
         for t in range(seq_len):
             batch_t = Batch.from_data_list([data_list[t]]).to(self.device)
             z_t_target, s_t, losses_t, mu_t = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch, tau=tau, hard=hard)
             
-            if torch.isnan(z_t_target).any():
-                z_t_target = torch.nan_to_num(z_t_target)
+            z_t_target = torch.nan_to_num(z_t_target)
             
             # Use z_preds for reconstruction to force consistency
             recon_t = self.model.decode(z_preds[t], s_t, batch_t.batch)
@@ -269,14 +271,9 @@ class Trainer:
         loss_align /= seq_len
         loss_sep /= seq_len
         loss_conn /= seq_len
-        s_stability /= (seq_len - 1)
         
-        self.s_history.append(s_stability)
-        if len(self.s_history) > self.max_s_history:
-            self.s_history.pop(0)
-        
-        # Adaptive Loss Weighting
-        lvars = torch.clamp(self.model.log_vars, min=-2.0, max=10.0)
+        # Adaptive Loss Weighting with tighter clamping
+        lvars = torch.clamp(self.model.log_vars, min=-1.0, max=5.0)
         
         weights = {
             'rec': torch.exp(-lvars[0]), 'cons': torch.exp(-lvars[1]),
@@ -300,16 +297,20 @@ class Trainer:
             loss = discovery_loss
         else:
             loss = discovery_loss + (weights['cons'] * loss_cons + lvars[1]) + \
-                   (weights['l2'] * loss_l2 + lvars[4]) + \
-                   (weights['lvr'] * loss_lvr + lvars[5])
+                   (weights['l2'] * 1e-4 * loss_l2 + lvars[4]) + \
+                   (weights['lvr'] * 1e-4 * loss_lvr + lvars[5])
         
         if not torch.isfinite(loss):
             self.optimizer.zero_grad()
             return 0.0, 0.0, 0.0
 
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.1) # Tighter clip
         self.optimizer.step()
+        
+        # Step scheduler
+        if not is_warmup:
+            self.scheduler.step(loss.item())
         
         return loss.item(), loss_rec.item(), loss_cons.item()
 

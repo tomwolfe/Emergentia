@@ -84,6 +84,84 @@ class FeatureTransformer:
     def denormalize_y(self, Y_norm):
         return Y_norm * self.target_std + self.target_mean
 
+    def transform_jacobian(self, z_flat):
+        """
+        Computes the Jacobian dX/dz of the transformation.
+        X = transform(z)
+        Returns a tensor of shape [n_features, n_latents]
+        """
+        n_latents = self.n_super_nodes * self.latent_dim
+        z_nodes = z_flat.reshape(self.n_super_nodes, self.latent_dim)
+        
+        # We need to track which features were generated to compute their derivatives
+        # 1. Raw latents: d(z)/dz = Identity [n_latents, n_latents]
+        jacobians = [np.eye(n_latents)]
+        
+        # 2. Distances and their inverses
+        if self.include_dists:
+            for i in range(self.n_super_nodes):
+                for j in range(i + 1, self.n_super_nodes):
+                    # Position dims (assumed first 2)
+                    diff = z_nodes[i, :2] - z_nodes[j, :2]
+                    if self.box_size is not None:
+                        for dim_idx in range(2):
+                            diff[dim_idx] -= self.box_size[dim_idx] * np.round(diff[dim_idx] / self.box_size[dim_idx])
+                    
+                    d = np.linalg.norm(diff) + 1e-9
+                    
+                    # d(d)/dz
+                    jd = np.zeros(n_latents)
+                    jd[i*self.latent_dim : i*self.latent_dim+2] = diff / d
+                    jd[j*self.latent_dim : j*self.latent_dim+2] = -diff / d
+                    jacobians.append(jd.reshape(1, -1))
+                    
+                    # d(1/(d+0.1))/dz = -1/(d+0.1)^2 * d(d)/dz
+                    jacobians.append((-1.0 / (d + 0.1)**2 * jd).reshape(1, -1))
+                    
+                    # d(1/(d^2+0.1))/dz = -2d/(d^2+0.1)^2 * d(d)/dz
+                    jacobians.append((-2.0 * d / (d**2 + 0.1)**2 * jd).reshape(1, -1))
+
+        # 3. Polynomial terms (Squares and cross-terms)
+        # poly_features.append((X[:, i:i+1]**2))
+        # This X here is the [z, dists, ...] vector.
+        # Let X_linear be the vector [z, dists, ...]
+        # d(X_linear_k^2)/dz = 2 * X_linear_k * d(X_linear_k)/dz
+        
+        X_linear_jac = np.vstack(jacobians)
+        X_linear = np.concatenate([z_flat] + [
+            np.array([
+                np.linalg.norm(z_nodes[i, :2] - z_nodes[j, :2] + 
+                              (0 if self.box_size is None else -np.array(self.box_size) * np.round((z_nodes[i, :2] - z_nodes[j, :2])/np.array(self.box_size)))),
+                1.0 / (np.linalg.norm(z_nodes[i, :2] - z_nodes[j, :2]) + 0.1),
+                1.0 / (np.linalg.norm(z_nodes[i, :2] - z_nodes[j, :2])**2 + 0.1)
+            ])
+            for i in range(self.n_super_nodes) for j in range(i + 1, self.n_super_nodes)
+        ]) if self.include_dists else z_flat
+        
+        poly_jacobians = [X_linear_jac]
+        
+        # Raw latent squares and cross terms
+        for i in range(n_latents):
+            # d(zi^2)/dz = 2 * zi * d(zi)/dz
+            jd_sq = 2 * z_flat[i] * X_linear_jac[i]
+            poly_jacobians.append(jd_sq.reshape(1, -1))
+            
+            node_idx = i // self.latent_dim
+            # Cross-terms same node
+            for j in range(i + 1, (node_idx + 1) * self.latent_dim):
+                # d(zi*zj)/dz = zi*d(zj)/dz + zj*d(zi)/dz
+                jd_cross = z_flat[i] * X_linear_jac[j] + z_flat[j] * X_linear_jac[i]
+                poly_jacobians.append(jd_cross.reshape(1, -1))
+            
+            # Cross-terms same dim other nodes
+            dim_idx = i % self.latent_dim
+            for other_node in range(node_idx + 1, self.n_super_nodes):
+                other_idx = other_node * self.latent_dim + dim_idx
+                jd_cross = z_flat[i] * X_linear_jac[other_idx] + z_flat[other_idx] * X_linear_jac[i]
+                poly_jacobians.append(jd_cross.reshape(1, -1))
+                
+        return np.vstack(poly_jacobians)
+
 def gp_to_sympy(expr_str, n_features=None):
     """
     Robustly converts a gplearn expression string to a SymPy expression.
@@ -282,31 +360,59 @@ class SymbolicDistiller:
         variances = np.var(X_norm, axis=0)
         valid_indices = np.where(variances > 1e-6)[0]
         X_pruned = X_norm[:, valid_indices]
+        
+        # Aggressive feature selection
         mask_pruned = self._select_features(X_pruned, Y_norm[:, i])
         full_mask = np.zeros(X_norm.shape[1], dtype=bool)
         full_mask[valid_indices[mask_pruned]] = True
         X_selected = X_norm[:, full_mask]
 
-        if X_selected.shape[1] == 0: return np.zeros((X_norm.shape[0], 1)), full_mask, 0.0
+        if X_selected.shape[1] == 0: 
+            return np.zeros((X_norm.shape[0], 1)), full_mask, 0.0
 
+        # Shortcut 1: Single feature correlation (Physics often has this)
+        corrs = np.array([np.abs(np.corrcoef(X_selected[:, j], Y_norm[:, i])[0, 1]) for j in range(X_selected.shape[1])])
+        if np.any(corrs > 0.99):
+            best_feat_idx = np.argmax(corrs)
+            from sklearn.linear_model import LinearRegression
+            lr = LinearRegression().fit(X_selected[:, [best_feat_idx]], Y_norm[:, i])
+            class SingleFeatProg:
+                def __init__(self, m, idx): self.m, self.idx, self.length_ = m, idx, 1
+                def execute(self, X): return self.m.predict(X[:, [self.idx]])
+                def __str__(self): return f"Linear(X{self.idx})"
+            return SingleFeatProg(lr, best_feat_idx), full_mask, lr.score(X_selected[:, [best_feat_idx]], Y_norm[:, i])
+
+        # Shortcut 2: Linear model (Ridge)
         ridge = RidgeCV(alphas=[1e-4, 1e-3, 1e-2, 1e-1, 1, 10])
         ridge.fit(X_selected, Y_norm[:, i])
-        if ridge.score(X_selected, Y_norm[:, i]) > 0.985:
+        r2 = ridge.score(X_selected, Y_norm[:, i])
+        if r2 > 0.95: # Lowered from 0.985
             class LinearProg:
                 def __init__(self, m): self.m, self.length_ = m, 1
                 def execute(self, X): return self.m.predict(X)
-                def __str__(self): return "LinearModel"
-            return LinearProg(ridge), full_mask, ridge.score(X_selected, Y_norm[:, i])
+                def __str__(self): 
+                    coeffs = self.m.coef_
+                    terms = [f"{coeffs[j]:.3f}*X{j}" for j in range(len(coeffs)) if abs(coeffs[j]) > 1e-3]
+                    return " + ".join(terms) + f" + {self.m.intercept_:.3f}"
+            return LinearProg(ridge), full_mask, r2
 
+        # Parallel GP candidates
         candidates = []
-        for p in [0.005, 0.02, 0.1]:
-            est = self._get_regressor(self.max_pop // 2, self.max_gen // 2, parsimony=p)
+        # Reduce population/generations if we have many features to speed up
+        pop_scale = 1.0 if X_selected.shape[1] < 20 else 0.5
+        
+        for p in [0.01, 0.05]: # Reduced from 3 trials to 2
+            est = self._get_regressor(int(self.max_pop * pop_scale), self.max_gen, parsimony=p)
             try:
                 est.fit(X_selected, Y_norm[:, i])
                 prog = est._program
                 score = est.score(X_selected, Y_norm[:, i])
-                if targets_shape_1 == latent_states_shape_1 and not self.validate_stability(prog, X_selected[0]): continue
+                if targets_shape_1 == latent_states_shape_1 and not self.validate_stability(prog, X_selected[0]): 
+                    continue
                 candidates.append({'prog': prog, 'score': score, 'complexity': prog.length_, 'p': p, 'pareto': score - 0.02 * prog.length_})
+                
+                # Early exit if we found a near-perfect model
+                if score > 0.99: break
             except: continue
 
         if not candidates: return None, full_mask, 0.0

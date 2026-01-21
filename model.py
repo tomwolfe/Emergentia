@@ -21,42 +21,71 @@ from stable_pooling import StableHierarchicalPooling
 
 class EquivariantGNNLayer(MessagePassing):
     """
-    E(n)-equivariant GNN Layer.
-    Uses relative distances and vectors to ensure rotation and translation invariance
-    for scalar features and equivariance for vector features.
+    Enhanced E(n)-equivariant GNN Layer.
+    Uses relative distances, relative velocities, and vector-valued messages
+    to better capture physical interactions like angular momentum.
     """
     def __init__(self, in_channels, out_channels, hidden_dim=64):
         super(EquivariantGNNLayer, self).__init__(aggr='add')
+        # Scalar message network
         self.phi_e = nn.Sequential(
-            nn.Linear(2 * in_channels + 1, hidden_dim),
+            nn.Linear(2 * in_channels + 2, hidden_dim), # +2 for dist_sq and dot(v, r)
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
+        # Vector message network (outputs a scalar weight for the rel_pos vector)
+        self.phi_v = nn.Sequential(
+            nn.Linear(2 * in_channels + 2, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+        # Node update network
         self.phi_h = nn.Sequential(
-            nn.Linear(in_channels + hidden_dim, hidden_dim),
+            nn.Linear(in_channels + hidden_dim + 1, hidden_dim), # +1 for vector message norm
             nn.SiLU(),
             nn.Linear(hidden_dim, out_channels)
         )
 
-    def forward(self, x, pos, edge_index):
-        # x: [N, in_channels], pos: [N, 2]
+    def forward(self, x, pos, vel, edge_index):
+        # x: [N, in_channels], pos: [N, 2], vel: [N, 2]
         rel_pos = pos[edge_index[0]] - pos[edge_index[1]]
+        rel_vel = vel[edge_index[0]] - vel[edge_index[1]]
+        
         dist_sq = torch.sum(rel_pos**2, dim=-1, keepdim=True)
+        dot_vr = torch.sum(rel_vel * rel_pos, dim=-1, keepdim=True)
         
         # Propagate messages
-        messages = self.propagate(edge_index, x=x, dist_sq=dist_sq)
+        m_h, m_v = self.propagate(edge_index, x=x, dist_sq=dist_sq, dot_vr=dot_vr, rel_pos=rel_pos)
+        
+        # m_v is a vector [N, 2]. We take its norm as a scalar feature
+        m_v_norm = torch.norm(m_v, dim=-1, keepdim=True)
         
         # Update node features
-        h_update = self.phi_h(torch.cat([x, messages], dim=-1))
+        h_update = self.phi_h(torch.cat([x, m_h, m_v_norm], dim=-1))
         
+        # In a full equivariant GNN we would also update velocities, 
+        # but here we focus on latent representation h.
         return h_update
 
-    def message(self, x_i, x_j, dist_sq):
-        # Compute message using concatenated features and squared distance
-        tmp = torch.cat([x_i, x_j, dist_sq], dim=1)
-        return self.phi_e(tmp)
+    def message(self, x_i, x_j, dist_sq, dot_vr, rel_pos):
+        # Scalar message
+        tmp = torch.cat([x_i, x_j, dist_sq, dot_vr], dim=1)
+        m_h = self.phi_e(tmp)
+        
+        # Vector message weight
+        v_w = self.phi_v(tmp)
+        m_v = v_w * rel_pos
+        
+        return m_h, m_v
+
+    def aggregate(self, inputs, index, dim_size=None):
+        # Custom aggregate to handle tuple of (scalar_msg, vector_msg)
+        m_h_in, m_v_in = inputs
+        m_h = scatter(m_h_in, index, dim=self.node_dim, dim_size=dim_size, reduce='sum')
+        m_v = scatter(m_v_in, index, dim=self.node_dim, dim_size=dim_size, reduce='sum')
+        return m_h, m_v
 
 class HierarchicalPooling(nn.Module):
     """
@@ -208,9 +237,10 @@ class GNNEncoder(nn.Module):
     def forward(self, x, edge_index, batch, tau=1.0, hard=False):
         # Store initial positions for spatial pooling
         pos = x[:, :2] 
+        vel = x[:, 2:4] # Assume [pos_x, pos_y, vel_x, vel_y]
         
-        x = self.ln1(torch.relu(self.gnn1(x, pos, edge_index)))
-        x = self.ln2(torch.relu(self.gnn2(x, pos, edge_index)))
+        x = self.ln1(torch.relu(self.gnn1(x, pos, vel, edge_index)))
+        x = self.ln2(torch.relu(self.gnn2(x, pos, vel, edge_index)))
         
         # Pool to K super-nodes preserving spatial features
         pooled, s, assign_losses, mu = self.pooling(x, batch, pos=pos, tau=tau, hard=hard) # [batch_size, n_super_nodes, hidden_dim], [N, n_super_nodes], mu: [B, K, 2]

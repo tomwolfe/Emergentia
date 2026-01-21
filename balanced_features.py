@@ -327,6 +327,74 @@ class BalancedFeatureTransformer:
     def denormalize_y(self, Y_norm):
         return Y_norm * self.target_std + self.target_mean
 
+    def transform_jacobian(self, z_flat):
+        """
+        Compute Jacobian dX/dz for the balanced transformation.
+        """
+        n_latents = self.n_super_nodes * self.latent_dim
+        z_nodes = z_flat.reshape(self.n_super_nodes, self.latent_dim)
+        
+        # 1. Base features Jacobian (Latents + Distances)
+        jac_list = [np.eye(n_latents)]
+        
+        if self.include_dists:
+            i_idx, j_idx = np.triu_indices(self.n_super_nodes, k=1)
+            for i, j in zip(i_idx, j_idx):
+                diff = z_nodes[i, :2] - z_nodes[j, :2]
+                if self.box_size is not None:
+                    box = np.array(self.box_size)
+                    diff -= box * np.round(diff / box)
+                
+                d = np.linalg.norm(diff) + 1e-9
+                
+                # d(d)/dz
+                jd = np.zeros(n_latents)
+                jd[i*self.latent_dim : i*self.latent_dim+2] = diff / d
+                jd[j*self.latent_dim : j*self.latent_dim+2] = -diff / d
+                
+                # d, 1/(d+0.1), 1/(d^2+0.1), exp(-d)
+                jac_list.append(jd.reshape(1, -1))
+                jac_list.append((-1.0 / (d + 0.1)**2 * jd).reshape(1, -1))
+                jac_list.append((-2.0 * d / (d**2 + 0.1)**2 * jd).reshape(1, -1))
+                jac_list.append((-np.exp(-d) * jd).reshape(1, -1))
+
+        X_base_jac = np.vstack(jac_list)
+        
+        # 2. Physics-informed expansion Jacobian
+        # Original features
+        poly_jacs = [X_base_jac]
+        
+        # Squares of raw latents
+        for i in range(n_latents):
+            poly_jacs.append((2 * z_flat[i] * X_base_jac[i]).reshape(1, -1))
+            
+        # Intra-node cross-terms
+        for node_idx in range(self.n_super_nodes):
+            start_idx = node_idx * self.latent_dim
+            for i in range(self.latent_dim):
+                for j in range(i + 1, self.latent_dim):
+                    idx_i = start_idx + i
+                    idx_j = start_idx + j
+                    # d(zi*zj)/dz = zi*d(zj)/dz + zj*d(zi)/dz
+                    jd_cross = z_flat[idx_i] * X_base_jac[idx_j] + z_flat[idx_j] * X_base_jac[idx_i]
+                    poly_jacs.append(jd_cross.reshape(1, -1))
+                    
+        # Inter-node cross-terms (same dimension)
+        for dim_idx in range(self.latent_dim):
+            for i in range(self.n_super_nodes):
+                for j in range(i + 1, self.n_super_nodes):
+                    idx_i = i * self.latent_dim + dim_idx
+                    idx_j = j * self.latent_dim + dim_idx
+                    jd_cross = z_flat[idx_i] * X_base_jac[idx_j] + z_flat[idx_j] * X_base_jac[idx_i]
+                    poly_jacs.append(jd_cross.reshape(1, -1))
+                    
+        X_expanded_jac = np.vstack(poly_jacs)
+        
+        # Apply feature selection if indices are present
+        if self.selected_feature_indices is not None:
+            return X_expanded_jac[self.selected_feature_indices]
+        return X_expanded_jac
+
     def get_n_features(self):
         return self.n_selected_features if self.n_selected_features is not None else 0
 
