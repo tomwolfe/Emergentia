@@ -386,8 +386,6 @@ class GNNDecoder(nn.Module):
     def __init__(self, latent_dim, hidden_dim, out_features, box_size=10.0):
         super(GNNDecoder, self).__init__()
         self.box_size = box_size
-        self.ln1 = nn.LayerNorm(hidden_dim)
-        self.ln2 = nn.LayerNorm(hidden_dim)
         self.mlp = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
             nn.ReLU(),
@@ -397,11 +395,6 @@ class GNNDecoder(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, out_features)
         )
-        # Final Linear layer initialized to identity for stable reconstruction scale
-        self.identity_projector = nn.Linear(out_features, out_features)
-        with torch.no_grad():
-            self.identity_projector.weight.copy_(torch.eye(out_features))
-            self.identity_projector.bias.zero_()
 
     def forward(self, z, s, batch, stats=None):
         # z: [batch_size, n_super_nodes, latent_dim]
@@ -414,7 +407,6 @@ class GNNDecoder(nn.Module):
         node_features_latent = torch.sum(s.unsqueeze(-1) * z_expanded, dim=1)
         
         out = self.mlp(node_features_latent)
-        out = self.identity_projector(out)
         
         # Positions and velocities are reconstructed
         pos_recon = out[:, :2]
@@ -475,11 +467,11 @@ class DiscoveryEngineModel(nn.Module):
         # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning, 8: sep, 9: conn, 10: sparsity, 11: mi, 12: sym, 13: var
         # Initialize log_vars[0] (rec) to a moderate value
         lvars = torch.zeros(14)
-        lvars[0] = -2.0 # High priority for reconstruction
+        lvars[0] = -5.0 # High priority for reconstruction
         lvars[1] = 0.5  # Consistency
         lvars[2] = 0.5  # Assignment
         lvars[3] = 0.0  # Ortho
-        lvars[6] = 1.0  # Start align sooner
+        lvars[6] = -3.0 # Start align immediately with high weight
         lvars[12] = 2.0 # Suppress symbolic significantly initially
         lvars[13] = 1.0 # Suppress latent variance loss more initially
         self.log_vars = nn.Parameter(lvars) 

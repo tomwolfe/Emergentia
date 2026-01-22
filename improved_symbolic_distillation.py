@@ -162,7 +162,7 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
 
     def __init__(self, populations=1500, generations=40, stopping_criteria=0.001, max_features=15,
                  secondary_optimization=True, opt_method='L-BFGS-B', opt_iterations=100,
-                 use_sindy_pruning=True, sindy_threshold=0.001,  # Reduced from 0.01 to prevent over-pruning
+                 use_sindy_pruning=True, sindy_threshold=0.05,  # Increased to be more selective by default
                  enhanced_feature_selection=True, physics_informed=True):
         super().__init__(populations, generations, stopping_criteria, max_features)
         self.secondary_optimization = secondary_optimization
@@ -283,7 +283,7 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
             mask[top_indices] = True
             return mask
 
-    def _sindy_select(self, X, y, threshold=0.005, max_iter=15):  # Reduced default threshold to be less aggressive
+    def _sindy_select(self, X, y, threshold=0.05, max_iter=15):  # Updated default threshold to 0.05
         """
         Enhanced Sequential Thresholded Least Squares (STLSQ) for SINDy-style pruning.
         With adaptive threshold fallback to prevent over-pruning.
@@ -335,18 +335,20 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
                 best_mask = mask
                 break
             
-            # If not enough features, reduce threshold and try again
-            curr_threshold *= 0.5
+            # If not enough features, reduce threshold significantly and try again
+            curr_threshold *= 0.3 # More aggressive reduction to find features
             best_mask = mask # Keep the best so far just in case
 
-        # FEATURE FALLBACK: If SINDy prunes to 0 features, force a fallback
+        # FEATURE FALLBACK: If SINDy still prunes to 0 features after all retries
         if np.sum(best_mask) == 0:
-            print("  -> SINDy pruned all features. Falling back to top 5 features by Mutual Information.")
+            print(f"  -> SINDy failed even with threshold={curr_threshold:.6f}. Falling back to top 5 features.")
             from sklearn.feature_selection import mutual_info_regression
             mi_scores = mutual_info_regression(X, y, random_state=42)
             top_indices = np.argsort(mi_scores)[-min(5, n_features):]
             best_mask = np.zeros(n_features, dtype=bool)
             best_mask[top_indices] = True
+            
+        return best_mask
             
         return best_mask
 

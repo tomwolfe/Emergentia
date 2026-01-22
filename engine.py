@@ -259,6 +259,7 @@ class Trainer:
         # Manually re-balance initial log_vars for stability
         with torch.no_grad():
             self.model.log_vars[0].fill_(-5.0)  # High priority for reconstruction
+            self.model.log_vars[6].fill_(-3.0)  # High priority for alignment
             self.model.log_vars[13].fill_(2.0)  # Suppress latent variance loss more to prevent explosion
 
         # Symbolic-in-the-loop
@@ -319,15 +320,24 @@ class Trainer:
             if hasattr(self.model.encoder.pooling, 'set_sparsity_weight'):
                 self.model.encoder.pooling.set_sparsity_weight(new_weight)
 
+        # Stage-based curriculum: Stage 1 (0-200 epochs) freezes ODE/Symbolic and focuses on Recon/Align
+        is_stage1 = epoch < 200
+        for p in self.model.ode_func.parameters():
+            p.requires_grad = not is_stage1
+        
+        if self.symbolic_proxy is not None:
+            for p in self.symbolic_proxy.parameters():
+                p.requires_grad = not is_stage1
+
         # Periodically apply hard revival to prevent resolution collapse
         if epoch > 0 and epoch % 50 == 0:  # More frequent revival
             if hasattr(self.model.encoder.pooling, 'apply_hard_revival'):
                 self.model.encoder.pooling.apply_hard_revival()
 
         # Determine if we should compute consistency loss based on frequency
-        # CRITICAL FIX: Do not skip consistency during the first 50 epochs to prevent early jitter
-        compute_consistency = (epoch >= self.warmup_epochs)
-        if epoch > 50:
+        # Stage 1 skips consistency loss to focus on static reconstruction
+        compute_consistency = (epoch >= self.warmup_epochs) and (not is_stage1)
+        if epoch > 200: # Only skip frequency after stage 1
             compute_consistency = compute_consistency and (epoch % self.skip_consistency_freq == 0)
 
         # For gradient accumulation
@@ -355,8 +365,8 @@ class Trainer:
         # 3. Decaying Teacher Forcing Ratio (more aggressive decay)
         tf_ratio = max(0.0, 0.8 * (1.0 - epoch / (0.5 * max_epochs + 1e-9)))  # Faster decay
 
-        # 4. Alignment weight
-        align_weight = 1.0
+        # 4. Alignment weight - Boosted in Stage 1
+        align_weight = 5.0 if is_stage1 else 1.0
 
         # 5. Adaptive Entropy Weight: Doubled growth rate to force discrete clusters
         # Point 1: Addressing "Blurry" Meso-scale
@@ -371,8 +381,8 @@ class Trainer:
         if torch.isnan(z_curr).any() or torch.isinf(z_curr).any():
             z_curr = torch.nan_to_num(z_curr, nan=0.0, posinf=1.0, neginf=-1.0)
 
-        # Apply high weight for initial reconstruction - Pass stats for denormalization
-        recon_0 = self.model.decode(z_curr, s_0, batch_0.batch, stats=self.stats)
+        # Apply high weight for initial reconstruction - Do NOT pass stats to keep in normalized space
+        recon_0 = self.model.decode(z_curr, s_0, batch_0.batch)
         loss_rec = self.criterion(recon_0, batch_0.x)
         
         loss_cons = torch.tensor(0.0, device=self.device)
@@ -483,8 +493,8 @@ class Trainer:
 
             z_t_target = torch.nan_to_num(z_t_target)
 
-            # Use z_preds for reconstruction to force consistency - Pass stats for denormalization
-            recon_t = self.model.decode(z_preds[t], s_t, batch_t.batch, stats=self.stats)
+            # Use z_preds for reconstruction to force consistency - Do NOT pass stats to keep in normalized space
+            recon_t = self.model.decode(z_preds[t], s_t, batch_t.batch)
 
             loss_rec += self.criterion(recon_t, batch_t.x)
             loss_assign += entropy_weight * losses_t['entropy'] + 2.0 * losses_t['diversity'] + 0.1 * losses_t['spatial']
@@ -530,7 +540,7 @@ class Trainer:
         loss_conn /= (seq_len // 2)
 
         # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning, 8: sep, 9: conn, 10: sparsity, 11: mi, 12: sym, 13: var
-        lvars = torch.clamp(self.model.log_vars, min=-0.5, max=3.0)
+        lvars = torch.clamp(self.model.log_vars, min=-6.0, max=5.0)
 
         raw_weights = {
             'rec': torch.exp(-lvars[0]), 'cons': torch.exp(-lvars[1]),
@@ -573,7 +583,7 @@ class Trainer:
 
         weights = raw_weights
 
-        discovery_loss = (weights['rec'] * 5.0 * loss_rec + lvars[0]) + \
+        discovery_loss = (weights['rec'] * loss_rec + lvars[0]) + \
                          (weights['assign'] * loss_assign + lvars[2]) + \
                          (weights['ortho'] * loss_ortho + lvars[3]) + \
                          (weights['align'] * loss_align + lvars[6]) + \

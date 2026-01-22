@@ -238,7 +238,7 @@ class ImprovedSymbolicDynamics:
             grad_H = np.nan_to_num(grad_H, nan=0.0, posinf=0.0, neginf=0.0)
 
         # FALLBACK: If grad_H is effectively zero, use learned neural derivatives
-        if np.linalg.norm(grad_H) < 1e-6 and self.model is not None:
+        if np.linalg.norm(grad_H) < 1e-5 and self.model is not None:
             # print("Warning: Symbolic gradient is zero. Using neural fallback.")
             with torch.no_grad():
                 z_tensor = torch.from_numpy(z_reshaped).float().unsqueeze(0)
@@ -332,7 +332,7 @@ class ImprovedSymbolicDynamics:
                 derivatives[0, i] = 0.0  # Default to zero if no equation
 
         # FALLBACK: If derivatives are effectively zero, use learned neural derivatives
-        if np.linalg.norm(derivatives) < 1e-6 and self.model is not None:
+        if np.linalg.norm(derivatives) < 1e-5 and self.model is not None:
             with torch.no_grad():
                 z_tensor = torch.from_numpy(derivatives.flatten()).float().unsqueeze(0)
                 # But we need the input z for neural fallback, not the (zero) derivatives

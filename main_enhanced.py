@@ -2,7 +2,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from simulator import SpringMassSimulator
-from model import DiscoveryEngineModel
+from optimized_model import OptimizedDiscoveryEngineModel
 from engine import Trainer, prepare_data
 from symbolic import SymbolicDistiller, extract_latent_data
 from enhanced_symbolic import create_enhanced_distiller
@@ -23,7 +23,7 @@ def main():
     # 3. Symbolic proxy fragility - using robust symbolic proxy
     # 4. Basis-free symbolic discovery - using transformer-based generator
     parser = argparse.ArgumentParser()
-    parser.add_argument('--epochs', type=int, default=5000)
+    parser.add_argument('--epochs', type=int, default=1000)
     parser.add_argument('--steps', type=int, default=800)
     parser.add_argument('--particles', type=int, default=16)
     parser.add_argument('--super_nodes', type=int, default=4)
@@ -73,12 +73,12 @@ def main():
     # Prepare data with device support and robust normalization
     dataset, stats = prepare_data(pos, vel, radius=dynamic_radius, device=device)
 
-    # 2. Initialize Model and Trainer
+    # 2. Initialize Model and Trainer ---
     print("--- 2. Initialize Model and Trainer ---")
     # Using Hamiltonian dynamics with learnable dissipation for improved physics fidelity
     # NEW: Ensure at least half of super-nodes stay active to prevent resolution collapse
     min_active = max(1, n_super_nodes // 2)
-    model = DiscoveryEngineModel(n_particles=n_particles,
+    model = OptimizedDiscoveryEngineModel(n_particles=n_particles,
                                  n_super_nodes=n_super_nodes,
                                  latent_dim=latent_dim,
                                  hidden_dim=128,
@@ -147,7 +147,9 @@ def main():
     # --- Quality Gate ---
     print(f"\nFinal Training Loss: {last_loss:.6f}")
     if rec > 0.1: # Check unweighted reconstruction loss
-        print(f"WARNING: Model may not have converged fully (Rec Loss: {rec:.6f}).")
+        print(f"CRITICAL ERROR: Model failed to converge (Rec Loss: {rec:.6f} > 0.1).")
+        print("This indicates a Normalization Failure. Aborting symbolic distillation.")
+        return
 
     # 3. Extract Symbolic Equations
     print("--- 3. Distilling Symbolic Laws ---")
@@ -240,9 +242,9 @@ def main():
 
     print("--- 5. Visualizing Results ---")
     from scipy.integrate import odeint
-    from optimized_symbolic import OptimizedSymbolicDynamics
+    from improved_symbolic import ImprovedSymbolicDynamics
 
-    dyn_fn = OptimizedSymbolicDynamics(distiller, equations, distiller.feature_masks, is_hamiltonian, n_super_nodes, latent_dim)
+    dyn_fn = ImprovedSymbolicDynamics(distiller, equations, distiller.feature_masks, is_hamiltonian, n_super_nodes, latent_dim, model=model)
 
     # Integrate the discovered equations
     z0 = z_states[0]
