@@ -206,7 +206,7 @@ class LennardJonesSimulator(SpringMassSimulator):
     Simulates particles interacting via the Lennard-Jones potential:
     V(r) = 4*epsilon * [(sigma/r)^12 - (sigma/r)^6]
     """
-    def __init__(self, n_particles=64, epsilon=1.0, sigma=1.0, m=1.0, dt=0.001, dynamic_radius=None, box_size=None, sub_steps=10):
+    def __init__(self, n_particles=64, epsilon=1.0, sigma=1.0, m=1.0, dt=0.0005, dynamic_radius=None, box_size=None, sub_steps=10):
         # LJ needs smaller dt for stability due to 1/r^12 term
         super().__init__(n_particles=n_particles, m=m, dt=dt, spring_dist=sigma, dynamic_radius=dynamic_radius, box_size=box_size)
         self.epsilon = epsilon

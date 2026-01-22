@@ -89,8 +89,8 @@ class EquivariantGNNLayer(MessagePassing):
     def aggregate(self, inputs, index, dim_size=None):
         # Custom aggregate to handle tuple of (scalar_msg, vector_msg)
         m_h_in, m_v_in = inputs
-        m_h = scatter(m_h_in, index, dim=self.node_dim, dim_size=dim_size, reduce='sum')
-        m_v = scatter(m_v_in, index, dim=self.node_dim, dim_size=dim_size, reduce='sum')
+        m_h = scatter(m_h_in, index, dim=self.node_dim, dim_size=dim_size, reduce='sum').to(torch.float32)
+        m_v = scatter(m_v_in, index, dim=self.node_dim, dim_size=dim_size, reduce='sum').to(torch.float32)
         return m_h, m_v
 
 class HierarchicalPooling(nn.Module):
@@ -201,10 +201,10 @@ class HierarchicalPooling(nn.Module):
         }
 
         super_node_mu = None
-        if pos is not None:
+        if pos is not None and batch is not None:
             s_pos_expanded = pos.unsqueeze(1) * s.unsqueeze(2)
-            sum_s_pos = scatter(s_pos_expanded, batch, dim=0, reduce='sum')
-            sum_s = scatter(s, batch, dim=0, reduce='sum').unsqueeze(-1) + 1e-9
+            sum_s_pos = scatter(s_pos_expanded, batch, dim=0, reduce='sum').to(torch.float32)
+            sum_s = scatter(s, batch, dim=0, reduce='sum').to(torch.float32).unsqueeze(-1) + 1e-9
             super_node_mu = sum_s_pos / sum_s
 
         if super_node_mu is not None:
@@ -216,7 +216,11 @@ class HierarchicalPooling(nn.Module):
             assign_losses['separation'] = separation_loss
 
         x_expanded = x.unsqueeze(1) * s.unsqueeze(2)
-        out = scatter(x_expanded, batch, dim=0, reduce='sum')
+        if batch is not None:
+            out = scatter(x_expanded, batch, dim=0, reduce='sum').to(torch.float32)
+        else:
+            # Return appropriate shape when batch is None
+            out = torch.zeros((0, self.n_super_nodes, x.size(1)), device=x.device, dtype=x.dtype)
 
         return out, s, assign_losses, mu
 

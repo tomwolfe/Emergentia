@@ -85,8 +85,8 @@ class OptimizedEquivariantGNNLayer(MessagePassing):
     def aggregate(self, inputs, index, dim_size=None):
         # Custom aggregate to handle tuple of (scalar_msg, vector_msg)
         m_h_in, m_v_in = inputs
-        m_h = scatter(m_h_in, index, dim=self.node_dim, dim_size=dim_size, reduce='sum')
-        m_v = scatter(m_v_in, index, dim=self.node_dim, dim_size=dim_size, reduce='sum')
+        m_h = scatter(m_h_in, index, dim=self.node_dim, dim_size=dim_size, reduce='sum').to(torch.float32)
+        m_v = scatter(m_v_in, index, dim=self.node_dim, dim_size=dim_size, reduce='sum').to(torch.float32)
         return m_h, m_v
 
 

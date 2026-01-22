@@ -261,7 +261,13 @@ class Trainer:
         # Manually re-balance initial log_vars for stability
         with torch.no_grad():
             self.model.log_vars[0].fill_(-5.0)  # High priority for reconstruction
+            self.model.log_vars[1].fill_(2.0)   # Lower initial priority for consistency
+            self.model.log_vars[2].fill_(2.0)   # Lower initial priority for assignment
+            self.model.log_vars[3].fill_(2.0)   # Lower initial priority for ortho
+            self.model.log_vars[4].fill_(2.0)   # Lower initial priority for l2
             self.model.log_vars[6].fill_(-3.0)  # High priority for alignment
+            self.model.log_vars[11].fill_(2.0)  # Lower initial priority for mi
+            self.model.log_vars[12].fill_(2.0)  # Lower initial priority for sym
             self.model.log_vars[13].fill_(2.0)  # Suppress latent variance loss more to prevent explosion
 
         # Symbolic-in-the-loop
@@ -322,20 +328,22 @@ class Trainer:
             if hasattr(self.model.encoder.pooling, 'set_sparsity_weight'):
                 self.model.encoder.pooling.set_sparsity_weight(new_weight)
 
-        # Stage 0: Grounding (0-50 epochs) - Prioritize Reconstruction and Alignment
-        if epoch < 50:
+        # Stage 0: Grounding (0-100 epochs) - Prioritize Reconstruction and Alignment
+        # Zero out auxiliary losses during warmup to allow GNN to find basic spatial mapping first
+        is_warmup = epoch < 100
+        if is_warmup:
             with torch.no_grad():
-                self.model.log_vars[0].fill_(-6.0)  # Maximum priority for reconstruction
-                self.model.log_vars[6].fill_(-5.0)  # Maximum priority for alignment
+                self.model.log_vars[0].fill_(-7.0)  # Maximum priority for reconstruction
+                self.model.log_vars[6].fill_(-6.0)  # Maximum priority for alignment
                 # Suppress other structural losses initially
-                self.model.log_vars[3].fill_(2.0)   # Ortho
-                self.model.log_vars[11].fill_(2.0)  # MI
+                self.model.log_vars[3].fill_(4.0)   # Ortho - higher to suppress more
+                self.model.log_vars[11].fill_(4.0)  # MI - higher to suppress more
 
         # Stage-based curriculum: Stage 1 freezes ODE/Symbolic and focuses on Recon/Align
         is_stage1 = epoch < self.warmup_epochs
         for p in self.model.ode_func.parameters():
             p.requires_grad = not is_stage1
-        
+
         if self.symbolic_proxy is not None:
             for p in self.symbolic_proxy.parameters():
                 p.requires_grad = not is_stage1
@@ -552,6 +560,13 @@ class Trainer:
 
         # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning, 8: sep, 9: conn, 10: sparsity, 11: mi, 12: sym, 13: var
         lvars = torch.clamp(self.model.log_vars, min=-6.0, max=5.0)
+
+        # Apply warmup suppression to auxiliary losses during first 50 epochs
+        if is_warmup:
+            # Suppress MI and ortho losses during warmup
+            lvars[11] = 5.0  # Very high value to suppress MI loss
+            lvars[3] = 5.0   # Very high value to suppress ortho loss
+            lvars[12] = 5.0  # Suppress symbolic loss during warmup
 
         raw_weights = {
             'rec': torch.exp(-lvars[0]), 'cons': torch.exp(-lvars[1]),
