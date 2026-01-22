@@ -26,7 +26,7 @@ class EquivariantGNNLayer(MessagePassing):
     to better capture physical interactions like angular momentum.
     """
     def __init__(self, in_channels, out_channels, hidden_dim=64):
-        super(EquivariantGNNLayer, self).__init__(aggr='add')
+        super(EquivariantGNNLayer, self).__init__(aggr='mean')
         # Scalar message network
         self.phi_e = nn.Sequential(
             nn.Linear(2 * in_channels + 2, hidden_dim), # +2 for dist_sq and dot(v, r)
@@ -241,7 +241,8 @@ class GNNEncoder(nn.Module):
         self.output_layer = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, latent_dim)
+            nn.Linear(hidden_dim, latent_dim),
+            nn.Tanh()
         )
 
     def forward(self, x, edge_index, batch, tau=1.0, hard=False):

@@ -4,7 +4,7 @@ import sympy as sp
 import re
 from gplearn.genetic import SymbolicRegressor
 from gplearn.functions import make_function
-from sklearn.linear_model import LassoCV, RidgeCV, ElasticNet
+from sklearn.linear_model import LassoCV, RidgeCV, ElasticNet, Lasso
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.feature_selection import SelectKBest, f_regression, mutual_info_regression
 from sklearn.metrics import mean_squared_error, r2_score
@@ -15,6 +15,21 @@ from scipy.optimize import minimize
 import warnings
 
 warnings.filterwarnings('ignore')
+
+# Sanitized Symbolic Primitives
+def _safe_sqrt(x):
+    return np.sqrt(np.abs(x))
+
+def _safe_log(x):
+    return np.log(np.abs(x) + 1e-9)
+
+def _safe_div(x, y):
+    return np.where(np.abs(y) < 1e-9, 1.0, x / y)
+
+safe_sqrt = make_function(function=_safe_sqrt, name='sqrt', arity=1)
+safe_log = make_function(function=_safe_log, name='log', arity=1)
+safe_div = make_function(function=_safe_div, name='div', arity=2)
+safe_inv = make_function(function=lambda x: _safe_div(1.0, x), name='inv', arity=1)
 
 class FeatureTransformer:
     """
@@ -29,6 +44,7 @@ class FeatureTransformer:
         self.x_poly_std = None
         self.target_mean = None
         self.target_std = None
+        self.selector = None
 
     def fit(self, latent_states, targets):
         X_poly = self.transform(latent_states)
@@ -83,7 +99,20 @@ class FeatureTransformer:
             for j in range(v_idx + 1, min(v_idx + 4, (node_idx + 1) * n_dims)):
                 poly_features.append(X[:, v_idx:v_idx+1] * X[:, j:j+1])
         
-        return np.clip(np.hstack(poly_features), -1e6, 1e6)
+        X_out = np.clip(np.hstack(poly_features), -1e6, 1e6)
+        
+        # Feature Pruning: prevent linear combination explosion
+        if batch_size < X_out.shape[1]:
+            k = max(1, batch_size // 2)
+            if self.selector is None:
+                # We need targets to fit SelectKBest, but transform is often called without them.
+                # In this pipeline, we'll assume fit() handles selector initialization if needed.
+                # However, for simplicity here we just use the first K features if selector not fitted.
+                X_out = X_out[:, :k]
+            else:
+                X_out = self.selector.transform(X_out)
+        
+        return X_out
 
     def normalize_x(self, X_poly): return (X_poly - self.x_poly_mean) / self.x_poly_std
     def normalize_y(self, Y): return (Y - self.target_mean) / self.target_std
@@ -127,10 +156,9 @@ class SymbolicDistiller:
         self.transformer = None
 
     def _get_regressor(self, pop, gen, parsimony=0.01):
-        inv = make_function(function=lambda x: 1.0/(x + 1e-9), name='inv', arity=1)
         square = make_function(function=lambda x: x**2, name='square', arity=1)
         return SymbolicRegressor(population_size=pop, generations=gen, parsimony_coefficient=parsimony,
-                                 function_set=('add', 'sub', 'mul', 'div', 'sqrt', 'log', 'abs', 'neg', inv, square),
+                                 function_set=('add', 'sub', 'mul', safe_div, safe_sqrt, safe_log, 'abs', 'neg', safe_inv, square),
                                  n_jobs=1, random_state=42, verbose=0)
 
     def _select_features(self, X, y):
@@ -152,11 +180,25 @@ class SymbolicDistiller:
         est = self._get_regressor(self.populations, self.generations).fit(X_sel, y)
         return OptimizedExpressionProgram(str(est._program)), mask, est.score(X_sel, y)
 
-    def distill(self, latent_states, targets, n_super_nodes, latent_dim, box_size=None):
+    def distill(self, latent_states, targets, n_super_nodes, latent_dim, box_size=None, hamiltonian=False):
         self.transformer = FeatureTransformer(n_super_nodes, latent_dim, box_size=box_size)
+        
+        # If pruning is needed, initialize selector
+        X_raw = self.transformer.transform(latent_states)
+        if latent_states.shape[0] < X_raw.shape[1]:
+            k = max(1, latent_states.shape[0] // 2)
+            self.transformer.selector = SelectKBest(f_regression, k=k).fit(X_raw, targets[:, 0])
+        
         self.transformer.fit(latent_states, targets)
         X_norm = self.transformer.normalize_x(self.transformer.transform(latent_states))
         Y_norm = self.transformer.normalize_y(targets)
+        
+        if hamiltonian:
+            # Regress a SINGLE target: the scalar Hamiltonian H
+            # We assume the first column of targets is H if hamiltonian=True is passed
+            # or that extract_latent_data was called with include_hamiltonian=True
+            res, mask, score = self._distill_single_target(X_norm, Y_norm[:, 0])
+            return [res]
         
         results = Parallel(n_jobs=-1)(delayed(self._distill_single_target)(X_norm, Y_norm[:, i]) for i in range(targets.shape[1]))
         return [r[0] for r in results]
@@ -167,28 +209,30 @@ def extract_latent_data(model, dataset, dt, include_hamiltonian=False):
     device = next(model.parameters()).device
     with torch.no_grad():
         for i, data in enumerate(dataset):
-            # Ensure data is on the correct device
             x = data.x.to(device)
-            # Handle edge_index if it exists, otherwise create empty
             if hasattr(data, 'edge_index') and data.edge_index is not None:
                 ei = data.edge_index.to(device)
             else:
                 ei = torch.empty((2, 0), dtype=torch.long, device=device)
             
-            # Create a single-item batch
             batch = torch.zeros(x.size(0), dtype=torch.long, device=device)
             
             try:
                 z, _, _, _ = model.encode(x, ei, batch)
                 z_flat = z.view(1, -1)
                 
-                # Extract dynamics derivative
-                # Some models might have ode_func on CPU (MPS fix)
-                ode_device = next(model.ode_func.parameters()).device
-                dz = model.ode_func(torch.tensor([i*dt], device=ode_device), z_flat.to(ode_device))
-                
                 states.append(z_flat[0].cpu().numpy())
-                derivs.append(dz[0].cpu().numpy())
+                
+                if include_hamiltonian and hasattr(model.ode_func, 'H_net'):
+                    # Extract scalar Hamiltonian
+                    ode_device = next(model.ode_func.parameters()).device
+                    H = model.ode_func.H_net(z_flat.to(ode_device))
+                    derivs.append(H.cpu().numpy().flatten())
+                else:
+                    # Extract dynamics derivative
+                    ode_device = next(model.ode_func.parameters()).device
+                    dz = model.ode_func(torch.tensor([i*dt], device=ode_device), z_flat.to(ode_device))
+                    derivs.append(dz[0].cpu().numpy())
             except Exception as e:
                 continue
                 
@@ -200,3 +244,4 @@ def extract_latent_data(model, dataset, dt, include_hamiltonian=False):
 def gp_to_sympy(expr_str):
     local_dict = {'add': lambda x,y: x+y, 'sub': lambda x,y: x-y, 'mul': lambda x,y: x*y, 'div': lambda x,y: x/(y+1e-9), 'sqrt': lambda x: sp.sqrt(sp.Abs(x)), 'log': lambda x: sp.log(sp.Abs(x)+1e-9), 'abs': sp.Abs, 'neg': lambda x: -x, 'inv': lambda x: 1.0/(x+1e-9), 'square': lambda x: x**2}
     return sp.sympify(expr_str, locals=local_dict)
+

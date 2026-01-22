@@ -265,20 +265,20 @@ class Trainer:
 
         # Manually re-balance initial log_vars for stability
         with torch.no_grad():
-            self.model.log_vars[0].fill_(-3.0)  # Very high priority for reconstruction
-            self.model.log_vars[1].fill_(0.0)   # Increased priority for consistency (was 3.0)
-            self.model.log_vars[2].fill_(3.0)   # Lower initial priority for assignment
-            self.model.log_vars[3].fill_(3.0)   # Lower initial priority for ortho
-            self.model.log_vars[4].fill_(3.0)   # Lower initial priority for l2
-            self.model.log_vars[5].fill_(0.0)   # Increased priority for lvr (was 3.0)
-            self.model.log_vars[6].fill_(3.0)   # Lower initial priority for alignment (changed from -3.0)
-            self.model.log_vars[7].fill_(3.0)   # Lower initial priority for pruning
-            self.model.log_vars[8].fill_(3.0)   # Lower initial priority for sep
-            self.model.log_vars[9].fill_(3.0)   # Lower initial priority for conn
-            self.model.log_vars[10].fill_(3.0)  # Lower initial priority for sparsity
-            self.model.log_vars[11].fill_(3.0)  # Lower initial priority for mi
-            self.model.log_vars[12].fill_(3.0)  # Lower initial priority for sym
-            self.model.log_vars[13].fill_(3.0)  # Lower initial priority for var
+            self.model.log_vars[0].fill_(-4.0)  # Even higher priority for reconstruction
+            self.model.log_vars[1].fill_(2.0)   # Lower initial priority for consistency
+            self.model.log_vars[2].fill_(2.0)   # Lower initial priority for assignment
+            self.model.log_vars[3].fill_(4.0)   # Lower initial priority for ortho
+            self.model.log_vars[4].fill_(4.0)   # Lower initial priority for l2
+            self.model.log_vars[5].fill_(2.0)   # Moderate priority for lvr
+            self.model.log_vars[6].fill_(6.0)   # Lower initial priority for alignment
+            self.model.log_vars[7].fill_(4.0)   # Lower initial priority for pruning
+            self.model.log_vars[8].fill_(4.0)   # Lower initial priority for sep
+            self.model.log_vars[9].fill_(4.0)   # Lower initial priority for conn
+            self.model.log_vars[10].fill_(4.0)  # Lower initial priority for sparsity
+            self.model.log_vars[11].fill_(6.0)  # Lower initial priority for mi
+            self.model.log_vars[12].fill_(4.0)  # Lower initial priority for sym
+            self.model.log_vars[13].fill_(4.0)  # Lower initial priority for var
 
         # Symbolic-in-the-loop
         self.symbolic_proxy = None
@@ -351,26 +351,23 @@ class Trainer:
         if torch.isnan(z_curr).any() or torch.isinf(z_curr).any():
             z_curr = torch.nan_to_num(z_curr, nan=0.0, posinf=1.0, neginf=-1.0)
 
-        p_min = torch.tensor(self.stats['pos_min'], device=self.device, dtype=torch.float32)
-        p_range = torch.tensor(self.stats['pos_range'], device=self.device, dtype=torch.float32)
-        v_mean = torch.tensor(self.stats['vel_mean'], device=self.device, dtype=torch.float32)
-        v_std = torch.tensor(self.stats['vel_std'], device=self.device, dtype=torch.float32)
+        # Use normalized reconstruction loss for better scale consistency
+        recon_0 = self.model.decode(z_curr, s_0, batch_0.batch, stats=None)
+        loss_rec = self.criterion(recon_0, batch_0.x)
         
-        x_0_phys = torch.cat([
-            0.5 * (batch_0.x[:, :2] + 1.0) * p_range + p_min,
-            batch_0.x[:, 2:4] * v_std + v_mean
-        ], dim=-1)
-
-        recon_0 = self.model.decode(z_curr, s_0, batch_0.batch, stats=self.stats)
-        loss_rec = self.criterion(recon_0, x_0_phys)
-        
-        loss_assign = entropy_weight * losses_0['entropy'] + 2.0 * losses_0['diversity'] + 0.1 * losses_0['spatial']
+        # Enhanced assignment loss including stability terms
+        loss_assign = (
+            entropy_weight * losses_0['entropy'] + 
+            0.5 * losses_0['diversity'] + 
+            0.1 * losses_0['spatial'] +
+            0.1 * losses_0.get('collapse_prevention', 0.0) +
+            0.1 * losses_0.get('balance', 0.0)
+        )
         
         initial_results = {
             'z_curr': z_curr, 's_0': s_0, 'mu_0': mu_0,
             'loss_rec': loss_rec, 'loss_assign': loss_assign,
-            'losses_0': losses_0, 'x_0_phys': x_0_phys,
-            'p_range': p_range, 'p_min': p_min, 'v_std': v_std, 'v_mean': v_mean
+            'losses_0': losses_0, 'x_0_target': batch_0.x
         }
         return initial_results
 
@@ -411,16 +408,32 @@ class Trainer:
     def _integrate_trajectories(self, z_curr, data_list, dt, tf_ratio, tau, hard, is_warmup):
         z_preds = [z_curr]
         seq_len = len(data_list)
+        
+        # MPS fix: torchdiffeq has issues with MPS. If we are on MPS,
+        # we ensure the ODE integration happens on CPU.
+        use_mps_fix = (str(self.device) == 'mps')
+        
         if not is_warmup:
             for t in range(1, seq_len):
                 if np.random.random() < tf_ratio:
                     batch_t_prev = Batch.from_data_list([data_list[t-1]]).to(self.device)
                     z_curr_forced, _, _, _ = self.model.encode(batch_t_prev.x, batch_t_prev.edge_index, batch_t_prev.batch, tau=tau, hard=hard)
                     z_curr = torch.nan_to_num(z_curr_forced)
+                
                 t_span = torch.tensor([0, dt], device=self.device, dtype=torch.float32)
+                
                 try:
-                    z_next_seq = self.model.forward_dynamics(z_curr, t_span)
-                    z_curr = torch.nan_to_num(z_next_seq[1], nan=0.0, posinf=1.0, neginf=-1.0)
+                    if use_mps_fix:
+                        # Move to CPU for integration
+                        z_curr_cpu = z_curr.cpu()
+                        t_span_cpu = t_span.cpu()
+                        # forward_dynamics already handles moving to ode_func's device (which is CPU)
+                        z_next_seq = self.model.forward_dynamics(z_curr_cpu, t_span_cpu)
+                        # Move back to MPS
+                        z_curr = torch.nan_to_num(z_next_seq[1].to(self.device), nan=0.0, posinf=1.0, neginf=-1.0)
+                    else:
+                        z_next_seq = self.model.forward_dynamics(z_curr, t_span)
+                        z_curr = torch.nan_to_num(z_next_seq[1], nan=0.0, posinf=1.0, neginf=-1.0)
                 except Exception:
                     z_curr = z_curr.detach()
                 z_preds.append(z_curr)
@@ -461,7 +474,6 @@ class Trainer:
         init_res = self._compute_initial_recon_loss(batch_0, tau, hard, entropy_weight)
         z_curr, s_0, mu_0 = init_res['z_curr'], init_res['s_0'], init_res['mu_0']
         loss_rec, loss_assign = init_res['loss_rec'], init_res['loss_assign']
-        p_range, p_min, v_std, v_mean = init_res['p_range'], init_res['p_min'], init_res['v_std'], init_res['v_mean']
 
         loss_curv = self._compute_hamiltonian_curv_loss(z_curr)
         loss_sym = self._compute_symbolic_loss(z_curr, is_warmup)
@@ -492,18 +504,26 @@ class Trainer:
             batch_t = Batch.from_data_list([data_list[t]]).to(self.device)
             z_t_target, s_t, losses_t, mu_t = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch, tau=tau, hard=hard)
             z_t_target = torch.nan_to_num(z_t_target)
-            recon_t = self.model.decode(z_preds[t], s_t, batch_t.batch, stats=self.stats)
-            x_t_phys = torch.cat([0.5 * (batch_t.x[:, :2] + 1.0) * p_range + p_min, batch_t.x[:, 2:4] * v_std + v_mean], dim=-1)
-
-            loss_rec += self.criterion(recon_t, x_t_phys)
-            loss_assign += entropy_weight * losses_t['entropy'] + 2.0 * losses_t['diversity'] + 0.1 * losses_t['spatial']
+            
+            # Use normalized targets for stability
+            recon_t = self.model.decode(z_preds[t], s_t, batch_t.batch, stats=None)
+            loss_rec += self.criterion(recon_t, batch_t.x)
+            
+            loss_assign += (
+                entropy_weight * losses_t['entropy'] + 
+                0.5 * losses_t['diversity'] + 
+                0.1 * losses_t['spatial'] +
+                0.1 * losses_t.get('collapse_prevention', 0.0) + 
+                0.1 * losses_t.get('balance', 0.0)
+            )
             loss_pruning += losses_t['pruning']
             loss_sparsity += losses_t['sparsity']
             loss_sep += losses_t.get('separation', torch.tensor(0.0, device=self.device))
             loss_conn += self.model.get_connectivity_loss(s_t, batch_t.edge_index)
             loss_ortho += self.model.get_ortho_loss(s_t)
 
-            mu_t_norm = 2.0 * (mu_t - mu_min) / mu_range - 1.0
+            # mu_t is already in normalized range [-1, 1] because it's computed from normalized x
+            mu_t_norm = mu_t 
             d_align = min(self.model.encoder.latent_dim // 2 if self.model.hamiltonian else 2, 2)
             loss_align += 2.0 * self.criterion(z_preds[t, :, :, :d_align], mu_t_norm[:, :, :d_align])
             loss_mi += self.model.get_mi_loss(z_preds[t], mu_t_norm)
@@ -553,9 +573,11 @@ class Trainer:
             self.optimizer.step()
 
         self.loss_tracker.update({'total': loss, 'rec_raw': loss_rec, 'cons_raw': loss_cons, 'assign': loss_assign, 'align': loss_align, 'mi': loss_mi, 'sym': loss_sym, 'lvar_raw': loss_var, 'curv_raw': loss_curv, 'lvars_mean': lvars.mean()}, weights=weights)
-        with torch.no_grad():
-            loss_rec_log = self.criterion(self.model.decode(z_curr, s_0, batch_0.batch, stats=None), batch_0.x)
-        return loss.item(), loss_rec_log.item(), loss_cons.item() if compute_consistency else 0.0
+        
+        if epoch % 100 == 0:
+            print(f"  [Loss Detail] Rec: {loss_rec:.4f} | Cons: {loss_cons:.4f} | Assign: {loss_assign:.4f} | Ortho: {loss_ortho:.4f} | Align: {loss_align:.4f} | Sym: {loss_sym:.4f}")
+
+        return loss.item(), loss_rec.item(), loss_cons.item() if compute_consistency else 0.0
 
 if __name__ == "__main__":
     n_particles = 16
