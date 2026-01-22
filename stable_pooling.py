@@ -134,10 +134,10 @@ class StableHierarchicalPooling(nn.Module):
             revival_mask = (torch.rand_like(self.active_mask) < 0.1).float() * revival_candidate # Increased prob from 0.05
             effective_active = torch.clamp(current_active + revival_mask, 0, 1)
 
-            # Use a faster EMA for revival (0.1 vs 0.02)
-            ema_rate = 0.1 if self.active_mask.sum() >= self.min_active_super_nodes else 0.2 # Increased from 0.02/0.05
+            # Use a much slower EMA for smoothness as requested
+            ema_rate = 0.001 # Extremely smooth EMA (0.999 weight on previous)
             if hard:
-                ema_rate *= 0.5 # Slower updates during hard sampling
+                ema_rate *= 0.5 # Even slower updates during hard sampling
 
             self.active_mask.copy_((1.0 - ema_rate) * self.active_mask + ema_rate * effective_active)
 

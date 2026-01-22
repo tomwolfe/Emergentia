@@ -517,23 +517,7 @@ class DiscoveryEngineModel(nn.Module):
 
         # Learnable loss log-variances for automatic loss balancing
         # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning, 8: sep, 9: conn, 10: sparsity, 11: mi, 12: sym, 13: var, 14: hinge
-        lvars = torch.zeros(15)
-        lvars[0] = -5.0 # Very high priority for reconstruction initially
-        lvars[1] = 5.0  # Very low initial priority for consistency
-        lvars[2] = 5.0  # Very low initial priority for assignment
-        lvars[3] = 5.0  # Very low initial priority for ortho (this was causing issues)
-        lvars[4] = 5.0  # Very low initial priority for l2
-        lvars[5] = 5.0  # Very low initial priority for lvr
-        lvars[6] = 5.0  # Very low initial priority for align
-        lvars[7] = 5.0  # Very low initial priority for pruning
-        lvars[8] = 5.0  # Very low initial priority for sep
-        lvars[9] = 5.0  # Very low initial priority for conn
-        lvars[10] = 5.0 # Very low initial priority for sparsity
-        lvars[11] = 5.0 # Very low initial priority for mi
-        lvars[12] = 5.0 # Very low initial priority for sym
-        lvars[13] = 5.0 # Very low initial priority for var
-        lvars[14] = 5.0 # Very low initial priority for hinge
-        self.log_vars = nn.Parameter(lvars) 
+        self.log_vars = nn.Parameter(torch.zeros(15)) 
         
     def get_latent_variance_loss(self, z):
         """

@@ -149,13 +149,18 @@ class OptimizedExpressionProgram:
     def __str__(self): return self.expr_str
 
 class SymbolicDistiller:
-    def __init__(self, populations=1000, generations=20, max_features=12):
+    def __init__(self, populations=1000, generations=20, stopping_criteria=0.001, max_features=12):
         self.populations = populations
         self.generations = generations
+        self.stopping_criteria = stopping_criteria
         self.max_features = max_features
         self.transformer = None
 
-    def _get_regressor(self, pop, gen, parsimony=0.01):
+    def get_complexity(self, program):
+        """Returns the length of the program as a measure of complexity."""
+        return getattr(program, 'length_', 1)
+
+    def _get_regressor(self, pop, gen, parsimony=0.02):
         square = make_function(function=lambda x: x**2, name='square', arity=1)
         return SymbolicRegressor(population_size=pop, generations=gen, parsimony_coefficient=parsimony,
                                  function_set=('add', 'sub', 'mul', safe_div, safe_sqrt, safe_log, 'abs', 'neg', safe_inv, square),
@@ -169,12 +174,21 @@ class SymbolicDistiller:
         mask[np.argsort(combined)[-self.max_features:]] = True
         return mask
 
-    def _distill_single_target(self, X, y):
+    def validate_stability(self, program, X_sample):
+        """Simple stability check: ensure no NaNs or Infs for a sample."""
+        try:
+            if hasattr(X_sample, 'detach'): X_sample = X_sample.detach().cpu().numpy()
+            y = program.execute(X_sample.reshape(1, -1))
+            return np.all(np.isfinite(y))
+        except:
+            return False
+
+    def _distill_single_target(self, i, X, y, targets_shape_1=None, latent_states_shape_1=None, is_hamiltonian=False):
         mask = self._select_features(X, y)
         X_sel = X[:, mask]
         
         lasso = LassoCV(cv=5).fit(X_sel, y)
-        if lasso.score(X_sel, y) > 0.99:
+        if lasso.score(X_sel, y) > 0.999:
             return OptimizedExpressionProgram(str(sp.simplify(sum(c*sp.Symbol(f'X{np.where(mask)[0][j]}') for j, c in enumerate(lasso.coef_)) + lasso.intercept_))), mask, lasso.score(X_sel, y)
             
         est = self._get_regressor(self.populations, self.generations).fit(X_sel, y)
@@ -197,10 +211,10 @@ class SymbolicDistiller:
             # Regress a SINGLE target: the scalar Hamiltonian H
             # We assume the first column of targets is H if hamiltonian=True is passed
             # or that extract_latent_data was called with include_hamiltonian=True
-            res, mask, score = self._distill_single_target(X_norm, Y_norm[:, 0])
+            res, mask, score = self._distill_single_target(0, X_norm, Y_norm[:, 0], 1, latent_dim, is_hamiltonian=True)
             return [res]
         
-        results = Parallel(n_jobs=-1)(delayed(self._distill_single_target)(X_norm, Y_norm[:, i]) for i in range(targets.shape[1]))
+        results = Parallel(n_jobs=-1)(delayed(self._distill_single_target)(i, X_norm, Y_norm[:, i], targets.shape[1], latent_dim) for i in range(targets.shape[1]))
         return [r[0] for r in results]
 
 def extract_latent_data(model, dataset, dt, include_hamiltonian=False):
@@ -241,7 +255,7 @@ def extract_latent_data(model, dataset, dt, include_hamiltonian=False):
         
     return np.array(states), np.array(derivs), np.linspace(0, len(states)*dt, len(states))
 
-def gp_to_sympy(expr_str):
+def gp_to_sympy(expr_str, *args, **kwargs):
     local_dict = {'add': lambda x,y: x+y, 'sub': lambda x,y: x-y, 'mul': lambda x,y: x*y, 'div': lambda x,y: x/(y+1e-9), 'sqrt': lambda x: sp.sqrt(sp.Abs(x)), 'log': lambda x: sp.log(sp.Abs(x)+1e-9), 'abs': sp.Abs, 'neg': lambda x: -x, 'inv': lambda x: 1.0/(x+1e-9), 'square': lambda x: x**2}
     return sp.sympify(expr_str, locals=local_dict)
 

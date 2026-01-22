@@ -60,7 +60,9 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
 
         # Distill the Hamiltonian function H
         # If we still have derivative targets here, it's a fallback (not ideal for H discovery)
-        h_prog, h_mask, h_conf = self._distill_single_target(0, X_norm, Y_norm, 1, latent_dim)
+        # Ensure Y_norm is 1D for _distill_single_target
+        y_target = Y_norm[:, 0] if Y_norm.ndim > 1 else Y_norm
+        h_prog, h_mask, h_conf = self._distill_single_target(0, X_norm, y_target, 1, latent_dim)
         
         if h_prog is None:
             return super().distill(latent_states, targets, n_super_nodes, latent_dim, box_size)

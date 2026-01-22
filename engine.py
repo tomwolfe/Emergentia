@@ -273,30 +273,16 @@ class Trainer:
         self.grad_acc_steps = grad_acc_steps
         self.enhanced_balancer = enhanced_balancer
         
-        # Learnable scaling for alignment to prevent scale mismatch
-        self.align_scale = torch.nn.Parameter(torch.tensor(1.0, device=device))
+        # Learnable log-scaling for alignment to ensure it stays positive and stable
+        self.log_align_scale = torch.nn.Parameter(torch.tensor(0.0, device=device))
 
-        # Manually re-balance initial log_vars for stability
+        # Manually re-balance initial log_vars for stability (all weights start at 1.0)
         with torch.no_grad():
-            self.model.log_vars[0].fill_(-5.0)  # Very high priority for reconstruction
-            self.model.log_vars[1].fill_(1.0)   # Higher priority for consistency (increased from 2.0)
-            self.model.log_vars[2].fill_(1.0)   # Higher priority for assignment (increased from 2.0)
-            self.model.log_vars[3].fill_(4.0)   # Lower initial priority for ortho
-            self.model.log_vars[4].fill_(4.0)   # Lower initial priority for l2
-            self.model.log_vars[5].fill_(2.0)   # Moderate priority for lvr
-            self.model.log_vars[6].fill_(6.0)   # Lower initial priority for alignment (decreased priority)
-            self.model.log_vars[7].fill_(4.0)   # Lower initial priority for pruning
-            self.model.log_vars[8].fill_(4.0)   # Lower initial priority for sep
-            self.model.log_vars[9].fill_(4.0)   # Lower initial priority for conn
-            self.model.log_vars[10].fill_(4.0)  # Lower initial priority for sparsity
-            self.model.log_vars[11].fill_(5.0)  # Lower initial priority for mi (increased priority from 6.0)
-            self.model.log_vars[12].fill_(4.0)  # Lower initial priority for sym
-            self.model.log_vars[13].fill_(4.0)  # Lower initial priority for var
-            self.model.log_vars[14].fill_(2.0)  # Moderate priority for hinge to prevent shrinkage
+            self.model.log_vars.fill_(0.0)
 
-        # Significantly increase temporal consistency weight
+        # Significantly increase spatial and connectivity loss multipliers by 10x
         if hasattr(self.model.encoder.pooling, 'temporal_consistency_weight'):
-            self.model.encoder.pooling.temporal_consistency_weight = 10.0 # Increased from 5.0
+            self.model.encoder.pooling.temporal_consistency_weight = 20.0 # Increased from 10.0
 
         # Symbolic-in-the-loop
         self.symbolic_proxy = None
@@ -330,7 +316,7 @@ class Trainer:
 
         param_groups = [
             {'params': other_params, 'weight_decay': 1e-5},
-            {'params': [self.align_scale], 'lr': 1e-3}, # Specific learning rate for scale
+            {'params': [self.log_align_scale], 'lr': 1e-3}, # Specific learning rate for scale
         ]
         if h_net_params:
             param_groups.append({'params': h_net_params, 'weight_decay': 1e-3})
@@ -384,10 +370,10 @@ class Trainer:
         loss_assign = (
             entropy_weight * losses_0['entropy'] + 
             5.0 * losses_0['diversity'] + # Increased from 2.0
-            0.1 * losses_0['spatial'] +
-            1.0 * losses_0.get('collapse_prevention', 0.0) + # Increased from 0.1
-            1.0 * losses_0.get('balance', 0.0) + # Increased from 0.1
-            2.0 * losses_0.get('temporal_consistency', 0.0) # Increased from 1.0
+            1.0 * losses_0['spatial'] + # Increased 10x from 0.1
+            2.0 * losses_0.get('collapse_prevention', 0.0) + # Increased from 1.0
+            2.0 * losses_0.get('balance', 0.0) + # Increased from 1.0
+            5.0 * losses_0.get('temporal_consistency', 0.0) # Increased from 2.0
         )
         
         initial_results = {
@@ -476,13 +462,16 @@ class Trainer:
             if hasattr(self.model.encoder.pooling, 'set_sparsity_weight'):
                 self.model.encoder.pooling.set_sparsity_weight(new_weight)
 
-        is_warmup = epoch < self.warmup_epochs
-        if is_warmup:
+        is_stage1 = epoch < 100
+        if is_stage1:
+            # During Stage 1 (Warmup), we freeze the adaptive balancer and 
+            # use fixed weights to encourage spatial coherence.
+            # w_rec = 0.1 (log_var = 2.3), others = 1.0 (log_var = 0.0)
             with torch.no_grad():
-                for idx, val in [(0, -8.0), (6, 5.0), (3, 5.0), (11, 5.0), (1, 5.0), (2, 5.0), (7, 5.0), (10, 5.0)]:
-                    self.model.log_vars[idx].fill_(val)
-
-        is_stage1 = is_warmup
+                self.model.log_vars.fill_(0.0)
+                self.model.log_vars[0].fill_(np.log(10.0)) 
+        
+        # ODE dynamics only start after warmup
         for p in self.model.ode_func.parameters(): p.requires_grad = not is_stage1
         if self.symbolic_proxy is not None:
             for p in self.symbolic_proxy.parameters(): p.requires_grad = not is_stage1
@@ -514,7 +503,8 @@ class Trainer:
         loss_pruning = init_res['losses_0']['pruning']
         loss_sparsity = init_res['losses_0']['sparsity']
         loss_sep = init_res['losses_0'].get('separation', torch.tensor(0.0, device=self.device))
-        loss_conn = self.model.get_connectivity_loss(s_0, batch_0.edge_index)
+        # Increase connectivity loss multiplier by 10x
+        loss_conn = 10.0 * self.model.get_connectivity_loss(s_0, batch_0.edge_index)
         loss_ortho = self.model.get_ortho_loss(s_0)
         loss_var = self.model.get_latent_variance_loss(z_curr)
         
@@ -543,15 +533,16 @@ class Trainer:
             loss_assign += (
                 entropy_weight * losses_t['entropy'] + 
                 5.0 * losses_t['diversity'] + 
-                0.1 * losses_t['spatial'] +
-                1.0 * losses_t.get('collapse_prevention', 0.0) + 
-                1.0 * losses_t.get('balance', 0.0) +
-                2.0 * losses_t.get('temporal_consistency', 0.0)
+                1.0 * losses_t['spatial'] + # Increased 10x
+                2.0 * losses_t.get('collapse_prevention', 0.0) + 
+                2.0 * losses_t.get('balance', 0.0) +
+                5.0 * losses_t.get('temporal_consistency', 0.0)
             )
             loss_pruning += losses_t['pruning']
             loss_sparsity += losses_t['sparsity']
             loss_sep += losses_t.get('separation', torch.tensor(0.0, device=self.device))
-            loss_conn += self.model.get_connectivity_loss(s_t, batch_t.edge_index)
+            # Increase connectivity loss multiplier by 10x
+            loss_conn += 10.0 * self.model.get_connectivity_loss(s_t, batch_t.edge_index)
             loss_ortho += self.model.get_ortho_loss(s_t)
 
             # mu_t is already in normalized range [-1, 1] because it's computed from normalized x
@@ -563,8 +554,8 @@ class Trainer:
             if epoch > 100:
                 align_weight = min(1.0, (epoch - 100) / self.align_anneal_epochs)
             
-            # Use learnable scale for alignment
-            loss_align += 2.0 * align_weight * self.criterion(z_preds[t, :, :, :d_align] * self.align_scale, mu_t_norm[:, :, :d_align])
+            # Use learnable scale in log-space for alignment
+            loss_align += 2.0 * align_weight * self.criterion(z_preds[t, :, :, :d_align] * torch.exp(self.log_align_scale), mu_t_norm[:, :, :d_align])
             loss_mi += self.model.get_mi_loss(z_preds[t], mu_t_norm)
 
             if t > 0:
@@ -580,22 +571,28 @@ class Trainer:
         loss_mi /= (n_steps * self.model.encoder.n_super_nodes)
 
         lvars = torch.clamp(self.model.log_vars, min=-6.0, max=5.0)
-        if is_warmup: lvars[11], lvars[3], lvars[12] = 5.0, 5.0, 5.0
+        if is_stage1: 
+            # Force structural losses to stay active during stage 1
+            lvars[11], lvars[3], lvars[12] = 0.0, 0.0, 0.0
 
         raw_losses = {'rec': loss_rec, 'cons': loss_cons, 'assign': loss_assign, 'ortho': loss_ortho, 'l2': loss_l2, 'lvr': loss_lvr, 'align': loss_align, 'pruning': loss_pruning, 'sep': loss_sep, 'conn': loss_conn, 'sparsity': loss_sparsity, 'mi': loss_mi, 'sym': loss_sym, 'var': loss_var, 'hinge': loss_hinge}
         
+        # Ensure all raw losses are float32 for stable balancing, especially on MPS
+        for k in raw_losses:
+            raw_losses[k] = raw_losses[k].to(torch.float32)
+
         weights = {k: torch.exp(-lvars[i]) for i, k in enumerate(raw_losses.keys())}
-        if self.enhanced_balancer:
+        if self.enhanced_balancer and not is_stage1:
             balanced = self.enhanced_balancer.get_balanced_losses(raw_losses, self.model.parameters())
             for k in weights:
                 if k in balanced and raw_losses[k].item() != 0: weights[k] = balanced[k] / raw_losses[k]
 
-        discovery_loss = sum(weights[k] * torch.clamp(raw_losses[k].to(torch.float32), 0, 100) + lvars[i] for i, k in enumerate(raw_losses.keys()) if k not in ['cons', 'l2', 'lvr'])
+        discovery_loss = sum(weights[k] * torch.clamp(raw_losses[k], 0, 100) + lvars[i] for i, k in enumerate(raw_losses.keys()) if k not in ['cons', 'l2', 'lvr'])
         discovery_loss += (weights['sym'] * (self.symbolic_weight - 1.0) * torch.clamp(loss_sym.to(torch.float32), 0, 100)) # Adjust sym weight
         discovery_loss += 1e-4 * torch.clamp(loss_curv.to(torch.float32), 0, 100)
         
         loss = discovery_loss + (weights['l2'] * 1e-4 * torch.clamp(loss_l2, 0, 100) + lvars[4]) + (weights['lvr'] * 1e-4 * torch.clamp(loss_lvr, 0, 100) + lvars[5])
-        if compute_consistency: loss += (weights['cons'] * torch.clamp(loss_cons, 0, 100) + lvars[1])
+        if compute_consistency: loss += (weights['cons'] * torch.clamp(loss_cons.to(torch.float32), 0, 100) + lvars[1])
         
         loss = torch.clamp(loss + 0.1 * torch.sum(lvars**2), 0, 1e4)
         if not torch.isfinite(loss): loss = loss_rec if torch.isfinite(loss_rec) else torch.tensor(1.0, device=self.device, requires_grad=True)
@@ -603,11 +600,17 @@ class Trainer:
         if self.enable_gradient_accumulation:
             (loss / self.grad_acc_steps).backward()
             if ((epoch + 1) % self.grad_acc_steps == 0) or (epoch == max_epochs - 1):
+                # Specific clipping for reconstruction head during stage 1 to prevent dominance
+                if is_stage1:
+                    torch.nn.utils.clip_grad_norm_(self.model.decoder.parameters(), 0.1)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
         else:
             loss.backward()
+            # Specific clipping for reconstruction head during stage 1 to prevent dominance
+            if is_stage1:
+                torch.nn.utils.clip_grad_norm_(self.model.decoder.parameters(), 0.1)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
             self.optimizer.step()
 

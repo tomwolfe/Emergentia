@@ -406,7 +406,7 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
         print(f"Selecting features for target_{i} (Input dim: {X_norm.shape[1]})...")
         
         # Increase parsimony if we are distilling a Hamiltonian to penalize junk linear terms
-        parsimony_multiplier = 50.0 if is_hamiltonian else 1.0
+        parsimony_multiplier = 100.0 if is_hamiltonian else 2.0
 
         # NEW: Advanced variance-based filtering
         variances = np.var(X_norm, axis=0)
@@ -646,15 +646,15 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
                     print(f"  -> Target_{i}: Linear fit too complex ({prog.length_} terms). Falling back to GP.")
 
         # NEW: Enhanced GP search with better parameters
-        parsimony_levels = [0.0001 * parsimony_multiplier, 0.001 * parsimony_multiplier, 0.01 * parsimony_multiplier]
+        parsimony_levels = [0.001 * parsimony_multiplier, 0.01 * parsimony_multiplier, 0.05 * parsimony_multiplier]
         complexity_factor = max(1.0, 3.0 * (1.0 - best_linear_score))  # Increased factor
-        scaled_pop = int(self.max_pop * complexity_factor)
+        scaled_pop = int(self.populations * complexity_factor)
         scaled_pop = min(scaled_pop, 8000)  # Increased max population
 
         candidates = []
         for p_coeff in parsimony_levels:
             est = self._get_regressor(scaled_pop//len(parsimony_levels), 
-                                     max(self.max_gen//2, 10), parsimony=p_coeff)  # At least 10 generations
+                                     max(self.generations//2, 10), parsimony=p_coeff)  # At least 10 generations
             try:
                 # Force float64 for stability
                 X_gp = X_selected.astype(np.float64)
@@ -972,19 +972,19 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
                     print(f"  -> TRIGGERING DEEP SEARCH (3x Population, 2x Generations)...")
                     
                     # Store original settings
-                    orig_pop = self.max_pop
-                    orig_gen = self.max_gen
+                    orig_pop = self.populations
+                    orig_gen = self.generations
                     
                     # Increase resources for deep search
-                    self.max_pop = orig_pop * 3
-                    self.max_gen = orig_gen * 2
+                    self.populations = orig_pop * 3
+                    self.generations = orig_gen * 2
                     
                     # Re-run single target distillation
                     eq, mask, conf = self._distill_single_target(i, X_norm, Y_norm, Y_norm.shape[1], latent_states.shape[1], is_hamiltonian=is_hamiltonian_distill)
                     
                     # Restore original settings
-                    self.max_pop = orig_pop
-                    self.max_gen = orig_gen
+                    self.populations = orig_pop
+                    self.generations = orig_gen
                     
                     # Final check after deep search
                     eq_str = str(eq)

@@ -345,12 +345,12 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
 
         parsimony_levels = [0.001, 0.01, 0.05, 0.1]
         complexity_factor = max(1.0, 3.0 * (1.0 - linear_score))
-        scaled_pop = int(self.max_pop * complexity_factor)
+        scaled_pop = int(self.populations * complexity_factor)
         scaled_pop = min(scaled_pop, 10000)
 
         candidates = []
         for p_coeff in parsimony_levels:
-            est = self._get_regressor(scaled_pop, self.max_gen // 2, parsimony=p_coeff)
+            est = self._get_regressor(scaled_pop, self.generations // 2, parsimony=p_coeff)
             try:
                 # Force float64 for stability
                 X_gp = X_selected.astype(np.float64)
@@ -398,7 +398,7 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
 
         if best_candidate['score'] < 0.85:
             print(f"  -> Escalating distillation for target_{i}...")
-            est = self._get_regressor(self.max_pop, self.max_gen, parsimony=best_candidate['p'])
+            est = self._get_regressor(self.populations, self.generations, parsimony=best_candidate['p'])
             est.fit(X_selected, Y_norm[:, i])
             # For the escalated model, we also check if it's better Pareto-wise
             esc_prog = est._program
