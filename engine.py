@@ -463,14 +463,15 @@ class Trainer:
                 self.model.encoder.pooling.set_sparsity_weight(new_weight)
 
         is_stage1 = epoch < 100
+        is_warmup = epoch < self.warmup_epochs
         if is_stage1:
-            # During Stage 1 (Warmup), we freeze the adaptive balancer and 
+            # During Stage 1 (Warmup), we freeze the adaptive balancer and
             # use fixed weights to encourage spatial coherence.
             # w_rec = 0.1 (log_var = 2.3), others = 1.0 (log_var = 0.0)
             with torch.no_grad():
                 self.model.log_vars.fill_(0.0)
-                self.model.log_vars[0].fill_(np.log(10.0)) 
-        
+                self.model.log_vars[0].fill_(np.log(10.0))
+
         # ODE dynamics only start after warmup
         for p in self.model.ode_func.parameters(): p.requires_grad = not is_stage1
         if self.symbolic_proxy is not None:
@@ -485,14 +486,14 @@ class Trainer:
 
         tau, hard, tf_ratio, entropy_weight = self._get_schedules(epoch, max_epochs)
         batch_0 = Batch.from_data_list([data_list[0]]).to(self.device)
-        
+
         init_res = self._compute_initial_recon_loss(batch_0, tau, hard, entropy_weight)
         z_curr, s_0, mu_0 = init_res['z_curr'], init_res['s_0'], init_res['mu_0']
         loss_rec, loss_assign = init_res['loss_rec'], init_res['loss_assign']
 
         loss_curv = self._compute_hamiltonian_curv_loss(z_curr)
         loss_sym = self._compute_symbolic_loss(z_curr, is_warmup)
-        
+
         z_preds = self._integrate_trajectories(z_curr, data_list, dt, tf_ratio, tau, hard, is_warmup)
         
         loss_l2 = torch.mean(z_preds**2)
