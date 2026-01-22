@@ -21,7 +21,7 @@ def main():
     parser.add_argument('--super_nodes', type=int, default=4)
     parser.add_argument('--epochs', type=int, default=1000)
     parser.add_argument('--steps', type=int, default=500)
-    parser.add_argument('--lr', type=float, default=5e-4)
+    parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--sim', type=str, default='spring', choices=['spring', 'lj'])
     parser.add_argument('--hamiltonian', action='store_true')
     parser.add_argument('--device', type=str, default='auto')
@@ -29,7 +29,7 @@ def main():
     parser.add_argument('--eval_every', type=int, default=50, help='Evaluate every N epochs')
     parser.add_argument('--quick_symbolic', action='store_true', help='Use quick symbolic distillation')
     parser.add_argument('--memory_efficient', action='store_true', help='Use memory-efficient mode')
-    parser.add_argument('--latent_dim', type=int, default=4, help='Dimension of latent space')
+    parser.add_argument('--latent_dim', type=int, default=8, help='Dimension of latent space')
     args = parser.parse_args()
 
     device = get_device() if args.device == 'auto' else args.device

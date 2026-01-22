@@ -89,8 +89,8 @@ class EquivariantGNNLayer(MessagePassing):
     def aggregate(self, inputs, index, dim_size=None):
         # Custom aggregate to handle tuple of (scalar_msg, vector_msg)
         m_h_in, m_v_in = inputs
-        m_h = scatter(m_h_in, index, dim=self.node_dim, dim_size=dim_size, reduce='sum').to(torch.float32)
-        m_v = scatter(m_v_in, index, dim=self.node_dim, dim_size=dim_size, reduce='sum').to(torch.float32)
+        m_h = scatter(m_h_in, index, dim=self.node_dim, dim_size=dim_size, reduce='mean').to(torch.float32)
+        m_v = scatter(m_v_in, index, dim=self.node_dim, dim_size=dim_size, reduce='mean').to(torch.float32)
         return m_h, m_v
 
 class HierarchicalPooling(nn.Module):
@@ -450,14 +450,11 @@ class GNNDecoder(nn.Module):
         self.pre_pos_norm = nn.LayerNorm(hidden_dim)
         self.pre_vel_norm = nn.LayerNorm(hidden_dim)
 
-        # Position head: Maps to [-1, 1]
-        self.pos_head = nn.Sequential(
-            nn.Linear(hidden_dim, 2),
-            nn.Tanh()
-        )
-        # Initialize pos_head weights to prevent initial saturation
-        nn.init.normal_(self.pos_head[0].weight, std=0.01)
-        nn.init.zeros_(self.pos_head[0].bias)
+        # Position head: Maps to unconstrained range (will be denormalized by stats)
+        self.pos_head = nn.Linear(hidden_dim, 2)
+        # Initialize pos_head weights to prevent initial large offsets
+        nn.init.normal_(self.pos_head.weight, std=0.01)
+        nn.init.zeros_(self.pos_head.bias)
 
         # Velocity head: Maps to unconstrained Z-score values
         self.vel_head = nn.Linear(hidden_dim, 2)
