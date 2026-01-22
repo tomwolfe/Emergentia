@@ -19,7 +19,7 @@ def main():
     parser = argparse.ArgumentParser(description="Unified Emergentia Training Pipeline - Optimized")
     parser.add_argument('--particles', type=int, default=16)
     parser.add_argument('--super_nodes', type=int, default=4)
-    parser.add_argument('--epochs', type=int, default=500)
+    parser.add_argument('--epochs', type=int, default=1000)
     parser.add_argument('--steps', type=int, default=500)
     parser.add_argument('--lr', type=float, default=5e-4)
     parser.add_argument('--sim', type=str, default='spring', choices=['spring', 'lj'])
@@ -57,7 +57,7 @@ def main():
     sparsity_scheduler = SparsityScheduler(
         initial_weight=0.0,
         target_weight=0.1,
-        warmup_steps=args.epochs // 2,
+        warmup_steps=400, # Stay at 0.0 until epoch 400
         max_steps=args.epochs
     )
 
@@ -66,7 +66,7 @@ def main():
         lr=args.lr,
         device=device,
         stats=stats,
-        warmup_epochs=100, # Stage 1: Train rec and assign - Increased from 50
+        warmup_epochs=200, # Stage 1: Train rec and assign - Increased to 200
         max_epochs=args.epochs,
         sparsity_scheduler=sparsity_scheduler
     )
@@ -115,11 +115,11 @@ def main():
     print(f"Latent Stability (Var[dz]): {dz_stability:.6f}")
 
     # Adjusted Quality Gate: Strict threshold to ensure meaningful physical mapping before distillation
-    rec_threshold = 0.02 if dz_stability < 0.01 else 0.02  # Both cases now use 0.02 threshold
+    rec_threshold = 0.01 if dz_stability < 0.01 else 0.01  # Both cases now use 0.01 threshold
 
-    if epoch < 100 or (last_rec > rec_threshold and dz_stability > 0.05):
+    if epoch < 200 or (last_rec > rec_threshold and dz_stability > 0.05):
         reason = ""
-        if epoch < 100: reason += "Insufficient epochs. "
+        if epoch < 200: reason += "Insufficient epochs. "
         if last_rec > rec_threshold: reason += f"Rec Loss too high ({last_rec:.4f} > {rec_threshold}). "
         if dz_stability > 0.05: reason += f"Latent space unstable ({dz_stability:.4f} > 0.05). "
         print(f"Skipping symbolic discovery: {reason}")

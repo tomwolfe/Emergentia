@@ -712,12 +712,24 @@ class Trainer:
             lvars[11], lvars[3], lvars[12] = 0.0, 0.0, 0.0
 
         raw_losses = {'rec': loss_rec, 'cons': loss_cons, 'assign': loss_assign, 'ortho': loss_ortho, 'l2': loss_l2, 'lvr': loss_lvr, 'align': loss_align, 'pruning': loss_pruning, 'sep': loss_sep, 'conn': loss_conn, 'sparsity': loss_sparsity, 'mi': loss_mi, 'sym': loss_sym, 'var': loss_var, 'hinge': loss_hinge, 'smooth': loss_smooth}
-        
+
+        # NEW: Latent Activity penalty to prevent static latent trap
+        if len(z_vel) > 0:
+            loss_activity = -0.1 * torch.log(z_vel.pow(2).mean() + 1e-6)
+            raw_losses['activity'] = loss_activity
+
         # Ensure all raw losses are float32 for stable balancing, especially on MPS
         for k in raw_losses:
             raw_losses[k] = raw_losses[k].to(torch.float32)
 
-        weights = {k: torch.exp(-lvars[i]) for i, k in enumerate(raw_losses.keys())}
+        # Create weights for losses that have corresponding log_vars entries (first 16)
+        base_keys = list(raw_losses.keys())[:16]  # Only first 16 keys that correspond to lvars
+        weights = {k: torch.exp(-lvars[i]) for i, k in enumerate(base_keys)}
+
+        # Special case for activity loss which might not be in log_vars yet
+        if 'activity' in raw_losses and 'activity' not in weights:
+            weights['activity'] = 1.0
+
         if self.enhanced_balancer and not is_stage1:
             balanced = self.enhanced_balancer.get_balanced_losses(raw_losses, self.model.parameters())
             for k in weights:
@@ -736,11 +748,11 @@ class Trainer:
                 weights['ortho'] = max(weights['ortho'], torch.exp(-self.model.log_vars[3]).item())
                 weights['sparsity'] = max(weights['sparsity'], torch.exp(-self.model.log_vars[11]).item())
 
-        discovery_loss = sum(weights[k] * torch.clamp(raw_losses[k], 0, 100) + lvars[i] for i, k in enumerate(raw_losses.keys()) if k not in ['cons', 'l2', 'lvr'])
+        discovery_loss = sum(weights[k] * torch.clamp(raw_losses[k], -100, 100) + (lvars[i] if i < len(lvars) else 0.0) for i, k in enumerate(raw_losses.keys()) if k not in ['cons', 'l2', 'lvr'])
         discovery_loss += (weights['sym'] * (self.symbolic_weight - 1.0) * torch.clamp(loss_sym.to(torch.float32), 0, 100)) # Adjust sym weight
         discovery_loss += 1e-4 * torch.clamp(loss_curv.to(torch.float32), 0, 100)
 
-        loss = discovery_loss + (weights['l2'] * 1e-4 * torch.clamp(loss_l2, 0, 100) + lvars[4]) + (weights['lvr'] * 0.5 * torch.clamp(loss_lvr, 0, 100) + lvars[5])  # Increased from 5e-2 to 0.5
+        loss = discovery_loss + (weights['l2'] * 1e-6 * torch.clamp(loss_l2, 0, 100) + lvars[4]) + (weights['lvr'] * 2.0 * torch.clamp(loss_lvr, 0, 100) + lvars[5])  # Decr l2 (1e-4->1e-6), Incr lvr (0.5->2.0)
         if compute_consistency: loss += (weights['cons'] * torch.clamp(loss_cons.to(torch.float32), 0, 100) + lvars[1])
 
         # Add smoothing loss to the total loss - INCREASED WEIGHT FOR DAMPING

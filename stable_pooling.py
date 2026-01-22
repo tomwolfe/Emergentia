@@ -26,7 +26,7 @@ class StableHierarchicalPooling(nn.Module):
 
     def __init__(self, in_channels, n_super_nodes, pruning_threshold=0.01,
                  temporal_consistency_weight=0.1, collapse_prevention_weight=2.0,
-                 sparsity_weight=0.01, min_active_super_nodes=1):
+                 sparsity_weight=0.01, min_active_super_nodes=4):
         """
         Initialize the stable hierarchical pooling layer.
 
@@ -52,7 +52,7 @@ class StableHierarchicalPooling(nn.Module):
             nn.ReLU(),
             nn.Linear(in_channels, n_super_nodes)
         )
-        self.scaling = nn.Parameter(torch.tensor(10.0)) # Increased to 10.0 for stronger symmetry breaking
+        self.scaling = nn.Parameter(torch.tensor(20.0)) # Increased to 20.0 for stronger symmetry breaking
         self.register_buffer('active_mask', torch.ones(n_super_nodes))
 
         # Track previous assignments for temporal consistency
@@ -210,7 +210,7 @@ class StableHierarchicalPooling(nn.Module):
 
         assign_losses = {
             'entropy': entropy,
-            'diversity': diversity_loss * 5.0, # Increased by 5x as requested
+            'diversity': diversity_loss * 20.0, # Increased by 20x as requested
             'spatial': spatial_loss,
             'pruning': pruning_loss,
             'sparsity': sparsity_loss * self.current_sparsity_weight,

@@ -225,7 +225,7 @@ class HierarchicalPooling(nn.Module):
         return out, s, assign_losses, mu
 
 class GNNEncoder(nn.Module):
-    def __init__(self, node_features, hidden_dim, latent_dim, n_super_nodes, min_active_super_nodes=2):
+    def __init__(self, node_features, hidden_dim, latent_dim, n_super_nodes, min_active_super_nodes=4):
         super(GNNEncoder, self).__init__()
         self.gnn1 = EquivariantGNNLayer(node_features, hidden_dim)
         self.ln1 = nn.LayerNorm(hidden_dim)
@@ -501,7 +501,7 @@ class MIDiscriminator(nn.Module):
         return self.net(zp)
 
 class DiscoveryEngineModel(nn.Module):
-    def __init__(self, n_particles, n_super_nodes, node_features=4, latent_dim=4, hidden_dim=64, hamiltonian=False, dissipative=True, min_active_super_nodes=2, box_size=10.0):
+    def __init__(self, n_particles, n_super_nodes, node_features=4, latent_dim=4, hidden_dim=128, hamiltonian=False, dissipative=True, min_active_super_nodes=4, box_size=10.0):
         super(DiscoveryEngineModel, self).__init__()
         self.encoder = GNNEncoder(node_features, hidden_dim, latent_dim, n_super_nodes, min_active_super_nodes=min_active_super_nodes)
         
