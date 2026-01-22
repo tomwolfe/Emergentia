@@ -188,11 +188,34 @@ class SymbolicDistiller:
         X_sel = X[:, mask]
         
         lasso = LassoCV(cv=5).fit(X_sel, y)
-        if lasso.score(X_sel, y) > 0.999:
-            return OptimizedExpressionProgram(str(sp.simplify(sum(c*sp.Symbol(f'X{np.where(mask)[0][j]}') for j, c in enumerate(lasso.coef_)) + lasso.intercept_))), mask, lasso.score(X_sel, y)
+        lasso_score = lasso.score(X_sel, y)
+        
+        # PHYSICALITY GATE: Check if Lasso found a simple identity
+        is_identity = False
+        if lasso_score > 0:
+            coeffs = np.abs(lasso.coef_)
+            if np.sum(coeffs > 1e-3) == 1 and np.max(coeffs) > 0.9:
+                is_identity = True
+        
+        if lasso_score > 0.999:
+            return OptimizedExpressionProgram(str(sp.simplify(sum(c*sp.Symbol(f'X{np.where(mask)[0][j]}') for j, c in enumerate(lasso.coef_)) + lasso.intercept_))), mask, lasso_score
             
+        # Initial GP search
         est = self._get_regressor(self.populations, self.generations).fit(X_sel, y)
-        return OptimizedExpressionProgram(str(est._program)), mask, est.score(X_sel, y)
+        score = est.score(X_sel, y)
+        program_str = str(est._program)
+        
+        # PHYSICALITY GATE: Trigger Deep Search if simple identity with low score
+        # Identifies simple Xn or -Xn or similar
+        is_gp_identity = re.match(r'^X\d+$', program_str) or re.match(r'^neg\(X\d+\)$', program_str)
+        
+        if (is_gp_identity or is_identity) and score < 0.95:
+            # print(f"Target {i}: Physicality Gate triggered. Simple identity found with score {score:.4f}. Starting Deep Search...")
+            est = self._get_regressor(self.populations * 3, self.generations * 2, parsimony=0.01).fit(X_sel, y)
+            score = est.score(X_sel, y)
+            program_str = str(est._program)
+            
+        return OptimizedExpressionProgram(program_str), mask, score
 
     def distill(self, latent_states, targets, n_super_nodes, latent_dim, box_size=None, hamiltonian=False):
         self.transformer = FeatureTransformer(n_super_nodes, latent_dim, box_size=box_size)

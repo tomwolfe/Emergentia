@@ -524,7 +524,8 @@ class Trainer:
 
         for t in range(0, seq_len, 2):
             batch_t = Batch.from_data_list([data_list[t]]).to(self.device)
-            z_t_target, s_t, losses_t, mu_t = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch, tau=tau, hard=hard)
+            # Pass s_prev for assignment persistence
+            z_t_target, s_t, losses_t, mu_t = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch, tau=tau, hard=hard, prev_assignments=s_prev)
             z_t_target = torch.nan_to_num(z_t_target)
             
             # Use normalized targets for stability
@@ -550,10 +551,10 @@ class Trainer:
             mu_t_norm = mu_t 
             d_align = min(self.model.encoder.latent_dim // 2 if self.model.hamiltonian else 2, 2)
             
-            # Soft-start for alignment loss: keep at 0 for first 100 epochs, then anneal in
+            # Soft-start for alignment loss: keep at 0 for first 20 epochs, then anneal in
             align_weight = 0.0
-            if epoch > 100:
-                align_weight = min(1.0, (epoch - 100) / self.align_anneal_epochs)
+            if epoch > 20:
+                align_weight = min(1.0, (epoch - 20) / self.align_anneal_epochs)
             
             # Use learnable scale in log-space for alignment
             loss_align += 2.0 * align_weight * self.criterion(z_preds[t, :, :, :d_align] * torch.exp(self.log_align_scale), mu_t_norm[:, :, :d_align])
@@ -592,7 +593,7 @@ class Trainer:
         discovery_loss += (weights['sym'] * (self.symbolic_weight - 1.0) * torch.clamp(loss_sym.to(torch.float32), 0, 100)) # Adjust sym weight
         discovery_loss += 1e-4 * torch.clamp(loss_curv.to(torch.float32), 0, 100)
         
-        loss = discovery_loss + (weights['l2'] * 1e-4 * torch.clamp(loss_l2, 0, 100) + lvars[4]) + (weights['lvr'] * 1e-4 * torch.clamp(loss_lvr, 0, 100) + lvars[5])
+        loss = discovery_loss + (weights['l2'] * 1e-4 * torch.clamp(loss_l2, 0, 100) + lvars[4]) + (weights['lvr'] * 1e-2 * torch.clamp(loss_lvr, 0, 100) + lvars[5])
         if compute_consistency: loss += (weights['cons'] * torch.clamp(loss_cons.to(torch.float32), 0, 100) + lvars[1])
         
         loss = torch.clamp(loss + 0.1 * torch.sum(lvars**2), 0, 1e4)

@@ -101,6 +101,11 @@ class StableHierarchicalPooling(nn.Module):
 
         logits = self.assign_mlp(x) * self.scaling
 
+        # NEW: Assignment Persistence - bias logits by previous assignments to stabilize flickering
+        if prev_assignments is not None and prev_assignments.size(0) == x.size(0):
+            # persistence_gain = 0.5 to strongly favor previous identity
+            logits = logits + 0.5 * prev_assignments.detach()
+
         # Apply active_mask to logits (soft mask to allow for revival)
         # Use detach() to prevent inplace modification errors during backward pass
         mask = self.active_mask.detach().unsqueeze(0)
@@ -159,7 +164,12 @@ class StableHierarchicalPooling(nn.Module):
                 self.active_mask[forced_indices] = 1.0
 
         entropy = -torch.mean(torch.sum(s * torch.log(s + 1e-9), dim=1))
-        diversity_loss = torch.sum(avg_s * torch.log(avg_s + 1e-9))
+        
+        # STABILITY FIX: Change diversity_loss from raw entropy to KL(Uniform || avg_s)
+        # This makes the loss positive-definite and prevents the "negative divergence" trap.
+        uniform_p = torch.full_like(avg_s, 1.0 / self.n_super_nodes)
+        diversity_loss = torch.sum(uniform_p * torch.log(uniform_p / (avg_s + 1e-9)))
+        
         pruning_loss = torch.mean(torch.abs(avg_s * (1 - self.active_mask))) # Penalize usage of "inactive" nodes
 
         # Sparsity loss to encourage finding the minimal scale

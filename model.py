@@ -258,7 +258,7 @@ class GNNEncoder(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, x, edge_index, batch, tau=1.0, hard=False):
+    def forward(self, x, edge_index, batch, tau=1.0, hard=False, prev_assignments=None):
         # Store initial positions for spatial pooling
         pos = x[:, :2]
         vel = x[:, 2:4] # Assume [pos_x, pos_y, vel_x, vel_y]
@@ -267,7 +267,7 @@ class GNNEncoder(nn.Module):
         x = self.ln2(torch.relu(self.gnn2(x, pos, vel, edge_index)))
 
         # Pool to K super-nodes preserving spatial features
-        pooled, s, assign_losses, mu = self.pooling(x, batch, pos=pos, tau=tau, hard=hard) # [batch_size, n_super_nodes, hidden_dim], [N, n_super_nodes], mu: [B, K, 2]
+        pooled, s, assign_losses, mu = self.pooling(x, batch, pos=pos, tau=tau, hard=hard, prev_assignments=prev_assignments) # [batch_size, n_super_nodes, hidden_dim], [N, n_super_nodes], mu: [B, K, 2]
         latent = self.output_layer(pooled) # [batch_size, n_super_nodes, latent_dim]
 
         # Apply learnable gain to prevent vanishing latents
@@ -555,8 +555,8 @@ class DiscoveryEngineModel(nn.Module):
         mi_est = torch.mean(joint) - torch.log(torch.mean(torch.exp(marginal)) + 1e-9)
         return -mi_est
 
-    def encode(self, x, edge_index, batch, tau=1.0, hard=False):
-        return self.encoder(x, edge_index, batch, tau=tau, hard=hard)
+    def encode(self, x, edge_index, batch, tau=1.0, hard=False, prev_assignments=None):
+        return self.encoder(x, edge_index, batch, tau=tau, hard=hard, prev_assignments=prev_assignments)
     
     def decode(self, z, s, batch, stats=None):
         return self.decoder(z, s, batch, stats=stats)

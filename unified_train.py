@@ -19,7 +19,7 @@ def main():
     parser = argparse.ArgumentParser(description="Unified Emergentia Training Pipeline")
     parser.add_argument('--particles', type=int, default=16)
     parser.add_argument('--super_nodes', type=int, default=4)
-    parser.add_argument('--epochs', type=int, default=1000)
+    parser.add_argument('--epochs', type=int, default=500)
     parser.add_argument('--steps', type=int, default=500)
     parser.add_argument('--lr', type=float, default=5e-4)
     parser.add_argument('--sim', type=str, default='spring', choices=['spring', 'lj'])
