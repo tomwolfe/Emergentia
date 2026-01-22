@@ -232,6 +232,10 @@ class OptimizedGNNDecoder(nn.Module):
             nn.Linear(hidden_dim//2, 2),
             nn.Tanh()
         )
+        # Initialize pos_head weights to prevent initial saturation
+        nn.init.normal_(self.pos_head[0].weight, std=0.001)
+        nn.init.zeros_(self.pos_head[0].bias)
+
         # Velocity head: Maps to unconstrained Z-score values
         self.vel_head = nn.Linear(hidden_dim//2, 2)
 

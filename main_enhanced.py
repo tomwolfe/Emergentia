@@ -314,6 +314,13 @@ def main():
     for i in range(n_plot):
         plt.plot(t_eval, z_states[:, i], 'k--', alpha=0.3, label=f'Learned Z_{i}' if i==0 else "")
         plt.plot(t_eval, z_simulated[:, i], label=f'Symbolic Z_{i}')
+    
+    if is_hamiltonian and confidences[0] < 0.5:
+        plt.text(0.5, 0.5, "Symbolic Law Invalid\nShowing Neural Fallback", 
+                 horizontalalignment='center', verticalalignment='center',
+                 transform=plt.gca().transAxes, color='red', fontsize=12, fontweight='bold',
+                 bbox=dict(facecolor='white', alpha=0.8))
+    
     plt.title("Meso: Symbolic Integration")
     plt.legend()
 

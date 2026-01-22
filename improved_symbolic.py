@@ -89,6 +89,21 @@ class ImprovedSymbolicDynamics:
         if z.ndim > 1:
             z = z.flatten()
 
+        # HYBRID FALLBACK: Check distiller confidence
+        use_neural_fallback = False
+        if hasattr(self.distiller, 'confidences'):
+            # If any confidence is too low, or we don't have enough confidences
+            if len(self.distiller.confidences) == 0 or np.min(self.distiller.confidences) < 0.5:
+                use_neural_fallback = True
+        
+        if use_neural_fallback and self.model is not None:
+            with torch.no_grad():
+                z_tensor = torch.from_numpy(z).float().unsqueeze(0)
+                device = next(self.model.parameters()).device
+                z_tensor = z_tensor.to(device)
+                dz_neural = self.model.ode_func(0, z_tensor).cpu().numpy().flatten()
+                return dz_neural
+
         # NEW: Enhanced error handling and numerical stability
         try:
             # Clamp input to prevent numerical explosion
@@ -138,10 +153,29 @@ class ImprovedSymbolicDynamics:
                 print(f"Size mismatch: expected {z.shape[0]}, got {result.shape[0]}. Returning zeros.")
                 return np.zeros_like(z)
 
+            # SECONDARY FALLBACK: If symbolic result is zero but neural isn't
+            if np.linalg.norm(result) < 1e-6 and self.model is not None:
+                with torch.no_grad():
+                    z_tensor = torch.from_numpy(z).float().unsqueeze(0)
+                    device = next(self.model.parameters()).device
+                    z_tensor = z_tensor.to(device)
+                    dz_neural = self.model.ode_func(0, z_tensor).cpu().numpy().flatten()
+                    if np.linalg.norm(dz_neural) > 1e-5:
+                        return dz_neural
+
             return result
         except Exception as e:
             print(f"Error in symbolic dynamics evaluation: {e}")
-            # Return a safe fallback (zeros) with same shape as input to prevent integration failure
+            # Fallback to neural model if possible, otherwise return zeros
+            if self.model is not None:
+                try:
+                    with torch.no_grad():
+                        z_tensor = torch.from_numpy(z).float().unsqueeze(0)
+                        device = next(self.model.parameters()).device
+                        z_tensor = z_tensor.to(device)
+                        return self.model.ode_func(0, z_tensor).cpu().numpy().flatten()
+                except:
+                    pass
             return np.zeros_like(z)
 
     def _compute_hamiltonian_derivative(self, z):

@@ -290,6 +290,13 @@ class SymbolicExpressionGenerator:
         import re
         device = next(self.model.parameters()).device
         
+        # Helper for diverse fallback
+        def get_fallback():
+            # Return a random linear combination of 2 random variables
+            v1, v2 = random.sample(range(self.n_variables), 2)
+            c1, c2 = random.uniform(0.01, 0.2), random.uniform(0.01, 0.2)
+            return f"{c1:.2f} * x{v1} + {c2:.2f} * x{v2}"
+
         # Get start token ID
         start_token_id = self.vocab.token_to_id[self.vocab.start_token]
         
@@ -310,13 +317,9 @@ class SymbolicExpressionGenerator:
         # Convert to expression string
         expression_str = ' '.join(cleaned_tokens)
         
-        # Debug print
-        # print(f"DEBUG: Transformer generated tokens: {tokens}")
-        # print(f"DEBUG: Cleaned expression: {expression_str}")
-        
         # Validation Step
         if not expression_str.strip():
-            return "0.5 * (x2**2 + x3**2)" # Safe fallback for empty string
+            return get_fallback()
             
         try:
             # Map common tokens to SymPy equivalents for validation
@@ -331,8 +334,8 @@ class SymbolicExpressionGenerator:
             sp.sympify(expression_str, locals=local_dict)
             return expression_str
         except Exception:
-            # If not valid math, return standard kinetic energy prior
-            return "0.5 * (x2**2 + x3**2)"
+            # If not valid math, return diverse fallback
+            return get_fallback()
     
     def parse_to_sympy(self, expression_str):
         """

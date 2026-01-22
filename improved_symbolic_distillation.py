@@ -396,6 +396,13 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
         """
         Improved single target distillation with enhanced validation and selection.
         """
+        # NEW: Low-variance gate to prevent fitting noise
+        target_variance = np.var(Y_norm[:, i])
+        if target_variance < 1e-4:
+            print(f"  -> Target_{i}: Variance ({target_variance:.6f}) below threshold. Skipping distillation.")
+            full_mask = np.zeros(X_norm.shape[1], dtype=bool)
+            return None, full_mask, 0.0
+
         print(f"Selecting features for target_{i} (Input dim: {X_norm.shape[1]})...")
         
         # Increase parsimony if we are distilling a Hamiltonian
