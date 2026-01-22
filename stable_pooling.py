@@ -114,7 +114,8 @@ class StableHierarchicalPooling(nn.Module):
         if self.training:
             # -5.0 is enough to suppress but allows much more gradient flow than -10.0
             # Also add a small random exploration factor to logits of inactive nodes
-            exploration = torch.randn_like(logits) * 0.01
+            # INCREASED: More noise for inactive nodes to encourage exploration (0.01 -> 0.1)
+            exploration = torch.randn_like(logits) * 0.1 * (1.0 - mask) 
             logits = logits + (mask - 1.0) * 5.0 + exploration
         else:
             # Harder mask during inference
@@ -136,7 +137,7 @@ class StableHierarchicalPooling(nn.Module):
             revival_candidate = (avg_s > revival_threshold).float()
 
             # Combine current_active with a small probability of reviving revival_candidates
-            revival_mask = (torch.rand_like(self.active_mask) < 0.1).float() * revival_candidate # Increased prob from 0.05
+            revival_mask = (torch.rand_like(self.active_mask) < 0.2).float() * revival_candidate # Increased prob from 0.1
             effective_active = torch.clamp(current_active + revival_mask, 0, 1)
 
             # Use a much slower EMA for smoothness as requested
@@ -209,7 +210,7 @@ class StableHierarchicalPooling(nn.Module):
 
         assign_losses = {
             'entropy': entropy,
-            'diversity': diversity_loss,
+            'diversity': diversity_loss * 5.0, # Increased by 5x as requested
             'spatial': spatial_loss,
             'pruning': pruning_loss,
             'sparsity': sparsity_loss * self.current_sparsity_weight,
@@ -260,15 +261,29 @@ class StableHierarchicalPooling(nn.Module):
     def apply_hard_revival(self):
         """
         Forcefully revive inactive nodes by re-initializing their assignment MLP weights
-        if they have been inactive (active_mask near zero).
+        if they have been inactive (active_mask near zero) OR if too few nodes are active.
         Called every 50-100 epochs.
         """
         if not self.training:
             return
 
-        inactive_indices = torch.where(self.active_mask < 0.1)[0]
+        inactive_indices = torch.where(self.active_mask < 0.1)[0].tolist()
+        n_active = (self.active_mask > 0.5).sum().item()
+
+        # If too few nodes are active, we might need to revive more than just the near-zero ones
+        if n_active < self.min_active_super_nodes:
+            # Sort all indices by their active_mask value (ascending)
+            all_indices = torch.argsort(self.active_mask).tolist()
+            # Take enough to reach min_active_super_nodes
+            needed = self.min_active_super_nodes - n_active
+            for idx in all_indices:
+                if idx not in inactive_indices and needed > 0:
+                    inactive_indices.append(idx)
+                    needed -= 1
+                if needed <= 0: break
+
         if len(inactive_indices) > 0:
-            print(f"  [Hard Revival] Reviving super-nodes: {inactive_indices.tolist()}")
+            print(f"  [Hard Revival] Reviving super-nodes: {inactive_indices}")
             # Re-initialize the final layer weights for inactive nodes to force new exploration
             with torch.no_grad():
                 # self.assign_mlp[2] is the Linear(in_channels, n_super_nodes) layer
@@ -276,7 +291,7 @@ class StableHierarchicalPooling(nn.Module):
                 for idx in inactive_indices:
                     # Re-initialize the weights for the corresponding output row
                     # We use a larger std to force exploration
-                    nn.init.normal_(last_layer.weight[idx], mean=0.0, std=0.5)
+                    nn.init.normal_(last_layer.weight[idx], mean=0.0, std=1.0) # Increased std to 1.0
                     nn.init.constant_(last_layer.bias[idx], 0.0)
 
                 # Reset active mask for these nodes to allow them to compete immediately

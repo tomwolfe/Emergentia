@@ -66,7 +66,7 @@ def main():
         lr=args.lr,
         device=device,
         stats=stats,
-        warmup_epochs=50, # Stage 1: Train rec and assign
+        warmup_epochs=100, # Stage 1: Train rec and assign - Increased from 50
         max_epochs=args.epochs,
         sparsity_scheduler=sparsity_scheduler
     )
@@ -115,7 +115,7 @@ def main():
     print(f"Latent Stability (Var[dz]): {dz_stability:.6f}")
 
     # Adjusted Quality Gate: Strict threshold to ensure meaningful physical mapping before distillation
-    rec_threshold = 0.1 if dz_stability < 0.01 else 0.1  # Both cases now use 0.1 threshold
+    rec_threshold = 0.02 if dz_stability < 0.01 else 0.02  # Both cases now use 0.02 threshold
 
     if epoch < 100 or (last_rec > rec_threshold and dz_stability > 0.05):
         reason = ""

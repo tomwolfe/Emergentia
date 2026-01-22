@@ -165,9 +165,17 @@ class BalancedFeatureTransformer:
         # z_flat: [Batch, n_super_nodes * latent_dim]
         # Robust clipping of input latents to prevent extreme values
         z_flat_clipped = np.clip(z_flat, -1e3, 1e3)
+        
+        # NEW: Center and normalize raw latents to prevent trivial H = X0 discovery
+        if self.z_mean is not None:
+            z_flat_norm = (z_flat_clipped - self.z_mean) / self.z_std
+        else:
+            z_flat_norm = z_flat_clipped
+            
         z_nodes = z_flat_clipped.reshape(-1, self.n_super_nodes, self.latent_dim)
 
-        features = [z_flat_clipped]
+        # Use normalized latents instead of raw ones in the feature set
+        features = [z_flat_norm]
         
         if self.include_dists and self.basis_functions != 'polynomial_only':
             dist_features = self._compute_distance_features(z_nodes)
@@ -352,7 +360,11 @@ class BalancedFeatureTransformer:
         z_nodes = z_flat.reshape(self.n_super_nodes, self.latent_dim)
         
         # 1. Base features Jacobian (Latents + Distances)
-        jac_list = [np.eye(n_latents)]
+        # Match normalization in transform(): d(z_norm)/dz = 1/z_std
+        if self.z_std is not None:
+            jac_list = [np.diag(1.0 / self.z_std)]
+        else:
+            jac_list = [np.eye(n_latents)]
         
         if self.include_dists:
             i_idx, j_idx = np.triu_indices(self.n_super_nodes, k=1)

@@ -375,7 +375,9 @@ class HamiltonianODEFunc(nn.Module):
         # create_graph=True is necessary for backpropagating through the ODE solver (especially for adjoint)
         with torch.set_grad_enabled(True):
             y_in = y.detach().requires_grad_(True)
-            H = self.H_net(y_in).sum()
+            H_raw = self.H_net(y_in)
+            # Add small L2 regularization on the output to prevent scaling to infinity
+            H = H_raw.sum() + 0.01 * torch.sum(H_raw**2)
             dH = torch.autograd.grad(H, y_in, create_graph=True, allow_unused=True)[0]
             
             if dH is None:

@@ -423,7 +423,7 @@ class Trainer:
             {'params': [self.model.log_vars], 'lr': 1e-3}, # Explicitly add log_vars to optimizer with higher LR
         ]
         if h_net_params:
-            param_groups.append({'params': h_net_params, 'weight_decay': 1e-3})
+            param_groups.append({'params': h_net_params, 'weight_decay': 1e-2}) # Increased from 1e-3
         if assign_mlp_params:
             param_groups.append({'params': assign_mlp_params, 'weight_decay': 1e-2}) # Penalize rapid assignment changes
 
@@ -476,11 +476,11 @@ class Trainer:
         # Enhanced assignment loss including stability terms
         loss_assign = (
             entropy_weight * losses_0['entropy'] + 
-            5.0 * losses_0['diversity'] + # Increased from 2.0
-            1.0 * losses_0['spatial'] + # Increased 10x from 0.1
-            2.0 * losses_0.get('collapse_prevention', 0.0) + # Increased from 1.0
-            2.0 * losses_0.get('balance', 0.0) + # Increased from 1.0
-            5.0 * losses_0.get('temporal_consistency', 0.0) # Increased from 2.0
+            1.0 * losses_0['diversity'] + # Weight was already increased by 5x inside pooling layer
+            5.0 * losses_0['spatial'] + # Increased from 1.0 to 5.0 (total 50x from original 0.1)
+            5.0 * losses_0.get('collapse_prevention', 0.0) + # Increased from 2.0 to 5.0
+            5.0 * losses_0.get('balance', 0.0) + # Increased from 2.0 to 5.0
+            10.0 * losses_0.get('temporal_consistency', 0.0) # Increased from 5.0 to 10.0
         )
         
         initial_results = {
@@ -497,15 +497,19 @@ class Trainer:
                 z_in = z_curr.view(z_curr.size(0), -1).detach().requires_grad_(True)
                 if self.mps_ode_on_cpu:
                     z_in_cpu = z_in.cpu()
-                    H = self.model.ode_func.H_net(z_in_cpu).sum()
+                    H_vals = self.model.ode_func.H_net(z_in_cpu)
+                    H = H_vals.sum()
                     dH = torch.autograd.grad(H, z_in_cpu, create_graph=True)[0]
                     if dH is not None:
-                        loss_curv = torch.norm(dH.to(self.device), p=2)
+                        # Add small L2 regularization on H output to prevent scaling to infinity
+                        loss_curv = torch.norm(dH.to(self.device), p=2) + 0.01 * torch.mean(H_vals**2).to(self.device)
                 else:
-                    H = self.model.ode_func.H_net(z_in).sum()
+                    H_vals = self.model.ode_func.H_net(z_in)
+                    H = H_vals.sum()
                     dH = torch.autograd.grad(H, z_in, create_graph=True)[0]
                     if dH is not None:
-                        loss_curv = torch.norm(dH, p=2)
+                        # Add small L2 regularization on H output to prevent scaling to infinity
+                        loss_curv = torch.norm(dH, p=2) + 0.01 * torch.mean(H_vals**2)
         return loss_curv
 
     def _compute_latent_smoothing_loss(self, z_preds):
@@ -664,11 +668,11 @@ class Trainer:
             
             loss_assign += (
                 entropy_weight * losses_t['entropy'] + 
-                5.0 * losses_t['diversity'] + 
-                1.0 * losses_t['spatial'] + # Increased 10x
-                2.0 * losses_t.get('collapse_prevention', 0.0) + 
-                2.0 * losses_t.get('balance', 0.0) +
-                5.0 * losses_t.get('temporal_consistency', 0.0)
+                1.0 * losses_t['diversity'] + 
+                5.0 * losses_t['spatial'] + 
+                5.0 * losses_t.get('collapse_prevention', 0.0) + 
+                5.0 * losses_t.get('balance', 0.0) +
+                10.0 * losses_t.get('temporal_consistency', 0.0)
             )
             loss_pruning += losses_t['pruning']
             loss_sparsity += losses_t['sparsity']
@@ -742,9 +746,9 @@ class Trainer:
         # Add smoothing loss to the total loss - INCREASED WEIGHT FOR DAMPING
         smooth_idx = list(raw_losses.keys()).index('smooth')  # This should be 15
         if smooth_idx < len(lvars):  # Make sure the index exists
-            loss += (weights['smooth'] * 2.0 * torch.clamp(loss_smooth, 0, 100) + lvars[smooth_idx])  # Increased from 5e-1 to 2.0
+            loss += (weights['smooth'] * 20.0 * torch.clamp(loss_smooth, 0, 100) + lvars[smooth_idx])  # Increased from 2.0 to 20.0
         else:
-            loss += weights['smooth'] * 2.0 * torch.clamp(loss_smooth, 0, 100)  # Just apply weight without log_var - INCREASED
+            loss += weights['smooth'] * 20.0 * torch.clamp(loss_smooth, 0, 100)  # Just apply weight without log_var - INCREASED to 20.0
         
         loss = torch.clamp(loss + 0.1 * torch.sum(lvars**2), 0, 1e4)
         if not torch.isfinite(loss): loss = loss_rec if torch.isfinite(loss_rec) else torch.tensor(1.0, device=self.device, requires_grad=True)
