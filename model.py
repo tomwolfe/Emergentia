@@ -283,20 +283,20 @@ class LatentODEFunc(nn.Module):
         self.n_super_nodes = n_super_nodes
         self.hidden_dim = hidden_dim
 
-        # Simplified and faster architecture
+        # Further simplified and faster architecture
         # Process each super-node individually (phi network)
         self.phi = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim//2),  # Reduced hidden size
+            nn.Linear(latent_dim, hidden_dim//4),  # Further reduced hidden size
             nn.SiLU(),  # Faster activation
-            nn.Linear(hidden_dim//2, hidden_dim//2)
+            nn.Linear(hidden_dim//4, hidden_dim//4)
         )
 
         # Aggregation function (rho network) - mean pooling is permutation invariant
         # This aggregates information from all super-nodes
         self.rho = nn.Sequential(
-            nn.Linear(hidden_dim//2, hidden_dim//2),
+            nn.Linear(hidden_dim//4, hidden_dim//4),
             nn.SiLU(),  # Faster activation
-            nn.Linear(hidden_dim//2, latent_dim * n_super_nodes)
+            nn.Linear(hidden_dim//4, latent_dim * n_super_nodes)
         )
 
     def forward(self, t, y):
@@ -346,11 +346,11 @@ class HamiltonianODEFunc(nn.Module):
         self.n_super_nodes = n_super_nodes
         self.dissipative = dissipative
 
-        # Simplified and faster Hamiltonian network
+        # Further simplified and faster Hamiltonian network
         self.H_net = nn.Sequential(
-            nn.Linear(latent_dim * n_super_nodes, hidden_dim//2),  # Reduced hidden size
+            nn.Linear(latent_dim * n_super_nodes, hidden_dim//4),  # Further reduced hidden size
             nn.SiLU(), # Faster activation function
-            nn.Linear(hidden_dim//2, 1)
+            nn.Linear(hidden_dim//4, 1)
         )
 
         if dissipative:

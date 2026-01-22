@@ -24,15 +24,28 @@ def plot_discovery_results(model, dataset, pos_raw, s, z_states, assignments, ou
 
     # 3. Latent Trajectories with symbolic predictions overlay
     n_plot = min(4, z_states.shape[1])
+
+    # Fix tensor size mismatch by checking dimensions
+    if symbolic_predictions is not None:
+        # Ensure symbolic_predictions has compatible dimensions
+        if z_states.shape[0] != symbolic_predictions.shape[0]:
+            # Interpolate or truncate to match time dimension
+            min_time = min(z_states.shape[0], symbolic_predictions.shape[0])
+            z_states = z_states[:min_time]
+            symbolic_predictions = symbolic_predictions[:min_time]
+
     for k in range(n_plot):
         axes[1, 0].plot(z_states[:, k, 0], label=f'Node {k} - q1 (Learned)', alpha=0.7)
         axes[1, 0].plot(z_states[:, k, 1], '--', label=f'Node {k} - q2 (Learned)', alpha=0.7)
 
-        # Overlay symbolic predictions if available
+        # Overlay symbolic predictions if available and compatible
         if symbolic_predictions is not None and k < symbolic_predictions.shape[1]:
-            # Plot symbolic prediction for this node
-            axes[1, 0].plot(symbolic_predictions[:, k, 0], label=f'Node {k} - q1 (Symbolic)', linestyle='-.', alpha=0.8)
-            axes[1, 0].plot(symbolic_predictions[:, k, 1], label=f'Node {k} - q2 (Symbolic)', linestyle=':', alpha=0.8)
+            # Ensure we don't exceed the time dimension
+            time_dim = min(z_states.shape[0], symbolic_predictions.shape[0])
+            axes[1, 0].plot(symbolic_predictions[:time_dim, k, 0],
+                           label=f'Node {k} - q1 (Symbolic)', linestyle='-.', alpha=0.8)
+            axes[1, 0].plot(symbolic_predictions[:time_dim, k, 1],
+                           label=f'Node {k} - q2 (Symbolic)', linestyle=':', alpha=0.8)
 
     axes[1, 0].set_title(f"Latent Trajectories (First {n_plot} nodes)")
     axes[1, 0].set_xlabel("Time step")
@@ -43,9 +56,11 @@ def plot_discovery_results(model, dataset, pos_raw, s, z_states, assignments, ou
         for k in range(n_plot):
             axes[1, 1].plot(z_states[:, k, 0], z_states[:, k, 2], label=f'Node {k} (Learned)', alpha=0.7)
 
-            # Overlay symbolic predictions if available
+            # Overlay symbolic predictions if available and compatible
             if symbolic_predictions is not None and k < symbolic_predictions.shape[1]:
-                axes[1, 1].plot(symbolic_predictions[:, k, 0], symbolic_predictions[:, k, 2],
+                time_dim = min(z_states.shape[0], symbolic_predictions.shape[0])
+                axes[1, 1].plot(symbolic_predictions[:time_dim, k, 0],
+                               symbolic_predictions[:time_dim, k, 2],
                                label=f'Node {k} (Symbolic)', linestyle='--', alpha=0.8)
 
         axes[1, 1].set_title("Latent Phase Space (q vs p)")
@@ -55,9 +70,11 @@ def plot_discovery_results(model, dataset, pos_raw, s, z_states, assignments, ou
         for k in range(n_plot):
             axes[1, 1].plot(z_states[:, k, 0], z_states[:, k, 1], label=f'Node {k} (Learned)', alpha=0.7)
 
-            # Overlay symbolic predictions if available
+            # Overlay symbolic predictions if available and compatible
             if symbolic_predictions is not None and k < symbolic_predictions.shape[1]:
-                axes[1, 1].plot(symbolic_predictions[:, k, 0], symbolic_predictions[:, k, 1],
+                time_dim = min(z_states.shape[0], symbolic_predictions.shape[0])
+                axes[1, 1].plot(symbolic_predictions[:time_dim, k, 0],
+                               symbolic_predictions[:time_dim, k, 1],
                                label=f'Node {k} (Symbolic)', linestyle='--', alpha=0.8)
 
         axes[1, 1].set_title("Latent Trajectories (q1 vs q2)")

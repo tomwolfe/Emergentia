@@ -74,11 +74,16 @@ The comprehensive enhanced version includes:
 
 ### Unified Training Pipeline
 
-For a unified approach that combines all improvements:
+For a unified approach that combines all improvements with performance optimizations:
 
 ```bash
-python unified_train.py --particles 16 --super_nodes 4 --epochs 500 --steps 500 --sim spring --hamiltonian
+python unified_train.py --particles 16 --super_nodes 4 --epochs 500 --steps 500 --sim spring --hamiltonian --memory_efficient --quick_symbolic
 ```
+
+Additional options for performance tuning:
+- `--memory_efficient`: Use memory-saving optimizations for large datasets
+- `--quick_symbolic`: Use faster symbolic distillation with reduced populations/generations
+- `--batch_size N`: Control batch size for training steps (default: 10)
 
 ### Enhanced Execution
 
@@ -122,10 +127,10 @@ The optimized version includes:
 
 ### Performance-Optimized Execution
 
-For maximum performance with reduced computational complexity, use the newly optimized version:
+For maximum performance with reduced computational complexity, use the optimized version:
 
 ```bash
-python optimized_fast_train.py --epochs 200 --steps 50 --particles 4 --super_nodes 2
+python unified_train.py --epochs 200 --steps 50 --particles 4 --super_nodes 2 --memory_efficient --quick_symbolic
 ```
 
 The performance-optimized version includes:
@@ -135,6 +140,9 @@ The performance-optimized version includes:
 - Streamlined feature computation to prevent combinatorial explosion
 - Early stopping and adaptive learning rates for efficiency
 - Memory-efficient operations throughout the pipeline
+- Sampling strategies to reduce memory usage during visualization
+- Batch processing controls for managing computational load
+- Tensor dimension compatibility fixes to prevent runtime errors
 
 ### Improved Optimized Execution
 
@@ -361,7 +369,7 @@ python test_verifications.py
 - `improved_optimized_fast_train.py`: Improved optimized training script with additional optimizations
 - `optimized_fast_train.py`: Maximum performance training script with reduced computational complexity
 - `comprehensive_improved_train.py`: Comprehensive improved training with enhanced energy conservation
-- `unified_train.py`: Unified training pipeline combining all improvements
+- `unified_train.py`: Unified training pipeline combining all improvements with performance optimizations
 - `example_usage.py`: Example usage of the pipeline
 - `config.yaml`: Configuration file for the enhanced pipeline
 - `enhanced_balancer.py`: Enhanced dynamic loss balancer with gradient-based weighting

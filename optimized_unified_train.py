@@ -28,7 +28,6 @@ def main():
     parser.add_argument('--batch_size', type=int, default=10, help='Batch size for training steps')
     parser.add_argument('--eval_every', type=int, default=50, help='Evaluate every N epochs')
     parser.add_argument('--quick_symbolic', action='store_true', help='Use quick symbolic distillation')
-    parser.add_argument('--memory_efficient', action='store_true', help='Use memory-efficient mode')
     args = parser.parse_args()
 
     device = get_device() if args.device == 'auto' else args.device
@@ -77,7 +76,7 @@ def main():
     print(f"Starting training for {args.epochs} epochs...")
     last_rec = 1.0
     
-    # Memory-efficient training loop
+    # Optimized training loop
     for epoch in range(args.epochs):
         # Random batch selection for training
         idx = np.random.randint(0, len(dataset) - args.batch_size)
@@ -96,16 +95,7 @@ def main():
 
     # 5. Analysis & Symbolic Discovery
     print("Extracting latent data for visualization...")
-    # Use memory-efficient extraction for large datasets
-    if args.memory_efficient and len(dataset) > 100:
-        # Sample a subset of the trajectory for analysis
-        sample_size = 100
-        sample_indices = np.linspace(0, len(dataset)-1, sample_size, dtype=int)
-        sample_dataset = [dataset[i] for i in sample_indices]
-        sample_pos = pos[sample_indices]
-        z_states, dz_states, t_states = extract_latent_data(model, sample_dataset, sim.dt, include_hamiltonian=args.hamiltonian)
-    else:
-        z_states, dz_states, t_states = extract_latent_data(model, dataset, sim.dt, include_hamiltonian=args.hamiltonian)
+    z_states, dz_states, t_states = extract_latent_data(model, dataset, sim.dt, include_hamiltonian=args.hamiltonian)
 
     # Compute stability metric: variance of latent derivatives over the last 20% of the trajectory
     # dz_states: [T, K, D]

@@ -145,7 +145,7 @@ class OptimizedExpressionProgram:
     def __str__(self): return self.expr_str
 
 class SymbolicDistiller:
-    def __init__(self, populations=1000, generations=20, stopping_criteria=0.001, max_features=12):
+    def __init__(self, populations=500, generations=10, stopping_criteria=0.001, max_features=8):
         self.populations = populations
         self.generations = generations
         self.stopping_criteria = stopping_criteria

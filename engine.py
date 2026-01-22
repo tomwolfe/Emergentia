@@ -442,20 +442,20 @@ class Trainer:
     def _integrate_trajectories(self, z_curr, data_list, dt, tf_ratio, tau, hard, is_warmup):
         z_preds = [z_curr]
         seq_len = len(data_list)
-        
+
         # MPS fix: torchdiffeq has issues with MPS. If we are on MPS,
         # we ensure the ODE integration happens on CPU.
         use_mps_fix = (str(self.device) == 'mps')
-        
+
         if not is_warmup:
             for t in range(1, seq_len):
                 if np.random.random() < tf_ratio:
                     batch_t_prev = Batch.from_data_list([data_list[t-1]]).to(self.device)
                     z_curr_forced, _, _, _ = self.model.encode(batch_t_prev.x, batch_t_prev.edge_index, batch_t_prev.batch, tau=tau, hard=hard)
                     z_curr = torch.nan_to_num(z_curr_forced)
-                
+
                 t_span = torch.tensor([0, dt], device=self.device, dtype=torch.float32)
-                
+
                 try:
                     if use_mps_fix:
                         # Move to CPU for integration

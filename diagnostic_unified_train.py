@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+"""
+Diagnostic version of unified_train.py to identify performance bottlenecks
+"""
 import torch
 import numpy as np
 import argparse
@@ -5,6 +9,7 @@ import os
 from datetime import datetime
 import matplotlib.pyplot as plt
 from torch_geometric.data import Batch
+import time
 
 from simulator import SpringMassSimulator, LennardJonesSimulator
 from model import DiscoveryEngineModel
@@ -15,8 +20,16 @@ from train_utils import ImprovedEarlyStopping, robust_energy, get_device
 from stable_pooling import SparsityScheduler
 from visualization import plot_discovery_results, plot_training_history
 
+def profile_section(name, func, *args, **kwargs):
+    """Profile a specific section of code"""
+    start_time = time.time()
+    result = func(*args, **kwargs)
+    end_time = time.time()
+    print(f"[PROFILE] {name}: {end_time - start_time:.4f}s")
+    return result
+
 def main():
-    parser = argparse.ArgumentParser(description="Unified Emergentia Training Pipeline - Optimized")
+    parser = argparse.ArgumentParser(description="Diagnostic Unified Emergentia Training Pipeline")
     parser.add_argument('--particles', type=int, default=16)
     parser.add_argument('--super_nodes', type=int, default=4)
     parser.add_argument('--epochs', type=int, default=500)
@@ -25,16 +38,13 @@ def main():
     parser.add_argument('--sim', type=str, default='spring', choices=['spring', 'lj'])
     parser.add_argument('--hamiltonian', action='store_true')
     parser.add_argument('--device', type=str, default='auto')
-    parser.add_argument('--batch_size', type=int, default=10, help='Batch size for training steps')
-    parser.add_argument('--eval_every', type=int, default=50, help='Evaluate every N epochs')
-    parser.add_argument('--quick_symbolic', action='store_true', help='Use quick symbolic distillation')
-    parser.add_argument('--memory_efficient', action='store_true', help='Use memory-efficient mode')
     args = parser.parse_args()
 
     device = get_device() if args.device == 'auto' else args.device
     print(f"Using device: {device}")
 
     # 1. Setup Simulator
+    print("Setting up simulator...")
     if args.sim == 'spring':
         sim = SpringMassSimulator(n_particles=args.particles, dynamic_radius=2.0)
     else:
@@ -42,10 +52,11 @@ def main():
 
     # 2. Generate Data
     print("Generating trajectory...")
-    pos, vel = sim.generate_trajectory(steps=args.steps)
-    dataset, stats = prepare_data(pos, vel, radius=2.0, device=device)
+    pos, vel = profile_section("Trajectory Generation", sim.generate_trajectory, steps=args.steps)
+    dataset, stats = profile_section("Data Preparation", prepare_data, pos, vel, radius=2.0, device=device)
 
     # 3. Setup Model & Trainer
+    print("Setting up model...")
     model = DiscoveryEngineModel(
         n_particles=args.particles,
         n_super_nodes=args.super_nodes,
@@ -61,6 +72,7 @@ def main():
         max_steps=args.epochs
     )
 
+    print("Setting up trainer...")
     trainer = Trainer(
         model,
         lr=args.lr,
@@ -77,18 +89,19 @@ def main():
     print(f"Starting training for {args.epochs} epochs...")
     last_rec = 1.0
     
-    # Memory-efficient training loop
     for epoch in range(args.epochs):
-        # Random batch selection for training
-        idx = np.random.randint(0, len(dataset) - args.batch_size)
-        batch_data = dataset[idx : idx + args.batch_size]
+        idx = np.random.randint(0, len(dataset) - 10)
+        batch_data = dataset[idx : idx + 10]
         
+        # Profile the training step
+        start_time = time.time()
         loss, rec, cons = trainer.train_step(batch_data, sim.dt, epoch=epoch, max_epochs=args.epochs)
         scheduler.step()
         last_rec = rec
-
+        train_step_time = time.time() - start_time
+        
         if epoch % 100 == 0:
-            print(f"Epoch {epoch:4d} | Loss: {loss:.4f} | Rec: {rec:.4f} | Cons: {cons:.4f}")
+            print(f"Epoch {epoch:4d} | Loss: {loss:.4f} | Rec: {rec:.4f} | Cons: {cons:.4f} | Time: {train_step_time:.4f}s")
 
         if early_stopping(loss):
             print(f"Early stopping triggered at epoch {epoch}")
@@ -96,16 +109,7 @@ def main():
 
     # 5. Analysis & Symbolic Discovery
     print("Extracting latent data for visualization...")
-    # Use memory-efficient extraction for large datasets
-    if args.memory_efficient and len(dataset) > 100:
-        # Sample a subset of the trajectory for analysis
-        sample_size = 100
-        sample_indices = np.linspace(0, len(dataset)-1, sample_size, dtype=int)
-        sample_dataset = [dataset[i] for i in sample_indices]
-        sample_pos = pos[sample_indices]
-        z_states, dz_states, t_states = extract_latent_data(model, sample_dataset, sim.dt, include_hamiltonian=args.hamiltonian)
-    else:
-        z_states, dz_states, t_states = extract_latent_data(model, dataset, sim.dt, include_hamiltonian=args.hamiltonian)
+    z_states, dz_states, t_states = profile_section("Latent Data Extraction", extract_latent_data, model, dataset, sim.dt, include_hamiltonian=args.hamiltonian)
 
     # Compute stability metric: variance of latent derivatives over the last 20% of the trajectory
     # dz_states: [T, K, D]
@@ -127,28 +131,18 @@ def main():
         symbolic_transformer = None
     else:
         print("Analyzing latent space...")
-        # Sample data for analysis to reduce computation time
-        sample_size = min(100, len(dataset))
-        sample_indices = np.linspace(0, len(dataset)-1, sample_size, dtype=int)
-        sample_dataset = [dataset[i] for i in sample_indices]
-        sample_pos = pos[sample_indices]
-        
-        corrs = analyze_latent_space(model, sample_dataset, sample_pos, device=device)
+        corrs = profile_section("Latent Space Analysis", analyze_latent_space, model, dataset, pos, device=device)
 
         print("Performing symbolic distillation...")
         if args.hamiltonian:
-            # Reduce populations and generations for faster execution
-            populations = 500 if args.quick_symbolic else 2000
-            generations = 10 if args.quick_symbolic else 40
+            # NEW: Increase populations and generations as requested
             from hamiltonian_symbolic import HamiltonianSymbolicDistiller
-            distiller = HamiltonianSymbolicDistiller(populations=populations, generations=generations)
+            distiller = HamiltonianSymbolicDistiller(populations=2000, generations=40)
             equations = distiller.distill(z_states, dz_states, args.super_nodes, 4, model=model)
         else:
-            # Reduce populations and generations for faster execution
-            populations = 500 if args.quick_symbolic else 2000
-            generations = 10 if args.quick_symbolic else 40
+            # NEW: Increase populations and generations as requested
             from symbolic import SymbolicDistiller
-            distiller = SymbolicDistiller(populations=populations, generations=generations)
+            distiller = SymbolicDistiller(populations=2000, generations=40)
             equations = distiller.distill(z_states, dz_states, args.super_nodes, 4)
 
         print("\nDiscovered Equations:")
@@ -156,7 +150,7 @@ def main():
             target = "H" if args.hamiltonian else f"dz_{i}/dt"
             print(f"{target} = {eq}")
 
-        # Create symbolic transformer and update trainer with symbolic proxy
+        # NEW: Create symbolic transformer and update trainer with symbolic proxy
         if hasattr(distiller, 'transformer'):
             symbolic_transformer = distiller.transformer
         else:
@@ -167,34 +161,22 @@ def main():
         # Update trainer with symbolic proxy
         trainer.update_symbolic_proxy(equations, symbolic_transformer, weight=0.1, confidence=0.8)
 
-    # 6. Visualization - OPTIMIZED
+    # 6. Visualization
     print("Visualizing results...")
-    # Only compute assignments for a subset to reduce computation
-    sample_size = min(50, len(dataset))
-    sample_indices = np.linspace(0, len(dataset)-1, sample_size, dtype=int)
-    sample_dataset = [dataset[i] for i in sample_indices]
     
-    # Get assignments for sampled data
-    model.eval()
-    s_list = []
-    with torch.no_grad():
-        for data in sample_dataset:
-            batch = Batch.from_data_list([data]).to(device)
-            _, s, _, _ = model.encode(batch.x, batch.edge_index, batch.batch)
-            s_list.append(s.cpu())
-
-    s_full = torch.cat(s_list, dim=0) # [sample_size*N, K]
-    # Reshape to [sample_size, N, K] and take mean over particles N for the heatmap
-    s_heatmap = s_full.view(sample_size, args.particles, args.super_nodes).mean(dim=1)
+    # Profile the assignment computation
+    s_full = profile_section("Assignment Computation", lambda: compute_assignments(model, dataset, device, args.particles, args.super_nodes))
+    
+    # Reshape to [T, N, K] and take mean over particles N for the heatmap?
+    # Actually visualization.py expects [T, K] for the heatmap
+    s_heatmap = s_full.view(len(dataset), args.particles, args.super_nodes).mean(dim=1)
 
     # Get final assignments for scatter plot
     batch_0 = Batch.from_data_list([dataset[0]]).to(device)
     _, s_0, _, _ = model.encode(batch_0.x, batch_0.edge_index, batch_0.batch)
     assignments = torch.argmax(s_0, dim=1).cpu().numpy()
 
-    # Use sampled z_states for visualization
-    sample_z_states = z_states[sample_indices] if len(z_states) > sample_size else z_states
-    z_states_plot = sample_z_states.reshape(-1, args.super_nodes, 4) if len(sample_z_states) > 0 else np.zeros((sample_size, args.super_nodes, 4))
+    z_states_plot = z_states.reshape(-1, args.super_nodes, 4) if 'z_states' in locals() else np.zeros((len(dataset), args.super_nodes, 4))
 
     # NEW: Generate symbolic predictions if symbolic equations exist
     symbolic_predictions = None
@@ -226,8 +208,21 @@ def main():
             print(f"Failed to generate symbolic predictions: {e}")
             symbolic_predictions = None
 
-    plot_discovery_results(model, sample_dataset, pos[sample_indices], s_heatmap, z_states_plot, assignments, symbolic_predictions=symbolic_predictions)
+    plot_discovery_results(model, dataset, pos, s_heatmap, z_states_plot, assignments, symbolic_predictions=symbolic_predictions)
     plot_training_history(trainer.loss_tracker)
+
+def compute_assignments(model, dataset, device, particles, super_nodes):
+    """Helper function to compute assignments for profiling"""
+    s_list = []
+    model.eval()
+    with torch.no_grad():
+        for data in dataset:
+            batch = Batch.from_data_list([data]).to(device)
+            _, s, _, _ = model.encode(batch.x, batch.edge_index, batch.batch)
+            s_list.append(s.cpu())
+
+    s_full = torch.cat(s_list, dim=0) # [T*N, K]
+    return s_full
 
 if __name__ == "__main__":
     main()
