@@ -170,31 +170,31 @@ def main():
     # 6. Visualization - OPTIMIZED
     print("Visualizing results...")
     # Only compute assignments for a subset to reduce computation
-    sample_size = min(50, len(dataset))
-    sample_indices = np.linspace(0, len(dataset)-1, sample_size, dtype=int)
-    sample_dataset = [dataset[i] for i in sample_indices]
-    
+    vis_sample_size = min(50, len(dataset))
+    vis_sample_indices = np.linspace(0, len(dataset)-1, vis_sample_size, dtype=int)
+    vis_sample_dataset = [dataset[i] for i in vis_sample_indices]
+
     # Get assignments for sampled data
     model.eval()
     s_list = []
     with torch.no_grad():
-        for data in sample_dataset:
+        for data in vis_sample_dataset:
             batch = Batch.from_data_list([data]).to(device)
             _, s, _, _ = model.encode(batch.x, batch.edge_index, batch.batch)
             s_list.append(s.cpu())
 
     s_full = torch.cat(s_list, dim=0) # [sample_size*N, K]
     # Reshape to [sample_size, N, K] and take mean over particles N for the heatmap
-    s_heatmap = s_full.view(sample_size, args.particles, args.super_nodes).mean(dim=1)
+    s_heatmap = s_full.view(vis_sample_size, args.particles, args.super_nodes).mean(dim=1)
 
     # Get final assignments for scatter plot
     batch_0 = Batch.from_data_list([dataset[0]]).to(device)
     _, s_0, _, _ = model.encode(batch_0.x, batch_0.edge_index, batch_0.batch)
     assignments = torch.argmax(s_0, dim=1).cpu().numpy()
 
-    # Use sampled z_states for visualization
-    sample_z_states = z_states[sample_indices] if len(z_states) > sample_size else z_states
-    z_states_plot = sample_z_states.reshape(-1, args.super_nodes, 4) if len(sample_z_states) > 0 else np.zeros((sample_size, args.super_nodes, 4))
+    # Extract z_states for visualization using the same indices
+    vis_z_states, _, _ = extract_latent_data(model, vis_sample_dataset, sim.dt, include_hamiltonian=args.hamiltonian)
+    z_states_plot = vis_z_states.reshape(-1, args.super_nodes, 4) if len(vis_z_states) > 0 else np.zeros((vis_sample_size, args.super_nodes, 4))
 
     # NEW: Generate symbolic predictions if symbolic equations exist
     symbolic_predictions = None
@@ -208,8 +208,20 @@ def main():
             with torch.no_grad():
                 symbolic_dz_dt = trainer.symbolic_proxy(z_tensor)
 
-            # Reshape to match z_states_plot dimensions [T, K, D]
-            symbolic_dz_dt = symbolic_dz_dt.cpu().numpy().reshape(-1, args.super_nodes, 4)
+            # Reshape to match z_states_plot dimensions [T, K, D], ensuring compatibility
+            expected_shape = z_states_plot.shape
+            num_elements_needed = expected_shape[0] * expected_shape[1] * expected_shape[2]
+            symbolic_dz_dt_flat = symbolic_dz_dt.cpu().numpy().flatten()
+
+            # Trim or pad if needed to match expected size
+            if len(symbolic_dz_dt_flat) > num_elements_needed:
+                symbolic_dz_dt_flat = symbolic_dz_dt_flat[:num_elements_needed]
+            elif len(symbolic_dz_dt_flat) < num_elements_needed:
+                # Pad with zeros if shorter
+                padding = np.zeros(num_elements_needed - len(symbolic_dz_dt_flat))
+                symbolic_dz_dt_flat = np.concatenate([symbolic_dz_dt_flat, padding])
+
+            symbolic_dz_dt = symbolic_dz_dt_flat.reshape(expected_shape)
 
             # Integrate to get trajectories (simple Euler integration)
             dt = 0.01  # Use a small time step for integration
@@ -218,15 +230,26 @@ def main():
 
             for t in range(1, len(symbolic_traj)):
                 # Simple Euler integration: z_new = z_old + dt * dz_dt
-                symbolic_traj[t] = symbolic_traj[t-1] + dt * symbolic_dz_dt[t-1]
+                # Ensure we don't go out of bounds
+                if t-1 < len(symbolic_dz_dt):
+                    symbolic_traj[t] = symbolic_traj[t-1] + dt * symbolic_dz_dt[t-1]
+                else:
+                    # If we run out of derivatives, hold the last value or use zeros
+                    symbolic_traj[t] = symbolic_traj[t-1]
 
             symbolic_predictions = symbolic_traj
             print(f"Generated symbolic predictions: shape {symbolic_predictions.shape}")
+        except RuntimeError as e:
+            if "size of tensor" in str(e) and "match the size" in str(e):
+                print(f"Tensor size mismatch in symbolic proxy: {e}. Skipping symbolic predictions.")
+                symbolic_predictions = None
+            else:
+                raise  # Re-raise if it's a different RuntimeError
         except Exception as e:
             print(f"Failed to generate symbolic predictions: {e}")
             symbolic_predictions = None
 
-    plot_discovery_results(model, sample_dataset, pos[sample_indices], s_heatmap, z_states_plot, assignments, symbolic_predictions=symbolic_predictions)
+    plot_discovery_results(model, vis_sample_dataset, pos[vis_sample_indices], s_heatmap, z_states_plot, assignments, symbolic_predictions=symbolic_predictions)
     plot_training_history(trainer.loss_tracker)
 
 if __name__ == "__main__":
