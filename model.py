@@ -363,7 +363,7 @@ class HamiltonianODEFunc(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),  # Full hidden size instead of hidden_dim//8
             nn.Softplus(), # Additional activation
             nn.Linear(hidden_dim, hidden_dim//2),  # Additional layer
-            nn.Tanh(),  # Add Tanh activation to bound the Hamiltonian's energy and prevent runaway momentum
+            nn.Softplus(),  # Replaced Tanh with Softplus to allow for quadratic kinetic energy
             nn.Linear(hidden_dim//2, 1)
         )
 
@@ -441,27 +441,33 @@ class HamiltonianODEFunc(nn.Module):
         result = torch.cat([dq, dp], dim=-1).view(y.shape[0], -1)
         return torch.clamp(result, -1e2, 1e2)
 
+class ResidualBlock(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.ReLU(),
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim),
+            nn.ReLU(),
+            nn.LayerNorm(dim)
+        )
+    def forward(self, x):
+        return x + self.net(x)
+
 class GNNDecoder(nn.Module):
     def __init__(self, latent_dim, hidden_dim, out_features, box_size=10.0):
         super(GNNDecoder, self).__init__()
         self.box_size = box_size
-        # ENHANCED: Add more capacity to decoder to improve reconstruction fidelity
+        # ENHANCED: Double hidden_dim and use Residual architecture
+        hidden_dim = hidden_dim * 2
         self.shared_mlp = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
             nn.ReLU(),
             nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),  # Additional layer for more capacity
-            nn.ReLU(),
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),  # Added extra layer as requested
-            nn.ReLU(),
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),  # Added extra layer as requested
-            nn.ReLU(),
-            nn.LayerNorm(hidden_dim)
+            ResidualBlock(hidden_dim),
+            ResidualBlock(hidden_dim),
+            ResidualBlock(hidden_dim)
         )
 
         # Add LayerNorm before the heads to prevent large latent values from saturating Tanh
@@ -543,6 +549,7 @@ class GNNDecoder(nn.Module):
 
         return torch.cat([pos_recon, vel_recon], dim=-1)
 
+
 class MIDiscriminator(nn.Module):
     """
     Discriminator for Mutual Information Estimation (MINE-style).
@@ -582,11 +589,8 @@ class DiscoveryEngineModel(nn.Module):
         self.mi_discriminator = MIDiscriminator(min(latent_dim, 2), 2, hidden_dim)
 
         # Learnable loss log-variances for automatic loss balancing
-        # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning, 8: sep, 9: conn, 10: sparsity, 11: mi, 12: sym, 13: var, 14: hinge, 15: smooth
-        initial_log_vars = torch.zeros(16)
-        # Initialize rec loss (index 0) to -5.0 to heavily prioritize reconstruction from the start
-        initial_log_vars[0] = -5.0
-        self.log_vars = nn.Parameter(initial_log_vars) 
+        # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning, 8: sep, 9: conn, 10: sparsity, 11: mi, 12: sym, 13: var, 14: hinge, 15: smooth, 16: anchor
+        self.log_vars = nn.Parameter(torch.zeros(17)) 
         
     def get_latent_variance_loss(self, z):
         """
@@ -670,17 +674,17 @@ class DiscoveryEngineModel(nn.Module):
             rtol = 1e-3 + eps
             atol = 1e-5 + eps
 
-        # Use dopri5 with max_step=0.01 as requested for stability
-        method = 'dopri5'
-        options = {'max_step': 0.01}
+        # Use rk4 with fixed step_size=0.01 for consistent gradient flow as requested
+        method = 'rk4'
+        options = {'step_size': 0.01}
 
         # Use the selected solver
         if self.hamiltonian and self.training:
             # Use adjoint method to save memory when training Hamiltonian
             # The adjoint method is more memory efficient for backpropagating through ODEs
-            zt_flat = odeint_adjoint(self.ode_func, y0, t_ode, rtol=rtol, atol=atol, method=method, options=options)
+            zt_flat = odeint_adjoint(self.ode_func, y0, t_ode, method=method, options=options)
         else:
-            zt_flat = odeint(self.ode_func, y0, t_ode, rtol=rtol, atol=atol, method=method, options=options)
+            zt_flat = odeint(self.ode_func, y0, t_ode, method=method, options=options)
 
         # Move back to original device
         zt_flat = zt_flat.to(original_device)

@@ -382,14 +382,6 @@ class Trainer:
         # Manually re-balance initial log_vars for stability - PRIORITIZE RECONSTRUCTION
         with torch.no_grad():
             self.model.log_vars.fill_(0.0)
-            # 0 is rec loss - set to -4.6 to give it weight of ~100.0 (exp(-(-4.6)) ≈ 100)
-            self.model.log_vars[0].fill_(-4.6)
-            # 2 is assign loss - set to 2.3 to give it weight of ~0.1 (exp(-2.3) ≈ 0.1)
-            self.model.log_vars[2].fill_(2.3)
-            # 6 is alignment loss - set to -1.0 to force physical grounding from epoch 0 (was not set before)
-            self.model.log_vars[6].fill_(-1.0)
-            # 10 is sparsity loss - set to 6.0 to encourage gradual sparsification (increased from 5.0)
-            self.model.log_vars[10].fill_(6.0)
 
         # Significantly increase spatial and connectivity loss multipliers by 10x
         if hasattr(self.model.encoder.pooling, 'temporal_consistency_weight'):
@@ -436,7 +428,7 @@ class Trainer:
         param_groups = [
             {'params': other_params, 'weight_decay': 1e-5},
             {'params': [self.log_align_scale], 'lr': 1e-3},
-            {'params': [self.model.log_vars], 'lr': 1e-2}, # Increased from 1e-3
+            {'params': [self.model.log_vars], 'lr': 1e-1}, # Increased from 1e-2
         ]
         if h_net_params:
             param_groups.append({'params': h_net_params, 'weight_decay': 1e-2}) # Increased from 1e-3
@@ -624,17 +616,18 @@ class Trainer:
         is_stage1 = epoch < 200 # Stage 1: Epochs 0-199, freeze ode_func
         is_stage2 = epoch >= 200 # Stage 2: Epochs 200+, unfreeze ode_func with sigmoid ramp
         is_warmup = epoch < self.warmup_epochs
+
+        # Multiplier tensor for Stage 1 masking
+        loss_multipliers = torch.ones(17, device=self.device)
         if is_stage1:
-            # During Stage 1 (Epochs 0-199), we freeze the ODE dynamics and focus on stable partitioning and reconstruction
-            # Apply Reconstruction-First Warmup: set rec_loss weight to high value and others low
-            with torch.no_grad():
-                self.model.log_vars.fill_(3.0)  # Set most weights to exp(-3) ≈ 0.05
-                # Set rec_loss weight to high value (exp(-(-4.6)) ≈ 100) to prioritize reconstruction
-                self.model.log_vars[0].fill_(-4.6)  # Increased from -4.0 to -4.6 for 100x weight
-                # Set assign_loss weight to low value (exp(-2.3) ≈ 0.1) to prevent assignment dominance
-                self.model.log_vars[2].fill_(-2.3) # Changed from -1.0 to -2.3 for 0.1 weight
-                # Set alignment loss weight to -1.0 to force physical grounding from epoch 0
-                self.model.log_vars[6].fill_(-1.0) # Added
+            # Mask out dynamics-related losses during Stage 1
+            loss_multipliers[1] = 0.0  # cons
+            loss_multipliers[4] = 0.01 # l2
+            loss_multipliers[5] = 0.01 # lvr
+            loss_multipliers[12] = 0.0 # sym
+            # Prioritize reconstruction and structural stability
+            loss_multipliers[0] = 10.0 # rec
+            loss_multipliers[6] = 5.0  # align
 
         # Two-stage training: Stage 1 freezes ODE, Stage 2 unfreezes it
         for p in self.model.ode_func.parameters(): p.requires_grad = is_stage2
@@ -683,11 +676,12 @@ class Trainer:
         loss_align = torch.tensor(0.0, device=self.device)
         loss_mi = torch.tensor(0.0, device=self.device)
         loss_cons = torch.tensor(0.0, device=self.device)
+        loss_anchor = torch.tensor(0.0, device=self.device)
 
         # NEW: Implement "Hard Gate" for Alignment - suppress alignment and MI losses during warmup
         # and when reconstruction loss is too high
         # Need to define raw_losses first with initial values before using it
-        raw_losses = {'rec': loss_rec, 'cons': loss_cons, 'assign': loss_assign, 'ortho': loss_ortho, 'l2': loss_l2, 'lvr': loss_lvr, 'align': loss_align, 'pruning': loss_pruning, 'sep': loss_sep, 'conn': loss_conn, 'sparsity': loss_sparsity, 'mi': loss_mi, 'sym': loss_sym, 'var': loss_var, 'hinge': loss_hinge, 'smooth': loss_smooth}
+        raw_losses = {'rec': loss_rec, 'cons': loss_cons, 'assign': loss_assign, 'ortho': loss_ortho, 'l2': loss_l2, 'lvr': loss_lvr, 'align': loss_align, 'pruning': loss_pruning, 'sep': loss_sep, 'conn': loss_conn, 'sparsity': loss_sparsity, 'mi': loss_mi, 'sym': loss_sym, 'var': loss_var, 'hinge': loss_hinge, 'smooth': loss_smooth, 'anchor': loss_anchor}
 
         # NEW: Latent Activity penalty to prevent static latent trap
         if len(z_vel) > 0:
@@ -756,6 +750,10 @@ class Trainer:
             mu_t_norm = mu_t
             d_align = min(self.model.encoder.latent_dim // 2 if self.model.hamiltonian else 2, 2)
 
+            # Hard Coordinate Anchor: Ground latent space to center-of-mass positions
+            # This prevents H = -X0 "Physical Collapse" by anchoring latents to real coordinates
+            loss_anchor += 50.0 * self.criterion(z_preds[t, :, :, :2], mu_t_norm)
+
             # Use learnable scale in log-space for alignment
             # NEW: Use HuberLoss instead of MSELoss to reduce sensitivity to outliers
             huber_loss = torch.nn.SmoothL1Loss(beta=0.1)  # delta=0.1 equivalent to beta=0.1 in SmoothL1Loss
@@ -791,41 +789,42 @@ class Trainer:
             # If no consistency steps or not computing it, keep it as is (likely 0.0)
             pass
 
-        for l in [loss_assign, loss_pruning, loss_sparsity, loss_ortho, loss_sep, loss_conn]: l /= processed_steps
+        for l in [loss_assign, loss_pruning, loss_sparsity, loss_ortho, loss_sep, loss_conn, loss_anchor]: l /= processed_steps
         loss_align /= (processed_steps * self.model.encoder.n_super_nodes)
         loss_mi /= (processed_steps * self.model.encoder.n_super_nodes)
 
         lvars = torch.clamp(self.model.log_vars, min=-6.0, max=5.0)
-        if is_stage1: 
-            # Force structural losses to stay active during stage 1
-            lvars[11], lvars[3], lvars[12] = 0.0, 0.0, 0.0
 
         # Ensure all raw losses are float32 for stable balancing, especially on MPS
         for k in raw_losses:
             raw_losses[k] = raw_losses[k].to(torch.float32)
 
-        # Additionally, ensure all loss components are float32 before being used in calculations
-        loss_rec = loss_rec.to(torch.float32)
-        loss_cons = loss_cons.to(torch.float32)
-        loss_assign = loss_assign.to(torch.float32)
-        loss_ortho = loss_ortho.to(torch.float32)
-        loss_l2 = loss_l2.to(torch.float32)
-        loss_lvr = loss_lvr.to(torch.float32)
-        loss_align = loss_align.to(torch.float32)
-        loss_mi = loss_mi.to(torch.float32)
-        loss_pruning = loss_pruning.to(torch.float32)
-        loss_sparsity = loss_sparsity.to(torch.float32)
-        loss_sep = loss_sep.to(torch.float32)
-        loss_conn = loss_conn.to(torch.float32)
-        loss_sym = loss_sym.to(torch.float32)
-        loss_var = loss_var.to(torch.float32)
-        loss_hinge = loss_hinge.to(torch.float32)
-        loss_smooth = loss_smooth.to(torch.float32)
-        loss_activity = loss_activity.to(torch.float32)
+        # Update raw_losses with final averaged values
+        raw_losses['rec'] = loss_rec
+        raw_losses['cons'] = loss_cons
+        raw_losses['assign'] = loss_assign
+        raw_losses['ortho'] = loss_ortho
+        raw_losses['l2'] = loss_l2
+        raw_losses['lvr'] = loss_lvr
+        raw_losses['align'] = loss_align
+        raw_losses['pruning'] = loss_pruning
+        raw_losses['sep'] = loss_sep
+        raw_losses['conn'] = loss_conn
+        raw_losses['sparsity'] = loss_sparsity
+        raw_losses['mi'] = loss_mi
+        raw_losses['sym'] = loss_sym
+        raw_losses['var'] = loss_var
+        raw_losses['hinge'] = loss_hinge
+        raw_losses['smooth'] = loss_smooth
+        raw_losses['anchor'] = loss_anchor
 
-        # Create weights for losses that have corresponding log_vars entries (first 16)
-        base_keys = list(raw_losses.keys())[:16]  # Only first 16 keys that correspond to lvars
-        weights = {k: torch.exp(-lvars[i]) for i, k in enumerate(base_keys)}
+        # Additionally, ensure all loss components are float32 before being used in calculations
+        for k in raw_losses:
+            raw_losses[k] = raw_losses[k].to(torch.float32)
+
+        # Create weights for losses that have corresponding log_vars entries (first 17)
+        base_keys = list(raw_losses.keys())[:17]  # Now includes anchor at index 16
+        weights = {k: torch.exp(-lvars[i]) * loss_multipliers[i] for i, k in enumerate(base_keys)}
 
         # Special case for activity loss which might not be in log_vars yet
         if 'activity' in raw_losses and 'activity' not in weights:
@@ -892,17 +891,17 @@ class Trainer:
 
             self.optimizer.step()
 
-        self.loss_tracker.update({'total': loss.to(torch.float32), 'rec_raw': loss_rec, 'cons_raw': loss_cons, 'assign': loss_assign, 'align': loss_align, 'mi': loss_mi, 'sym': loss_sym, 'lvar_raw': loss_var, 'curv_raw': loss_curv, 'hinge_raw': loss_hinge, 'smooth_raw': loss_smooth, 'lvars_mean': lvars.mean()}, weights=weights)
+        self.loss_tracker.update({'total': loss.to(torch.float32), 'rec_raw': loss_rec, 'cons_raw': loss_cons, 'assign': loss_assign, 'align': loss_align, 'mi': loss_mi, 'sym': loss_sym, 'lvar_raw': loss_var, 'curv_raw': loss_curv, 'hinge_raw': loss_hinge, 'smooth_raw': loss_smooth, 'anchor_raw': loss_anchor, 'lvars_mean': lvars.mean()}, weights=weights)
         
         if epoch % 100 == 0:
             # Grouped loss reporting
             fidelity_loss = loss_rec + loss_cons
             structural_loss = loss_assign + loss_ortho + loss_pruning + loss_sep + loss_conn + loss_sparsity
-            physical_loss = loss_align + loss_mi + loss_curv + loss_sym
+            physical_loss = loss_align + loss_mi + loss_curv + loss_sym + loss_anchor
             reg_loss = loss_l2 + loss_lvr + loss_var + loss_hinge + loss_smooth + loss_activity
             
             print(f"  [Loss Meta] Fidelity: {fidelity_loss:.4f} | Structure: {structural_loss:.4f} | Physics: {physical_loss:.4f} | Reg: {reg_loss:.4f}")
-            print(f"  [Loss Detail] Rec: {loss_rec:.4f} | Cons: {loss_cons:.4f} | Assign: {loss_assign:.4f} | Align: {loss_align:.4f} | Sym: {loss_sym:.4f}")
+            print(f"  [Loss Detail] Rec: {loss_rec:.4f} | Cons: {loss_cons:.4f} | Assign: {loss_assign:.4f} | Align: {loss_align:.4f} | Anchor: {loss_anchor:.4f} | Sym: {loss_sym:.4f}")
 
         return loss.item(), loss_rec.item(), loss_cons.item() if compute_consistency else 0.0
 

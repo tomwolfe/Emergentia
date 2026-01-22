@@ -65,7 +65,7 @@ class SymbolicDistiller:
         """Returns the length of the program as a measure of complexity."""
         return getattr(program, 'length_', 1)
 
-    def _get_regressor(self, pop, gen, parsimony=0.02):
+    def _get_regressor(self, pop, gen, parsimony=0.05):
         # Safe square function that prevents overflow
         def safe_square(x):
             x_clipped = np.clip(x, -1e6, 1e6)  # Prevent large values before squaring

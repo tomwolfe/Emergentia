@@ -285,6 +285,13 @@ class BalancedFeatureTransformer:
         X_raw = X[:, :n_raw_latents]
         features.append(X_raw**2)
 
+        # NEW: Explicit sum of squares of momentum dims (p^2) per super-node
+        # Assuming last half of latent_dim are momentum dims
+        d_sub = self.latent_dim // 2
+        X_nodes = X_raw.reshape(batch_size, self.n_super_nodes, self.latent_dim)
+        p_sq_sum = (X_nodes[:, :, d_sub:]**2).sum(axis=2) # [Batch, K]
+        features.append(p_sq_sum)
+
         # For small systems, target < 60 features by skipping cross-terms
         if self.n_super_nodes <= 4:
             return np.concatenate(features, axis=1)

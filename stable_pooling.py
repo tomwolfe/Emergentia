@@ -64,6 +64,10 @@ class StableHierarchicalPooling(nn.Module):
         self.register_buffer('assignment_distribution', torch.ones(n_super_nodes) / n_super_nodes)
         self.register_buffer('assignment_variance', torch.zeros(n_super_nodes))
         
+        # NEW: Logit smoothing EMA buffer
+        self.register_buffer('logits_ema', None)
+        self.logit_ema_alpha = 0.5 # Smoothing factor
+        
         # Adaptive sparsity scheduling
         self.current_sparsity_weight = sparsity_weight
 
@@ -115,6 +119,13 @@ class StableHierarchicalPooling(nn.Module):
             self.active_mask[most_needed_indices] = 1.0
 
         logits = self.assign_mlp(x) * self.scaling
+
+        # NEW: Logit Smoothing (EMA) to prevent "banding" and temporal chatter
+        if self.logits_ema is not None and self.logits_ema.size(0) == logits.size(0):
+            logits = self.logit_ema_alpha * self.logits_ema.detach() + (1.0 - self.logit_ema_alpha) * logits
+        
+        # Update EMA buffer
+        self.logits_ema = logits.detach()
 
         # NEW: Assignment Persistence - bias logits by previous assignments to stabilize flickering
         if prev_assignments is not None and prev_assignments.size(0) == x.size(0):
