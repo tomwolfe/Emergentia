@@ -3,7 +3,7 @@ import numpy as np
 import torch
 
 class SpringMassSimulator:
-    def __init__(self, n_particles=64, k=10.0, m=1.0, dt=0.01, spring_dist=1.0, dynamic_radius=None, box_size=None):
+    def __init__(self, n_particles=64, k=10.0, m=1.0, dt=0.001, spring_dist=1.0, dynamic_radius=None, box_size=None):
         self.n_particles = n_particles
         self.k = k
         self.m = m
@@ -11,7 +11,7 @@ class SpringMassSimulator:
         self.spring_dist = spring_dist
         self.dynamic_radius = dynamic_radius
         self.box_size = box_size # tuple (L_x, L_y) or None
-        
+
         # Initialize particles in a grid
         side = int(np.ceil(np.sqrt(n_particles)))
         # Start at 1.122 * spring_dist to avoid overlap issues with LJ potential
@@ -22,7 +22,7 @@ class SpringMassSimulator:
         self.pos = np.stack([xv.flatten()[:n_particles], yv.flatten()[:n_particles]], axis=1)
         # Random initial velocity
         self.vel = np.random.randn(n_particles, 2) * 0.5
-        
+
         # Create initial adjacency info
         self.radius = self.dynamic_radius if self.dynamic_radius else 1.1 * self.spring_dist
         if not self.dynamic_radius:
@@ -87,36 +87,40 @@ class SpringMassSimulator:
     def compute_forces(self, pos):
         forces = np.zeros_like(pos)
         pairs = self._compute_pairs(pos) if (self.dynamic_radius or self.box_size) else self.fixed_pairs
-        
+
         if len(pairs) == 0:
             return forces
 
         idx1, idx2 = zip(*pairs)
         idx1 = np.array(idx1)
         idx2 = np.array(idx2)
-        
+
         diff = pos[idx2] - pos[idx1]
-        
+
         # Apply Minimum Image Convention for PBC
         if self.box_size:
             for i in range(2):
                 diff[:, i] -= self.box_size[i] * np.round(diff[:, i] / self.box_size[i])
 
         dist = np.linalg.norm(diff, axis=1, keepdims=True)
-        dist_clamped = np.maximum(dist, 0.2 * self.spring_dist)
-        
-        f_mag = self.k * (dist - self.spring_dist)
-        repulsion = 0.5 * self.k * np.power(self.spring_dist / dist_clamped, 4)
+
+        # Soft floor for particle distances to prevent infinite forces
+        # Use a soft minimum distance to prevent numerical instabilities
+        min_dist = 0.1 * self.spring_dist
+        dist_smooth = np.sqrt(dist**2 + min_dist**2)
+
+        f_mag = self.k * (dist_smooth - self.spring_dist)
+        repulsion = 0.5 * self.k * np.power(self.spring_dist / dist_smooth, 4)
         f_mag -= repulsion
-        
-        force_vec = f_mag * (diff / (dist + 1e-9))
-        
+
+        force_vec = f_mag * (diff / (dist_smooth + 1e-9))
+
         max_f = 500.0
         force_vec = np.clip(force_vec, -max_f, max_f)
-        
+
         np.add.at(forces, idx1, force_vec)
         np.add.at(forces, idx2, -force_vec)
-        
+
         return forces
 
     def energy(self, pos=None, vel=None):

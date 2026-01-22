@@ -233,29 +233,46 @@ class GNNEncoder(nn.Module):
         self.ln2 = nn.LayerNorm(hidden_dim)
         self.n_super_nodes = n_super_nodes
         self.latent_dim = latent_dim
-        
+
         # Spatially-aware pooling instead of global_mean_pool
         # Use the Enhanced StableHierarchicalPooling
         self.pooling = StableHierarchicalPooling(hidden_dim, n_super_nodes, min_active_super_nodes=min_active_super_nodes)
-        
+
         self.output_layer = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, latent_dim),
-            nn.Tanh()
         )
+
+        # Initialize weights using Xavier uniform
+        self._initialize_weights()
+
+        # Add a learnable gain parameter to prevent vanishing latents
+        self.latent_gain = nn.Parameter(torch.ones(latent_dim) * 1.0)
+
+    def _initialize_weights(self):
+        """Initialize weights using Xavier uniform initialization."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, x, edge_index, batch, tau=1.0, hard=False):
         # Store initial positions for spatial pooling
-        pos = x[:, :2] 
+        pos = x[:, :2]
         vel = x[:, 2:4] # Assume [pos_x, pos_y, vel_x, vel_y]
-        
+
         x = self.ln1(torch.relu(self.gnn1(x, pos, vel, edge_index)))
         x = self.ln2(torch.relu(self.gnn2(x, pos, vel, edge_index)))
-        
+
         # Pool to K super-nodes preserving spatial features
         pooled, s, assign_losses, mu = self.pooling(x, batch, pos=pos, tau=tau, hard=hard) # [batch_size, n_super_nodes, hidden_dim], [N, n_super_nodes], mu: [B, K, 2]
         latent = self.output_layer(pooled) # [batch_size, n_super_nodes, latent_dim]
+
+        # Apply learnable gain to prevent vanishing latents
+        latent = latent * self.latent_gain
+
         return latent, s, assign_losses, mu
 
 class LatentODEFunc(nn.Module):
@@ -416,6 +433,17 @@ class GNNDecoder(nn.Module):
         # Velocity head: Maps to unconstrained Z-score values
         self.vel_head = nn.Linear(hidden_dim, 2)
 
+        # Initialize weights using Xavier uniform
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        """Initialize weights using Xavier uniform initialization."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
     def forward(self, z, s, batch, stats=None):
         # z: [batch_size, n_super_nodes, latent_dim]
         # s: [N_total, n_super_nodes]
@@ -489,22 +517,22 @@ class DiscoveryEngineModel(nn.Module):
 
         # Learnable loss log-variances for automatic loss balancing
         # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning, 8: sep, 9: conn, 10: sparsity, 11: mi, 12: sym, 13: var
-        # Initialize log_vars[0] (rec) to a moderate value, others to low weight to force reconstruction first
+        # Initialize log_vars[0] (rec) to a high priority value, others to low weight to force reconstruction first
         lvars = torch.zeros(14)
-        lvars[0] = -2.0 # High priority for reconstruction
-        lvars[1] = 2.0  # Low initial priority for consistency
-        lvars[2] = 2.0  # Low initial priority for assignment
-        lvars[3] = 2.0  # Low initial priority for ortho
-        lvars[4] = 2.0  # Low initial priority for l2
-        lvars[5] = 2.0  # Low initial priority for lvr
-        lvars[6] = 2.0  # Low initial priority for align (was -3.0)
-        lvars[7] = 2.0  # Low initial priority for pruning
-        lvars[8] = 2.0  # Low initial priority for sep
-        lvars[9] = 2.0  # Low initial priority for conn
-        lvars[10] = 2.0 # Low initial priority for sparsity
-        lvars[11] = 2.0 # Low initial priority for mi (was not set)
-        lvars[12] = 2.0 # Low initial priority for sym
-        lvars[13] = 2.0 # Low initial priority for var
+        lvars[0] = -5.0 # Very high priority for reconstruction initially
+        lvars[1] = 5.0  # Very low initial priority for consistency
+        lvars[2] = 5.0  # Very low initial priority for assignment
+        lvars[3] = 5.0  # Very low initial priority for ortho (this was causing issues)
+        lvars[4] = 5.0  # Very low initial priority for l2
+        lvars[5] = 5.0  # Very low initial priority for lvr
+        lvars[6] = 5.0  # Very low initial priority for align
+        lvars[7] = 5.0  # Very low initial priority for pruning
+        lvars[8] = 5.0  # Very low initial priority for sep
+        lvars[9] = 5.0  # Very low initial priority for conn
+        lvars[10] = 5.0 # Very low initial priority for sparsity
+        lvars[11] = 5.0 # Very low initial priority for mi
+        lvars[12] = 5.0 # Very low initial priority for sym
+        lvars[13] = 5.0 # Very low initial priority for var
         self.log_vars = nn.Parameter(lvars) 
         
     def get_latent_variance_loss(self, z):

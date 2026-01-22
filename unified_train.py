@@ -70,16 +70,17 @@ def main():
             break
 
     # 5. Analysis & Symbolic Discovery
+    print("Extracting latent data for visualization...")
+    z_states, dz_states, t_states = extract_latent_data(model, dataset, sim.dt, include_hamiltonian=args.hamiltonian)
+
     if epoch < 100 or last_rec > 0.25:
         print(f"Skipping symbolic discovery: Latent manifold not stabilized (Epoch: {epoch}, Rec Loss: {last_rec:.4f}).")
         equations = []
     else:
         print("Analyzing latent space...")
         corrs = analyze_latent_space(model, dataset, pos, device=device)
-        
-        print("Extracting latent data for symbolic distillation...")
-        z_states, dz_states, t_states = extract_latent_data(model, dataset, sim.dt, include_hamiltonian=args.hamiltonian)
-        
+
+        print("Performing symbolic distillation...")
         if args.hamiltonian:
             distiller = HamiltonianSymbolicDistiller()
             equations = distiller.distill(z_states, dz_states, args.super_nodes, 4, model=model)

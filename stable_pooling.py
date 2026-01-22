@@ -273,12 +273,12 @@ class StableHierarchicalPooling(nn.Module):
                 # self.assign_mlp[2] is the Linear(in_channels, n_super_nodes) layer
                 last_layer = self.assign_mlp[2]
                 for idx in inactive_indices:
-                    # Give it a fresh random start for this node's output slice
-                    nn.init.normal_(last_layer.weight[idx], mean=0.0, std=0.02)
+                    # Give it a fresh random start for this node's output slice with higher variance
+                    nn.init.normal_(last_layer.weight[idx], mean=0.0, std=0.1)  # Increased from 0.02
                     nn.init.constant_(last_layer.bias[idx], 0.0)
-                
+
                 # Also reset the active mask slightly for these nodes to allow them to show up
-                self.active_mask[inactive_indices] = 0.2
+                self.active_mask[inactive_indices] = 0.3  # Increased from 0.2 to make revival more likely
 
 
 class DynamicLossBalancer:
