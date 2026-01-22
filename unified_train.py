@@ -29,6 +29,7 @@ def main():
     parser.add_argument('--eval_every', type=int, default=50, help='Evaluate every N epochs')
     parser.add_argument('--quick_symbolic', action='store_true', help='Use quick symbolic distillation')
     parser.add_argument('--memory_efficient', action='store_true', help='Use memory-efficient mode')
+    parser.add_argument('--latent_dim', type=int, default=4, help='Dimension of latent space')
     args = parser.parse_args()
 
     device = get_device() if args.device == 'auto' else args.device
@@ -49,7 +50,7 @@ def main():
     model = DiscoveryEngineModel(
         n_particles=args.particles,
         n_super_nodes=args.super_nodes,
-        latent_dim=4,
+        latent_dim=args.latent_dim,
         hamiltonian=args.hamiltonian
     ).to(device)
 
@@ -66,7 +67,7 @@ def main():
         lr=args.lr,
         device=device,
         stats=stats,
-        warmup_epochs=200, # Stage 1: Train rec and assign - Increased to 200
+        warmup_epochs=int(args.epochs * 0.25), # Stage 1: Train rec and assign - 25% of total epochs
         max_epochs=args.epochs,
         sparsity_scheduler=sparsity_scheduler
     )
@@ -76,17 +77,25 @@ def main():
     # 4. Training Loop
     print(f"Starting training for {args.epochs} epochs...")
     last_rec = 1.0
-    
+
     # Track historical metrics for stability check
     loss_history = []
-    
+
     # Memory-efficient training loop
     for epoch in range(args.epochs):
         # Random batch selection for training
         idx = np.random.randint(0, len(dataset) - args.batch_size)
         batch_data = dataset[idx : idx + args.batch_size]
-        
+
         loss, rec, cons = trainer.train_step(batch_data, sim.dt, epoch=epoch, max_epochs=args.epochs)
+
+        # Learning rate warmup: gradually increase LR for first 20 epochs
+        if epoch < 20:
+            # Linear warmup from 0 to the scheduled LR
+            warmup_factor = (epoch + 1) / 20.0
+            for param_group in trainer.optimizer.param_groups:
+                param_group['lr'] = args.lr * warmup_factor
+
         scheduler.step()
         last_rec = rec
         loss_history.append(loss)

@@ -157,8 +157,8 @@ class StableHierarchicalPooling(nn.Module):
             revival_mask = (torch.rand_like(self.active_mask) < 0.2).float() * revival_candidate # Increased prob from 0.1
             effective_active = torch.clamp(current_active + revival_mask, 0, 1)
 
-            # Use a much slower EMA for smoothness as requested
-            ema_rate = 0.00001 # Decreased from 0.0001 to 0.00001 for much slower pruning
+            # Use a much slower EMA for smoothness as requested - REDUCED FROM 0.00001 TO 0.000001
+            ema_rate = 0.000001 # Decreased from 0.00001 to 0.000001 for much slower pruning
             if hard:
                 ema_rate *= 0.5 # Even slower updates during hard sampling
 
@@ -307,8 +307,8 @@ class StableHierarchicalPooling(nn.Module):
                 last_layer = self.assign_mlp[2]
                 for idx in inactive_indices:
                     # Re-initialize the weights for the corresponding output row
-                    # We use a larger std to force exploration
-                    nn.init.normal_(last_layer.weight[idx], mean=0.0, std=2.0) # Increased std to 2.0 for aggressive revival
+                    # We use a larger std to force exploration - INCREASED FROM 2.0 TO 5.0
+                    nn.init.normal_(last_layer.weight[idx], mean=0.0, std=5.0) # Increased std to 5.0 for aggressive revival
                     nn.init.constant_(last_layer.bias[idx], 0.0)
 
                 # Reset active mask for these nodes to allow them to compete immediately

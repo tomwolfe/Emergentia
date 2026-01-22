@@ -247,8 +247,12 @@ class GNNEncoder(nn.Module):
         # Initialize weights using Xavier uniform
         self._initialize_weights()
 
-        # Add a learnable gain parameter to prevent vanishing latents
-        self.latent_gain = nn.Parameter(torch.ones(latent_dim) * 1.0)
+        # Add a learnable gain parameter to prevent vanishing latents - INCREASED FROM 1.0 TO 2.0
+        self.latent_gain = nn.Parameter(torch.ones(latent_dim) * 2.0)
+
+        # Initialize output layer with higher variance to promote activity
+        nn.init.normal_(self.output_layer[-1].weight, mean=0.0, std=2.0)
+        nn.init.normal_(self.output_layer[-1].bias, mean=0.0, std=2.0)
 
     def _initialize_weights(self):
         """Initialize weights using Xavier uniform initialization."""
@@ -530,6 +534,17 @@ class DiscoveryEngineModel(nn.Module):
         """
         from common_losses import get_latent_variance_loss as common_latent_variance_loss
         return common_latent_variance_loss(z)
+
+    def get_activity_penalty(self, z):
+        """
+        Encourage the latent variables to have non-zero standard deviation over the temporal sequence.
+        z: [T, B, K, D] where T is time steps
+        """
+        # Calculate std across time dimension
+        temporal_std = torch.std(z, dim=0)  # [B, K, D]
+        # Encourage non-zero standard deviation to prevent static latents
+        activity_penalty = torch.mean(torch.relu(0.1 - temporal_std))
+        return activity_penalty
 
     def get_mi_loss(self, z, mu):
         """

@@ -363,8 +363,8 @@ class Trainer:
         self.s_history = []
         self.max_s_history = 10
         self.align_anneal_epochs = align_anneal_epochs
-        # Cap warmup_epochs to 20% of max_epochs
-        self.warmup_epochs = min(warmup_epochs, int(max_epochs * 0.2))
+        # Modify warmup_epochs logic to be 25% of total epochs instead of a fixed 200
+        self.warmup_epochs = int(max_epochs * 0.25)
         self.sparsity_scheduler = sparsity_scheduler
         self.hard_assignment_start = hard_assignment_start
         self.skip_consistency_freq = skip_consistency_freq  # Skip consistency loss every N epochs
@@ -378,10 +378,12 @@ class Trainer:
         # Manually re-balance initial log_vars for stability - PRIORITIZE RECONSTRUCTION
         with torch.no_grad():
             self.model.log_vars.fill_(0.0)
-            # 2 is assign loss - set to 5.0 (exp(-5.0) ~= 0.006) to prevent initial dominance
-            self.model.log_vars[2].fill_(5.0)
-            # 0 is rec loss - set to -5.0 (exp(5.0) ~= 148.4) to prioritize reconstruction more strongly
+            # 0 is rec loss - set to -5.0 to prioritize reconstruction fidelity in first 100 epochs
             self.model.log_vars[0].fill_(-5.0)
+            # 2 is assign loss - set to 5.0 to prevent initial dominance
+            self.model.log_vars[2].fill_(5.0)
+            # 10 is sparsity loss - set to 5.0 to encourage gradual sparsification
+            self.model.log_vars[10].fill_(5.0)
 
         # Significantly increase spatial and connectivity loss multipliers by 10x
         if hasattr(self.model.encoder.pooling, 'temporal_consistency_weight'):
@@ -744,6 +746,10 @@ class Trainer:
         if len(z_vel) > 0:
             # Change from log penalty to Hinge Loss: explicitly forces latents to move if velocity drops below threshold
             loss_activity = torch.relu(0.5 - torch.norm(z_vel, dim=-1)).mean()  # Hinge loss with threshold 0.5
+            raw_losses['activity'] = loss_activity
+        else:
+            # Calculate activity penalty using the model's method if z_vel is empty
+            loss_activity = self.model.get_activity_penalty(z_preds)
             raw_losses['activity'] = loss_activity
 
         # Ensure all raw losses are float32 for stable balancing, especially on MPS
