@@ -51,6 +51,7 @@ class SymPyToTorch(torch.nn.Module):
             sp.Function('neg'): torch.neg,
             sp.Function('inv'): lambda x: 1.0 / (x + self.eps),
             sp.Function('square'): lambda x: torch.pow(x, 2),
+            sp.Function('inv_square'): lambda x: 1.0 / (torch.pow(x, 2) + self.eps),
         }
 
     def _safe_div(self, x, y):
@@ -217,18 +218,23 @@ class TorchFeatureTransformer(torch.nn.Module):
         X_expanded = torch.nan_to_num(X_expanded, nan=0.0, posinf=1e9, neginf=-1e9)
         X_expanded = torch.clamp(X_expanded, -1e12, 1e12)
 
-        # 1. Normalize using FULL buffers
-        X_norm_full = (X_expanded - self.x_poly_mean) / self.x_poly_std
-
-        # 2. Apply feature mask AFTER normalization to match distilled feature set
+        # 1. Apply feature mask IMMEDIATELY after expansion and BEFORE normalization
         if self.feature_mask is not None and self.feature_mask.numel() > 0:
             mask = self.feature_mask.to(X_expanded.device)
             # Ensure indices are within bounds
-            valid_mask = mask[mask < X_norm_full.size(1)]
-            X_norm_selected = X_norm_full[:, valid_mask]
+            valid_mask = mask[mask < X_expanded.size(1)]
+            X_selected = X_expanded[:, valid_mask]
+            
+            # 2. Mask normalization buffers accordingly
+            mu = self.x_poly_mean[valid_mask]
+            std = self.x_poly_std[valid_mask]
+            
+            # 3. Normalize selected features
+            X_norm_selected = (X_selected - mu) / std
             return X_norm_selected
 
-        return X_norm_full
+        # Fallback to full normalization if no mask
+        return (X_expanded - self.x_poly_mean) / self.x_poly_std
 
     def _compute_distance_features(self, z_nodes):
         """

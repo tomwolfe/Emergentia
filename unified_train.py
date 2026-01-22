@@ -137,16 +137,16 @@ def main():
 
         print("Performing symbolic distillation...")
         if args.hamiltonian:
-            # Reduce populations and generations for faster execution
-            populations = 500 if args.quick_symbolic else 2000
-            generations = 10 if args.quick_symbolic else 40
+            # INCREASED: populations to 5000 and generations to 100 for better convergence
+            populations = 1000 if args.quick_symbolic else 5000
+            generations = 20 if args.quick_symbolic else 100
             from hamiltonian_symbolic import HamiltonianSymbolicDistiller
             distiller = HamiltonianSymbolicDistiller(populations=populations, generations=generations)
             equations = distiller.distill(z_states, dz_states, args.super_nodes, 4, model=model)
         else:
-            # Reduce populations and generations for faster execution
-            populations = 500 if args.quick_symbolic else 2000
-            generations = 10 if args.quick_symbolic else 40
+            # INCREASED: populations to 5000 and generations to 100 for better convergence
+            populations = 1000 if args.quick_symbolic else 5000
+            generations = 20 if args.quick_symbolic else 100
             from symbolic import SymbolicDistiller
             distiller = SymbolicDistiller(populations=populations, generations=generations)
             equations = distiller.distill(z_states, dz_states, args.super_nodes, 4)

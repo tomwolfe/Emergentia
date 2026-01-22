@@ -666,7 +666,12 @@ class Trainer:
         mu_range = torch.tensor(self.stats['pos_range'], device=self.device, dtype=torch.float32) if self.stats else 1
         seq_len = len(data_list)
 
-        for t in range(0, seq_len, 2):
+        for t in range(seq_len):
+            # To save computation, we only encode every 2nd step, but we always 
+            # ensure the last step is included for consistency checks
+            if t % 2 != 0 and t != seq_len - 1:
+                continue
+
             batch_t = Batch.from_data_list([data_list[t]]).to(self.device)
             # Pass s_prev for assignment persistence
             z_t_target, s_t, losses_t, mu_t = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch, tau=tau, hard=hard, prev_assignments=s_prev)
@@ -705,16 +710,28 @@ class Trainer:
             loss_mi += self.model.get_mi_loss(z_preds[t], mu_t_norm)
 
             if t > 0:
+                # Add a small weight to the consistency term between assignments and positions
                 loss_assign += self.criterion(s_t, s_prev) + 10.0 * self.criterion(mu_t, mu_prev) + 0.5 * self.criterion(z_t_target, z_enc_prev)
-                if compute_consistency and not is_warmup: loss_cons += self.criterion(z_preds[t], z_t_target)
+                # Ensure consistency loss is added if compute_consistency is on
+                if compute_consistency and not is_warmup: 
+                    loss_cons += self.criterion(z_preds[t], z_t_target)
             s_prev, mu_prev, z_enc_prev = s_t, mu_t, z_t_target
 
-        n_steps = (seq_len // 2)
-        loss_rec /= n_steps
-        loss_cons /= (n_steps - 1) if (not is_warmup and compute_consistency) else 1
-        for l in [loss_assign, loss_pruning, loss_sparsity, loss_ortho, loss_sep, loss_conn]: l /= n_steps
-        loss_align /= (n_steps * self.model.encoder.n_super_nodes)
-        loss_mi /= (n_steps * self.model.encoder.n_super_nodes)
+        # Count how many steps were actually processed
+        processed_steps = sum(1 for t in range(seq_len) if (t % 2 == 0 or t == seq_len - 1))
+        loss_rec /= processed_steps
+        
+        # Calculate how many consistency comparisons were made (t > 0)
+        cons_steps = processed_steps - 1
+        if cons_steps > 0 and compute_consistency and not is_warmup:
+            loss_cons /= cons_steps
+        else:
+            # If no consistency steps or not computing it, keep it as is (likely 0.0)
+            pass
+
+        for l in [loss_assign, loss_pruning, loss_sparsity, loss_ortho, loss_sep, loss_conn]: l /= processed_steps
+        loss_align /= (processed_steps * self.model.encoder.n_super_nodes)
+        loss_mi /= (processed_steps * self.model.encoder.n_super_nodes)
 
         lvars = torch.clamp(self.model.log_vars, min=-6.0, max=5.0)
         if is_stage1: 
@@ -725,7 +742,8 @@ class Trainer:
 
         # NEW: Latent Activity penalty to prevent static latent trap
         if len(z_vel) > 0:
-            loss_activity = -0.1 * torch.log(z_vel.pow(2).mean() + 1e-6)
+            # INCREASED: Multiplier from 0.1 to 5.0 to strongly penalize static latents
+            loss_activity = -5.0 * torch.log(z_vel.pow(2).mean() + 1e-6)
             raw_losses['activity'] = loss_activity
 
         # Ensure all raw losses are float32 for stable balancing, especially on MPS
@@ -751,6 +769,10 @@ class Trainer:
             weights['assign'] = min(weights['assign'], 0.1)  # Much lower weight
             weights['ortho'] = min(weights['ortho'], 0.1)   # Suppress ortho loss
             weights['sparsity'] = min(weights['sparsity'], 0.1)  # Suppress sparsity loss
+            # DO NOT suppress activity or lvr - we need motion to learn physics
+            if 'activity' in weights:
+                weights['activity'] = max(weights['activity'], 2.0) # Boost activity during poor reconstruction
+            weights['lvr'] = max(weights['lvr'], 1.0)
         else:
             # Once reconstruction drops below 0.1, allow structural losses to resume
             if raw_losses['rec'].item() < 0.1:

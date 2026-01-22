@@ -135,8 +135,8 @@ def compute_assignment_loss(losses_t, entropy_weight):
         Combined assignment loss
     """
     return (
-        entropy_weight * losses_t['entropy'] +
-        5.0 * losses_t['diversity'] +
+        0.5 * entropy_weight * losses_t['entropy'] +
+        2.5 * losses_t['diversity'] +
         1.0 * losses_t['spatial'] + # Increased 10x
         2.0 * losses_t.get('collapse_prevention', 0.0) +
         2.0 * losses_t.get('balance', 0.0) +

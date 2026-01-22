@@ -99,6 +99,19 @@ class StableHierarchicalPooling(nn.Module):
                     'balance': torch.tensor(0.0, device=x.device)}, \
                    None
 
+        # Ensure minimum number of super-nodes remain active to prevent total collapse
+        # We check this at the start to ensure the mask used for logits is valid
+        n_active_pre = (self.active_mask > 0.5).sum().item()
+        if n_active_pre < self.min_active_super_nodes:
+            # If history is available, use it to revive the most promising nodes
+            if self.history_counter > 0:
+                _, most_needed_indices = torch.topk(self.assignment_history, self.min_active_super_nodes, largest=True)
+            else:
+                # Otherwise just pick the first few
+                most_needed_indices = torch.arange(self.min_active_super_nodes, device=x.device)
+            self.active_mask.zero_()
+            self.active_mask[most_needed_indices] = 1.0
+
         logits = self.assign_mlp(x) * self.scaling
 
         # NEW: Assignment Persistence - bias logits by previous assignments to stabilize flickering
@@ -125,6 +138,10 @@ class StableHierarchicalPooling(nn.Module):
 
         avg_s = s.mean(dim=0)
 
+        # Update assignment history for future revival decisions
+        self.assignment_history.copy_(0.9 * self.assignment_history + 0.1 * avg_s.detach())
+        self.history_counter += 1
+
         # Update active_mask with exponential moving average for smoother updates
         # We allow updates during both soft and hard training to maintain consistency
         if self.training:
@@ -141,7 +158,7 @@ class StableHierarchicalPooling(nn.Module):
             effective_active = torch.clamp(current_active + revival_mask, 0, 1)
 
             # Use a much slower EMA for smoothness as requested
-            ema_rate = 0.0001 # Decreased from 0.001 to 0.0001 for much slower pruning
+            ema_rate = 0.00001 # Decreased from 0.0001 to 0.00001 for much slower pruning
             if hard:
                 ema_rate *= 0.5 # Even slower updates during hard sampling
 
@@ -210,7 +227,7 @@ class StableHierarchicalPooling(nn.Module):
 
         assign_losses = {
             'entropy': entropy,
-            'diversity': diversity_loss * 20.0, # Increased by 20x as requested
+            'diversity': diversity_loss * 200.0, # Increased from 20x to 200x as requested
             'spatial': spatial_loss,
             'pruning': pruning_loss,
             'sparsity': sparsity_loss * self.current_sparsity_weight,

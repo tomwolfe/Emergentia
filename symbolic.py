@@ -67,8 +67,10 @@ class SymbolicDistiller:
 
     def _get_regressor(self, pop, gen, parsimony=0.02):
         square = make_function(function=lambda x: x**2, name='square', arity=1)
+        # Added inv_square to better capture 1/r^6 and 1/r^12 terms in LJ systems
+        inv_square = make_function(function=lambda x: 1.0/(x**2 + 1e-9), name='inv_square', arity=1)
         return SymbolicRegressor(population_size=pop, generations=gen, parsimony_coefficient=parsimony,
-                                 function_set=('add', 'sub', 'mul', safe_div, safe_sqrt, safe_log, 'abs', 'neg', safe_inv, square),
+                                 function_set=('add', 'sub', 'mul', safe_div, safe_sqrt, safe_log, 'abs', 'neg', safe_inv, square, inv_square),
                                  n_jobs=1, random_state=42, verbose=0)
 
     def _select_features(self, X, y):
@@ -176,6 +178,6 @@ def extract_latent_data(model, dataset, dt, include_hamiltonian=False):
     return np.array(states), np.array(derivs), np.linspace(0, len(states)*dt, len(states))
 
 def gp_to_sympy(expr_str, *args, **kwargs):
-    local_dict = {'add': lambda x,y: x+y, 'sub': lambda x,y: x-y, 'mul': lambda x,y: x*y, 'div': lambda x,y: x/(y+1e-9), 'sqrt': lambda x: sp.sqrt(sp.Abs(x)), 'log': lambda x: sp.log(sp.Abs(x)+1e-9), 'abs': sp.Abs, 'neg': lambda x: -x, 'inv': lambda x: 1.0/(x+1e-9), 'square': lambda x: x**2}
+    local_dict = {'add': lambda x,y: x+y, 'sub': lambda x,y: x-y, 'mul': lambda x,y: x*y, 'div': lambda x,y: x/(y+1e-9), 'sqrt': lambda x: sp.sqrt(sp.Abs(x)), 'log': lambda x: sp.log(sp.Abs(x)+1e-9), 'abs': sp.Abs, 'neg': lambda x: -x, 'inv': lambda x: 1.0/(x+1e-9), 'square': lambda x: x**2, 'inv_square': lambda x: 1.0/(x**2+1e-9)}
     return sp.sympify(expr_str, locals=local_dict)
 
