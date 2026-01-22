@@ -729,17 +729,17 @@ class Trainer:
             
             loss_assign += (
                 entropy_weight * losses_t['entropy'] +
-                1.0 * losses_t['diversity'] +
-                0.1 * losses_t['spatial'] +
-                0.1 * losses_t.get('collapse_prevention', 0.0) +
-                0.1 * losses_t.get('balance', 0.0) +
-                0.1 * losses_t.get('temporal_consistency', 0.0)
+                5.0 * losses_t['diversity'] +
+                5.0 * losses_t['spatial'] +
+                1.0 * losses_t.get('collapse_prevention', 0.0) +
+                1.0 * losses_t.get('balance', 0.0) +
+                1.0 * losses_t.get('temporal_consistency', 0.0)
             )
             loss_pruning += losses_t['pruning']
             loss_sparsity += losses_t['sparsity']
             loss_sep += losses_t.get('separation', torch.tensor(0.0, device=self.device))
-            # Increase connectivity loss multiplier by 10x
-            loss_conn += 10.0 * self.model.get_connectivity_loss(s_t, batch_t.edge_index)
+            # Increase connectivity loss multiplier to 50x
+            loss_conn += 50.0 * self.model.get_connectivity_loss(s_t, batch_t.edge_index)
             loss_ortho += self.model.get_ortho_loss(s_t)
 
             # mu_t is already in normalized range [-1, 1] because it's computed from normalized x
@@ -820,29 +820,6 @@ class Trainer:
             balanced = self.enhanced_balancer.get_balanced_losses(raw_losses, self.model.parameters())
             for k in weights:
                 if k in balanced and raw_losses[k].item() != 0: weights[k] = balanced[k] / raw_losses[k]
-
-        # NEW: Reconstruction-First logic - ENHANCED
-        # If reconstruction is poor, suppress structural weights to prioritize physics over clustering
-        # BUT keep balance and diversity losses active to maintain super-node utilization
-        if raw_losses['rec'].item() > 0.1:
-            weights['assign'] = min(weights['assign'], 0.1)  # Much lower weight
-            weights['ortho'] = min(weights['ortho'], 0.1)   # Suppress ortho loss
-            weights['sparsity'] = min(weights['sparsity'], 0.1)  # Suppress sparsity loss
-            # DO NOT suppress balance and diversity losses - they are required for super-node utilization
-            if 'balance' in weights:
-                weights['balance'] = max(weights['balance'], torch.exp(-self.model.log_vars[12]).item())
-            if 'diversity' in weights:
-                weights['diversity'] = max(weights['diversity'], torch.exp(-self.model.log_vars[1]).item())
-            # DO NOT suppress activity or lvr - we need motion to learn physics
-            if 'activity' in weights:
-                weights['activity'] = max(weights['activity'], 2.0) # Boost activity during poor reconstruction
-            weights['lvr'] = max(weights['lvr'], 1.0)
-        else:
-            # Once reconstruction drops below 0.1, allow structural losses to resume
-            if raw_losses['rec'].item() < 0.1:
-                weights['assign'] = max(weights['assign'], torch.exp(-self.model.log_vars[2]).item())
-                weights['ortho'] = max(weights['ortho'], torch.exp(-self.model.log_vars[3]).item())
-                weights['sparsity'] = max(weights['sparsity'], torch.exp(-self.model.log_vars[11]).item())
 
         # Dynamics warmup: Gradually introduce dynamics losses over 100 epochs after warmup (was 200)
         dynamics_factor = 0.0  # Start at 0.0 during warmup
