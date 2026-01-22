@@ -405,8 +405,8 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
 
         print(f"Selecting features for target_{i} (Input dim: {X_norm.shape[1]})...")
         
-        # Increase parsimony if we are distilling a Hamiltonian
-        parsimony_multiplier = 10.0 if is_hamiltonian else 1.0
+        # Increase parsimony if we are distilling a Hamiltonian to penalize junk linear terms
+        parsimony_multiplier = 50.0 if is_hamiltonian else 1.0
 
         # NEW: Advanced variance-based filtering
         variances = np.var(X_norm, axis=0)
@@ -893,6 +893,10 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
         """
         Improved distillation with better validation and physics-informed features.
         """
+        # NEW: Complexity Floor for short sequences
+        # If the input trajectory is very short (< 50 steps), we are suspicious of simple models
+        is_short_sequence = len(latent_states) < 50
+        
         # Use improved transformer
         self.transformer = ImprovedFeatureTransformer(n_super_nodes, latent_dim, box_size=box_size)
         self.transformer.fit(latent_states, targets)
@@ -915,6 +919,13 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
         for i in range(Y_norm.shape[1]):
             eq, mask, conf = self._distill_single_target(i, X_norm, Y_norm, Y_norm.shape[1], latent_states.shape[1], is_hamiltonian=is_hamiltonian_distill)
             
+            # Apply Complexity Floor: reduce confidence of very simple models on short sequences
+            if is_short_sequence and eq is not None:
+                complexity = getattr(eq, 'length_', 10)
+                if complexity < 5: # Threshold for "simple"
+                    print(f"  -> Complexity Floor triggered: Reducing confidence of simple model ({complexity} terms) on short sequence.")
+                    conf *= 0.5
+
             # HARD PHYSICALITY GATING for Hamiltonian
             if is_hamiltonian_distill and eq is not None:
                 # Get the set of features used in the equation
@@ -936,8 +947,28 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
                 has_q = any(f in q_indices for f in used_features)
                 has_p = any(f in p_indices for f in used_features)
                 
-                if not (has_q and has_p):
-                    print(f"  -> PHYSICALITY GATE FAILED for Hamiltonian H(z) = {eq_str}. Lacks q or p dependency.")
+                # NEW: Enforce Kinetic Energy term (quadratic in p)
+                # Check for 'square(Xn)' or 'mul(Xn, Xn)' where n is a p-index
+                has_quadratic_p = False
+                for p_idx in p_indices:
+                    # Check for square(Xp) or mul(Xp, Xp)
+                    # Use regex to be robust to whitespace and naming
+                    patterns = [
+                        fr'square\([Xx]{p_idx}\)',
+                        fr'mul\([Xx]{p_idx},\s*[Xx]{p_idx}\)',
+                        fr'mul\([Xx]{p_idx},\s*[Xx]{p_idx}\)'
+                    ]
+                    if any(re.search(p, eq_str) for p in patterns):
+                        has_quadratic_p = True
+                        break
+                
+                if not (has_q and has_p and has_quadratic_p):
+                    reason = []
+                    if not has_q: reason.append("lacks q")
+                    if not has_p: reason.append("lacks p")
+                    if not has_quadratic_p: reason.append("lacks quadratic T(p)")
+                    
+                    print(f"  -> PHYSICALITY GATE FAILED for Hamiltonian H(z) = {eq_str}. Reason: {', '.join(reason)}.")
                     print(f"  -> TRIGGERING DEEP SEARCH (3x Population, 2x Generations)...")
                     
                     # Store original settings
@@ -961,7 +992,14 @@ class ImprovedSymbolicDistiller(SymbolicDistiller):
                     has_q = any(f in q_indices for f in used_features)
                     has_p = any(f in p_indices for f in used_features)
                     
-                    if not (has_q and has_p):
+                    has_quadratic_p = False
+                    for p_idx in p_indices:
+                        patterns = [fr'square\([Xx]{p_idx}\)', fr'mul\([Xx]{p_idx},\s*[Xx]{p_idx}\)']
+                        if any(re.search(p, eq_str) for p in patterns):
+                            has_quadratic_p = True
+                            break
+                    
+                    if not (has_q and has_p and has_quadratic_p):
                         print(f"  -> DEEP SEARCH also failed physicality gate. Invalidating result.")
                         conf = 0.0
             

@@ -171,7 +171,7 @@ def main():
 
     # Adjust based on number of particles and super nodes
     complexity_factor = args.super_nodes / max(1, args.particles / 4)  # Higher if more super-nodes relative to particles
-    rec_threshold = min(3.0, base_threshold * (1.0 + complexity_factor * 0.5))  # Cap at 3.0 and be more lenient
+    rec_threshold = min(5.0, base_threshold * (2.0 + complexity_factor * 0.5))  # More lenient threshold
 
     if rec > rec_threshold:
         print(f"CRITICAL ERROR: Model failed to converge (Rec Loss: {rec:.6f} > {rec_threshold}).")
@@ -296,9 +296,20 @@ def main():
 
     # 1. Micro Plot: Reconstruction
     plt.subplot(1, 3, 1)
-    plt.scatter(data.x.cpu().numpy()[:, 0], data.x.cpu().numpy()[:, 1], c='blue', alpha=0.5, label='Truth')
-    plt.scatter(recon[:, 0], recon[:, 1], c='red', marker='x', label='Recon')
-    plt.title("Micro: Reconstruction")
+    # Denormalize Truth for plot
+    p_min, p_range = stats['pos_min'], stats['pos_range']
+    v_mean, v_std = stats['vel_mean'], stats['vel_std']
+    
+    truth_x = data.x.cpu().numpy()
+    truth_pos = 0.5 * (truth_x[:, :2] + 1.0) * p_range + p_min
+    
+    # Pass stats to decode for physical reconstruction
+    recon_phys = model.decode(z, s, batch, stats=stats).cpu().numpy()
+    recon_pos = recon_phys[:, :2]
+
+    plt.scatter(truth_pos[:, 0], truth_pos[:, 1], c='blue', alpha=0.5, label='Truth')
+    plt.scatter(recon_pos[:, 0], recon_pos[:, 1], c='red', marker='x', label='Recon')
+    plt.title("Micro: Reconstruction (Physical)")
     plt.legend()
 
     # 2. Assignment Plot

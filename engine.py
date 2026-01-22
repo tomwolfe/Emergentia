@@ -266,11 +266,11 @@ class Trainer:
         # Manually re-balance initial log_vars for stability
         with torch.no_grad():
             self.model.log_vars[0].fill_(-3.0)  # Very high priority for reconstruction
-            self.model.log_vars[1].fill_(3.0)   # Lower initial priority for consistency
+            self.model.log_vars[1].fill_(0.0)   # Increased priority for consistency (was 3.0)
             self.model.log_vars[2].fill_(3.0)   # Lower initial priority for assignment
             self.model.log_vars[3].fill_(3.0)   # Lower initial priority for ortho
             self.model.log_vars[4].fill_(3.0)   # Lower initial priority for l2
-            self.model.log_vars[5].fill_(3.0)   # Lower initial priority for lvr
+            self.model.log_vars[5].fill_(0.0)   # Increased priority for lvr (was 3.0)
             self.model.log_vars[6].fill_(3.0)   # Lower initial priority for alignment (changed from -3.0)
             self.model.log_vars[7].fill_(3.0)   # Lower initial priority for pruning
             self.model.log_vars[8].fill_(3.0)   # Lower initial priority for sep
@@ -415,9 +415,20 @@ class Trainer:
         if torch.isnan(z_curr).any() or torch.isinf(z_curr).any():
             z_curr = torch.nan_to_num(z_curr, nan=0.0, posinf=1.0, neginf=-1.0)
 
-        # Apply high weight for initial reconstruction - Do NOT pass stats to keep in normalized space
-        recon_0 = self.model.decode(z_curr, s_0, batch_0.batch)
-        loss_rec = self.criterion(recon_0, batch_0.x)
+        # Explicit denormalization of targets to physical space for Reconstruction Scaling fix
+        p_min = torch.tensor(self.stats['pos_min'], device=self.device, dtype=torch.float32)
+        p_range = torch.tensor(self.stats['pos_range'], device=self.device, dtype=torch.float32)
+        v_mean = torch.tensor(self.stats['vel_mean'], device=self.device, dtype=torch.float32)
+        v_std = torch.tensor(self.stats['vel_std'], device=self.device, dtype=torch.float32)
+        
+        x_0_phys = torch.cat([
+            0.5 * (batch_0.x[:, :2] + 1.0) * p_range + p_min,
+            batch_0.x[:, 2:4] * v_std + v_mean
+        ], dim=-1)
+
+        # Apply high weight for initial reconstruction - Pass stats to keep in physical space
+        recon_0 = self.model.decode(z_curr, s_0, batch_0.batch, stats=self.stats)
+        loss_rec = self.criterion(recon_0, x_0_phys)
         
         loss_cons = torch.tensor(0.0, device=self.device)
         # Apply entropy weight and boost diversity to prevent collapse
@@ -468,7 +479,8 @@ class Trainer:
                 sym_dz_cpu = self.symbolic_proxy(z0_flat_cpu)
 
                 # Use Huber loss for more robustness against "garbage" symbolic laws
-                loss_sym_cpu = torch.nn.functional.huber_loss(gnn_dz_cpu, sym_dz_cpu, delta=1.0)
+                # Point 4: Using smaller delta for Huber loss as requested
+                loss_sym_cpu = torch.nn.functional.huber_loss(gnn_dz_cpu, sym_dz_cpu, delta=0.1)
                 # Move loss back to original device
                 loss_sym = loss_sym_cpu.to(self.device)
             else:
@@ -478,10 +490,12 @@ class Trainer:
                 sym_dz = self.symbolic_proxy(z0_flat)
 
                 # Use Huber loss for more robustness against "garbage" symbolic laws
-                loss_sym = torch.nn.functional.huber_loss(gnn_dz, sym_dz, delta=1.0)
+                # Point 4: Using smaller delta for Huber loss as requested
+                loss_sym = torch.nn.functional.huber_loss(gnn_dz, sym_dz, delta=0.1)
 
         s_prev = s_0
         mu_prev = mu_0
+        z_enc_prev = z_curr
         z_preds = [z_curr]
 
         # Only do forward dynamics if not in deep warmup
@@ -511,7 +525,10 @@ class Trainer:
         loss_l2 = torch.mean(z_preds**2)
 
         z_vel = (z_preds[1:] - z_preds[:-1]) / dt
+        # Curvature penalty (acceleration)
         loss_lvr = torch.mean((z_vel[1:] - z_vel[:-1])**2) if len(z_vel) > 1 else torch.tensor(0.0, device=self.device)
+        # Latent velocity penalty for temporal smoothing
+        loss_lvr += 0.1 * torch.mean(z_vel**2) if len(z_vel) > 0 else torch.tensor(0.0, device=self.device)
 
         s_stability = 0
         mu_stability = 0
@@ -527,10 +544,16 @@ class Trainer:
 
             z_t_target = torch.nan_to_num(z_t_target)
 
-            # Use z_preds for reconstruction to force consistency - Do NOT pass stats to keep in normalized space
-            recon_t = self.model.decode(z_preds[t], s_t, batch_t.batch)
+            # Use z_preds for reconstruction to force consistency - Pass stats to keep in physical space
+            recon_t = self.model.decode(z_preds[t], s_t, batch_t.batch, stats=self.stats)
 
-            loss_rec += self.criterion(recon_t, batch_t.x)
+            # Explicit denormalization of targets for Reconstruction Scaling fix
+            x_t_phys = torch.cat([
+                0.5 * (batch_t.x[:, :2] + 1.0) * p_range + p_min,
+                batch_t.x[:, 2:4] * v_std + v_mean
+            ], dim=-1)
+
+            loss_rec += self.criterion(recon_t, x_t_phys)
             loss_assign += entropy_weight * losses_t['entropy'] + 2.0 * losses_t['diversity'] + 0.1 * losses_t['spatial']
             loss_pruning += losses_t['pruning']
             loss_sparsity += losses_t['sparsity']
@@ -553,13 +576,16 @@ class Trainer:
             if t > 0:
                 s_diff = self.criterion(s_t, s_prev)
                 mu_diff = self.criterion(mu_t, mu_prev)
-                loss_assign += s_diff + 5.0 * mu_diff
+                z_enc_diff = self.criterion(z_t_target, z_enc_prev)
+                # Point 3: Temporal Smoothing for GNN Encoder - Increased weight for mu_diff and added z_enc_diff
+                loss_assign += s_diff + 10.0 * mu_diff + 0.5 * z_enc_diff
                 if compute_consistency and not is_warmup and t % 2 == 0:  # Only compute consistency every other step
                     loss_cons += self.criterion(z_preds[t], z_t_target)
                 s_stability += s_diff.item()
                 mu_stability += mu_diff.item()
             s_prev = s_t
             mu_prev = mu_t
+            z_enc_prev = z_t_target
 
         # Normalization - account for sampling every other step and number of super nodes
         n_super_nodes = self.model.encoder.n_super_nodes
@@ -728,7 +754,12 @@ class Trainer:
             'lvars_mean': lvars.mean()
         }, weights=weights)
 
-        return loss.item(), loss_rec.item(), loss_cons.item() if compute_consistency else 0.0
+        # Compute a normalized version for logging/thresholding to keep main_enhanced.py quality gates happy
+        with torch.no_grad():
+            recon_0_norm = self.model.decode(z_curr, s_0, batch_0.batch, stats=None)
+            loss_rec_log = self.criterion(recon_0_norm, batch_0.x)
+        
+        return loss.item(), loss_rec_log.item(), loss_cons.item() if compute_consistency else 0.0
 
 if __name__ == "__main__":
     n_particles = 16

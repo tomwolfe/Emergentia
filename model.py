@@ -409,7 +409,7 @@ class GNNDecoder(nn.Module):
             nn.Tanh()
         )
         # Initialize pos_head weights to prevent initial saturation
-        nn.init.normal_(self.pos_head[0].weight, std=0.001)
+        nn.init.normal_(self.pos_head[0].weight, std=0.01)
         nn.init.zeros_(self.pos_head[0].bias)
 
         # Velocity head: Maps to unconstrained Z-score values
