@@ -247,8 +247,8 @@ class GNNEncoder(nn.Module):
         # Initialize weights using Xavier uniform
         self._initialize_weights()
 
-        # Add a learnable gain parameter to prevent vanishing latents - INCREASED FROM 2.0 TO 5.0
-        self.latent_gain = nn.Parameter(torch.ones(latent_dim) * 5.0)
+        # Add a learnable gain parameter to prevent vanishing latents - REDUCED FROM 5.0 TO 1.0
+        self.latent_gain = nn.Parameter(torch.ones(latent_dim) * 1.0)
 
         # Initialize output layer with higher variance to promote activity
         nn.init.normal_(self.output_layer[-1].weight, mean=0.0, std=2.0)
@@ -276,6 +276,9 @@ class GNNEncoder(nn.Module):
 
         # Apply learnable gain to prevent vanishing latents
         latent = latent * self.latent_gain
+
+        # Add tanh activation to bound the latent space between [-5, 5]
+        latent = torch.tanh(latent) * 5.0
 
         return latent, s, assign_losses, mu
 
@@ -368,6 +371,15 @@ class HamiltonianODEFunc(nn.Module):
             # Small initial dissipation
             self.gamma = nn.Parameter(torch.full((n_super_nodes, 1), -5.0)) # log space
 
+    def _initialize_weights_small(self):
+        """Initialize weights with smaller standard deviation to prevent initial spikes."""
+        for m in self.H_net.modules():
+            if isinstance(m, nn.Linear):
+                # Initialize with smaller std (0.01) to prevent initial consistency spikes
+                nn.init.normal_(m.weight, mean=0.0, std=0.01)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
     def forward(self, t, y):
         """
         Compute time derivatives using Hamiltonian mechanics.
@@ -383,7 +395,7 @@ class HamiltonianODEFunc(nn.Module):
         training = torch.is_grad_enabled()
 
         # We need to compute dH/dy. We use autograd.grad.
-        # create_graph=True is necessary for backpropagating through the ODE solver (especially for adjoint)
+        # For MPS stability, use create_graph=False unless explicitly needed for higher-order derivatives
         with torch.set_grad_enabled(True):
             # Apply input normalization to stabilize gradients
             y_norm = self.input_norm(y)
@@ -391,7 +403,9 @@ class HamiltonianODEFunc(nn.Module):
             H_raw = self.H_net(y_in)
             # Add small L2 regularization on the output to prevent scaling to infinity
             H = H_raw.sum() + 0.01 * torch.sum(H_raw**2)
-            dH = torch.autograd.grad(H, y_in, create_graph=True, allow_unused=True)[0]
+            # For Hamiltonian dynamics, we need create_graph=True for higher-order derivatives
+            # But use retain_graph=True to avoid the error when accessed multiple times
+            dH = torch.autograd.grad(H, y_in, create_graph=True, retain_graph=True, allow_unused=True)[0]
 
             if dH is None:
                 dH = torch.zeros_like(y_in)

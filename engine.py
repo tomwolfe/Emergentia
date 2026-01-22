@@ -286,8 +286,9 @@ class SymbolicProxy(torch.nn.Module):
                 # Denormalize H to physical units
                 H = self.torch_transformer.denormalize_y(H_norm)
                 
-                # Compute dH/dz. We use create_graph=True to allow higher-order derivatives
-                dH_dz = torch.autograd.grad(H.sum(), z_flat, create_graph=True)[0]
+                # For Hamiltonian symbolic proxy, we do need higher-order derivatives
+                # Use create_graph=True but with retain_graph=True to avoid the error
+                dH_dz = torch.autograd.grad(H.sum(), z_flat, create_graph=True, retain_graph=True)[0]
             
             # Continue with derivative computation (gradients no longer needed)
             # Split z and dH_dz into q and p
@@ -512,14 +513,14 @@ class Trainer:
                     z_in_cpu = z_in.cpu()
                     H_vals = self.model.ode_func.H_net(z_in_cpu)
                     H = H_vals.sum()
-                    dH = torch.autograd.grad(H, z_in_cpu, create_graph=True)[0]
+                    dH = torch.autograd.grad(H, z_in_cpu, create_graph=True, retain_graph=True)[0]
                     if dH is not None:
                         # Add small L2 regularization on H output to prevent scaling to infinity
                         loss_curv = torch.norm(dH.to(self.device), p=2) + 0.01 * torch.mean(H_vals**2).to(self.device)
                 else:
                     H_vals = self.model.ode_func.H_net(z_in)
                     H = H_vals.sum()
-                    dH = torch.autograd.grad(H, z_in, create_graph=True)[0]
+                    dH = torch.autograd.grad(H, z_in, create_graph=True, retain_graph=True)[0]
                     if dH is not None:
                         # Add small L2 regularization on H output to prevent scaling to infinity
                         loss_curv = torch.norm(dH, p=2) + 0.01 * torch.mean(H_vals**2)
@@ -558,22 +559,35 @@ class Trainer:
                 loss_sym = torch.nn.functional.huber_loss(gnn_dz, sym_dz, delta=0.1)
         return loss_sym
 
-    def _integrate_trajectories(self, z_curr, data_list, dt, tf_ratio, tau, hard, is_warmup):
+    def _integrate_trajectories(self, z_curr, data_list, dt, tf_ratio, tau, hard, is_warmup, epoch):
         z_preds = [z_curr]
         seq_len = len(data_list)
 
-        # MPS fix: torchdiffeq has issues with MPS. If we are on MPS,
-        # we ensure the ODE integration happens on CPU.
-        use_mps_fix = (str(self.device) == 'mps')
-
+        # NEW: Gradual Integration Schedule - start with 2 steps and increase to full length
+        # Only apply during dynamics phase (after warmup)
         if not is_warmup:
+            # Calculate how many time steps to integrate based on training progress
+            # Start with 2 steps and gradually increase to full sequence length
+            progress_after_warmup = max(0.0, (epoch - self.warmup_epochs) / max(1, 100))  # Over 100 epochs
+            target_integration_steps = max(2, int(progress_after_warmup * seq_len))
+
+            # MPS fix: torchdiffeq has issues with MPS. If we are on MPS,
+            # we ensure the ODE integration happens on CPU.
+            use_mps_fix = (str(self.device) == 'mps')
+
             for t in range(1, seq_len):
                 if np.random.random() < tf_ratio:
                     batch_t_prev = Batch.from_data_list([data_list[t-1]]).to(self.device)
                     z_curr_forced, _, _, _ = self.model.encode(batch_t_prev.x, batch_t_prev.edge_index, batch_t_prev.batch, tau=tau, hard=hard)
                     z_curr = torch.nan_to_num(z_curr_forced)
 
-                t_span = torch.tensor([0, dt], device=self.device, dtype=torch.float32)
+                # NEW: Use variable integration steps based on schedule
+                # If we're still in the gradual integration phase, only integrate a few steps
+                if t <= target_integration_steps:
+                    t_span = torch.tensor([0, dt], device=self.device, dtype=torch.float32)
+                else:
+                    # For steps beyond our current integration capacity, use shorter spans
+                    t_span = torch.tensor([0, min(dt, dt * (target_integration_steps / seq_len))], device=self.device, dtype=torch.float32)
 
                 try:
                     if use_mps_fix:
@@ -638,7 +652,7 @@ class Trainer:
         loss_curv = self._compute_hamiltonian_curv_loss(z_curr)
         loss_sym = self._compute_symbolic_loss(z_curr, is_warmup)
 
-        z_preds = self._integrate_trajectories(z_curr, data_list, dt, tf_ratio, tau, hard, is_warmup)
+        z_preds = self._integrate_trajectories(z_curr, data_list, dt, tf_ratio, tau, hard, is_warmup, epoch)
 
         loss_l2 = torch.mean(z_preds**2)
         z_vel = (z_preds[1:] - z_preds[:-1]) / dt
@@ -679,7 +693,19 @@ class Trainer:
             loss_activity = self.model.get_activity_penalty(z_preds)
             raw_losses['activity'] = loss_activity
 
-        alignment_suppressed = epoch < self.warmup_epochs or raw_losses['rec'] > 0.1
+        # NEW: Gradual alignment annealing instead of hard gate
+        # Calculate a gradual alignment weight that increases over time
+        # Start with a minimum weight after warmup to ensure alignment always has influence
+        alignment_base_weight = 0.0
+        if epoch > self.warmup_epochs:
+            # Linear annealing from 0.05 to 1.0 over align_anneal_epochs after warmup
+            progress_after_warmup = min(1.0, (epoch - self.warmup_epochs) / max(1, self.align_anneal_epochs))
+            alignment_base_weight = 0.05 + 0.95 * progress_after_warmup  # Start with 0.05 minimum weight
+
+        # NEW: Use reconstruction quality to modulate alignment strength (but never to zero)
+        # Instead of hard gate, use a smooth function based on reconstruction quality
+        rec_quality_factor = 1.0 - min(1.0, raw_losses['rec'].item() / 0.5)  # 0.5 threshold instead of 0.1
+        alignment_weight = max(0.01, alignment_base_weight * (0.2 + 0.8 * rec_quality_factor))  # Never below 0.01
 
         s_prev, mu_prev, z_enc_prev = s_0, mu_0, z_curr
         mu_min = torch.tensor(self.stats['pos_min'], device=self.device, dtype=torch.float32) if self.stats else 0
@@ -717,23 +743,18 @@ class Trainer:
             loss_ortho += self.model.get_ortho_loss(s_t)
 
             # mu_t is already in normalized range [-1, 1] because it's computed from normalized x
-            mu_t_norm = mu_t 
+            mu_t_norm = mu_t
             d_align = min(self.model.encoder.latent_dim // 2 if self.model.hamiltonian else 2, 2)
-            
-            # Soft-start for alignment loss: keep at 0 for first 20 epochs, then anneal in
-            align_weight = 0.0
-            if epoch > 20:
-                align_weight = min(1.0, (epoch - 20) / self.align_anneal_epochs)
-            
+
             # Use learnable scale in log-space for alignment
             # NEW: Use HuberLoss instead of MSELoss to reduce sensitivity to outliers
             huber_loss = torch.nn.SmoothL1Loss(beta=0.1)  # delta=0.1 equivalent to beta=0.1 in SmoothL1Loss
             loss_align_component = huber_loss(z_preds[t, :, :, :d_align] * torch.exp(self.log_align_scale), mu_t_norm[:, :, :d_align])
 
-            # Apply hard gate: only add alignment and MI losses if not suppressed
-            if not alignment_suppressed:
-                loss_align += 2.0 * align_weight * loss_align_component
-                loss_mi += self.model.get_mi_loss(z_preds[t], mu_t_norm)
+            # Apply gradual alignment instead of hard gate
+            # Always add alignment and MI losses with the calculated weight
+            loss_align += 2.0 * alignment_weight * loss_align_component
+            loss_mi += alignment_weight * self.model.get_mi_loss(z_preds[t], mu_t_norm)
 
             if t > 0:
                 # Add a small weight to the consistency term between assignments and positions
@@ -802,10 +823,16 @@ class Trainer:
 
         # NEW: Reconstruction-First logic - ENHANCED
         # If reconstruction is poor, suppress structural weights to prioritize physics over clustering
+        # BUT keep balance and diversity losses active to maintain super-node utilization
         if raw_losses['rec'].item() > 0.1:
             weights['assign'] = min(weights['assign'], 0.1)  # Much lower weight
             weights['ortho'] = min(weights['ortho'], 0.1)   # Suppress ortho loss
             weights['sparsity'] = min(weights['sparsity'], 0.1)  # Suppress sparsity loss
+            # DO NOT suppress balance and diversity losses - they are required for super-node utilization
+            if 'balance' in weights:
+                weights['balance'] = max(weights['balance'], torch.exp(-self.model.log_vars[12]).item())
+            if 'diversity' in weights:
+                weights['diversity'] = max(weights['diversity'], torch.exp(-self.model.log_vars[1]).item())
             # DO NOT suppress activity or lvr - we need motion to learn physics
             if 'activity' in weights:
                 weights['activity'] = max(weights['activity'], 2.0) # Boost activity during poor reconstruction
@@ -817,10 +844,10 @@ class Trainer:
                 weights['ortho'] = max(weights['ortho'], torch.exp(-self.model.log_vars[3]).item())
                 weights['sparsity'] = max(weights['sparsity'], torch.exp(-self.model.log_vars[11]).item())
 
-        # Dynamics warmup: Gradually introduce dynamics losses over 200 epochs after warmup
+        # Dynamics warmup: Gradually introduce dynamics losses over 100 epochs after warmup (was 200)
         dynamics_factor = 0.0  # Start at 0.0 during warmup
         if epoch > self.warmup_epochs:
-            dynamics_factor = min(1.0, (epoch - self.warmup_epochs) / 200.0)  # Ramp over 200 epochs
+            dynamics_factor = min(1.0, (epoch - self.warmup_epochs) / 100.0)  # Ramp over 100 epochs (was 200)
 
         discovery_loss = sum(weights[k] * torch.clamp(raw_losses[k], -100, 100) + (lvars[i] if i < len(lvars) else 0.0) for i, k in enumerate(raw_losses.keys()) if k not in ['cons', 'l2', 'lvr'])
         discovery_loss += (weights['sym'] * (self.symbolic_weight - 1.0) * torch.clamp(loss_sym.to(torch.float32), 0, 100) * dynamics_factor) # Adjust sym weight with dynamics factor

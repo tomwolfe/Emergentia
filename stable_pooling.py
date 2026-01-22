@@ -157,8 +157,8 @@ class StableHierarchicalPooling(nn.Module):
             revival_mask = (torch.rand_like(self.active_mask) < 0.2).float() * revival_candidate # Increased prob from 0.1
             effective_active = torch.clamp(current_active + revival_mask, 0, 1)
 
-            # Use a much faster EMA for quicker adaptation as requested - INCREASED FROM 0.000001 TO 0.01
-            ema_rate = 0.01 # Increased from 0.000001 to 0.01 for faster mask adaptation
+            # Use a much faster EMA for quicker adaptation as requested - INCREASED FROM 0.01 TO 0.05
+            ema_rate = 0.05 # Increased from 0.01 to 0.05 for faster mask adaptation
             if hard:
                 ema_rate *= 0.5 # Even slower updates during hard sampling
 
@@ -232,7 +232,7 @@ class StableHierarchicalPooling(nn.Module):
             'pruning': pruning_loss,
             'sparsity': sparsity_loss * self.current_sparsity_weight,
             'temporal_consistency': temporal_consistency_loss * self.temporal_consistency_weight,
-            'collapse_prevention': collapse_prevention_loss * self.collapse_prevention_weight,
+            'collapse_prevention': collapse_prevention_loss * (self.collapse_prevention_weight * 5.0), # 5x stronger as requested
             'balance': balance_loss
         }
 
