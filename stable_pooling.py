@@ -52,7 +52,7 @@ class StableHierarchicalPooling(nn.Module):
             nn.ReLU(),
             nn.Linear(in_channels, n_super_nodes)
         )
-        self.scaling = nn.Parameter(torch.tensor(5.0)) # Reduced from 20.0 to 5.0 to prevent softmax saturation
+        self.scaling = nn.Parameter(torch.tensor(5.0)) # Kept at 5.0 to prevent softmax saturation
         self.register_buffer('active_mask', torch.ones(n_super_nodes))
 
         # Track previous assignments for temporal consistency
@@ -127,8 +127,8 @@ class StableHierarchicalPooling(nn.Module):
         if self.training:
             # -5.0 is enough to suppress but allows much more gradient flow than -10.0
             # Also add a small random exploration factor to logits of inactive nodes
-            # INCREASED: More noise for inactive nodes to encourage exploration (0.01 -> 0.1)
-            exploration = torch.randn_like(logits) * 0.1 * (1.0 - mask) 
+            # INCREASED: More noise for inactive nodes to encourage exploration (0.1 -> 0.5)
+            exploration = torch.randn_like(logits) * 0.5 * (1.0 - mask)
             logits = logits + (mask - 1.0) * 5.0 + exploration
         else:
             # Harder mask during inference
@@ -157,8 +157,8 @@ class StableHierarchicalPooling(nn.Module):
             revival_mask = (torch.rand_like(self.active_mask) < 0.2).float() * revival_candidate # Increased prob from 0.1
             effective_active = torch.clamp(current_active + revival_mask, 0, 1)
 
-            # Use a much faster EMA for quicker adaptation as requested - INCREASED FROM 0.01 TO 0.05
-            ema_rate = 0.05 # Increased from 0.01 to 0.05 for faster mask adaptation
+            # Use a much faster EMA for quicker adaptation as requested - INCREASED FROM 0.05 TO 0.2
+            ema_rate = 0.2 # Increased from 0.05 to 0.2 for faster mask adaptation
             if hard:
                 ema_rate *= 0.5 # Even slower updates during hard sampling
 
@@ -307,8 +307,8 @@ class StableHierarchicalPooling(nn.Module):
                 last_layer = self.assign_mlp[2]
                 for idx in inactive_indices:
                     # Re-initialize the weights for the corresponding output row
-                    # We use a larger std to force exploration - INCREASED FROM 2.0 TO 5.0
-                    nn.init.normal_(last_layer.weight[idx], mean=0.0, std=5.0) # Increased std to 5.0 for aggressive revival
+                    # We use a larger std to force exploration - INCREASED FROM 5.0 TO 10.0
+                    nn.init.normal_(last_layer.weight[idx], mean=0.0, std=10.0) # Increased std to 10.0 for more aggressive revival
                     nn.init.constant_(last_layer.bias[idx], 0.0)
 
                 # Reset active mask for these nodes to allow them to compete immediately

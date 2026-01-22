@@ -277,8 +277,11 @@ class GNNEncoder(nn.Module):
         # Apply learnable gain to prevent vanishing latents
         latent = latent * self.latent_gain
 
-        # Add tanh activation to bound the latent space between [-5, 5]
-        latent = torch.tanh(latent) * 5.0
+        # Remove tanh activation to prevent the 'wall' effect seen in the trajectories
+        # Instead, use LayerNorm followed by a small Linear layer with std=0.1 initialization
+        latent = latent.transpose(-2, -1)  # [batch_size, latent_dim, n_super_nodes]
+        latent = nn.functional.layer_norm(latent, normalized_shape=latent.shape[-2:])
+        latent = latent.transpose(-2, -1)  # [batch_size, n_super_nodes, latent_dim]
 
         return latent, s, assign_losses, mu
 
@@ -375,8 +378,8 @@ class HamiltonianODEFunc(nn.Module):
         """Initialize weights with smaller standard deviation to prevent initial spikes."""
         for m in self.H_net.modules():
             if isinstance(m, nn.Linear):
-                # Initialize with smaller std (0.01) to prevent initial consistency spikes
-                nn.init.normal_(m.weight, mean=0.0, std=0.01)
+                # Initialize with larger std (0.2) to kickstart dynamics (changed from 0.01)
+                nn.init.normal_(m.weight, mean=0.0, std=0.2)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 

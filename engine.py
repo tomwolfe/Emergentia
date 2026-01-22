@@ -375,15 +375,17 @@ class Trainer:
         
         # Learnable log-scaling for alignment to ensure it stays positive and stable
         # Initialize to a value that brings the initial alignment loss below 1.0
-        self.log_align_scale = torch.nn.Parameter(torch.tensor(-2.0, device=device))  # exp(-2) ≈ 0.13
+        self.log_align_scale = torch.nn.Parameter(torch.tensor(0.0, device=device))  # exp(0) = 1.0
 
         # Manually re-balance initial log_vars for stability - PRIORITIZE RECONSTRUCTION
         with torch.no_grad():
             self.model.log_vars.fill_(0.0)
-            # 0 is rec loss - set to -7.0 to prioritize reconstruction fidelity in first 100 epochs (increased from -5.0)
-            self.model.log_vars[0].fill_(-7.0)
-            # 2 is assign loss - set to 6.0 to prevent initial dominance (increased from 5.0)
-            self.model.log_vars[2].fill_(6.0)
+            # 0 is rec loss - set to -4.0 to reduce reconstruction dominance (decreased from -7.0)
+            self.model.log_vars[0].fill_(-4.0)
+            # 2 is assign loss - set to -1.0 to force diversity from epoch 0 (decreased from 6.0)
+            self.model.log_vars[2].fill_(-1.0)
+            # 6 is alignment loss - set to -1.0 to force physical grounding from epoch 0 (was not set before)
+            self.model.log_vars[6].fill_(-1.0)
             # 10 is sparsity loss - set to 6.0 to encourage gradual sparsification (increased from 5.0)
             self.model.log_vars[10].fill_(6.0)
 
@@ -508,7 +510,7 @@ class Trainer:
         loss_curv = torch.tensor(0.0, device=self.device)
         if self.model.hamiltonian:
             with torch.set_grad_enabled(True):
-                z_in = z_curr.view(z_curr.size(0), -1).detach().requires_grad_(True)
+                z_in = z_curr.reshape(z_curr.size(0), -1).detach().requires_grad_(True)
                 if self.mps_ode_on_cpu:
                     z_in_cpu = z_in.cpu()
                     H_vals = self.model.ode_func.H_net(z_in_cpu)
@@ -622,13 +624,15 @@ class Trainer:
         if is_stage1:
             # During Stage 1 (Warmup), we freeze the adaptive balancer and
             # use fixed weights to encourage spatial coherence.
-            # Apply Reconstruction-First Warmup: set rec_loss weight to 100000x and others low
+            # Apply Reconstruction-First Warmup: set rec_loss weight to 54x and others low
             with torch.no_grad():
                 self.model.log_vars.fill_(3.0)  # Set most weights to exp(-3) ≈ 0.05
-                # Set rec_loss weight to 100000x (exp(-(-11.5)) ≈ 100000) - significantly increased
-                self.model.log_vars[0].fill_(-11.5)
-                # Set assign_loss weight to very low during initial phase
-                self.model.log_vars[2].fill_(7.0) # Increased from 6.0
+                # Set rec_loss weight to 54x (exp(-(-4.0)) ≈ 54) - reduced from 100000x
+                self.model.log_vars[0].fill_(-4.0)
+                # Set assign_loss weight to -1.0 to force diversity from epoch 0
+                self.model.log_vars[2].fill_(-1.0) # Changed from 7.0
+                # Set alignment loss weight to -1.0 to force physical grounding from epoch 0
+                self.model.log_vars[6].fill_(-1.0) # Added
 
         # ODE dynamics only start after warmup
         for p in self.model.ode_func.parameters(): p.requires_grad = not is_warmup
@@ -693,6 +697,9 @@ class Trainer:
             loss_activity = self.model.get_activity_penalty(z_preds)
             raw_losses['activity'] = loss_activity
 
+        # Increase activity loss weight by 10x to penalize static latent trajectories more heavily
+        raw_losses['activity'] = raw_losses['activity'] * 10.0
+
         # NEW: Gradual alignment annealing instead of hard gate
         # Calculate a gradual alignment weight that increases over time
         # Start with a minimum weight after warmup to ensure alignment always has influence
@@ -749,7 +756,12 @@ class Trainer:
             # Use learnable scale in log-space for alignment
             # NEW: Use HuberLoss instead of MSELoss to reduce sensitivity to outliers
             huber_loss = torch.nn.SmoothL1Loss(beta=0.1)  # delta=0.1 equivalent to beta=0.1 in SmoothL1Loss
-            loss_align_component = huber_loss(z_preds[t, :, :, :d_align] * torch.exp(self.log_align_scale), mu_t_norm[:, :, :d_align])
+
+            # Clamp both z_preds and mu_t_norm to the same range [-1, 1] before calculating alignment loss
+            z_clamped = torch.clamp(z_preds[t, :, :, :d_align], -1.0, 1.0)
+            mu_clamped = torch.clamp(mu_t_norm[:, :, :d_align], -1.0, 1.0)
+
+            loss_align_component = huber_loss(z_clamped * torch.exp(self.log_align_scale), mu_clamped)
 
             # Apply gradual alignment instead of hard gate
             # Always add alignment and MI losses with the calculated weight
