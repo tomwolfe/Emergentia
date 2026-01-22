@@ -62,7 +62,7 @@ def main():
         lr=args.lr, 
         device=device, 
         stats=stats, 
-        warmup_epochs=50,
+        warmup_epochs=50, # Stage 1: Train rec and assign
         max_epochs=args.epochs,
         sparsity_scheduler=sparsity_scheduler
     )

@@ -37,6 +37,14 @@ Particle Dynamics → GNN Encoder → Super-Node Latents → Hamiltonian ODE →
                 Loss            Consistency      Constraints       Programming
 ```
 
+## Results Visualization
+
+![Training History](training_history.png)
+*Training history showing loss components and balancing weights over time.*
+
+![Discovery Result](discovery_result.png)
+*Visualization of the discovery results including particle assignments, latent trajectories, and phase space analysis.*
+
 ## Installation
 
 ```bash
@@ -45,7 +53,34 @@ pip install -r requirements.txt
 
 ## Usage
 
-### Recommended: Enhanced Execution
+### Recommended: Comprehensive Enhanced Execution
+
+For the most comprehensive execution with all improvements, use the comprehensive enhanced version:
+
+```bash
+python comprehensive_improved_train.py --epochs 500 --steps 500 --particles 16 --super_nodes 4
+```
+
+The comprehensive enhanced version includes:
+- Learnable basis functions to address the basis function bottleneck
+- Optimized ODE functions to reduce adjoint sensitivity complexity
+- Improved hyperparameter management with auto-tuning
+- Enhanced symbolic distillation with secondary optimization
+- Robust symbolic proxy with validation
+- Multi-scale loss balancing
+- Configurable problem type optimization
+- Enhanced energy conservation mechanisms
+- Comprehensive early stopping criteria
+
+### Unified Training Pipeline
+
+For a unified approach that combines all improvements:
+
+```bash
+python unified_train.py --particles 16 --super_nodes 4 --epochs 500 --steps 500 --sim spring --hamiltonian
+```
+
+### Enhanced Execution
 
 For the most advanced execution with all improvements, use the enhanced version:
 
@@ -61,6 +96,14 @@ The enhanced version includes:
 - Robust symbolic proxy with validation
 - Multi-scale loss balancing
 - Configurable problem type optimization
+
+### Alternative: Enhanced Execution with Additional Features
+
+For enhanced execution with additional features:
+
+```bash
+python main_enhanced.py --epochs 1000 --steps 800 --particles 16 --super_nodes 4 --use_learnable_bases --use_robust_proxy --use_enhanced_balancer
+```
 
 ### Alternative: Fast Execution
 
@@ -92,6 +135,14 @@ The performance-optimized version includes:
 - Streamlined feature computation to prevent combinatorial explosion
 - Early stopping and adaptive learning rates for efficiency
 - Memory-efficient operations throughout the pipeline
+
+### Improved Optimized Execution
+
+For improved performance with additional optimizations:
+
+```bash
+python improved_optimized_fast_train.py --epochs 300 --steps 100 --particles 8 --super_nodes 3
+```
 
 ### Original Version
 
@@ -225,6 +276,26 @@ coord_distiller = AlignedHamiltonianSymbolicDistiller(
 - **Automatic Parameter Search**: Finds optimal hyperparameters for specific problems
 - **Validation-Based Selection**: Uses held-out data to select best configurations
 
+### 7. Robust Symbolic Proxy
+- **Equation Validation**: Validates symbolic expressions for numerical stability before integration
+- **Complexity Control**: Limits expression complexity to prevent numerical instabilities
+- **Gradient-Based Selection**: Uses gradient information to select stable symbolic expressions
+
+### 8. Enhanced Loss Balancing
+- **Gradient-Based Weighting**: Uses gradient information to dynamically adjust loss weights
+- **Priority Loss Maintenance**: Ensures critical losses (e.g., collapse prevention) maintain minimum influence
+- **Adaptive Adaptation**: Adjusts adaptation rates based on training progress
+
+### 9. Transformer-Based Symbolic Discovery
+- **Basis-Free Discovery**: Moves toward discovering symbolic expressions without relying on hand-crafted basis functions
+- **Sequence-to-Sequence Modeling**: Uses transformer architectures to generate symbolic expressions
+- **Learnable Representations**: Learns distributed representations of mathematical operations
+
+### 10. Improved Energy Conservation
+- **Robust Energy Calculation**: Implements soft-floors for particle distances to prevent singularities
+- **Energy Tracking**: Monitors energy conservation during training and inference
+- **Conservation Loss**: Adds explicit energy conservation terms to the loss function
+
 ## Mathematical Foundation
 
 ### Hamiltonian Mechanics
@@ -259,6 +330,9 @@ python test_symbolic.py
 python test_ode.py
 python test_pareto.py
 python test_implemented_fixes.py
+python test_enhancements.py
+python test_robustness.py
+python test_verifications.py
 ```
 
 ## Files Overview
@@ -267,7 +341,10 @@ python test_implemented_fixes.py
 - `optimized_model.py`: Performance-optimized neural network architecture with reduced computational complexity
 - `symbolic.py`: Basic symbolic regression implementation
 - `enhanced_symbolic.py`: Enhanced symbolic regression with secondary optimization
+- `improved_symbolic.py`: Further improvements to symbolic regression
+- `improved_symbolic_distillation.py`: Performance-optimized symbolic regression with enhanced feature selection
 - `optimized_symbolic_distillation.py`: Performance-optimized symbolic regression with streamlined feature computation
+- `robust_symbolic.py`: Robust symbolic proxy with validation and stability mechanisms
 - `coordinate_mapping.py`: Neural-physical coordinate alignment
 - `stable_pooling.py`: Enhanced pooling with collapse prevention
 - `hamiltonian_symbolic.py`: Hamiltonian structure preservation
@@ -279,9 +356,30 @@ python test_implemented_fixes.py
 - `optimized_ode.py`: Optimized ODE functions to reduce adjoint sensitivity complexity
 - `config_manager.py`: Configuration management and hyperparameter auto-tuning
 - `main_enhanced_complete.py`: Complete enhanced pipeline with all improvements
+- `main_enhanced.py`: Enhanced pipeline with additional features
 - `fast_train.py`: Fast training script with performance optimizations
+- `improved_optimized_fast_train.py`: Improved optimized training script with additional optimizations
 - `optimized_fast_train.py`: Maximum performance training script with reduced computational complexity
+- `comprehensive_improved_train.py`: Comprehensive improved training with enhanced energy conservation
+- `unified_train.py`: Unified training pipeline combining all improvements
+- `example_usage.py`: Example usage of the pipeline
 - `config.yaml`: Configuration file for the enhanced pipeline
+- `enhanced_balancer.py`: Enhanced dynamic loss balancer with gradient-based weighting
+- `transformer_symbolic.py`: Transformer-based symbolic expression generator for basis-free discovery
+- `train_utils.py`: Training utilities including improved early stopping and robust energy calculation
+- `visualization.py`: Visualization tools for training history and discovery results
+- `main.py`: Original baseline implementation
+- `test_changes.py`: Tests for recent changes
+- `test_enhancements.py`: Tests for all enhancements
+- `test_implemented_fixes.py`: Tests for implemented fixes
+- `test_mps_fix.py`: Tests for MPS (Apple Silicon) compatibility fixes
+- `test_ode.py`: Tests for ODE functionality
+- `test_pareto.py`: Tests for Pareto optimization
+- `test_robustness.py`: Tests for robustness improvements
+- `test_symbolic.py`: Tests for symbolic regression
+- `test_verifications.py`: Verification tests
+- `training_history.png`: Visualization of training progress and loss components
+- `discovery_result.png`: Visualization of discovery results including particle assignments and latent dynamics
 
 ## Contributing
 

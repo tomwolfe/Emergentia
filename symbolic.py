@@ -101,16 +101,12 @@ class FeatureTransformer:
         
         X_out = np.clip(np.hstack(poly_features), -1e6, 1e6)
         
-        # Feature Pruning: prevent linear combination explosion
-        if batch_size < X_out.shape[1]:
-            k = max(1, batch_size // 2)
-            if self.selector is None:
-                # We need targets to fit SelectKBest, but transform is often called without them.
-                # In this pipeline, we'll assume fit() handles selector initialization if needed.
-                # However, for simplicity here we just use the first K features if selector not fitted.
-                X_out = X_out[:, :k]
-            else:
+        # Feature Pruning: remove near-constant or highly redundant features
+        if self.selector is not None:
+            try:
                 X_out = self.selector.transform(X_out)
+            except:
+                pass # Fallback to raw features if selector fails
         
         return X_out
 
@@ -205,12 +201,11 @@ class SymbolicDistiller:
         score = est.score(X_sel, y)
         program_str = str(est._program)
         
-        # PHYSICALITY GATE: Trigger Deep Search if simple identity with low score
-        # Identifies simple Xn or -Xn or similar
-        is_gp_identity = re.match(r'^X\d+$', program_str) or re.match(r'^neg\(X\d+\)$', program_str)
+        # PHYSICALITY GATE: Trigger Deep Search if score is low or result is trivial
+        is_gp_trivial = re.match(r'^X\d+$', program_str) or re.match(r'^neg\(X\d+\)$', program_str) or len(program_str) < 5
         
-        if (is_gp_identity or is_identity) and score < 0.95:
-            # print(f"Target {i}: Physicality Gate triggered. Simple identity found with score {score:.4f}. Starting Deep Search...")
+        if (score < 0.8) or (is_gp_trivial and score < 0.95) or is_identity:
+            # print(f"Target {i}: Physicality Gate triggered. Score {score:.4f} or trivial result. Starting Deep Search...")
             est = self._get_regressor(self.populations * 3, self.generations * 2, parsimony=0.01).fit(X_sel, y)
             score = est.score(X_sel, y)
             program_str = str(est._program)

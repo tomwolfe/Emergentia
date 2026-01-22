@@ -276,9 +276,13 @@ class Trainer:
         # Learnable log-scaling for alignment to ensure it stays positive and stable
         self.log_align_scale = torch.nn.Parameter(torch.tensor(0.0, device=device))
 
-        # Manually re-balance initial log_vars for stability (all weights start at 1.0)
+        # Manually re-balance initial log_vars for stability
         with torch.no_grad():
             self.model.log_vars.fill_(0.0)
+            # 2 is assign loss - set to 2.0 (exp(-2.0) ~= 0.13) to prevent initial dominance
+            self.model.log_vars[2].fill_(2.0)
+            # 0 is rec loss - set to -1.0 (exp(1.0) ~= 2.7) to prioritize reconstruction
+            self.model.log_vars[0].fill_(-1.0)
 
         # Significantly increase spatial and connectivity loss multipliers by 10x
         if hasattr(self.model.encoder.pooling, 'temporal_consistency_weight'):
@@ -291,9 +295,9 @@ class Trainer:
         self.min_symbolic_confidence = 0.7
 
         # MPS fix: torchdiffeq has issues with MPS (float64 defaults and stability)
-        # But we need to ensure all components are on the same device
-        if str(device) == 'mps':
-            # Move the ODE function to CPU but keep track of the device for other operations
+        self.use_mps_fix = (str(device) == 'mps')
+        if self.use_mps_fix:
+            # Move the ODE function to CPU for stability
             self.model.ode_func.to('cpu')
             self.mps_ode_on_cpu = True
         else:
@@ -312,11 +316,12 @@ class Trainer:
 
         h_ids = {id(p) for p in h_net_params}
         assign_ids = {id(p) for p in assign_mlp_params}
-        other_params = [p for p in self.model.parameters() if id(p) not in h_ids and id(p) not in assign_ids]
+        other_params = [p for p in self.model.parameters() if id(p) not in h_ids and id(p) not in assign_ids and id(p) != id(self.model.log_vars)]
 
         param_groups = [
             {'params': other_params, 'weight_decay': 1e-5},
-            {'params': [self.log_align_scale], 'lr': 1e-3}, # Specific learning rate for scale
+            {'params': [self.log_align_scale], 'lr': 1e-3},
+            {'params': [self.model.log_vars], 'lr': 1e-3}, # Explicitly add log_vars to optimizer
         ]
         if h_net_params:
             param_groups.append({'params': h_net_params, 'weight_decay': 1e-3})
@@ -462,7 +467,7 @@ class Trainer:
             if hasattr(self.model.encoder.pooling, 'set_sparsity_weight'):
                 self.model.encoder.pooling.set_sparsity_weight(new_weight)
 
-        is_stage1 = epoch < 100
+        is_stage1 = epoch < 50
         is_warmup = epoch < self.warmup_epochs
         if is_stage1:
             # During Stage 1 (Warmup), we freeze the adaptive balancer and
@@ -477,7 +482,7 @@ class Trainer:
         if self.symbolic_proxy is not None:
             for p in self.symbolic_proxy.parameters(): p.requires_grad = not is_stage1
 
-        if epoch > 0 and epoch % 100 == 0:
+        if epoch > 0 and epoch % 50 == 0:
             if hasattr(self.model.encoder.pooling, 'apply_hard_revival'):
                 self.model.encoder.pooling.apply_hard_revival()
 

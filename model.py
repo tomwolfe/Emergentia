@@ -586,13 +586,19 @@ class DiscoveryEngineModel(nn.Module):
         # Use the device of the ode_func parameters
         ode_device = next(self.ode_func.parameters()).device
         original_device = z0.device
+        
+        # MPS fix: torchdiffeq is unstable on MPS. If original or ode device is MPS, use CPU.
+        is_mps = (str(original_device) == 'mps' or str(ode_device) == 'mps')
+        target_device = torch.device('cpu') if is_mps else ode_device
 
-        y0 = z0_flat.to(ode_device)
-        t_ode = t.to(ode_device)
+        y0 = z0_flat.to(target_device)
+        t_ode = t.to(target_device)
+        
+        # Ensure ode_func is on the correct device
+        self.ode_func.to(target_device)
 
-        # Use adaptive tolerance based on training stage to balance accuracy and efficiency
-        # Add a small epsilon to prevent over-fitting to numerical noise on MPS
-        eps = 1e-3 if str(ode_device) == 'mps' or str(original_device) == 'mps' else 0.0
+        # Use adaptive tolerance based on training stage
+        eps = 1e-3 if is_mps else 0.0
         
         if self.training:
             # Looser tolerances during training for efficiency

@@ -52,7 +52,7 @@ class StableHierarchicalPooling(nn.Module):
             nn.ReLU(),
             nn.Linear(in_channels, n_super_nodes)
         )
-        self.scaling = nn.Parameter(torch.tensor(1.0)) # Increased from 0.1
+        self.scaling = nn.Parameter(torch.tensor(10.0)) # Increased to 10.0 for stronger symmetry breaking
         self.register_buffer('active_mask', torch.ones(n_super_nodes))
 
         # Track previous assignments for temporal consistency
@@ -270,25 +270,28 @@ class StableHierarchicalPooling(nn.Module):
 
     def apply_hard_revival(self):
         """
-        Forcefully revive inactive nodes by perturbing their assignment MLP weights
-        if they have been inactive for too long.
+        Forcefully revive inactive nodes by re-initializing their assignment MLP weights
+        if they have been inactive (active_mask near zero).
+        Called every 50-100 epochs.
         """
         if not self.training:
             return
 
         inactive_indices = torch.where(self.active_mask < 0.1)[0]
         if len(inactive_indices) > 0:
-            # Re-initialize the final layer weights for inactive nodes to encourage new exploration
+            print(f"  [Hard Revival] Reviving super-nodes: {inactive_indices.tolist()}")
+            # Re-initialize the final layer weights for inactive nodes to force new exploration
             with torch.no_grad():
                 # self.assign_mlp[2] is the Linear(in_channels, n_super_nodes) layer
                 last_layer = self.assign_mlp[2]
                 for idx in inactive_indices:
-                    # Give it a fresh random start for this node's output slice with higher variance
-                    nn.init.normal_(last_layer.weight[idx], mean=0.0, std=0.1)  # Increased from 0.02
+                    # Re-initialize the weights for the corresponding output row
+                    # We use a larger std to force exploration
+                    nn.init.normal_(last_layer.weight[idx], mean=0.0, std=0.5)
                     nn.init.constant_(last_layer.bias[idx], 0.0)
 
-                # Also reset the active mask slightly for these nodes to allow them to show up
-                self.active_mask[inactive_indices] = 0.3  # Increased from 0.2 to make revival more likely
+                # Reset active mask for these nodes to allow them to compete immediately
+                self.active_mask[inactive_indices] = 1.0
 
 
 class DynamicLossBalancer:
