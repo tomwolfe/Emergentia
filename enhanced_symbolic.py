@@ -161,18 +161,25 @@ class TorchFeatureTransformer(torch.nn.Module):
 
         # Register feature selection mask to match distillation dimensions
         if hasattr(transformer, 'selected_feature_indices') and transformer.selected_feature_indices is not None:
-            self.register_buffer('feature_mask', torch.from_numpy(np.array(transformer.selected_feature_indices)).long())
+            indices = transformer.selected_feature_indices
+            if isinstance(indices, (np.ndarray, list)):
+                indices_np = np.array(indices)
+                if indices_np.dtype == bool:
+                    indices_np = np.where(indices_np)[0]
+                self.register_buffer('feature_mask', torch.from_numpy(indices_np).long())
+            else:
+                self.register_buffer('feature_mask', torch.from_numpy(np.array(indices)).long())
         elif hasattr(transformer, 'selector') and transformer.selector is not None:
             try:
                 indices = transformer.selector.get_support(indices=True)
                 self.register_buffer('feature_mask', torch.from_numpy(np.array(indices)).long())
             except Exception as e:
                 print(f"DEBUG: Failed to get feature mask from selector: {e}")
-                self.feature_mask = None
+                self.register_buffer('feature_mask', torch.tensor([], dtype=torch.long))  # Empty tensor instead of None
         else:
             # If no explicit feature selection was done, we need to determine the actual number of features
             # The number of features after transformation is stored in x_poly_mean
-            self.feature_mask = None
+            self.register_buffer('feature_mask', torch.tensor([], dtype=torch.long))  # Empty tensor instead of None
             print(f"DEBUG: No feature selection found in original transformer")
 
     def forward(self, z_flat):
@@ -209,9 +216,11 @@ class TorchFeatureTransformer(torch.nn.Module):
         X_expanded = torch.clamp(X_expanded, -1e12, 1e12)
 
         # Apply feature mask if present to match distilled feature set
-        if self.feature_mask is not None:
+        if self.feature_mask is not None and self.feature_mask.numel() > 0:
+            # Ensure mask is on correct device
+            mask = self.feature_mask.to(X_expanded.device)
             # Only use indices that are within the current feature vector size
-            valid_mask = self.feature_mask[self.feature_mask < X_expanded.size(1)]
+            valid_mask = mask[mask < X_expanded.size(1)]
             X_expanded = X_expanded[:, valid_mask]
 
         return (X_expanded - self.x_poly_mean) / self.x_poly_std
@@ -276,45 +285,45 @@ class TorchFeatureTransformer(torch.nn.Module):
 
         # For small systems, target < 40 features by skipping higher-order terms
         if self.n_super_nodes <= 4:
-            return torch.cat(features, dim=1)
+            X_expanded = torch.cat(features, dim=1)
+        else:
+            # 2. Squares of raw latents: [Batch, n_raw_latents]
+            X_raw = X[:, :n_raw_latents]
+            features.append(X_raw**2)
 
-        # 2. Squares of raw latents: [Batch, n_raw_latents]
-        X_raw = X[:, :n_raw_latents]
-        features.append(X_raw**2)
+            # 3. Intra-node cross-terms: O(K * D^2)
+            # Using vectorized outer product per node
+            X_nodes = X_raw.reshape(batch_size, self.n_super_nodes, self.latent_dim)
+            intra_terms = []
+            for i in range(self.latent_dim):
+                for j in range(i + 1, self.latent_dim):
+                    intra_terms.append(X_nodes[:, :, i] * X_nodes[:, :, j])
 
-        # 3. Intra-node cross-terms: O(K * D^2)
-        # Using vectorized outer product per node
-        X_nodes = X_raw.reshape(batch_size, self.n_super_nodes, self.latent_dim)
-        intra_terms = []
-        for i in range(self.latent_dim):
-            for j in range(i + 1, self.latent_dim):
-                intra_terms.append(X_nodes[:, :, i] * X_nodes[:, :, j])
+            if intra_terms:
+                features.append(torch.stack(intra_terms, dim=-1).reshape(batch_size, -1))
 
-        if intra_terms:
-            features.append(torch.stack(intra_terms, dim=-1).reshape(batch_size, -1))
+            # 4. Inter-node cross-terms (same dimension): O(D * K^2)
+            # We only consider pairs of nodes here.
+            inter_terms = []
+            for d in range(self.latent_dim):
+                # Vectorized pair-wise multiplication for this dimension
+                # [Batch, K]
+                val_d = X_nodes[:, :, d]
+                i_idx, j_idx = torch.triu_indices(self.n_super_nodes, self.n_super_nodes, offset=1, device=X_nodes.device)
+                inter_terms.append(val_d[:, i_idx] * val_d[:, j_idx])
 
-        # 4. Inter-node cross-terms (same dimension): O(D * K^2)
-        # We only consider pairs of nodes here.
-        inter_terms = []
-        for d in range(self.latent_dim):
-            # Vectorized pair-wise multiplication for this dimension
-            # [Batch, K]
-            val_d = X_nodes[:, :, d]
-            i_idx, j_idx = torch.triu_indices(self.n_super_nodes, self.n_super_nodes, offset=1, device=X_nodes.device)
-            inter_terms.append(val_d[:, i_idx] * val_d[:, j_idx])
+            if inter_terms:
+                features.append(torch.stack(inter_terms, dim=-1).reshape(batch_size, -1))
 
-        if inter_terms:
-            features.append(torch.stack(inter_terms, dim=-1).reshape(batch_size, -1))
+            # Combine all features
+            X_expanded = torch.cat(features, dim=1)
 
-        # Combine all features
-        X_expanded = torch.cat(features, dim=1)
-
-        # Memory Safety: If the number of features is still too large,
-        # we can perform a quick variance-based pruning here
-        if X_expanded.shape[1] > 1000:
-            variances = torch.var(X_expanded, dim=0)
-            top_indices = torch.argsort(variances, descending=True)[:1000]
-            X_expanded = X_expanded[:, top_indices]
+            # Memory Safety: If the number of features is still too large,
+            # we can perform a quick variance-based pruning here
+            if X_expanded.shape[1] > 1000:
+                variances = torch.var(X_expanded, dim=0)
+                top_indices = torch.argsort(variances, descending=True)[:1000]
+                X_expanded = X_expanded[:, top_indices]
 
         return X_expanded
 
@@ -658,6 +667,15 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
         equations = [r[0] for r in results]
         self.feature_masks = [r[1] for r in results]
         self.confidences = [r[2] for r in results]
+
+        # Store the feature masks in the transformer for later use by TorchFeatureTransformer
+        # Use the first mask if all masks are the same, or store all masks if they differ
+        if len(set(map(tuple, self.feature_masks))) == 1:
+            # All masks are the same, store as selected_feature_indices
+            self.transformer.selected_feature_indices = self.feature_masks[0]
+        else:
+            # Different masks for different targets, store all of them
+            self.transformer.selected_feature_indices = self.feature_masks[0]  # Use first as default
 
         return equations
 

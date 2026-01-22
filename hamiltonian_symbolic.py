@@ -115,6 +115,9 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
         self.feature_masks = [h_mask]
         self.confidences = [h_conf]
         
+        # Store the feature mask in the transformer for later use by TorchFeatureTransformer
+        self.transformer.selected_feature_indices = h_mask
+        
         return [ham_eq]
 
     def _estimate_gamma_from_residuals(self, h_prog, h_mask, states, derivs, n_super_nodes, latent_dim):

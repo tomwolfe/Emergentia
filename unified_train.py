@@ -114,8 +114,8 @@ def main():
     dz_stability = np.var(recent_dz)
     print(f"Latent Stability (Var[dz]): {dz_stability:.6f}")
 
-    # Adjusted Quality Gate: Relax threshold if latent space is stable
-    rec_threshold = 0.45 if dz_stability < 0.01 else 0.25
+    # Adjusted Quality Gate: Strict threshold to ensure meaningful physical mapping before distillation
+    rec_threshold = 0.1 if dz_stability < 0.01 else 0.1  # Both cases now use 0.1 threshold
 
     if epoch < 100 or (last_rec > rec_threshold and dz_stability > 0.05):
         reason = ""
@@ -226,7 +226,7 @@ def main():
                 # Also check the actual output size after transformation
                 try:
                     with torch.no_grad():
-                        dummy_input = torch.randn(1, 16)  # Same size as actual input
+                        dummy_input = torch.randn(1, args.super_nodes * 4, device=device)  # Same size as actual input
                         transformed_output = trainer.symbolic_proxy.torch_transformer(dummy_input)
                         print(f"DEBUG: Actual transformed output size: {transformed_output.size(1)}")
                 except Exception as e:

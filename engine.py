@@ -210,6 +210,8 @@ class SymbolicProxy(torch.nn.Module):
         super().__init__()
         self.n_super_nodes = n_super_nodes
         self.latent_dim = latent_dim
+        self.is_hamiltonian = False
+        self.dissipation_coeffs = None
 
         # 1. Initialize differentiable feature transformer
         from enhanced_symbolic import TorchFeatureTransformer, SymPyToTorch
@@ -233,9 +235,23 @@ class SymbolicProxy(torch.nn.Module):
             # Fallback to using the size of normalization parameters
             if hasattr(self.torch_transformer, 'feature_mask') and self.torch_transformer.feature_mask is not None:
                 n_inputs = self.torch_transformer.feature_mask.size(0)
+                print(f"DEBUG: Using feature_mask size: {n_inputs}")
             else:
+                # Use the size of normalization parameters, but make sure to account for feature selection
                 n_inputs = self.torch_transformer.x_poly_mean.size(0)
-            print(f"DEBUG: Failed to determine output size from dummy forward pass, using fallback: {n_inputs}, error: {e}")
+                print(f"DEBUG: Using normalization parameter size: {n_inputs}")
+
+                # If the transformer has selected_feature_indices, use that to determine actual feature count
+                if hasattr(transformer, 'selected_feature_indices') and transformer.selected_feature_indices is not None:
+                    indices = transformer.selected_feature_indices
+                    if isinstance(indices, (np.ndarray, list)):
+                        indices_np = np.array(indices)
+                        if indices_np.dtype == bool:
+                            n_inputs = int(np.sum(indices_np))
+                            print(f"DEBUG: Using sum of boolean selected_feature_indices: {n_inputs}")
+                        else:
+                            n_inputs = len(indices_np)
+                            print(f"DEBUG: Using selected_feature_indices length: {n_inputs}")
 
         for eq in equations:
             if eq is not None:
@@ -248,7 +264,9 @@ class SymbolicProxy(torch.nn.Module):
                 # For Hamiltonian equations, we may need to handle them differently
                 if hasattr(eq, 'compute_derivatives'):
                     # This is a Hamiltonian equation that computes derivatives differently
-                    # We'll handle this specially in the forward pass
+                    self.is_hamiltonian = True
+                    if hasattr(eq, 'dissipation_coeffs'):
+                        self.register_buffer('dissipation', torch.from_numpy(eq.dissipation_coeffs).float())
                     self.sym_modules.append(SymPyToTorch(sympy_expr, n_inputs))
                 else:
                     self.sym_modules.append(SymPyToTorch(sympy_expr, n_inputs))
@@ -259,6 +277,53 @@ class SymbolicProxy(torch.nn.Module):
         # z_flat: [Batch, K * D]
         # Ensure input is float32 for MPS stability
         z_flat = z_flat.to(torch.float32)
+
+        if self.is_hamiltonian:
+            # Enable gradients for Hamiltonian derivative computation
+            # We need to compute dH/dz. If we want to backprop through this (second-order),
+            # we must ensure the input z_flat has requires_grad=True.
+            with torch.enable_grad():
+                # If input already requires grad, don't detach it to preserve the graph
+                if not z_flat.requires_grad:
+                    z_flat = z_flat.detach().requires_grad_(True)
+                
+                X_norm = self.torch_transformer(z_flat)
+                
+                # Hamiltonian H is the output of the first (and only) sym_module
+                H_norm = self.sym_modules[0](X_norm)
+                
+                # Denormalize H to physical units
+                H = self.torch_transformer.denormalize_y(H_norm)
+                
+                # Compute dH/dz. We use create_graph=True to allow higher-order derivatives
+                dH_dz = torch.autograd.grad(H.sum(), z_flat, create_graph=True)[0]
+            
+            # Continue with derivative computation (gradients no longer needed)
+            # Split z and dH_dz into q and p
+            batch_size = z_flat.size(0)
+            d_sub = self.latent_dim // 2
+            
+            dz_dt = torch.zeros_like(z_flat)
+            
+            for k in range(self.n_super_nodes):
+                q_start = k * self.latent_dim
+                q_end = q_start + d_sub
+                p_start = q_end
+                p_end = p_start + d_sub
+                
+                # dq/dt = dH/dp
+                dz_dt[:, q_start:q_end] = dH_dz[:, p_start:p_end]
+                
+                # dp/dt = -dH/dq - gamma*p
+                # Conservative part
+                dz_dt[:, p_start:p_end] = -dH_dz[:, q_start:q_end]
+                
+                # Dissipative part
+                if hasattr(self, 'dissipation'):
+                    gamma = self.dissipation[k]
+                    dz_dt[:, p_start:p_end] -= gamma * z_flat[:, p_start:p_end]
+            
+            return dz_dt
 
         # 1. Differentiable feature transformation
         X_norm = self.torch_transformer(z_flat)
@@ -272,7 +337,6 @@ class SymbolicProxy(torch.nn.Module):
                 # So X_norm.size(1) should match the number of selected features
                 # But double-check and handle mismatches gracefully
                 if X_norm.size(1) != sym_mod.n_inputs:
-                    print(f"DEBUG: Tensor size mismatch in symbolic proxy: X_norm has {X_norm.size(1)} features but SymPyToTorch expects {sym_mod.n_inputs} features")
                     # Adjust X_norm to match expected input size
                     if X_norm.size(1) > sym_mod.n_inputs:
                         X_input = X_norm[:, :sym_mod.n_inputs]
@@ -387,6 +451,9 @@ class Trainer:
                 symbolic_proxy_or_equations,
                 transformer
             )
+            # Ensure all parameters and buffers of the symbolic proxy are on the same device as the model
+            self.symbolic_proxy = self.symbolic_proxy.to(self.device)
+
         self.symbolic_weight = weight
         self.symbolic_confidence = confidence
         print(f"Symbolic proxy updated. Weight: {weight}, Confidence: {confidence:.3f}")
