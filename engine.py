@@ -237,7 +237,7 @@ class SymbolicProxy(torch.nn.Module):
         # z_flat: [Batch, K * D]
         # 1. Differentiable feature transformation
         X_norm = self.torch_transformer(z_flat)
-        
+
         # 2. Execute each symbolic equation
         y_preds = []
         for sym_mod in self.sym_modules:
@@ -245,12 +245,12 @@ class SymbolicProxy(torch.nn.Module):
                 y_preds.append(sym_mod(X_norm))
             else:
                 y_preds.append(torch.zeros(z_flat.size(0), device=z_flat.device))
-        
+
         Y_norm_pred = torch.stack(y_preds, dim=1)
-        
+
         # 3. Denormalize
         Y_pred = self.torch_transformer.denormalize_y(Y_norm_pred)
-        
+
         return Y_pred
 
 class Trainer:
@@ -307,10 +307,10 @@ class Trainer:
         h_net_params = []
         assign_mlp_params = []
         other_params = []
-        
+
         if hasattr(self.model.ode_func, 'H_net'):
             h_net_params = list(self.model.ode_func.H_net.parameters())
-        
+
         if hasattr(self.model.encoder.pooling, 'assign_mlp'):
             assign_mlp_params = list(self.model.encoder.pooling.assign_mlp.parameters())
 
@@ -321,7 +321,7 @@ class Trainer:
         param_groups = [
             {'params': other_params, 'weight_decay': 1e-5},
             {'params': [self.log_align_scale], 'lr': 1e-3},
-            {'params': [self.model.log_vars], 'lr': 1e-3}, # Explicitly add log_vars to optimizer
+            {'params': [self.model.log_vars], 'lr': 1e-3}, # Explicitly add log_vars to optimizer with higher LR
         ]
         if h_net_params:
             param_groups.append({'params': h_net_params, 'weight_decay': 1e-3})
@@ -406,6 +406,23 @@ class Trainer:
                         loss_curv = torch.norm(dH, p=2)
         return loss_curv
 
+    def _compute_latent_smoothing_loss(self, z_preds):
+        """
+        Compute a loss that penalizes the second derivative of latent trajectories
+        to eliminate high-frequency jitter.
+        """
+        if z_preds.size(0) < 3:  # Need at least 3 points to compute second derivative
+            return torch.tensor(0.0, device=self.device)
+
+        # Compute first differences
+        first_diff = z_preds[1:] - z_preds[:-1]  # [T-1, B, K, D]
+
+        # Compute second differences (second derivative approximation)
+        second_diff = first_diff[1:] - first_diff[:-1]  # [T-2, B, K, D]
+
+        # Return the mean squared second difference
+        return torch.mean(second_diff**2)
+
     def _compute_symbolic_loss(self, z_curr, is_warmup):
         loss_sym = torch.tensor(0.0, device=self.device)
         if (self.symbolic_proxy is not None and not is_warmup and
@@ -472,10 +489,13 @@ class Trainer:
         if is_stage1:
             # During Stage 1 (Warmup), we freeze the adaptive balancer and
             # use fixed weights to encourage spatial coherence.
-            # w_rec = 0.1 (log_var = 2.3), others = 1.0 (log_var = 0.0)
+            # Apply Reconstruction-First Warmup: set rec_loss weight to 10x and assign_loss to 0.1x
             with torch.no_grad():
-                self.model.log_vars.fill_(0.0)
+                self.model.log_vars.fill_(0.0)  # Reset all log_vars to 0
+                # Set rec_loss weight to 10x (log(10) ≈ 2.3)
                 self.model.log_vars[0].fill_(np.log(10.0))
+                # Set assign_loss weight to 0.1x (log(0.1) ≈ -2.3)
+                self.model.log_vars[2].fill_(np.log(0.1))
 
         # ODE dynamics only start after warmup
         for p in self.model.ode_func.parameters(): p.requires_grad = not is_stage1
@@ -500,11 +520,14 @@ class Trainer:
         loss_sym = self._compute_symbolic_loss(z_curr, is_warmup)
 
         z_preds = self._integrate_trajectories(z_curr, data_list, dt, tf_ratio, tau, hard, is_warmup)
-        
+
         loss_l2 = torch.mean(z_preds**2)
         z_vel = (z_preds[1:] - z_preds[:-1]) / dt
         loss_lvr = torch.mean((z_vel[1:] - z_vel[:-1])**2) if len(z_vel) > 1 else torch.tensor(0.0, device=self.device)
         loss_lvr += 0.1 * torch.mean(z_vel**2) if len(z_vel) > 0 else torch.tensor(0.0, device=self.device)
+
+        # NEW: Latent smoothing loss to penalize high-frequency jitter
+        loss_smooth = self._compute_latent_smoothing_loss(z_preds)
 
         loss_pruning = init_res['losses_0']['pruning']
         loss_sparsity = init_res['losses_0']['sparsity']
@@ -582,7 +605,7 @@ class Trainer:
             # Force structural losses to stay active during stage 1
             lvars[11], lvars[3], lvars[12] = 0.0, 0.0, 0.0
 
-        raw_losses = {'rec': loss_rec, 'cons': loss_cons, 'assign': loss_assign, 'ortho': loss_ortho, 'l2': loss_l2, 'lvr': loss_lvr, 'align': loss_align, 'pruning': loss_pruning, 'sep': loss_sep, 'conn': loss_conn, 'sparsity': loss_sparsity, 'mi': loss_mi, 'sym': loss_sym, 'var': loss_var, 'hinge': loss_hinge}
+        raw_losses = {'rec': loss_rec, 'cons': loss_cons, 'assign': loss_assign, 'ortho': loss_ortho, 'l2': loss_l2, 'lvr': loss_lvr, 'align': loss_align, 'pruning': loss_pruning, 'sep': loss_sep, 'conn': loss_conn, 'sparsity': loss_sparsity, 'mi': loss_mi, 'sym': loss_sym, 'var': loss_var, 'hinge': loss_hinge, 'smooth': loss_smooth}
         
         # Ensure all raw losses are float32 for stable balancing, especially on MPS
         for k in raw_losses:
@@ -597,9 +620,16 @@ class Trainer:
         discovery_loss = sum(weights[k] * torch.clamp(raw_losses[k], 0, 100) + lvars[i] for i, k in enumerate(raw_losses.keys()) if k not in ['cons', 'l2', 'lvr'])
         discovery_loss += (weights['sym'] * (self.symbolic_weight - 1.0) * torch.clamp(loss_sym.to(torch.float32), 0, 100)) # Adjust sym weight
         discovery_loss += 1e-4 * torch.clamp(loss_curv.to(torch.float32), 0, 100)
-        
+
         loss = discovery_loss + (weights['l2'] * 1e-4 * torch.clamp(loss_l2, 0, 100) + lvars[4]) + (weights['lvr'] * 1e-2 * torch.clamp(loss_lvr, 0, 100) + lvars[5])
         if compute_consistency: loss += (weights['cons'] * torch.clamp(loss_cons.to(torch.float32), 0, 100) + lvars[1])
+
+        # Add smoothing loss to the total loss
+        smooth_idx = list(raw_losses.keys()).index('smooth')  # This should be 15
+        if smooth_idx < len(lvars):  # Make sure the index exists
+            loss += (weights['smooth'] * 1e-1 * torch.clamp(loss_smooth, 0, 100) + lvars[smooth_idx])
+        else:
+            loss += weights['smooth'] * 1e-1 * torch.clamp(loss_smooth, 0, 100)  # Just apply weight without log_var
         
         loss = torch.clamp(loss + 0.1 * torch.sum(lvars**2), 0, 1e4)
         if not torch.isfinite(loss): loss = loss_rec if torch.isfinite(loss_rec) else torch.tensor(1.0, device=self.device, requires_grad=True)
@@ -621,7 +651,7 @@ class Trainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
             self.optimizer.step()
 
-        self.loss_tracker.update({'total': loss, 'rec_raw': loss_rec, 'cons_raw': loss_cons, 'assign': loss_assign, 'align': loss_align, 'mi': loss_mi, 'sym': loss_sym, 'lvar_raw': loss_var, 'curv_raw': loss_curv, 'hinge_raw': loss_hinge, 'lvars_mean': lvars.mean()}, weights=weights)
+        self.loss_tracker.update({'total': loss, 'rec_raw': loss_rec, 'cons_raw': loss_cons, 'assign': loss_assign, 'align': loss_align, 'mi': loss_mi, 'sym': loss_sym, 'lvar_raw': loss_var, 'curv_raw': loss_curv, 'hinge_raw': loss_hinge, 'smooth_raw': loss_smooth, 'lvars_mean': lvars.mean()}, weights=weights)
         
         if epoch % 100 == 0:
             print(f"  [Loss Detail] Rec: {loss_rec:.4f} | Cons: {loss_cons:.4f} | Assign: {loss_assign:.4f} | Ortho: {loss_ortho:.4f} | Align: {loss_align:.4f} | Sym: {loss_sym:.4f}")

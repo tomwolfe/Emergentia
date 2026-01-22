@@ -42,7 +42,7 @@ class StableHierarchicalPooling(nn.Module):
         super(StableHierarchicalPooling, self).__init__()
         self.n_super_nodes = n_super_nodes
         self.pruning_threshold = pruning_threshold
-        self.temporal_consistency_weight = temporal_consistency_weight
+        self.temporal_consistency_weight = temporal_consistency_weight * 5  # Increased by factor of 5 as requested
         self.collapse_prevention_weight = collapse_prevention_weight
         self.sparsity_weight = sparsity_weight
         self.min_active_super_nodes = min(max(1, min_active_super_nodes), n_super_nodes)

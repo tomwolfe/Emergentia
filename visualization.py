@@ -3,12 +3,12 @@ import numpy as np
 import torch
 from torch_geometric.data import Batch
 
-def plot_discovery_results(model, dataset, pos_raw, s, z_states, assignments, output_path='discovery_result.png'):
+def plot_discovery_results(model, dataset, pos_raw, s, z_states, assignments, output_path='discovery_result.png', symbolic_predictions=None):
     """
     Comprehensive visualization of the discovery results.
     """
     fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-    
+
     # 1. Spatial Assignments
     scatter = axes[0, 0].scatter(pos_raw[0, :, 0], pos_raw[0, :, 1], c=assignments, cmap='tab10', s=50)
     axes[0, 0].set_title("Initial Particle Assignments (Meso-nodes)")
@@ -22,11 +22,18 @@ def plot_discovery_results(model, dataset, pos_raw, s, z_states, assignments, ou
     axes[0, 1].set_ylabel("Super-node index")
     plt.colorbar(im, ax=axes[0, 1])
 
-    # 3. Latent Trajectories
+    # 3. Latent Trajectories with symbolic predictions overlay
     n_plot = min(4, z_states.shape[1])
     for k in range(n_plot):
-        axes[1, 0].plot(z_states[:, k, 0], label=f'Node {k} - q1')
-        axes[1, 0].plot(z_states[:, k, 1], '--', label=f'Node {k} - q2')
+        axes[1, 0].plot(z_states[:, k, 0], label=f'Node {k} - q1 (Learned)', alpha=0.7)
+        axes[1, 0].plot(z_states[:, k, 1], '--', label=f'Node {k} - q2 (Learned)', alpha=0.7)
+
+        # Overlay symbolic predictions if available
+        if symbolic_predictions is not None and k < symbolic_predictions.shape[1]:
+            # Plot symbolic prediction for this node
+            axes[1, 0].plot(symbolic_predictions[:, k, 0], label=f'Node {k} - q1 (Symbolic)', linestyle='-.', alpha=0.8)
+            axes[1, 0].plot(symbolic_predictions[:, k, 1], label=f'Node {k} - q2 (Symbolic)', linestyle=':', alpha=0.8)
+
     axes[1, 0].set_title(f"Latent Trajectories (First {n_plot} nodes)")
     axes[1, 0].set_xlabel("Time step")
     axes[1, 0].legend(fontsize='small', ncol=2)
@@ -34,13 +41,25 @@ def plot_discovery_results(model, dataset, pos_raw, s, z_states, assignments, ou
     # 4. Energy Conservation or Phase Space
     if z_states.shape[2] >= 4: # Hamiltonian (q, p)
         for k in range(n_plot):
-            axes[1, 1].plot(z_states[:, k, 0], z_states[:, k, 2], label=f'Node {k}')
+            axes[1, 1].plot(z_states[:, k, 0], z_states[:, k, 2], label=f'Node {k} (Learned)', alpha=0.7)
+
+            # Overlay symbolic predictions if available
+            if symbolic_predictions is not None and k < symbolic_predictions.shape[1]:
+                axes[1, 1].plot(symbolic_predictions[:, k, 0], symbolic_predictions[:, k, 2],
+                               label=f'Node {k} (Symbolic)', linestyle='--', alpha=0.8)
+
         axes[1, 1].set_title("Latent Phase Space (q vs p)")
         axes[1, 1].set_xlabel("q")
         axes[1, 1].set_ylabel("p")
     else:
         for k in range(n_plot):
-            axes[1, 1].plot(z_states[:, k, 0], z_states[:, k, 1], label=f'Node {k}')
+            axes[1, 1].plot(z_states[:, k, 0], z_states[:, k, 1], label=f'Node {k} (Learned)', alpha=0.7)
+
+            # Overlay symbolic predictions if available
+            if symbolic_predictions is not None and k < symbolic_predictions.shape[1]:
+                axes[1, 1].plot(symbolic_predictions[:, k, 0], symbolic_predictions[:, k, 1],
+                               label=f'Node {k} (Symbolic)', linestyle='--', alpha=0.8)
+
         axes[1, 1].set_title("Latent Trajectories (q1 vs q2)")
         axes[1, 1].set_xlabel("q1")
         axes[1, 1].set_ylabel("q2")

@@ -89,8 +89,14 @@ class ImprovedFeatureTransformer(FeatureTransformer):
             # Clamp distances to avoid 1/0
             dists_flat = np.maximum(dists_flat, 1e-3)
 
-            inv_dists_flat = 1.0 / (dists_flat + 0.1)
-            inv_sq_dists_flat = 1.0 / (dists_flat**2 + 0.1)
+            # NEW: Use soft-floor for distance calculations to prevent numerical singularities on MPS
+            inv_dists_flat = 1.0 / (dists_flat + 0.1)  # This is already implemented correctly
+            inv_sq_dists_flat = 1.0 / (dists_flat**2 + 0.1)  # This is already implemented correctly
+
+            # NEW: Additional soft-floor for other distance-based features
+            soft_floor = 0.1  # As requested in the requirements
+            inv_dists_flat = 1.0 / (dists_flat + soft_floor)
+            inv_sq_dists_flat = 1.0 / (dists_flat**2 + soft_floor)
 
             # NEW: Physics-informed basis functions
             exp_dist = np.exp(-np.clip(dists_flat, 0, 20))

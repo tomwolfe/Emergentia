@@ -107,22 +107,38 @@ def main():
         if dz_stability > 0.05: reason += f"Latent space unstable ({dz_stability:.4f} > 0.05). "
         print(f"Skipping symbolic discovery: {reason}")
         equations = []
+        symbolic_transformer = None
     else:
         print("Analyzing latent space...")
         corrs = analyze_latent_space(model, dataset, pos, device=device)
 
         print("Performing symbolic distillation...")
         if args.hamiltonian:
-            distiller = HamiltonianSymbolicDistiller()
+            # NEW: Increase populations and generations as requested
+            from hamiltonian_symbolic import HamiltonianSymbolicDistiller
+            distiller = HamiltonianSymbolicDistiller(populations=2000, generations=40)
             equations = distiller.distill(z_states, dz_states, args.super_nodes, 4, model=model)
         else:
-            distiller = SymbolicDistiller()
+            # NEW: Increase populations and generations as requested
+            from symbolic import SymbolicDistiller
+            distiller = SymbolicDistiller(populations=2000, generations=40)
             equations = distiller.distill(z_states, dz_states, args.super_nodes, 4)
 
         print("\nDiscovered Equations:")
         for i, eq in enumerate(equations):
             target = "H" if args.hamiltonian else f"dz_{i}/dt"
             print(f"{target} = {eq}")
+
+        # NEW: Create symbolic transformer and update trainer with symbolic proxy
+        if hasattr(distiller, 'transformer'):
+            symbolic_transformer = distiller.transformer
+        else:
+            from symbolic import FeatureTransformer
+            symbolic_transformer = FeatureTransformer(args.super_nodes, 4)
+            symbolic_transformer.fit(z_states, dz_states)
+
+        # Update trainer with symbolic proxy
+        trainer.update_symbolic_proxy(equations, symbolic_transformer, weight=0.1, confidence=0.8)
 
     # 6. Visualization
     print("Visualizing results...")
@@ -134,20 +150,50 @@ def main():
             batch = Batch.from_data_list([data]).to(device)
             _, s, _, _ = model.encode(batch.x, batch.edge_index, batch.batch)
             s_list.append(s.cpu())
-    
+
     s_full = torch.cat(s_list, dim=0) # [T*N, K]
     # Reshape to [T, N, K] and take mean over particles N for the heatmap?
     # Actually visualization.py expects [T, K] for the heatmap
     s_heatmap = s_full.view(len(dataset), args.particles, args.super_nodes).mean(dim=1)
-    
+
     # Get final assignments for scatter plot
     batch_0 = Batch.from_data_list([dataset[0]]).to(device)
     _, s_0, _, _ = model.encode(batch_0.x, batch_0.edge_index, batch_0.batch)
     assignments = torch.argmax(s_0, dim=1).cpu().numpy()
-    
+
     z_states_plot = z_states.reshape(-1, args.super_nodes, 4) if 'z_states' in locals() else np.zeros((len(dataset), args.super_nodes, 4))
-    
-    plot_discovery_results(model, dataset, pos, s_heatmap, z_states_plot, assignments)
+
+    # NEW: Generate symbolic predictions if symbolic equations exist
+    symbolic_predictions = None
+    if 'equations' in locals() and equations and trainer.symbolic_proxy is not None:
+        print("Generating symbolic predictions for visualization...")
+        try:
+            # Convert z_states to tensor for symbolic prediction
+            z_tensor = torch.tensor(z_states_plot.reshape(-1, args.super_nodes * 4), dtype=torch.float32, device=device)
+
+            # Get symbolic predictions
+            with torch.no_grad():
+                symbolic_dz_dt = trainer.symbolic_proxy(z_tensor)
+
+            # Reshape to match z_states_plot dimensions [T, K, D]
+            symbolic_dz_dt = symbolic_dz_dt.cpu().numpy().reshape(-1, args.super_nodes, 4)
+
+            # Integrate to get trajectories (simple Euler integration)
+            dt = 0.01  # Use a small time step for integration
+            symbolic_traj = np.zeros_like(z_states_plot)
+            symbolic_traj[0] = z_states_plot[0]  # Initialize with first state
+
+            for t in range(1, len(symbolic_traj)):
+                # Simple Euler integration: z_new = z_old + dt * dz_dt
+                symbolic_traj[t] = symbolic_traj[t-1] + dt * symbolic_dz_dt[t-1]
+
+            symbolic_predictions = symbolic_traj
+            print(f"Generated symbolic predictions: shape {symbolic_predictions.shape}")
+        except Exception as e:
+            print(f"Failed to generate symbolic predictions: {e}")
+            symbolic_predictions = None
+
+    plot_discovery_results(model, dataset, pos, s_heatmap, z_states_plot, assignments, symbolic_predictions=symbolic_predictions)
     plot_training_history(trainer.loss_tracker)
 
 if __name__ == "__main__":
