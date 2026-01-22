@@ -128,3 +128,10 @@ dmypy.json
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# Project-specific artifacts
+checkpoints/
+results/
+logs/
+*.png
+.pytest_cache/

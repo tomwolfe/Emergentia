@@ -331,91 +331,26 @@ class Trainer:
         self.symbolic_confidence = confidence
         print(f"Symbolic proxy updated. Weight: {weight}, Confidence: {confidence:.3f}")
         
-    def train_step(self, data_list, dt, epoch=0, max_epochs=2000):
-        # Update sparsity weight if scheduler is present
-        if self.sparsity_scheduler is not None:
-            new_weight = self.sparsity_scheduler.step()
-            if hasattr(self.model.encoder.pooling, 'set_sparsity_weight'):
-                self.model.encoder.pooling.set_sparsity_weight(new_weight)
-
-        # Stage 0: Grounding (0 to warmup_epochs) - Prioritize Reconstruction over Alignment
-        # Zero out auxiliary losses during warmup to allow GNN to find basic spatial mapping first
-        is_warmup = epoch < self.warmup_epochs
-        if is_warmup:
-            with torch.no_grad():
-                self.model.log_vars[0].fill_(-8.0)  # Maximum priority for reconstruction
-                self.model.log_vars[6].fill_(5.0)   # Suppress alignment during warmup to focus on reconstruction first
-                # Suppress other structural losses initially
-                self.model.log_vars[3].fill_(5.0)   # Ortho - higher to suppress more
-                self.model.log_vars[11].fill_(5.0)  # MI - higher to suppress more
-                # Also suppress other losses during warmup
-                self.model.log_vars[1].fill_(5.0)   # Consistency
-                self.model.log_vars[2].fill_(5.0)   # Assignment
-                self.model.log_vars[7].fill_(5.0)   # Pruning
-                self.model.log_vars[10].fill_(5.0)  # Sparsity
-
-        # Stage-based curriculum: Stage 1 freezes ODE/Symbolic and focuses on Recon/Align
-        is_stage1 = epoch < self.warmup_epochs
-        for p in self.model.ode_func.parameters():
-            p.requires_grad = not is_stage1
-
-        if self.symbolic_proxy is not None:
-            for p in self.symbolic_proxy.parameters():
-                p.requires_grad = not is_stage1
-
-        # Periodically apply hard revival to prevent resolution collapse
-        if epoch > 0 and epoch % 50 == 0:  # More frequent revival
-            if hasattr(self.model.encoder.pooling, 'apply_hard_revival'):
-                self.model.encoder.pooling.apply_hard_revival()
-
-        # Determine if we should compute consistency loss based on frequency
-        # Stage 1 skips consistency loss to focus on static reconstruction
-        compute_consistency = (epoch >= self.warmup_epochs) and (not is_stage1)
-        if epoch > self.warmup_epochs: # Only skip frequency after stage 1
-            compute_consistency = compute_consistency and (epoch % self.skip_consistency_freq == 0)
-
-        # For gradient accumulation
-        if self.enable_gradient_accumulation:
-            self.optimizer.zero_grad(set_to_none=True)  # More memory efficient
-
-        seq_len = len(data_list)
-
-        # Progress ratio
+    def _get_schedules(self, epoch, max_epochs):
         progress = epoch / max_epochs
-
-        # 1. Tau schedule: Faster annealing as requested
-        # Start at 1.0 and anneal to 0.1 by epoch 50
         tau = max(0.1, 1.0 * np.exp(-epoch / 25.0))
-
-        # 2. Hard assignment scheduling:
-        # Gradually increase the probability of using 'hard' assignments in Gumbel-Softmax
-        # to bridge the gap between training and inference.
+        
         hard = False
         if progress > self.hard_assignment_start:
-            # Probability of hard assignment increases linearly after start threshold
             hard_prob = min(1.0, (progress - self.hard_assignment_start) / (1.0 - self.hard_assignment_start))
             hard = np.random.random() < hard_prob
+            
+        tf_ratio = max(0.0, 0.8 * (1.0 - epoch / (0.5 * max_epochs + 1e-9)))
+        entropy_weight = 0.5 + 2.0 * progress
+        
+        return tau, hard, tf_ratio, entropy_weight
 
-        # 3. Decaying Teacher Forcing Ratio (more aggressive decay)
-        tf_ratio = max(0.0, 0.8 * (1.0 - epoch / (0.5 * max_epochs + 1e-9)))  # Faster decay
-
-        # 4. Alignment weight - Removed hardcoded multiplier to rely solely on log_vars
-        align_weight = 1.0
-
-        # 5. Adaptive Entropy Weight: More conservative growth to prevent early instability
-        # Point 1: Addressing "Blurry" Meso-scale
-        entropy_weight = 0.5 + 2.0 * progress  # Reduced from 5.0 to 2.0 for more gradual assignments
-
-        # Warmup logic
-        is_warmup = epoch < self.warmup_epochs
-
-        batch_0 = Batch.from_data_list([data_list[0]]).to(self.device)
+    def _compute_initial_recon_loss(self, batch_0, tau, hard, entropy_weight):
         z_curr, s_0, losses_0, mu_0 = self.model.encode(batch_0.x, batch_0.edge_index, batch_0.batch, tau=tau, hard=hard)
 
         if torch.isnan(z_curr).any() or torch.isinf(z_curr).any():
             z_curr = torch.nan_to_num(z_curr, nan=0.0, posinf=1.0, neginf=-1.0)
 
-        # Explicit denormalization of targets to physical space for Reconstruction Scaling fix
         p_min = torch.tensor(self.stats['pos_min'], device=self.device, dtype=torch.float32)
         p_range = torch.tensor(self.stats['pos_range'], device=self.device, dtype=torch.float32)
         v_mean = torch.tensor(self.stats['vel_mean'], device=self.device, dtype=torch.float32)
@@ -426,132 +361,139 @@ class Trainer:
             batch_0.x[:, 2:4] * v_std + v_mean
         ], dim=-1)
 
-        # Apply high weight for initial reconstruction - Pass stats to keep in physical space
         recon_0 = self.model.decode(z_curr, s_0, batch_0.batch, stats=self.stats)
         loss_rec = self.criterion(recon_0, x_0_phys)
         
-        loss_cons = torch.tensor(0.0, device=self.device)
-        # Apply entropy weight and boost diversity to prevent collapse
         loss_assign = entropy_weight * losses_0['entropy'] + 2.0 * losses_0['diversity'] + 0.1 * losses_0['spatial']
-        loss_pruning = losses_0['pruning']
-        loss_sparsity = losses_0['sparsity']
-        loss_sep = losses_0.get('separation', torch.tensor(0.0, device=self.device))
-        loss_conn = self.model.get_connectivity_loss(s_0, batch_0.edge_index)
-        loss_ortho = self.model.get_ortho_loss(s_0)
-        loss_align = torch.tensor(0.0, device=self.device)
-        loss_mi = torch.tensor(0.0, device=self.device)
-        loss_sym = torch.tensor(0.0, device=self.device)
-        loss_var = self.model.get_latent_variance_loss(z_curr)
         
-        # Add Curvature Penalty for Hamiltonian dynamics - Computed on initial state
+        initial_results = {
+            'z_curr': z_curr, 's_0': s_0, 'mu_0': mu_0,
+            'loss_rec': loss_rec, 'loss_assign': loss_assign,
+            'losses_0': losses_0, 'x_0_phys': x_0_phys,
+            'p_range': p_range, 'p_min': p_min, 'v_std': v_std, 'v_mean': v_mean
+        }
+        return initial_results
+
+    def _compute_hamiltonian_curv_loss(self, z_curr):
         loss_curv = torch.tensor(0.0, device=self.device)
         if self.model.hamiltonian:
             with torch.set_grad_enabled(True):
                 z_in = z_curr.view(z_curr.size(0), -1).detach().requires_grad_(True)
-
-                # Handle MPS device mismatch: if ODE func is on CPU but z_in is on MPS
                 if self.mps_ode_on_cpu:
                     z_in_cpu = z_in.cpu()
                     H = self.model.ode_func.H_net(z_in_cpu).sum()
                     dH = torch.autograd.grad(H, z_in_cpu, create_graph=True)[0]
                     if dH is not None:
-                        # Move gradient back to original device for loss calculation
-                        dH = dH.to(self.device)
-                        loss_curv = torch.norm(dH, p=2)
+                        loss_curv = torch.norm(dH.to(self.device), p=2)
                 else:
                     H = self.model.ode_func.H_net(z_in).sum()
                     dH = torch.autograd.grad(H, z_in, create_graph=True)[0]
                     if dH is not None:
                         loss_curv = torch.norm(dH, p=2)
+        return loss_curv
 
-        # Symbolic-in-the-loop loss with FIDELITY GATING
-        # Point 3: Addressing Symbolic-Neural Feedback Loop Fragility
+    def _compute_symbolic_loss(self, z_curr, is_warmup):
+        loss_sym = torch.tensor(0.0, device=self.device)
         if (self.symbolic_proxy is not None and not is_warmup and
             self.symbolic_confidence >= self.min_symbolic_confidence):
             z0_flat = z_curr.view(z_curr.size(0), -1)
-
-            # Handle MPS device mismatch: if ODE func is on CPU but z0_flat is on MPS
             if self.mps_ode_on_cpu:
                 z0_flat_cpu = z0_flat.cpu()
-                # GNN predicted derivative
                 gnn_dz_cpu = self.model.ode_func(0, z0_flat_cpu)
-                # Symbolic predicted derivative (now differentiable!)
                 sym_dz_cpu = self.symbolic_proxy(z0_flat_cpu)
-
-                # Use Huber loss for more robustness against "garbage" symbolic laws
-                # Point 4: Using smaller delta for Huber loss as requested
-                loss_sym_cpu = torch.nn.functional.huber_loss(gnn_dz_cpu, sym_dz_cpu, delta=0.1)
-                # Move loss back to original device
-                loss_sym = loss_sym_cpu.to(self.device)
+                loss_sym = torch.nn.functional.huber_loss(gnn_dz_cpu, sym_dz_cpu, delta=0.1).to(self.device)
             else:
-                # GNN predicted derivative
                 gnn_dz = self.model.ode_func(0, z0_flat)
-                # Symbolic predicted derivative (now differentiable!)
                 sym_dz = self.symbolic_proxy(z0_flat)
-
-                # Use Huber loss for more robustness against "garbage" symbolic laws
-                # Point 4: Using smaller delta for Huber loss as requested
                 loss_sym = torch.nn.functional.huber_loss(gnn_dz, sym_dz, delta=0.1)
+        return loss_sym
 
-        s_prev = s_0
-        mu_prev = mu_0
-        z_enc_prev = z_curr
+    def _integrate_trajectories(self, z_curr, data_list, dt, tf_ratio, tau, hard, is_warmup):
         z_preds = [z_curr]
-
-        # Only do forward dynamics if not in deep warmup
+        seq_len = len(data_list)
         if not is_warmup:
             for t in range(1, seq_len):
                 if np.random.random() < tf_ratio:
                     batch_t_prev = Batch.from_data_list([data_list[t-1]]).to(self.device)
                     z_curr_forced, _, _, _ = self.model.encode(batch_t_prev.x, batch_t_prev.edge_index, batch_t_prev.batch, tau=tau, hard=hard)
                     z_curr = torch.nan_to_num(z_curr_forced)
-
                 t_span = torch.tensor([0, dt], device=self.device, dtype=torch.float32)
                 try:
                     z_next_seq = self.model.forward_dynamics(z_curr, t_span)
                     z_curr = torch.nan_to_num(z_next_seq[1], nan=0.0, posinf=1.0, neginf=-1.0)
-                except Exception as e:
-                    # If ODE solver fails, fallback to previous state and add penalty
+                except Exception:
                     z_curr = z_curr.detach()
                 z_preds.append(z_curr)
         else:
-            # During warmup, just use encoded states
             for t in range(1, seq_len):
                 batch_t = Batch.from_data_list([data_list[t]]).to(self.device)
                 z_t, _, _, _ = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch, tau=tau, hard=hard)
                 z_preds.append(z_t)
+        return torch.stack(z_preds)
 
-        z_preds = torch.stack(z_preds)
+    def train_step(self, data_list, dt, epoch=0, max_epochs=2000):
+        if self.sparsity_scheduler is not None:
+            new_weight = self.sparsity_scheduler.step()
+            if hasattr(self.model.encoder.pooling, 'set_sparsity_weight'):
+                self.model.encoder.pooling.set_sparsity_weight(new_weight)
+
+        is_warmup = epoch < self.warmup_epochs
+        if is_warmup:
+            with torch.no_grad():
+                for idx, val in [(0, -8.0), (6, 5.0), (3, 5.0), (11, 5.0), (1, 5.0), (2, 5.0), (7, 5.0), (10, 5.0)]:
+                    self.model.log_vars[idx].fill_(val)
+
+        is_stage1 = is_warmup
+        for p in self.model.ode_func.parameters(): p.requires_grad = not is_stage1
+        if self.symbolic_proxy is not None:
+            for p in self.symbolic_proxy.parameters(): p.requires_grad = not is_stage1
+
+        if epoch > 0 and epoch % 50 == 0:
+            if hasattr(self.model.encoder.pooling, 'apply_hard_revival'):
+                self.model.encoder.pooling.apply_hard_revival()
+
+        compute_consistency = (epoch >= self.warmup_epochs) and (not is_stage1) and (epoch % self.skip_consistency_freq == 0)
+        if self.enable_gradient_accumulation: self.optimizer.zero_grad(set_to_none=True)
+
+        tau, hard, tf_ratio, entropy_weight = self._get_schedules(epoch, max_epochs)
+        batch_0 = Batch.from_data_list([data_list[0]]).to(self.device)
+        
+        init_res = self._compute_initial_recon_loss(batch_0, tau, hard, entropy_weight)
+        z_curr, s_0, mu_0 = init_res['z_curr'], init_res['s_0'], init_res['mu_0']
+        loss_rec, loss_assign = init_res['loss_rec'], init_res['loss_assign']
+        p_range, p_min, v_std, v_mean = init_res['p_range'], init_res['p_min'], init_res['v_std'], init_res['v_mean']
+
+        loss_curv = self._compute_hamiltonian_curv_loss(z_curr)
+        loss_sym = self._compute_symbolic_loss(z_curr, is_warmup)
+        
+        z_preds = self._integrate_trajectories(z_curr, data_list, dt, tf_ratio, tau, hard, is_warmup)
+        
         loss_l2 = torch.mean(z_preds**2)
-
         z_vel = (z_preds[1:] - z_preds[:-1]) / dt
-        # Curvature penalty (acceleration)
         loss_lvr = torch.mean((z_vel[1:] - z_vel[:-1])**2) if len(z_vel) > 1 else torch.tensor(0.0, device=self.device)
-        # Latent velocity penalty for temporal smoothing
         loss_lvr += 0.1 * torch.mean(z_vel**2) if len(z_vel) > 0 else torch.tensor(0.0, device=self.device)
 
-        s_stability = 0
-        mu_stability = 0
+        loss_pruning = init_res['losses_0']['pruning']
+        loss_sparsity = init_res['losses_0']['sparsity']
+        loss_sep = init_res['losses_0'].get('separation', torch.tensor(0.0, device=self.device))
+        loss_conn = self.model.get_connectivity_loss(s_0, batch_0.edge_index)
+        loss_ortho = self.model.get_ortho_loss(s_0)
+        loss_var = self.model.get_latent_variance_loss(z_curr)
+        loss_align = torch.tensor(0.0, device=self.device)
+        loss_mi = torch.tensor(0.0, device=self.device)
+        loss_cons = torch.tensor(0.0, device=self.device)
 
+        s_prev, mu_prev, z_enc_prev = s_0, mu_0, z_curr
         mu_min = torch.tensor(self.stats['pos_min'], device=self.device, dtype=torch.float32) if self.stats else 0
         mu_range = torch.tensor(self.stats['pos_range'], device=self.device, dtype=torch.float32) if self.stats else 1
+        seq_len = len(data_list)
 
-        # Optimize the target computation loop - only compute targets when needed
-        # Process every other time step to reduce computation
-        for t in range(0, seq_len, 2):  # Process every other time step
+        for t in range(0, seq_len, 2):
             batch_t = Batch.from_data_list([data_list[t]]).to(self.device)
             z_t_target, s_t, losses_t, mu_t = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch, tau=tau, hard=hard)
-
             z_t_target = torch.nan_to_num(z_t_target)
-
-            # Use z_preds for reconstruction to force consistency - Pass stats to keep in physical space
             recon_t = self.model.decode(z_preds[t], s_t, batch_t.batch, stats=self.stats)
-
-            # Explicit denormalization of targets for Reconstruction Scaling fix
-            x_t_phys = torch.cat([
-                0.5 * (batch_t.x[:, :2] + 1.0) * p_range + p_min,
-                batch_t.x[:, 2:4] * v_std + v_mean
-            ], dim=-1)
+            x_t_phys = torch.cat([0.5 * (batch_t.x[:, :2] + 1.0) * p_range + p_min, batch_t.x[:, 2:4] * v_std + v_mean], dim=-1)
 
             loss_rec += self.criterion(recon_t, x_t_phys)
             loss_assign += entropy_weight * losses_t['entropy'] + 2.0 * losses_t['diversity'] + 0.1 * losses_t['spatial']
@@ -561,204 +503,58 @@ class Trainer:
             loss_conn += self.model.get_connectivity_loss(s_t, batch_t.edge_index)
             loss_ortho += self.model.get_ortho_loss(s_t)
 
-            # CoM Position Alignment - Enhanced weight for better physical mapping
             mu_t_norm = 2.0 * (mu_t - mu_min) / mu_range - 1.0
-            d_sub = self.model.encoder.latent_dim // 2 if self.model.hamiltonian else 2
-            d_align = min(d_sub, 2)
-
-            p_align = self.criterion(z_preds[t, :, :, :d_align], mu_t_norm[:, :, :d_align])
-            # Increase the alignment weight to promote stronger physical mapping
-            loss_align += align_weight * 2.0 * p_align  # Doubled the alignment contribution
-
-            # Mutual Information Alignment (Unsupervised)
+            d_align = min(self.model.encoder.latent_dim // 2 if self.model.hamiltonian else 2, 2)
+            loss_align += 2.0 * self.criterion(z_preds[t, :, :, :d_align], mu_t_norm[:, :, :d_align])
             loss_mi += self.model.get_mi_loss(z_preds[t], mu_t_norm)
 
             if t > 0:
-                s_diff = self.criterion(s_t, s_prev)
-                mu_diff = self.criterion(mu_t, mu_prev)
-                z_enc_diff = self.criterion(z_t_target, z_enc_prev)
-                # Point 3: Temporal Smoothing for GNN Encoder - Increased weight for mu_diff and added z_enc_diff
-                loss_assign += s_diff + 10.0 * mu_diff + 0.5 * z_enc_diff
-                if compute_consistency and not is_warmup and t % 2 == 0:  # Only compute consistency every other step
-                    loss_cons += self.criterion(z_preds[t], z_t_target)
-                s_stability += s_diff.item()
-                mu_stability += mu_diff.item()
-            s_prev = s_t
-            mu_prev = mu_t
-            z_enc_prev = z_t_target
+                loss_assign += self.criterion(s_t, s_prev) + 10.0 * self.criterion(mu_t, mu_prev) + 0.5 * self.criterion(z_t_target, z_enc_prev)
+                if compute_consistency and not is_warmup: loss_cons += self.criterion(z_preds[t], z_t_target)
+            s_prev, mu_prev, z_enc_prev = s_t, mu_t, z_t_target
 
-        # Normalization - account for sampling every other step and number of super nodes
-        n_super_nodes = self.model.encoder.n_super_nodes
-        loss_rec /= (seq_len // 2)
-        loss_cons /= ((seq_len // 2) - 1) if (not is_warmup and compute_consistency) else 1
-        loss_assign /= (seq_len // 2)
-        loss_pruning /= (seq_len // 2)
-        loss_sparsity /= (seq_len // 2)
-        loss_ortho /= (seq_len // 2)
-        loss_align /= (seq_len // 2) * n_super_nodes  # Also normalize by number of super nodes
-        loss_mi /= (seq_len // 2) * n_super_nodes    # Also normalize by number of super nodes
-        loss_sep /= (seq_len // 2)
-        loss_conn /= (seq_len // 2)
+        n_steps = (seq_len // 2)
+        loss_rec /= n_steps
+        loss_cons /= (n_steps - 1) if (not is_warmup and compute_consistency) else 1
+        for l in [loss_assign, loss_pruning, loss_sparsity, loss_ortho, loss_sep, loss_conn]: l /= n_steps
+        loss_align /= (n_steps * self.model.encoder.n_super_nodes)
+        loss_mi /= (n_steps * self.model.encoder.n_super_nodes)
 
-        # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning, 8: sep, 9: conn, 10: sparsity, 11: mi, 12: sym, 13: var
         lvars = torch.clamp(self.model.log_vars, min=-6.0, max=5.0)
+        if is_warmup: lvars[11], lvars[3], lvars[12] = 5.0, 5.0, 5.0
 
-        # Apply warmup suppression to auxiliary losses during first 50 epochs
-        if is_warmup:
-            # Suppress MI and ortho losses during warmup
-            lvars[11] = 5.0  # Very high value to suppress MI loss
-            lvars[3] = 5.0   # Very high value to suppress ortho loss
-            lvars[12] = 5.0  # Suppress symbolic loss during warmup
+        raw_losses = {'rec': loss_rec, 'cons': loss_cons, 'assign': loss_assign, 'ortho': loss_ortho, 'l2': loss_l2, 'lvr': loss_lvr, 'align': loss_align, 'pruning': loss_pruning, 'sep': loss_sep, 'conn': loss_conn, 'sparsity': loss_sparsity, 'mi': loss_mi, 'sym': loss_sym, 'var': loss_var}
+        
+        weights = {k: torch.exp(-lvars[i]) for i, k in enumerate(raw_losses.keys())}
+        if self.enhanced_balancer:
+            balanced = self.enhanced_balancer.get_balanced_losses(raw_losses, self.model.parameters())
+            for k in weights:
+                if k in balanced and raw_losses[k].item() != 0: weights[k] = balanced[k] / raw_losses[k]
 
-        raw_weights = {
-            'rec': torch.exp(-lvars[0]), 'cons': torch.exp(-lvars[1]),
-            'assign': torch.exp(-lvars[2]), 'ortho': torch.exp(-lvars[3]),
-            'l2': torch.exp(-lvars[4]), 'lvr': torch.exp(-lvars[5]),
-            'align': torch.exp(-lvars[6]), 'pruning': torch.exp(-lvars[7]),
-            'sep': torch.exp(-lvars[8]), 'conn': torch.exp(-lvars[9]),
-            'sparsity': torch.exp(-lvars[10]), 'mi': torch.exp(-lvars[11]),
-            'sym': torch.exp(-lvars[12]), 'var': torch.exp(-lvars[13])
-        }
+        discovery_loss = sum(weights[k] * torch.clamp(raw_losses[k].to(torch.float32), 0, 100) + lvars[i] for i, k in enumerate(raw_losses.keys()) if k not in ['cons', 'l2', 'lvr'])
+        discovery_loss += (weights['sym'] * (self.symbolic_weight - 1.0) * torch.clamp(loss_sym.to(torch.float32), 0, 100)) # Adjust sym weight
+        discovery_loss += 1e-4 * torch.clamp(loss_curv.to(torch.float32), 0, 100)
+        
+        loss = discovery_loss + (weights['l2'] * 1e-4 * torch.clamp(loss_l2, 0, 100) + lvars[4]) + (weights['lvr'] * 1e-4 * torch.clamp(loss_lvr, 0, 100) + lvars[5])
+        if compute_consistency: loss += (weights['cons'] * torch.clamp(loss_cons, 0, 100) + lvars[1])
+        
+        loss = torch.clamp(loss + 0.1 * torch.sum(lvars**2), 0, 1e4)
+        if not torch.isfinite(loss): loss = loss_rec if torch.isfinite(loss_rec) else torch.tensor(1.0, device=self.device, requires_grad=True)
 
-        # NEW: Use enhanced loss balancer if available
-        if self.enhanced_balancer is not None:
-            # Prepare raw losses for the balancer
-            raw_losses = {
-                'rec': loss_rec, 'cons': loss_cons,
-                'assign': loss_assign, 'ortho': loss_ortho,
-                'l2': loss_l2, 'lvr': loss_lvr,
-                'align': loss_align, 'pruning': loss_pruning,
-                'sep': loss_sep, 'conn': loss_conn,
-                'sparsity': loss_sparsity, 'mi': loss_mi,
-                'sym': loss_sym, 'var': loss_var
-            }
-
-            # Update weights using enhanced balancer
-            if hasattr(self.enhanced_balancer, 'get_balanced_losses'):
-                # Pass model parameters for gradient-based balancing
-                balanced_losses = self.enhanced_balancer.get_balanced_losses(
-                    raw_losses, self.model.parameters()
-                )
-
-                # Extract updated weights from balanced losses
-                for key in raw_weights:
-                    if key in balanced_losses:
-                        # Calculate new weight as balanced_loss / raw_loss
-                        if raw_losses[key].item() != 0:
-                            raw_weights[key] = balanced_losses[key] / raw_losses[key]
-                        else:
-                            raw_weights[key] = raw_weights[key]  # Keep original weight
-
-        weights = raw_weights
-
-        # Clamp individual loss components to prevent gradient explosion and cast to float32 for MPS stability
-        loss_rec_clamped = torch.clamp(loss_rec.to(torch.float32), min=0.0, max=100.0)
-        loss_assign_clamped = torch.clamp(loss_assign.to(torch.float32), min=0.0, max=100.0)
-        loss_ortho_clamped = torch.clamp(loss_ortho.to(torch.float32), min=0.0, max=100.0)
-        loss_align_clamped = torch.clamp(loss_align.to(torch.float32), min=0.0, max=100.0)
-        loss_pruning_clamped = torch.clamp(loss_pruning.to(torch.float32), min=0.0, max=100.0)
-        loss_sep_clamped = torch.clamp(loss_sep.to(torch.float32), min=0.0, max=100.0)
-        loss_conn_clamped = torch.clamp(loss_conn.to(torch.float32), min=0.0, max=100.0)
-        loss_sparsity_clamped = torch.clamp(loss_sparsity.to(torch.float32), min=0.0, max=100.0)
-        loss_mi_clamped = torch.clamp(loss_mi.to(torch.float32), min=0.0, max=100.0)
-        loss_sym_clamped = torch.clamp(loss_sym.to(torch.float32), min=0.0, max=100.0)
-        loss_var_clamped = torch.clamp(loss_var.to(torch.float32), min=0.0, max=100.0)
-        loss_curv_clamped = torch.clamp(loss_curv.to(torch.float32), min=0.0, max=100.0)
-
-        discovery_loss = (weights['rec'] * loss_rec_clamped + lvars[0]) + \
-                         (weights['assign'] * loss_assign_clamped + lvars[2]) + \
-                         (weights['ortho'] * loss_ortho_clamped + lvars[3]) + \
-                         (weights['align'] * loss_align_clamped + lvars[6]) + \
-                         (weights['pruning'] * loss_pruning_clamped + lvars[7]) + \
-                         (weights['sep'] * loss_sep_clamped + lvars[8]) + \
-                         (weights['conn'] * loss_conn_clamped + lvars[9]) + \
-                         (weights['sparsity'] * loss_sparsity_clamped + lvars[10]) + \
-                         (weights['mi'] * loss_mi_clamped + lvars[11]) + \
-                         (weights['sym'] * self.symbolic_weight * loss_sym_clamped + lvars[12]) + \
-                         (weights['var'] * loss_var_clamped + lvars[13]) + \
-                         (1e-4 * loss_curv_clamped)
-
-        # Clamp discovery_loss to prevent explosion
-        discovery_loss = torch.clamp(discovery_loss, min=0.0, max=1000.0)
-
-        if is_warmup:
-            loss = discovery_loss
-        else:
-            # Check for finiteness of components before adding consistency losses
-            if not torch.isfinite(loss_cons): loss_cons = torch.tensor(0.0, device=self.device)
-            if not torch.isfinite(loss_l2): loss_l2 = torch.tensor(0.0, device=self.device)
-            if not torch.isfinite(loss_lvr): loss_lvr = torch.tensor(0.0, device=self.device)
-
-            # Clamp consistency losses as well
-            loss_cons_clamped = torch.clamp(loss_cons, min=0.0, max=100.0)
-            loss_l2_clamped = torch.clamp(loss_l2, min=0.0, max=100.0)
-            loss_lvr_clamped = torch.clamp(loss_lvr, min=0.0, max=100.0)
-
-            # Only add consistency loss if we computed it
-            if compute_consistency:
-                loss = discovery_loss + (weights['cons'] * loss_cons_clamped + lvars[1]) + \
-                       (weights['l2'] * 1e-4 * loss_l2_clamped + lvars[4]) + \
-                       (weights['lvr'] * 1e-4 * loss_lvr_clamped + lvars[5])
-            else:
-                loss = discovery_loss + (weights['l2'] * 1e-4 * loss_l2_clamped + lvars[4]) + \
-                       (weights['lvr'] * 1e-4 * loss_lvr_clamped + lvars[5])
-
-        # Add L2 regularization on lvars to prevent them from growing indefinitely
-        loss += 0.1 * torch.sum(lvars**2)
-
-        # Numerical stability for MPS: clamp total loss to prevent explosion
-        loss = torch.clamp(loss, min=0.0, max=1e4)
-
-        if not torch.isfinite(loss):
-            # Try to recover by ignoring non-finite components
-            print(f"Warning: Non-finite loss detected at epoch {epoch}. Attempting recovery.")
-            # Final fallback to a very small reconstruction loss to keep training alive
-            loss = loss_rec if torch.isfinite(loss_rec) else torch.tensor(1.0, device=self.device, requires_grad=True)
-
-        if not torch.isfinite(loss) or loss.grad_fn is None:
-            if not self.enable_gradient_accumulation:
-                self.optimizer.zero_grad()
-            return 0.0, 0.0, 0.0
-
-        # Handle gradient accumulation
         if self.enable_gradient_accumulation:
-            # Scale loss for gradient accumulation
-            loss = loss / self.grad_acc_steps
-            loss.backward()
-
-            # Perform optimizer step only at the end of accumulation cycle
+            (loss / self.grad_acc_steps).backward()
             if ((epoch + 1) % self.grad_acc_steps == 0) or (epoch == max_epochs - 1):
-                # Increased gradient clipping for better stability
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
-                torch.nn.utils.clip_grad_value_(self.model.parameters(), clip_value=0.1)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
         else:
             loss.backward()
-            # Increased gradient clipping for better stability
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
-            torch.nn.utils.clip_grad_value_(self.model.parameters(), clip_value=0.1)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
             self.optimizer.step()
 
-        # Update loss tracker for logging
-        self.loss_tracker.update({
-            'total': loss,
-            'rec_raw': loss_rec,
-            'cons_raw': loss_cons if compute_consistency else loss_cons,  # Will be 0 if not computed
-            'assign': loss_assign,
-            'align': loss_align,
-            'mi': loss_mi,
-            'sym': loss_sym,
-            'lvar_raw': loss_var,
-            'curv_raw': loss_curv,
-            'lvars_mean': lvars.mean()
-        }, weights=weights)
-
-        # Compute a normalized version for logging/thresholding to keep main_enhanced.py quality gates happy
+        self.loss_tracker.update({'total': loss, 'rec_raw': loss_rec, 'cons_raw': loss_cons, 'assign': loss_assign, 'align': loss_align, 'mi': loss_mi, 'sym': loss_sym, 'lvar_raw': loss_var, 'curv_raw': loss_curv, 'lvars_mean': lvars.mean()}, weights=weights)
         with torch.no_grad():
-            recon_0_norm = self.model.decode(z_curr, s_0, batch_0.batch, stats=None)
-            loss_rec_log = self.criterion(recon_0_norm, batch_0.x)
-        
+            loss_rec_log = self.criterion(self.model.decode(z_curr, s_0, batch_0.batch, stats=None), batch_0.x)
         return loss.item(), loss_rec_log.item(), loss_cons.item() if compute_consistency else 0.0
 
 if __name__ == "__main__":
