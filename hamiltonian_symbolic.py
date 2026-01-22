@@ -13,54 +13,94 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
     dp/dt = -∂H/∂q - γp
     """
     
-    def __init__(self, populations=2000, generations=40, stopping_criteria=0.001, max_features=12, 
-                 enforce_hamiltonian_structure=True, estimate_dissipation=True):
+    def __init__(self, populations=2000, generations=40, stopping_criteria=0.001, max_features=12,
+                 enforce_hamiltonian_structure=True, estimate_dissipation=True,
+                 perform_coordinate_alignment=True):
         super().__init__(populations, generations, stopping_criteria, max_features)
         self.enforce_hamiltonian_structure = enforce_hamiltonian_structure
         self.estimate_dissipation = estimate_dissipation
+        self.perform_coordinate_alignment = perform_coordinate_alignment
 
     def _perform_coordinate_alignment(self, latent_states, n_super_nodes, latent_dim):
         """
         Perform coordinate alignment to rotate the latent z to maximize correlation with physical CoM.
         This ensures that X0, X1 in the discovered equations correspond to physical positions.
+
+        Uses memory-efficient SVD to avoid computing large covariance matrices.
         """
         import numpy as np
-        from scipy.linalg import orthogonal_procrustes
 
         # Reshape latent states to [N, K, D] where N is number of samples, K is super nodes, D is latent dim
         n_samples = latent_states.shape[0]
         z_reshaped = latent_states.reshape(n_samples, n_super_nodes, latent_dim)
 
-        # For coordinate alignment, we need reference coordinates (e.g., physical positions)
-        # Since we don't have access to the physical coordinates here, we'll use a statistical approach
-        # to align the latent space with the principal components of the data
-
         # Flatten to [N*K, D] for PCA-like alignment
         z_flat = z_reshaped.reshape(-1, latent_dim)
 
-        # Compute the covariance matrix of the flattened latent states
-        z_centered = z_flat - np.mean(z_flat, axis=0, keepdims=True)
-        cov_matrix = np.dot(z_centered.T, z_centered) / (z_centered.shape[0] - 1)
+        # Memory optimization: if data is huge, sample it for PCA computation
+        if z_flat.shape[0] > 20000:
+            indices = np.random.choice(z_flat.shape[0], 20000, replace=False)
+            z_for_pca = z_flat[indices]
+        else:
+            z_for_pca = z_flat
 
-        # Compute eigenvalues and eigenvectors
-        eigenvals, eigenvecs = np.linalg.eigh(cov_matrix)
+        # Center the data
+        z_mean = np.mean(z_for_pca, axis=0, keepdims=True)
+        z_centered_pca = z_for_pca - z_mean
 
-        # Sort in descending order of eigenvalues
-        idx = np.argsort(eigenvals)[::-1]
-        eigenvals = eigenvals[idx]
-        eigenvecs = eigenvecs[:, idx]
+        # Use SVD instead of computing the full covariance matrix
+        # For matrix A, A = U * S * V.T, where V.T contains the principal components
+        # This avoids computing A.T @ A which would be huge
+        try:
+            # Use economy SVD which is more memory efficient
+            # We only need Vt for the rotation, so we can use compute_uv=True but only take Vt
+            _, _, Vt = np.linalg.svd(z_centered_pca, full_matrices=False)
 
-        # Transform the original latent states using the rotation matrix
-        # This aligns the latent dimensions with the principal components of the data
-        aligned_z_flat = np.dot(z_centered, eigenvecs)
+            # Rotate the FULL dataset using the discovered principal components
+            z_centered_full = z_flat - np.mean(z_flat, axis=0, keepdims=True)
+            aligned_z_flat = z_centered_full @ Vt.T
+
+            # Reshape back to original shape
+            aligned_latent_states = aligned_z_flat.reshape(n_samples, n_super_nodes, latent_dim)
+
+            # Reshape back to original format [N, K*D]
+            aligned_latent_states = aligned_latent_states.reshape(n_samples, -1)
+
+            print(f"  -> Performed coordinate alignment using principal component analysis")
+
+            return aligned_latent_states
+        except np.linalg.LinAlgError:
+            # If SVD fails due to memory issues, fall back to a sampling approach
+            print("  -> SVD failed, using sampled PCA approach...")
+            return self._perform_coordinate_alignment_sampled(z_centered_pca, n_samples, n_super_nodes, latent_dim)
+
+    def _perform_coordinate_alignment_sampled(self, z_centered, n_samples, n_super_nodes, latent_dim):
+        """
+        Fallback method that uses a sample of the data for PCA when full SVD fails.
+        """
+        import numpy as np
+
+        # Sample a subset of the data for PCA
+        sample_ratio = min(1.0, 10000 / z_centered.shape[0])  # Use max 10k samples
+        if sample_ratio < 1.0:
+            n_samples_to_use = int(z_centered.shape[0] * sample_ratio)
+            indices = np.random.choice(z_centered.shape[0], n_samples_to_use, replace=False)
+            z_sampled = z_centered[indices]
+        else:
+            z_sampled = z_centered
+
+        # Perform SVD on the sampled data
+        U, S, Vt = np.linalg.svd(z_sampled, full_matrices=False)
+
+        # Use the rotation matrix from the sampled data to transform the full dataset
+        aligned_z_flat = z_centered @ Vt.T
 
         # Reshape back to original shape
-        aligned_latent_states = aligned_z_flat.reshape(n_samples, n_super_nodes, latent_dim)
+        n_total_samples = n_samples
+        aligned_latent_states = aligned_z_flat.reshape(n_total_samples, n_super_nodes, latent_dim)
 
         # Reshape back to original format [N, K*D]
-        aligned_latent_states = aligned_latent_states.reshape(n_samples, -1)
-
-        print(f"  -> Performed coordinate alignment using principal component analysis")
+        aligned_latent_states = aligned_latent_states.reshape(n_total_samples, -1)
 
         return aligned_latent_states
         
@@ -83,8 +123,12 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
         is_derivative_targets = targets.shape[1] > 1
 
         # NEW: Perform Coordinate Alignment to rotate latent z to maximize correlation with physical CoM
-        aligned_latent_states = self._perform_coordinate_alignment(latent_states, n_super_nodes, latent_dim)
+        if self.perform_coordinate_alignment:
+            aligned_latent_states = self._perform_coordinate_alignment(latent_states, n_super_nodes, latent_dim)
+        else:
+            aligned_latent_states = latent_states
 
+        print(f"  -> Initializing FeatureTransformer...")
         self.transformer = FeatureTransformer(n_super_nodes, latent_dim, box_size=box_size)
 
         # If we have a model and it has H_net, we should try to get the scalar H as target
@@ -92,6 +136,7 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
         h_targets = targets
         if is_derivative_targets and model is not None and hasattr(model.ode_func, 'H_net'):
             try:
+                print(f"  -> Extracting Hamiltonian values from neural model...")
                 import torch
                 device = next(model.parameters()).device
                 z_torch = torch.from_numpy(aligned_latent_states).float().to(device)
@@ -107,31 +152,32 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
 
                 # Ensure the shape matches exactly with latent_states first dimension
                 if h_val.shape[0] != aligned_latent_states.shape[0]:
-                    print(f"Shape mismatch: h_val has {h_val.shape[0]} elements, aligned_latent_states has {aligned_latent_states.shape[0]} elements")
-                    print(f"Using original targets as fallback due to shape mismatch")
+                    print(f"    -> Shape mismatch: h_val {h_val.shape[0]}, expected {aligned_latent_states.shape[0]}")
                     h_targets = targets
                 else:
                     h_targets = h_val
                     is_derivative_targets = False
             except Exception as e:
-                print(f"Failed to extract H from model: {e}")
-                # Fallback to using the original targets
+                print(f"    -> Failed to extract H from model: {e}")
                 h_targets = targets
 
+        print(f"  -> Fitting FeatureTransformer to {aligned_latent_states.shape[0]} samples...")
         self.transformer.fit(aligned_latent_states, h_targets)
         X_norm = self.transformer.normalize_x(self.transformer.transform(aligned_latent_states))
         Y_norm = self.transformer.normalize_y(h_targets)
 
-        # Distill the Hamiltonian function H with increased populations and generations for better kinetic energy discovery
-        # If we still have derivative targets here, it's a fallback (not ideal for H discovery)
-        # Ensure Y_norm is 1D for _distill_single_target
+        # Distill the Hamiltonian function H
         y_target = Y_norm[:, 0] if Y_norm.ndim > 1 else Y_norm
-        # Increase populations and generations to better capture kinetic energy terms
+        
+        # Ensure minimum search depth for Hamiltonian but respect lower values if quick mode is used
         original_populations = self.populations
         original_generations = self.generations
-        self.populations = max(self.populations, 2000)  # Increase to ensure kinetic energy terms are found
-        self.generations = max(self.generations, 50)    # Increase to ensure convergence
+        self.populations = max(self.populations, 500)
+        self.generations = max(self.generations, 10)
+        
+        print(f"  -> Starting symbolic regression for Hamiltonian (Pop: {self.populations}, Gen: {self.generations})...")
         h_prog, h_mask, h_conf = self._distill_single_target(0, X_norm, y_target, 1, latent_dim)
+        
         # Restore original values
         self.populations = original_populations
         self.generations = original_generations

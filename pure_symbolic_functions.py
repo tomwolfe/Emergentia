@@ -20,7 +20,12 @@ def _safe_log(x):
 
 def _safe_div(x, y):
     """Safe division function that handles division by zero and extreme values."""
-    return np.where(np.abs(y) < 1e-12, 0.0, x / (y + np.sign(y) * 1e-12))
+    # Handle the case where y is zero by returning 0
+    # This ensures closure against zeros in argument vectors as required by gplearn
+    with np.errstate(divide='ignore', invalid='ignore'):
+        result = np.where(np.abs(y) < 1e-12, 0.0, x / np.where(y >= 0, y + 1e-12, y - 1e-12))
+    # Clip the result to prevent overflow
+    return np.clip(result, -1e12, 1e12)
 
 
 def create_safe_functions():

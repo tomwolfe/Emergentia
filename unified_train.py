@@ -197,16 +197,17 @@ def main():
 
         print("Performing symbolic distillation...")
         if args.hamiltonian:
-            # INCREASED: populations to 10,000 and generations to 200 for better convergence
-            populations = 1000 if args.quick_symbolic else 10000
-            generations = 20 if args.quick_symbolic else 200
+            # REDUCED: populations and generations for better performance on standard hardware
+            populations = 1000 if args.quick_symbolic else 2000
+            generations = 20 if args.quick_symbolic else 50
             from hamiltonian_symbolic import HamiltonianSymbolicDistiller
-            distiller = HamiltonianSymbolicDistiller(populations=populations, generations=generations)
+            distiller = HamiltonianSymbolicDistiller(populations=populations, generations=generations,
+                                                   perform_coordinate_alignment=not args.quick_symbolic)
             equations = distiller.distill(z_states, dz_states, args.super_nodes, args.latent_dim, model=model)
         else:
-            # INCREASED: populations to 10,000 and generations to 200 for better convergence
-            populations = 1000 if args.quick_symbolic else 10000
-            generations = 20 if args.quick_symbolic else 200
+            # REDUCED: populations and generations for better performance on standard hardware
+            populations = 1000 if args.quick_symbolic else 2000
+            generations = 20 if args.quick_symbolic else 50
             from symbolic import SymbolicDistiller
             distiller = SymbolicDistiller(populations=populations, generations=generations)
             equations = distiller.distill(z_states, dz_states, args.super_nodes, args.latent_dim)

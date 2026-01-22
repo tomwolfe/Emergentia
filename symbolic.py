@@ -66,16 +66,42 @@ class SymbolicDistiller:
         return getattr(program, 'length_', 1)
 
     def _get_regressor(self, pop, gen, parsimony=0.02):
-        square = make_function(function=lambda x: x**2, name='square', arity=1)
-        # Added inv_square to better capture 1/r^6 and 1/r^12 terms in LJ systems
-        inv_square = make_function(function=lambda x: 1.0/(x**2 + 1e-9), name='inv_square', arity=1)
+        # Safe square function that prevents overflow
+        def safe_square(x):
+            x_clipped = np.clip(x, -1e6, 1e6)  # Prevent large values before squaring
+            return np.clip(x_clipped**2, -1e12, 1e12)  # Also clip result
+
+        square = make_function(function=safe_square, name='square', arity=1)
+
+        # Safe inverse square function that prevents overflow
+        def safe_inv_square(x):
+            x_squared = np.clip(x**2, 1e-12, 1e12)  # Prevent underflow/overflow in x^2
+            result = 1.0 / (x_squared + 1e-9)
+            return np.clip(result, -1e12, 1e12)  # Clip final result
+
+        inv_square = make_function(function=safe_inv_square, name='inv_square', arity=1)
+
+        # Use n_jobs=-1 to utilize all available CPU cores for GP
+        # Added max_samples=0.9 to speed up fitness evaluation and reduce memory
         return SymbolicRegressor(population_size=pop, generations=gen, parsimony_coefficient=parsimony,
                                  function_set=('add', 'sub', 'mul', safe_div, safe_sqrt, safe_log, 'abs', 'neg', safe_inv, square, inv_square),
-                                 n_jobs=1, random_state=42, verbose=0)
+                                 max_samples=0.9, n_jobs=-1, random_state=42, verbose=0)
 
     def _select_features(self, X, y):
-        f_scores, _ = f_regression(X, y)
-        mi_scores = mutual_info_regression(X, y, random_state=42)
+        # Sample data if it's too large for mutual_info_regression
+        if X.shape[0] > 1000:
+            indices = np.random.choice(X.shape[0], 1000, replace=False)
+            X_sample = X[indices]
+            y_sample = y[indices]
+        else:
+            X_sample = X
+            y_sample = y
+
+        f_scores, _ = f_regression(X_sample, y_sample)
+        
+        # mutual_info_regression is slow; using sampled data improves performance significantly
+        mi_scores = mutual_info_regression(X_sample, y_sample, random_state=42)
+        
         combined = 0.5 * (f_scores / (f_scores.max() + 1e-9)) + 0.5 * (mi_scores / (mi_scores.max() + 1e-9))
         mask = np.zeros(X.shape[1], dtype=bool)
         mask[np.argsort(combined)[-self.max_features:]] = True
@@ -91,9 +117,11 @@ class SymbolicDistiller:
             return False
 
     def _distill_single_target(self, i, X, y, targets_shape_1=None, latent_states_shape_1=None, is_hamiltonian=False):
+        print(f"    -> [Target {i}] Selecting top {self.max_features} features...")
         mask = self._select_features(X, y)
         X_sel = X[:, mask]
         
+        print(f"    -> [Target {i}] Fitting LassoCV for baseline...")
         lasso = LassoCV(cv=5).fit(X_sel, y)
         lasso_score = lasso.score(X_sel, y)
         
@@ -105,21 +133,27 @@ class SymbolicDistiller:
                 is_identity = True
         
         if lasso_score > 0.999:
+            print(f"    -> [Target {i}] Lasso found near-perfect fit (R2={lasso_score:.4f}). Skipping GP.")
             return OptimizedExpressionProgram(str(sp.simplify(sum(c*sp.Symbol(f'X{np.where(mask)[0][j]}') for j, c in enumerate(lasso.coef_)) + lasso.intercept_))), mask, lasso_score
             
         # Initial GP search
+        print(f"    -> [Target {i}] Starting initial GP search (Pop: {self.populations}, Gen: {self.generations}, Samples: 90%)...")
         est = self._get_regressor(self.populations, self.generations).fit(X_sel, y)
         score = est.score(X_sel, y)
         program_str = str(est._program)
+        print(f"    -> [Target {i}] Initial GP R2: {score:.4f}")
         
         # PHYSICALITY GATE: Trigger Deep Search if score is low or result is trivial
         is_gp_trivial = re.match(r'^X\d+$', program_str) or re.match(r'^neg\(X\d+\)$', program_str) or len(program_str) < 5
         
         if (score < 0.8) or (is_gp_trivial and score < 0.95) or is_identity:
-            # print(f"Target {i}: Physicality Gate triggered. Score {score:.4f} or trivial result. Starting Deep Search...")
-            est = self._get_regressor(self.populations * 3, self.generations * 2, parsimony=0.01).fit(X_sel, y)
+            p_deep = min(self.populations * 2, 5000) # Capped at 5000 to save RAM
+            g_deep = min(self.generations * 2, 100)  # Capped at 100 to save time
+            print(f"    -> [Target {i}] Physicality Gate triggered. Starting Deep Search (Pop: {p_deep}, Gen: {g_deep})...")
+            est = self._get_regressor(p_deep, g_deep, parsimony=0.01).fit(X_sel, y)
             score = est.score(X_sel, y)
             program_str = str(est._program)
+            print(f"    -> [Target {i}] Deep Search R2: {score:.4f}")
             
         return OptimizedExpressionProgram(program_str), mask, score
 
@@ -198,6 +232,18 @@ def extract_latent_data(model, dataset, dt, include_hamiltonian=False):
     return np.array(states), np.array(derivs), np.linspace(0, len(states)*dt, len(states))
 
 def gp_to_sympy(expr_str, *args, **kwargs):
-    local_dict = {'add': lambda x,y: x+y, 'sub': lambda x,y: x-y, 'mul': lambda x,y: x*y, 'div': lambda x,y: x/(y+1e-9), 'sqrt': lambda x: sp.sqrt(sp.Abs(x)), 'log': lambda x: sp.log(sp.Abs(x)+1e-9), 'abs': sp.Abs, 'neg': lambda x: -x, 'inv': lambda x: 1.0/(x+1e-9), 'square': lambda x: x**2, 'inv_square': lambda x: 1.0/(x**2+1e-9)}
+    local_dict = {
+        'add': lambda x,y: x+y,
+        'sub': lambda x,y: x-y,
+        'mul': lambda x,y: x*y,
+        'div': lambda x,y: x/(y+1e-9),
+        'sqrt': lambda x: sp.sqrt(sp.Abs(x)),
+        'log': lambda x: sp.log(sp.Abs(x)+1e-9),
+        'abs': sp.Abs,
+        'neg': lambda x: -x,
+        'inv': lambda x: 1.0/(x+1e-9),
+        'square': lambda x: sp.Pow(x, 2),  # Using SymPy power function for better handling
+        'inv_square': lambda x: 1.0/(sp.Pow(x, 2)+1e-9)  # Using SymPy power function for better handling
+    }
     return sp.sympify(expr_str, locals=local_dict)
 

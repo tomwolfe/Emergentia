@@ -26,15 +26,24 @@ class RecursiveFeatureSelector:
         X = np.nan_to_num(X, nan=0.0, posinf=1e9, neginf=-1e9)
         y = np.nan_to_num(y, nan=0.0, posinf=1e9, neginf=-1e9)
 
+        # Memory optimization: sample data if it's too large for stable selection
+        if X.shape[0] > 5000:
+            indices = np.random.choice(X.shape[0], 5000, replace=False)
+            X_fit = X[indices]
+            y_fit = y[indices]
+        else:
+            X_fit = X
+            y_fit = y
+
         # 1. Variance filtering to remove constant or near-constant features
-        variances = np.var(X, axis=0)
+        variances = np.var(X_fit, axis=0)
         high_variance_indices = np.where(variances > self.min_variance)[0]
         
         if len(high_variance_indices) == 0:
             self.selected_indices = np.array([], dtype=int)
             return self
             
-        X_filtered = X[:, high_variance_indices]
+        X_filtered = X_fit[:, high_variance_indices]
         
         # 2. Use Orthogonal Matching Pursuit or LassoLars for selection
         from sklearn.linear_model import OrthogonalMatchingPursuit, LassoLarsCV
@@ -50,7 +59,7 @@ class RecursiveFeatureSelector:
             # LassoLars is often more stable for feature selection than OMP
             lasso = LassoLarsCV(cv=3, max_iter=500)
             # Use the first output for feature selection if multi-output is provided
-            y_selection = y[:, 0] if y.ndim > 1 else y
+            y_selection = y_fit[:, 0] if y_fit.ndim > 1 else y_fit
             lasso.fit(X_filtered, y_selection)
             
             # Get indices of non-zero coefficients
