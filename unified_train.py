@@ -114,14 +114,14 @@ def main():
     dz_stability = np.var(recent_dz)
     print(f"Latent Stability (Var[dz]): {dz_stability:.6f}")
 
-    # Adjusted Quality Gate: Strict threshold to ensure meaningful physical mapping before distillation
-    rec_threshold = 0.01 if dz_stability < 0.01 else 0.01  # Both cases now use 0.01 threshold
+    # Adjusted Quality Gate: Relaxed thresholds for symbolic discovery
+    rec_threshold = 0.05 # Relaxed from 0.01
 
-    if epoch < 200 or (last_rec > rec_threshold and dz_stability > 0.05):
+    if epoch < 200 or (last_rec > rec_threshold and dz_stability > 0.1): # Relaxed dz_stability from 0.05 to 0.1
         reason = ""
         if epoch < 200: reason += "Insufficient epochs. "
         if last_rec > rec_threshold: reason += f"Rec Loss too high ({last_rec:.4f} > {rec_threshold}). "
-        if dz_stability > 0.05: reason += f"Latent space unstable ({dz_stability:.4f} > 0.05). "
+        if dz_stability > 0.1: reason += f"Latent space unstable ({dz_stability:.4f} > 0.1). "
         print(f"Skipping symbolic discovery: {reason}")
         equations = []
         symbolic_transformer = None

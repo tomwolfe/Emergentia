@@ -378,10 +378,10 @@ class Trainer:
         # Manually re-balance initial log_vars for stability - PRIORITIZE RECONSTRUCTION
         with torch.no_grad():
             self.model.log_vars.fill_(0.0)
-            # 2 is assign loss - set to 2.0 (exp(-2.0) ~= 0.13) to prevent initial dominance
-            self.model.log_vars[2].fill_(2.0)
-            # 0 is rec loss - set to -2.0 (exp(2.0) ~= 7.4) to prioritize reconstruction more strongly
-            self.model.log_vars[0].fill_(-2.0)
+            # 2 is assign loss - set to 5.0 (exp(-5.0) ~= 0.006) to prevent initial dominance
+            self.model.log_vars[2].fill_(5.0)
+            # 0 is rec loss - set to -5.0 (exp(5.0) ~= 148.4) to prioritize reconstruction more strongly
+            self.model.log_vars[0].fill_(-5.0)
 
         # Significantly increase spatial and connectivity loss multipliers by 10x
         if hasattr(self.model.encoder.pooling, 'temporal_consistency_weight'):
@@ -402,9 +402,10 @@ class Trainer:
         else:
             self.mps_ode_on_cpu = False
 
-        # Separate H_net and GNNEncoder.assign_mlp parameters to apply specific weight decay
+        # Separate H_net, GNNEncoder.assign_mlp, and GNNEncoder.output_layer parameters to apply specific weight decay
         h_net_params = []
         assign_mlp_params = []
+        output_layer_params = []
         other_params = []
 
         if hasattr(self.model.ode_func, 'H_net'):
@@ -412,10 +413,17 @@ class Trainer:
 
         if hasattr(self.model.encoder.pooling, 'assign_mlp'):
             assign_mlp_params = list(self.model.encoder.pooling.assign_mlp.parameters())
+            
+        if hasattr(self.model.encoder, 'output_layer'):
+            output_layer_params = list(self.model.encoder.output_layer.parameters())
 
         h_ids = {id(p) for p in h_net_params}
         assign_ids = {id(p) for p in assign_mlp_params}
-        other_params = [p for p in self.model.parameters() if id(p) not in h_ids and id(p) not in assign_ids and id(p) != id(self.model.log_vars)]
+        output_ids = {id(p) for p in output_layer_params}
+        
+        other_params = [p for p in self.model.parameters() 
+                       if id(p) not in h_ids and id(p) not in assign_ids 
+                       and id(p) not in output_ids and id(p) != id(self.model.log_vars)]
 
         param_groups = [
             {'params': other_params, 'weight_decay': 1e-5},
@@ -426,6 +434,8 @@ class Trainer:
             param_groups.append({'params': h_net_params, 'weight_decay': 1e-2}) # Increased from 1e-3
         if assign_mlp_params:
             param_groups.append({'params': assign_mlp_params, 'weight_decay': 1e-2}) # Penalize rapid assignment changes
+        if output_layer_params:
+            param_groups.append({'params': output_layer_params, 'weight_decay': 1e-2}) # Prevent high-frequency latent oscillations
 
         self.optimizer = optim.Adam(param_groups, lr=lr)
         self.criterion = torch.nn.MSELoss().to(device)
@@ -590,29 +600,29 @@ class Trainer:
             if hasattr(self.model.encoder.pooling, 'set_sparsity_weight'):
                 self.model.encoder.pooling.set_sparsity_weight(new_weight)
 
-        is_stage1 = epoch < 50
+        is_stage1 = epoch < 100 # Increased from 50
         is_warmup = epoch < self.warmup_epochs
         if is_stage1:
             # During Stage 1 (Warmup), we freeze the adaptive balancer and
             # use fixed weights to encourage spatial coherence.
-            # Apply Reconstruction-First Warmup: set rec_loss weight to 10x and assign_loss to 0.1x
+            # Apply Reconstruction-First Warmup: set rec_loss weight to 100x and others low
             with torch.no_grad():
-                self.model.log_vars.fill_(0.0)  # Reset all log_vars to 0
-                # Set rec_loss weight to 10x (log(10) ≈ 2.3)
-                self.model.log_vars[0].fill_(np.log(10.0))
-                # Set assign_loss weight to 0.1x (log(0.1) ≈ -2.3)
-                self.model.log_vars[2].fill_(np.log(0.1))
+                self.model.log_vars.fill_(2.0)  # Set most weights to exp(-2) ≈ 0.13
+                # Set rec_loss weight to 100x (exp(-(-4.6)) ≈ 100)
+                self.model.log_vars[0].fill_(-4.6)
+                # Set assign_loss weight to very low during initial phase
+                self.model.log_vars[2].fill_(5.0)
 
         # ODE dynamics only start after warmup
-        for p in self.model.ode_func.parameters(): p.requires_grad = not is_stage1
+        for p in self.model.ode_func.parameters(): p.requires_grad = not is_warmup
         if self.symbolic_proxy is not None:
-            for p in self.symbolic_proxy.parameters(): p.requires_grad = not is_stage1
+            for p in self.symbolic_proxy.parameters(): p.requires_grad = not is_warmup
 
         if epoch > 0 and epoch % 50 == 0:
             if hasattr(self.model.encoder.pooling, 'apply_hard_revival'):
                 self.model.encoder.pooling.apply_hard_revival()
 
-        compute_consistency = (epoch >= self.warmup_epochs) and (not is_stage1) and (epoch % self.skip_consistency_freq == 0)
+        compute_consistency = (epoch >= self.warmup_epochs) and (epoch % self.skip_consistency_freq == 0)
         if self.enable_gradient_accumulation: self.optimizer.zero_grad(set_to_none=True)
 
         tau, hard, tf_ratio, entropy_weight = self._get_schedules(epoch, max_epochs)
@@ -758,9 +768,9 @@ class Trainer:
         # Add smoothing loss to the total loss - INCREASED WEIGHT FOR DAMPING
         smooth_idx = list(raw_losses.keys()).index('smooth')  # This should be 15
         if smooth_idx < len(lvars):  # Make sure the index exists
-            loss += (weights['smooth'] * 20.0 * torch.clamp(loss_smooth, 0, 100) + lvars[smooth_idx])  # Increased from 2.0 to 20.0
+            loss += (weights['smooth'] * 100.0 * torch.clamp(loss_smooth, 0, 100) + lvars[smooth_idx])  # Increased from 20.0 to 100.0
         else:
-            loss += weights['smooth'] * 20.0 * torch.clamp(loss_smooth, 0, 100)  # Just apply weight without log_var - INCREASED to 20.0
+            loss += weights['smooth'] * 100.0 * torch.clamp(loss_smooth, 0, 100)  # Just apply weight without log_var - INCREASED to 100.0
         
         loss = torch.clamp(loss + 0.1 * torch.sum(lvars**2), 0, 1e4)
         if not torch.isfinite(loss): loss = loss_rec if torch.isfinite(loss_rec) else torch.tensor(1.0, device=self.device, requires_grad=True)

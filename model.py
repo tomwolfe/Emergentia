@@ -592,18 +592,25 @@ class DiscoveryEngineModel(nn.Module):
             atol = 1e-5 + eps
 
         # Use a more efficient solver during training, but accurate one for evaluation
-        if self.training:
+        if is_mps:
+            method = 'rk4'
+            # Fixed step size for MPS stability as requested
+            dt = (t[1] - t[0]).item() if len(t) > 1 else 0.01
+            options = {'step_size': dt}
+        elif self.training:
             method = 'euler'  # Fastest fixed-step method during early training
+            options = None
         else:
             method = 'rk4'  # Faster than dopri5 but still reasonably accurate
+            options = None
 
         # Use the selected solver
         if self.hamiltonian and self.training:
             # Use adjoint method to save memory when training Hamiltonian
             # The adjoint method is more memory efficient for backpropagating through ODEs
-            zt_flat = odeint_adjoint(self.ode_func, y0, t_ode, rtol=rtol, atol=atol, method=method)
+            zt_flat = odeint_adjoint(self.ode_func, y0, t_ode, rtol=rtol, atol=atol, method=method, options=options)
         else:
-            zt_flat = odeint(self.ode_func, y0, t_ode, rtol=rtol, atol=atol, method=method)
+            zt_flat = odeint(self.ode_func, y0, t_ode, rtol=rtol, atol=atol, method=method, options=options)
 
         # Move back to original device
         zt_flat = zt_flat.to(original_device)

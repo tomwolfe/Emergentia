@@ -141,7 +141,7 @@ class StableHierarchicalPooling(nn.Module):
             effective_active = torch.clamp(current_active + revival_mask, 0, 1)
 
             # Use a much slower EMA for smoothness as requested
-            ema_rate = 0.001 # Extremely smooth EMA (0.999 weight on previous)
+            ema_rate = 0.0001 # Decreased from 0.001 to 0.0001 for much slower pruning
             if hard:
                 ema_rate *= 0.5 # Even slower updates during hard sampling
 
@@ -150,12 +150,12 @@ class StableHierarchicalPooling(nn.Module):
             # Ensure minimum number of super-nodes remain active to prevent total collapse
             n_active_now = (self.active_mask > 0.5).sum().item()
             if n_active_now < self.min_active_super_nodes:
-                # Force-revive the nodes with highest average logits to meet minimum requirement
-                avg_logits = logits.mean(dim=0)
-                _, most_needed_indices = torch.topk(avg_logits, self.min_active_super_nodes, largest=True)
+                # Force-revive the nodes with highest average assignments to meet minimum requirement
+                _, most_needed_indices = torch.topk(avg_s, self.min_active_super_nodes, largest=True)
                 new_active = self.active_mask.clone()
+                new_active.zero_()
                 new_active[most_needed_indices] = 1.0
-                self.active_mask.copy_(new_active)  # Direct assignment instead of EMA to enforce constraint
+                self.active_mask.copy_(new_active)  # Direct reset instead of EMA to enforce constraint
 
             # Double-check that the constraint is met after update
             n_active_final = (self.active_mask > 0.5).sum().item()
