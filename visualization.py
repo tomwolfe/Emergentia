@@ -40,12 +40,15 @@ def plot_discovery_results(model, dataset, pos_raw, s, z_states, assignments, ou
 
         # Overlay symbolic predictions if available and compatible
         if symbolic_predictions is not None and k < symbolic_predictions.shape[1]:
-            # Ensure we don't exceed the time dimension
-            time_dim = min(z_states.shape[0], symbolic_predictions.shape[0])
-            axes[1, 0].plot(symbolic_predictions[:time_dim, k, 0],
-                           label=f'Node {k} - q1 (Symbolic)', linestyle='-.', alpha=0.8)
-            axes[1, 0].plot(symbolic_predictions[:time_dim, k, 1],
-                           label=f'Node {k} - q2 (Symbolic)', linestyle=':', alpha=0.8)
+            try:
+                # Ensure we don't exceed the time dimension
+                time_dim = min(z_states.shape[0], symbolic_predictions.shape[0])
+                axes[1, 0].plot(symbolic_predictions[:time_dim, k, 0],
+                               label=f'Node {k} - q1 (Symbolic)', linestyle='-.', alpha=0.8)
+                axes[1, 0].plot(symbolic_predictions[:time_dim, k, 1],
+                               label=f'Node {k} - q2 (Symbolic)', linestyle=':', alpha=0.8)
+            except Exception as e:
+                print(f"Warning: Failed to plot symbolic prediction (traj) for node {k}: {e}")
 
     axes[1, 0].set_title(f"Latent Trajectories (First {n_plot} nodes)")
     axes[1, 0].set_xlabel("Time step")
@@ -58,10 +61,13 @@ def plot_discovery_results(model, dataset, pos_raw, s, z_states, assignments, ou
 
             # Overlay symbolic predictions if available and compatible
             if symbolic_predictions is not None and k < symbolic_predictions.shape[1]:
-                time_dim = min(z_states.shape[0], symbolic_predictions.shape[0])
-                axes[1, 1].plot(symbolic_predictions[:time_dim, k, 0],
-                               symbolic_predictions[:time_dim, k, 2],
-                               label=f'Node {k} (Symbolic)', linestyle='--', alpha=0.8)
+                try:
+                    time_dim = min(z_states.shape[0], symbolic_predictions.shape[0])
+                    axes[1, 1].plot(symbolic_predictions[:time_dim, k, 0],
+                                   symbolic_predictions[:time_dim, k, 2],
+                                   label=f'Node {k} (Symbolic)', linestyle='--', alpha=0.8)
+                except Exception as e:
+                    print(f"Warning: Failed to plot symbolic prediction (phase q-p) for node {k}: {e}")
 
         axes[1, 1].set_title("Latent Phase Space (q vs p)")
         axes[1, 1].set_xlabel("q")
@@ -72,10 +78,13 @@ def plot_discovery_results(model, dataset, pos_raw, s, z_states, assignments, ou
 
             # Overlay symbolic predictions if available and compatible
             if symbolic_predictions is not None and k < symbolic_predictions.shape[1]:
-                time_dim = min(z_states.shape[0], symbolic_predictions.shape[0])
-                axes[1, 1].plot(symbolic_predictions[:time_dim, k, 0],
-                               symbolic_predictions[:time_dim, k, 1],
-                               label=f'Node {k} (Symbolic)', linestyle='--', alpha=0.8)
+                try:
+                    time_dim = min(z_states.shape[0], symbolic_predictions.shape[0])
+                    axes[1, 1].plot(symbolic_predictions[:time_dim, k, 0],
+                                   symbolic_predictions[:time_dim, k, 1],
+                                   label=f'Node {k} (Symbolic)', linestyle='--', alpha=0.8)
+                except Exception as e:
+                    print(f"Warning: Failed to plot symbolic prediction (phase q1-q2) for node {k}: {e}")
 
         axes[1, 1].set_title("Latent Trajectories (q1 vs q2)")
         axes[1, 1].set_xlabel("q1")

@@ -150,6 +150,18 @@ class TorchFeatureTransformer(torch.nn.Module):
         self.register_buffer('target_mean', torch.from_numpy(transformer.target_mean).float())
         self.register_buffer('target_std', torch.from_numpy(transformer.target_std).float())
 
+        # NEW: Register feature selection mask if it exists to match distillation dimensions
+        if hasattr(transformer, 'selected_feature_indices') and transformer.selected_feature_indices is not None:
+            self.register_buffer('feature_mask', torch.from_numpy(np.array(transformer.selected_feature_indices)).long())
+        elif hasattr(transformer, 'selector') and transformer.selector is not None:
+            try:
+                indices = transformer.selector.get_support(indices=True)
+                self.register_buffer('feature_mask', torch.from_numpy(np.array(indices)).long())
+            except:
+                self.feature_mask = None
+        else:
+            self.feature_mask = None
+
     def forward(self, z_flat):
         # z_flat: [Batch, K * D]
         # Safety clamp
@@ -209,6 +221,13 @@ class TorchFeatureTransformer(torch.nn.Module):
         X_poly = torch.cat(poly_features, dim=1)
         # Final safety clamp
         X_poly = torch.clamp(X_poly, -1e6, 1e6)
+
+        # NEW: Apply feature mask if present to match distilled feature set
+        if self.feature_mask is not None:
+            # Only use indices that are within the current feature vector size
+            valid_mask = self.feature_mask[self.feature_mask < X_poly.size(1)]
+            X_poly = X_poly[:, valid_mask]
+            
         return (X_poly - self.x_poly_mean) / self.x_poly_std
 
     def denormalize_y(self, Y_norm):

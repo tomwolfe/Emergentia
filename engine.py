@@ -235,6 +235,9 @@ class SymbolicProxy(torch.nn.Module):
         
     def forward(self, z_flat):
         # z_flat: [Batch, K * D]
+        # Ensure input is float32 for MPS stability
+        z_flat = z_flat.to(torch.float32)
+        
         # 1. Differentiable feature transformation
         X_norm = self.torch_transformer(z_flat)
 
@@ -242,16 +245,27 @@ class SymbolicProxy(torch.nn.Module):
         y_preds = []
         for sym_mod in self.sym_modules:
             if sym_mod is not None:
-                y_preds.append(sym_mod(X_norm))
+                # NEW: Safety check to match n_inputs
+                if X_norm.size(1) != sym_mod.n_inputs:
+                    if X_norm.size(1) > sym_mod.n_inputs:
+                        X_input = X_norm[:, :sym_mod.n_inputs]
+                    else:
+                        padding = torch.zeros((X_norm.size(0), sym_mod.n_inputs - X_norm.size(1)), 
+                                              device=X_norm.device, dtype=X_norm.dtype)
+                        X_input = torch.cat([X_norm, padding], dim=1)
+                else:
+                    X_input = X_norm
+                
+                y_preds.append(sym_mod(X_input))
             else:
-                y_preds.append(torch.zeros(z_flat.size(0), device=z_flat.device))
+                y_preds.append(torch.zeros(z_flat.size(0), device=z_flat.device, dtype=torch.float32))
 
         Y_norm_pred = torch.stack(y_preds, dim=1)
 
         # 3. Denormalize
         Y_pred = self.torch_transformer.denormalize_y(Y_norm_pred)
 
-        return Y_pred
+        return Y_pred.to(z_flat.dtype)
 
 class Trainer:
     def __init__(self, model, lr=5e-4, device='cpu', stats=None, align_anneal_epochs=1000,
@@ -616,6 +630,11 @@ class Trainer:
             balanced = self.enhanced_balancer.get_balanced_losses(raw_losses, self.model.parameters())
             for k in weights:
                 if k in balanced and raw_losses[k].item() != 0: weights[k] = balanced[k] / raw_losses[k]
+
+        # NEW: Reconstruction-First logic
+        # If reconstruction is poor, suppress assignment weight to prioritize physics over clustering
+        if raw_losses['rec'].item() > 0.1:
+            weights['assign'] = min(weights['assign'], 1.0)
 
         discovery_loss = sum(weights[k] * torch.clamp(raw_losses[k], 0, 100) + lvars[i] for i, k in enumerate(raw_losses.keys()) if k not in ['cons', 'l2', 'lvr'])
         discovery_loss += (weights['sym'] * (self.symbolic_weight - 1.0) * torch.clamp(loss_sym.to(torch.float32), 0, 100)) # Adjust sym weight
