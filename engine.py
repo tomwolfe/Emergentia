@@ -226,32 +226,23 @@ class SymbolicProxy(torch.nn.Module):
         # Since there might be inconsistencies in how the feature selection is handled,
         # we'll determine the actual number of features by running a dummy forward pass
         try:
-            dummy_input = torch.randn(1, n_super_nodes * latent_dim, dtype=self.torch_transformer.x_poly_mean.dtype, device=self.torch_transformer.x_poly_mean.device)
+            # Use same device and dtype as the transformer buffers
+            dummy_input = torch.zeros(1, n_super_nodes * latent_dim, 
+                                     dtype=self.torch_transformer.x_poly_mean.dtype, 
+                                     device=self.torch_transformer.x_poly_mean.device)
             with torch.no_grad():
                 dummy_output = self.torch_transformer(dummy_input)
                 n_inputs = dummy_output.size(1)
                 print(f"DEBUG: Determined actual output size from TorchFeatureTransformer: {n_inputs}")
         except Exception as e:
-            # Fallback to using the size of normalization parameters
-            if hasattr(self.torch_transformer, 'feature_mask') and self.torch_transformer.feature_mask is not None:
+            # Fallback to using the size of feature mask if dummy pass fails
+            if hasattr(self.torch_transformer, 'feature_mask') and self.torch_transformer.feature_mask.numel() > 0:
                 n_inputs = self.torch_transformer.feature_mask.size(0)
-                print(f"DEBUG: Using feature_mask size: {n_inputs}")
+                print(f"DEBUG: Using feature_mask size fallback: {n_inputs}")
             else:
-                # Use the size of normalization parameters, but make sure to account for feature selection
+                # Use the size of normalization parameters as last resort
                 n_inputs = self.torch_transformer.x_poly_mean.size(0)
-                print(f"DEBUG: Using normalization parameter size: {n_inputs}")
-
-                # If the transformer has selected_feature_indices, use that to determine actual feature count
-                if hasattr(transformer, 'selected_feature_indices') and transformer.selected_feature_indices is not None:
-                    indices = transformer.selected_feature_indices
-                    if isinstance(indices, (np.ndarray, list)):
-                        indices_np = np.array(indices)
-                        if indices_np.dtype == bool:
-                            n_inputs = int(np.sum(indices_np))
-                            print(f"DEBUG: Using sum of boolean selected_feature_indices: {n_inputs}")
-                        else:
-                            n_inputs = len(indices_np)
-                            print(f"DEBUG: Using selected_feature_indices length: {n_inputs}")
+                print(f"DEBUG: Using normalization parameter size fallback: {n_inputs}")
 
         for eq in equations:
             if eq is not None:

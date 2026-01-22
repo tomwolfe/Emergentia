@@ -43,7 +43,18 @@ class SymPyToTorch(torch.nn.Module):
             sp.tan: self._safe_tan,
             sp.Abs: torch.abs,
             sp.sqrt: lambda x: torch.sqrt(torch.abs(x) + self.eps),
+            # Add explicit support for potential remaining gplearn-style functions
+            sp.Function('sub'): torch.sub,
+            sp.Function('add'): torch.add,
+            sp.Function('mul'): torch.mul,
+            sp.Function('div'): self._safe_div,
+            sp.Function('neg'): torch.neg,
+            sp.Function('inv'): lambda x: 1.0 / (x + self.eps),
+            sp.Function('square'): lambda x: torch.pow(x, 2),
         }
+
+    def _safe_div(self, x, y):
+        return x / (y + torch.sign(y + 1e-12) * self.eps)
 
     def _safe_pow(self, x, y):
         # Handle division (y < 0) and square roots (y = 0.5) safely
@@ -146,16 +157,10 @@ class TorchFeatureTransformer(torch.nn.Module):
         self.box_size = transformer.box_size
         self.basis_functions = getattr(transformer, 'basis_functions', 'physics_informed')
 
-        # Register buffers for normalization parameters
-        # Apply feature selection to normalization parameters if feature mask exists
-        if hasattr(transformer, 'selected_feature_indices') and transformer.selected_feature_indices is not None:
-            selected_indices = transformer.selected_feature_indices
-            self.register_buffer('x_poly_mean', torch.from_numpy(transformer.x_poly_mean[selected_indices]).float())
-            self.register_buffer('x_poly_std', torch.from_numpy(transformer.x_poly_std[selected_indices]).float())
-        else:
-            self.register_buffer('x_poly_mean', torch.from_numpy(transformer.x_poly_mean).float())
-            self.register_buffer('x_poly_std', torch.from_numpy(transformer.x_poly_std).float())
-
+        # Register FULL buffers for normalization parameters
+        # We now store full buffers and apply masking in forward() to avoid shape mismatches
+        self.register_buffer('x_poly_mean', torch.from_numpy(transformer.x_poly_mean).float())
+        self.register_buffer('x_poly_std', torch.from_numpy(transformer.x_poly_std).float())
         self.register_buffer('target_mean', torch.from_numpy(transformer.target_mean).float())
         self.register_buffer('target_std', torch.from_numpy(transformer.target_std).float())
 
@@ -175,17 +180,14 @@ class TorchFeatureTransformer(torch.nn.Module):
                 self.register_buffer('feature_mask', torch.from_numpy(np.array(indices)).long())
             except Exception as e:
                 print(f"DEBUG: Failed to get feature mask from selector: {e}")
-                self.register_buffer('feature_mask', torch.tensor([], dtype=torch.long))  # Empty tensor instead of None
+                self.register_buffer('feature_mask', torch.tensor([], dtype=torch.long))
         else:
-            # If no explicit feature selection was done, we need to determine the actual number of features
-            # The number of features after transformation is stored in x_poly_mean
-            self.register_buffer('feature_mask', torch.tensor([], dtype=torch.long))  # Empty tensor instead of None
-            print(f"DEBUG: No feature selection found in original transformer")
+            self.register_buffer('feature_mask', torch.tensor([], dtype=torch.long))
 
     def forward(self, z_flat):
         # z_flat: [Batch, K * D]
         # Safety clamp
-        z_flat = torch.clamp(z_flat, -1e6, 1e6)
+        z_flat = torch.clamp(z_flat.to(torch.float32), -1e6, 1e6)
         batch_size = z_flat.size(0)
         z_nodes = z_flat.view(batch_size, self.n_super_nodes, self.latent_dim)
 
@@ -215,15 +217,18 @@ class TorchFeatureTransformer(torch.nn.Module):
         X_expanded = torch.nan_to_num(X_expanded, nan=0.0, posinf=1e9, neginf=-1e9)
         X_expanded = torch.clamp(X_expanded, -1e12, 1e12)
 
-        # Apply feature mask if present to match distilled feature set
-        if self.feature_mask is not None and self.feature_mask.numel() > 0:
-            # Ensure mask is on correct device
-            mask = self.feature_mask.to(X_expanded.device)
-            # Only use indices that are within the current feature vector size
-            valid_mask = mask[mask < X_expanded.size(1)]
-            X_expanded = X_expanded[:, valid_mask]
+        # 1. Normalize using FULL buffers
+        X_norm_full = (X_expanded - self.x_poly_mean) / self.x_poly_std
 
-        return (X_expanded - self.x_poly_mean) / self.x_poly_std
+        # 2. Apply feature mask AFTER normalization to match distilled feature set
+        if self.feature_mask is not None and self.feature_mask.numel() > 0:
+            mask = self.feature_mask.to(X_expanded.device)
+            # Ensure indices are within bounds
+            valid_mask = mask[mask < X_norm_full.size(1)]
+            X_norm_selected = X_norm_full[:, valid_mask]
+            return X_norm_selected
+
+        return X_norm_full
 
     def _compute_distance_features(self, z_nodes):
         """
@@ -242,7 +247,7 @@ class TorchFeatureTransformer(torch.nn.Module):
 
         if self.box_size is not None:
             # Minimum Image Convention
-            box = torch.tensor(self.box_size, device=z_nodes.device, dtype=z_nodes.dtype)
+            box = torch.tensor(self.box_size, device=z_nodes.device, dtype=torch.float32)
             diff -= box * torch.round(diff / box)
 
         # [Batch, n_pairs]
@@ -280,50 +285,46 @@ class TorchFeatureTransformer(torch.nn.Module):
         batch_size, n_total_features = X.shape
         n_raw_latents = self.n_super_nodes * self.latent_dim
 
+        # For small systems, target < 40 features by skipping higher-order terms
+        if self.n_super_nodes <= 4:
+            # Match BalancedFeatureTransformer: return just X
+            return X
+
         # 1. Base features: Raw latents + already computed distance features
         features = [X]
 
-        # For small systems, target < 40 features by skipping higher-order terms
-        if self.n_super_nodes <= 4:
-            X_expanded = torch.cat(features, dim=1)
-        else:
-            # 2. Squares of raw latents: [Batch, n_raw_latents]
-            X_raw = X[:, :n_raw_latents]
-            features.append(X_raw**2)
+        # 2. Squares of raw latents: [Batch, n_raw_latents]
+        X_raw = X[:, :n_raw_latents]
+        features.append(X_raw**2)
 
-            # 3. Intra-node cross-terms: O(K * D^2)
-            # Using vectorized outer product per node
-            X_nodes = X_raw.reshape(batch_size, self.n_super_nodes, self.latent_dim)
-            intra_terms = []
-            for i in range(self.latent_dim):
-                for j in range(i + 1, self.latent_dim):
-                    intra_terms.append(X_nodes[:, :, i] * X_nodes[:, :, j])
+        # 3. Intra-node cross-terms: O(K * D^2)
+        X_nodes = X_raw.reshape(batch_size, self.n_super_nodes, self.latent_dim)
+        intra_terms = []
+        for i in range(self.latent_dim):
+            for j in range(i + 1, self.latent_dim):
+                intra_terms.append(X_nodes[:, :, i] * X_nodes[:, :, j])
 
-            if intra_terms:
-                features.append(torch.stack(intra_terms, dim=-1).reshape(batch_size, -1))
+        if intra_terms:
+            features.append(torch.stack(intra_terms, dim=-1).reshape(batch_size, -1))
 
-            # 4. Inter-node cross-terms (same dimension): O(D * K^2)
-            # We only consider pairs of nodes here.
-            inter_terms = []
-            for d in range(self.latent_dim):
-                # Vectorized pair-wise multiplication for this dimension
-                # [Batch, K]
-                val_d = X_nodes[:, :, d]
-                i_idx, j_idx = torch.triu_indices(self.n_super_nodes, self.n_super_nodes, offset=1, device=X_nodes.device)
-                inter_terms.append(val_d[:, i_idx] * val_d[:, j_idx])
+        # 4. Inter-node cross-terms (same dimension): O(D * K^2)
+        inter_terms = []
+        for d in range(self.latent_dim):
+            val_d = X_nodes[:, :, d]
+            i_idx, j_idx = torch.triu_indices(self.n_super_nodes, self.n_super_nodes, offset=1, device=X_nodes.device)
+            inter_terms.append(val_d[:, i_idx] * val_d[:, j_idx])
 
-            if inter_terms:
-                features.append(torch.stack(inter_terms, dim=-1).reshape(batch_size, -1))
+        if inter_terms:
+            features.append(torch.stack(inter_terms, dim=-1).reshape(batch_size, -1))
 
-            # Combine all features
-            X_expanded = torch.cat(features, dim=1)
+        # Combine all features
+        X_expanded = torch.cat(features, dim=1)
 
-            # Memory Safety: If the number of features is still too large,
-            # we can perform a quick variance-based pruning here
-            if X_expanded.shape[1] > 1000:
-                variances = torch.var(X_expanded, dim=0)
-                top_indices = torch.argsort(variances, descending=True)[:1000]
-                X_expanded = X_expanded[:, top_indices]
+        # Memory Safety
+        if X_expanded.shape[1] > 1000:
+            variances = torch.var(X_expanded, dim=0)
+            top_indices = torch.argsort(variances, descending=True)[:1000]
+            X_expanded = X_expanded[:, top_indices]
 
         return X_expanded
 

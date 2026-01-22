@@ -19,100 +19,20 @@ warnings.filterwarnings('ignore')
 # Sanitized Symbolic Primitives
 from pure_symbolic_functions import create_safe_functions
 safe_sqrt, safe_log, safe_div, safe_inv = create_safe_functions()
-
-class FeatureTransformer:
-    """
-    Consolidated Feature Transformer with physics-inspired features and normalization.
-    """
-    def __init__(self, n_super_nodes, latent_dim, include_dists=True, box_size=None):
-        self.n_super_nodes = n_super_nodes
-        self.latent_dim = latent_dim
-        self.include_dists = include_dists
-        self.box_size = box_size
-        self.x_poly_mean = None
-        self.x_poly_std = None
-        self.target_mean = None
-        self.target_std = None
-        self.selector = None
-
-    def fit(self, latent_states, targets):
-        X_poly = self.transform(latent_states)
-        self.x_poly_mean = X_poly.mean(axis=0)
-        self.x_poly_std = X_poly.std(axis=0) + 1e-6
-        self.target_mean = targets.mean(axis=0)
-        self.target_std = targets.std(axis=0) + 1e-6
-
-    def transform(self, z_flat):
-        if torch.is_tensor(z_flat):
-            z_flat = z_flat.detach().cpu().numpy()
-        if z_flat.ndim == 1:
-            z_flat = z_flat.reshape(1, -1)
-            
-        batch_size = z_flat.shape[0]
-        n_nodes = self.n_super_nodes
-        n_dims = self.latent_dim
-        z_flat = np.clip(z_flat, -1e6, 1e6)
-        z_nodes = z_flat.reshape(batch_size, n_nodes, n_dims)
-
-        features = [z_flat]
-        if self.include_dists:
-            pos = z_nodes[:, :, :2]
-            diffs = pos[:, :, None, :] - pos[:, None, :, :]
-            if self.box_size is not None:
-                box = np.array(self.box_size)
-                diffs = diffs - box * np.round(diffs / box)
-            
-            dists_matrix = np.linalg.norm(diffs, axis=-1)
-            i_idx, j_idx = np.triu_indices(n_nodes, k=1)
-            dists_flat = dists_matrix[:, i_idx, j_idx]
-            dists_flat = np.maximum(dists_flat, 1e-3)
-            
-            exp_dist = np.exp(-np.clip(dists_flat, 0, 20))
-            features.extend([
-                dists_flat, 1.0/(dists_flat + 0.1), 1.0/(dists_flat**2 + 0.1),
-                exp_dist, exp_dist/(dists_flat + 0.1), np.log(dists_flat + 1.0)
-            ])
-            
-            half_d = n_dims // 2
-            p_vars = z_nodes[:, :, half_d:]
-            features.append(np.sum(p_vars**2, axis=-1))
-
-        X = np.hstack(features)
-        X = np.clip(X, -1e3, 1e3)
-        poly_features = [X]
-        max_poly = min(20, n_nodes * n_dims)
-        for i in range(max_poly):
-            v_idx = i % (n_nodes * n_dims)
-            poly_features.append(X[:, v_idx:v_idx+1]**2)
-            node_idx = v_idx // n_dims
-            for j in range(v_idx + 1, min(v_idx + 4, (node_idx + 1) * n_dims)):
-                poly_features.append(X[:, v_idx:v_idx+1] * X[:, j:j+1])
-        
-        X_out = np.clip(np.hstack(poly_features), -1e6, 1e6)
-        
-        # Feature Pruning: remove near-constant or highly redundant features
-        if self.selector is not None:
-            try:
-                X_out = self.selector.transform(X_out)
-            except:
-                pass # Fallback to raw features if selector fails
-        
-        return X_out
-
-    def normalize_x(self, X_poly): return (X_poly - self.x_poly_mean) / self.x_poly_std
-    def normalize_y(self, Y): return (Y - self.target_mean) / self.target_std
-    def denormalize_y(self, Y_norm): return Y_norm * self.target_std + self.target_mean
+from balanced_features import BalancedFeatureTransformer as FeatureTransformer
 
 class OptimizedExpressionProgram:
     def __init__(self, expr_str, original_program=None):
         self.expr_str = expr_str
         self.original_program = original_program
         try:
-            self.sympy_expr = sp.sympify(expr_str)
+            # Use the robust gp_to_sympy logic for consistency
+            self.sympy_expr = gp_to_sympy(expr_str)
             self.symbols = sorted(list(self.sympy_expr.free_symbols), key=lambda s: str(s))
             self.func = sp.lambdify(self.symbols, self.sympy_expr, modules=['numpy'])
             self.length_ = len(self.sympy_expr.args) if self.sympy_expr.is_Add else 1
-        except:
+        except Exception as e:
+            # print(f"DEBUG: OptimizedExpressionProgram failed for {expr_str}: {e}")
             self.func = None
             self.length_ = getattr(original_program, 'length_', 1) if original_program else 1
 
@@ -203,13 +123,6 @@ class SymbolicDistiller:
 
     def distill(self, latent_states, targets, n_super_nodes, latent_dim, box_size=None, hamiltonian=False):
         self.transformer = FeatureTransformer(n_super_nodes, latent_dim, box_size=box_size)
-        
-        # If pruning is needed, initialize selector
-        X_raw = self.transformer.transform(latent_states)
-        if latent_states.shape[0] < X_raw.shape[1]:
-            k = max(1, latent_states.shape[0] // 2)
-            self.transformer.selector = SelectKBest(f_regression, k=k).fit(X_raw, targets[:, 0])
-        
         self.transformer.fit(latent_states, targets)
         X_norm = self.transformer.normalize_x(self.transformer.transform(latent_states))
         Y_norm = self.transformer.normalize_y(targets)

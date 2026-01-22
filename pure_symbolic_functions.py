@@ -9,18 +9,18 @@ from gplearn.functions import make_function
 
 
 def _safe_sqrt(x):
-    """Safe square root function that handles negative inputs."""
-    return np.sqrt(np.abs(x))
+    """Safe square root function that handles negative inputs and very small values."""
+    return np.sqrt(np.abs(x) + 1e-12)
 
 
 def _safe_log(x):
-    """Safe logarithm function that handles zero and negative inputs."""
-    return np.log(np.abs(x) + 1e-9)
+    """Safe logarithm function that handles zero and negative inputs with better epsilon."""
+    return np.log(np.abs(x) + 1e-12)
 
 
 def _safe_div(x, y):
-    """Safe division function that handles division by zero."""
-    return np.where(np.abs(y) < 1e-9, 1.0, x / y)
+    """Safe division function that handles division by zero and extreme values."""
+    return np.where(np.abs(y) < 1e-12, 0.0, x / (y + np.sign(y) * 1e-12))
 
 
 def create_safe_functions():

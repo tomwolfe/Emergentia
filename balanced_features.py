@@ -143,14 +143,13 @@ class BalancedFeatureTransformer:
         # 2. Transform to poly features
         X_poly = self.transform(latent_states, fit_transformer=True)
 
-        # 3. Perform feature selection BEFORE fitting poly normalization to save memory/time
+        # 3. Fit poly feature normalization on ALL features (to support full buffers in Torch)
+        self.x_poly_mean = X_poly.mean(axis=0)
+        self.x_poly_std = X_poly.std(axis=0) + 1e-6
+
+        # 4. Perform feature selection
         self._perform_feature_selection(X_poly, targets)
         
-        # 4. Fit poly feature normalization on SELECTED features
-        X_selected = X_poly[:, self.selected_feature_indices]
-        self.x_poly_mean = X_selected.mean(axis=0)
-        self.x_poly_std = X_selected.std(axis=0) + 1e-6
-
         # 5. Fit target normalization
         if targets.ndim == 1:
             self.target_mean = targets.mean()
@@ -247,7 +246,8 @@ class BalancedFeatureTransformer:
         
         # For small systems, target < 40 features by skipping higher-order terms
         if self.n_super_nodes <= 4:
-            return np.concatenate(features, axis=1)
+            # Important: return just the base features without further expansion
+            return X
 
         # 2. Squares of raw latents: [Batch, n_raw_latents]
         X_raw = X[:, :n_raw_latents]
@@ -334,8 +334,9 @@ class BalancedFeatureTransformer:
         """
         Normalize features using fitted statistics.
         """
-        X_selected = X_poly[:, self.selected_feature_indices]
-        return (X_selected - self.x_poly_mean) / self.x_poly_std
+        # Normalize ALL first, then slice. This ensures consistency with TorchFeatureTransformer
+        X_norm_full = (X_poly - self.x_poly_mean) / self.x_poly_std
+        return X_norm_full[:, self.selected_feature_indices]
 
     def normalize_y(self, Y):
         return (Y - self.target_mean) / self.target_std

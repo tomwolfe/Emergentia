@@ -66,6 +66,17 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
         
         if h_prog is None:
             return super().distill(latent_states, targets, n_super_nodes, latent_dim, box_size)
+
+        # Validate Hamiltonian stability before accepting
+        # Check for NaNs or Infs on the training buffer
+        try:
+            h_pred = h_prog.execute(X_norm[:, h_mask])
+            if not np.all(np.isfinite(h_pred)):
+                print("Warning: Discovered Hamiltonian produces NaNs/Infs. Reducing confidence.")
+                h_conf *= 0.1
+        except Exception as e:
+            print(f"Warning: Failed to validate Hamiltonian stability: {e}")
+            h_conf = 0.0
             
         # Estimate dissipation coefficients γ
         dissipation_coeffs = np.zeros(n_super_nodes)
@@ -89,11 +100,12 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
             
             # Convert discovered program to SymPy
             expr_str = str(h_prog)
-            n_vars = X_norm.shape[1]
-            sympy_expr = gp_to_sympy(expr_str, n_features=n_vars)
+            n_vars = X_norm.shape[1]  # Number of selected features
+            sympy_expr = gp_to_sympy(expr_str)
             
-            # Compute analytical gradients
-            sympy_vars = [sp.Symbol(f'x{i}') for i in range(n_vars)]
+            # Compute analytical gradients with respect to the input features X0, X1, ...
+            # These X variables correspond to the masked features
+            sympy_vars = [sp.Symbol(f'X{i}') for i in range(n_vars)]
             grad_funcs = []
             for var in sympy_vars:
                 # sp.diff computes the analytical derivative
@@ -201,30 +213,30 @@ class HamiltonianEquation:
         
         # If we have analytical gradients, use them for much higher precision
         if self.grad_funcs is not None:
+            # We must use the transformer to get the selected features
             X_p = transformer.transform(z.reshape(1, -1))
-            X_n = transformer.normalize_x(X_p)
+            X_n = transformer.normalize_x(X_p) # Already sliced to mask
             
-            # Compute full Jacobian of the transformation dX/dz
-            # X = f(z) -> dH/dz = dH/dX * dX/dz
-            dX_dz = transformer.transform_jacobian(z) # [n_features, n_latents]
+            # Compute full Jacobian of the transformation dX/dz for ALL features
+            # and then slice it to the selected features
+            dX_dz = transformer.transform_jacobian(z) # [n_selected, n_latents]
             
-            # dH/dX: gradients of H with respect to its input features
-            # We only care about features in the mask
+            # dH/dX: gradients of H with respect to its input features (masked ones)
             dH_dX = np.zeros(X_n.shape[1])
-            # The grad_funcs are expected to be ordered the same as features
             for i, grad_f in enumerate(self.grad_funcs):
                 if grad_f is not None:
-                    # Execute lambdified gradient function
-                    # Some grad_funcs might need all features as input
                     try:
+                        # Pass all masked features to the lambdified gradient function
                         val = grad_f(*[X_n[0, j] for j in range(X_n.shape[1])])
                         dH_dX[i] = val
                     except:
                         pass
             
             # dH/dz = dH/dX @ dX_dz
-            # Account for normalization: dH/dz = (dH/dX_norm / X_std) @ dX_dz
-            dH_dX_norm = dH_dX / transformer.x_poly_std
+            # Account for normalization: dH/dz = (dH/dX_norm / X_std_selected) @ dX_dz
+            # transformer.x_poly_std is the FULL array now, so we must slice it
+            x_std_selected = transformer.x_poly_std[self.feature_mask]
+            dH_dX_norm = dH_dX / x_std_selected
             dH_dz = dH_dX_norm @ dX_dz
             
             for k in range(self.n_super_nodes):
