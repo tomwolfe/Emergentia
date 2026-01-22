@@ -163,6 +163,14 @@ class StableHierarchicalPooling(nn.Module):
                 _, forced_indices = torch.topk(avg_s, self.min_active_super_nodes, largest=True)
                 self.active_mask[forced_indices] = 1.0
 
+        # FINAL HARD CHECK: Perform a hard check at the end to ensure constraint is met
+        final_check = (self.active_mask > 0.5).sum().item()
+        if final_check < self.min_active_super_nodes:
+            # Emergency activation: activate nodes with highest avg_s values
+            _, emergency_indices = torch.topk(avg_s, self.min_active_super_nodes, largest=True)
+            self.active_mask.zero_()
+            self.active_mask[emergency_indices] = 1.0
+
         entropy = -torch.mean(torch.sum(s * torch.log(s + 1e-9), dim=1))
         
         # STABILITY FIX: Change diversity_loss from raw entropy to KL(Uniform || avg_s)

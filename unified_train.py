@@ -207,8 +207,30 @@ def main():
             # Log dimensions for debugging if mismatch occurs
             print(f"DEBUG: SymbolicProxy input z_tensor shape: {z_tensor.shape}")
             if trainer.symbolic_proxy is not None:
-                expected_in = trainer.symbolic_proxy.torch_transformer.x_poly_mean.size(0)
-                print(f"DEBUG: SymbolicProxy expects {expected_in} features (pre-mask)")
+                # Check the actual number of features the SymPyToTorch modules expect
+                if trainer.symbolic_proxy.sym_modules and trainer.symbolic_proxy.sym_modules[0] is not None:
+                    expected_by_module = trainer.symbolic_proxy.sym_modules[0].n_inputs
+                    print(f"DEBUG: SymPyToTorch module expects {expected_by_module} features")
+
+                # Also check what the transformer thinks it should output
+                expected_by_transformer = trainer.symbolic_proxy.torch_transformer.x_poly_mean.size(0)
+                print(f"DEBUG: TorchFeatureTransformer normalization params suggest {expected_by_transformer} features")
+
+                # Check if there's a feature mask
+                if hasattr(trainer.symbolic_proxy.torch_transformer, 'feature_mask') and trainer.symbolic_proxy.torch_transformer.feature_mask is not None:
+                    mask_size = trainer.symbolic_proxy.torch_transformer.feature_mask.size(0)
+                    print(f"DEBUG: TorchFeatureTransformer feature_mask size: {mask_size}")
+                else:
+                    print(f"DEBUG: TorchFeatureTransformer has no feature_mask or it's None")
+
+                # Also check the actual output size after transformation
+                try:
+                    with torch.no_grad():
+                        dummy_input = torch.randn(1, 16)  # Same size as actual input
+                        transformed_output = trainer.symbolic_proxy.torch_transformer(dummy_input)
+                        print(f"DEBUG: Actual transformed output size: {transformed_output.size(1)}")
+                except Exception as e:
+                    print(f"DEBUG: Error getting transformed output size: {e}")
 
             # Get symbolic predictions
             with torch.no_grad():

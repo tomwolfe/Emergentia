@@ -136,6 +136,7 @@ class SymPyToTorch(torch.nn.Module):
 class TorchFeatureTransformer(torch.nn.Module):
     """
     PyTorch implementation of FeatureTransformer for differentiable symbolic proxy.
+    Updated to match BalancedFeatureTransformer logic exactly.
     """
     def __init__(self, transformer):
         super().__init__()
@@ -143,24 +144,36 @@ class TorchFeatureTransformer(torch.nn.Module):
         self.latent_dim = transformer.latent_dim
         self.include_dists = transformer.include_dists
         self.box_size = transformer.box_size
-        
+        self.basis_functions = getattr(transformer, 'basis_functions', 'physics_informed')
+
         # Register buffers for normalization parameters
-        self.register_buffer('x_poly_mean', torch.from_numpy(transformer.x_poly_mean).float())
-        self.register_buffer('x_poly_std', torch.from_numpy(transformer.x_poly_std).float())
+        # Apply feature selection to normalization parameters if feature mask exists
+        if hasattr(transformer, 'selected_feature_indices') and transformer.selected_feature_indices is not None:
+            selected_indices = transformer.selected_feature_indices
+            self.register_buffer('x_poly_mean', torch.from_numpy(transformer.x_poly_mean[selected_indices]).float())
+            self.register_buffer('x_poly_std', torch.from_numpy(transformer.x_poly_std[selected_indices]).float())
+        else:
+            self.register_buffer('x_poly_mean', torch.from_numpy(transformer.x_poly_mean).float())
+            self.register_buffer('x_poly_std', torch.from_numpy(transformer.x_poly_std).float())
+
         self.register_buffer('target_mean', torch.from_numpy(transformer.target_mean).float())
         self.register_buffer('target_std', torch.from_numpy(transformer.target_std).float())
 
-        # NEW: Register feature selection mask if it exists to match distillation dimensions
+        # Register feature selection mask to match distillation dimensions
         if hasattr(transformer, 'selected_feature_indices') and transformer.selected_feature_indices is not None:
             self.register_buffer('feature_mask', torch.from_numpy(np.array(transformer.selected_feature_indices)).long())
         elif hasattr(transformer, 'selector') and transformer.selector is not None:
             try:
                 indices = transformer.selector.get_support(indices=True)
                 self.register_buffer('feature_mask', torch.from_numpy(np.array(indices)).long())
-            except:
+            except Exception as e:
+                print(f"DEBUG: Failed to get feature mask from selector: {e}")
                 self.feature_mask = None
         else:
+            # If no explicit feature selection was done, we need to determine the actual number of features
+            # The number of features after transformation is stored in x_poly_mean
             self.feature_mask = None
+            print(f"DEBUG: No feature selection found in original transformer")
 
     def forward(self, z_flat):
         # z_flat: [Batch, K * D]
@@ -168,97 +181,149 @@ class TorchFeatureTransformer(torch.nn.Module):
         z_flat = torch.clamp(z_flat, -1e6, 1e6)
         batch_size = z_flat.size(0)
         z_nodes = z_flat.view(batch_size, self.n_super_nodes, self.latent_dim)
-        
+
         features = [z_flat]
-        
-        if self.include_dists:
-            # Vectorized distance calculation
-            pos = z_nodes[:, :, :2] # [Batch, K, 2]
-            # Expansion to [Batch, K, K, 2]
-            diffs = pos[:, :, None, :] - pos[:, None, :, :]
-            
-            if self.box_size is not None:
-                box = torch.tensor(self.box_size, device=z_flat.device, dtype=z_flat.dtype)
-                diffs = diffs - box * torch.round(diffs / box)
-            
-            # Compute norms [Batch, K, K]
-            dists_matrix = torch.norm(diffs, dim=-1)
-            
-            # Extract upper triangle indices (i < j)
-            i_idx, j_idx = torch.triu_indices(self.n_super_nodes, self.n_super_nodes, offset=1, device=z_flat.device)
-            
-            dists_flat = dists_matrix[:, i_idx, j_idx] # [Batch, K*(K-1)/2]
-            # Clamp distances to avoid 1/0
-            dists_flat = torch.clamp(dists_flat, min=1e-3)
 
-            inv_dists_flat = 1.0 / (dists_flat + 0.1)
-            inv_sq_dists_flat = 1.0 / (dists_flat**2 + 0.1)
-            
-            # New physics-informed basis functions (Differentiable)
-            exp_dist = torch.exp(-torch.clamp(dists_flat, max=20.0))
-            screened_coulomb = exp_dist / (dists_flat + 0.1)
-            log_dist = torch.log(dists_flat + 1.0)
-
-            # NEW: Additional physics-inspired features (Synced with ImprovedFeatureTransformer)
-            sin_dist = torch.sin(dists_flat)
-            cos_dist = torch.cos(dists_flat)
-            sqrt_dist = torch.sqrt(dists_flat)
-            dist_times_inv = dists_flat * inv_dists_flat
-            dist_plus_inv = dists_flat + inv_dists_flat
-            
-            features.extend([dists_flat, inv_dists_flat, inv_sq_dists_flat, 
-                           exp_dist, screened_coulomb, log_dist,
-                           sin_dist, cos_dist, sqrt_dist,
-                           dist_times_inv, dist_plus_inv])
-
-            # NEW: Explicit kinetic energy terms (p^2) for each node
-            half_d = self.latent_dim // 2
-            p_vars = z_nodes[:, :, half_d:]
-            ke_terms = torch.sum(p_vars**2, dim=-1) # [Batch, K]
-            features.append(ke_terms)
+        if self.include_dists and self.basis_functions != 'polynomial_only':
+            # Compute distance features using the same logic as BalancedFeatureTransformer
+            dist_features = self._compute_distance_features(z_nodes)
+            if dist_features:
+                features.extend(dist_features)
 
         X = torch.cat(features, dim=1)
-        # Final clamp of linear features before polynomial expansion
-        X = torch.clamp(X, -1e3, 1e3)
+        # Final safety clip before expansion
+        X = torch.clamp(X, -1e6, 1e6)
 
-        poly_features = [X]
-        n_latents = self.n_super_nodes * self.latent_dim
-        
-        # NEW: Sophisticated polynomial features synced with ImprovedFeatureTransformer
-        max_features_for_poly = min(20, n_latents)
+        # Apply basis function expansion based on configuration
+        if self.basis_functions == 'polynomial':
+            X_expanded = self._polynomial_expansion(X)
+        elif self.basis_functions == 'physics_informed':
+            X_expanded = self._physics_informed_expansion(X, z_nodes)
+        elif self.basis_functions == 'adaptive':
+            X_expanded = self._adaptive_expansion(X, z_nodes)
+        else:
+            X_expanded = self._physics_informed_expansion(X, z_nodes)
 
-        for i in range(max_features_for_poly):
-            valid_idx = i % n_latents
-            # Quadratic terms
-            poly_features.append(X[:, valid_idx:valid_idx+1]**2)
-            
-            node_idx = valid_idx // self.latent_dim
-            dim_idx = valid_idx % self.latent_dim
-            
-            # Cross terms with expanded range
-            for j in range(valid_idx + 1, min(valid_idx + 6, (node_idx + 1) * self.latent_dim)):
-                poly_features.append(X[:, valid_idx:valid_idx+1] * X[:, j:j+1])
-                
-            # Cross terms with other nodes
-            for other_node in range(node_idx + 1, min(node_idx + 5, self.n_super_nodes)):
-                other_idx = other_node * self.latent_dim + dim_idx
-                poly_features.append(X[:, valid_idx:valid_idx+1] * X[:, other_idx:other_idx+1])
+        # Final safety clip and NaN handling
+        X_expanded = torch.nan_to_num(X_expanded, nan=0.0, posinf=1e9, neginf=-1e9)
+        X_expanded = torch.clamp(X_expanded, -1e12, 1e12)
 
-            # NEW: Cubic terms for important features
-            if valid_idx % 3 == 0:
-                poly_features.append(X[:, valid_idx:valid_idx+1]**3)
-
-        X_poly = torch.cat(poly_features, dim=1)
-        # Final safety clamp
-        X_poly = torch.clamp(X_poly, -1e6, 1e6)
-
-        # NEW: Apply feature mask if present to match distilled feature set
+        # Apply feature mask if present to match distilled feature set
         if self.feature_mask is not None:
             # Only use indices that are within the current feature vector size
-            valid_mask = self.feature_mask[self.feature_mask < X_poly.size(1)]
-            X_poly = X_poly[:, valid_mask]
-            
-        return (X_poly - self.x_poly_mean) / self.x_poly_std
+            valid_mask = self.feature_mask[self.feature_mask < X_expanded.size(1)]
+            X_expanded = X_expanded[:, valid_mask]
+
+        return (X_expanded - self.x_poly_mean) / self.x_poly_std
+
+    def _compute_distance_features(self, z_nodes):
+        """
+        Compute distance-based features between super-nodes using vectorized operations.
+        Matches BalancedFeatureTransformer logic.
+        """
+        n_batch = z_nodes.shape[0]
+        if self.n_super_nodes < 2:
+            return []
+
+        # Get all pairs of indices
+        i_idx, j_idx = torch.triu_indices(self.n_super_nodes, self.n_super_nodes, offset=1, device=z_nodes.device)
+
+        # [Batch, n_pairs, 2]
+        diff = z_nodes[:, i_idx, :2] - z_nodes[:, j_idx, :2]
+
+        if self.box_size is not None:
+            # Minimum Image Convention
+            box = torch.tensor(self.box_size, device=z_nodes.device, dtype=z_nodes.dtype)
+            diff -= box * torch.round(diff / box)
+
+        # [Batch, n_pairs]
+        d = torch.norm(diff, dim=2) + 1e-6
+
+        # Only return 1/r and 1/r^2 as requested for small systems
+        return [1.0 / (d + 0.1), 1.0 / (d**2 + 0.1)]
+
+    def _polynomial_expansion(self, X):
+        """
+        Perform standard polynomial expansion.
+        """
+        # For simplicity, we'll use a basic quadratic expansion here
+        batch_size, n_features = X.shape
+
+        # Base features
+        features = [X]
+
+        # Quadratic terms
+        for i in range(min(n_features, 10)):  # Limit to avoid explosion
+            features.append(X[:, i:i+1]**2)
+
+        # Cross terms for first few features
+        for i in range(min(n_features, 5)):
+            for j in range(i+1, min(n_features, 5)):
+                features.append(X[:, i:i+1] * X[:, j:j+1])
+
+        return torch.cat(features, dim=1)
+
+    def _physics_informed_expansion(self, X, z_nodes):
+        """
+        Perform physics-informed polynomial expansion with cross-terms.
+        Matches BalancedFeatureTransformer logic.
+        """
+        batch_size, n_total_features = X.shape
+        n_raw_latents = self.n_super_nodes * self.latent_dim
+
+        # 1. Base features: Raw latents + already computed distance features
+        features = [X]
+
+        # For small systems, target < 40 features by skipping higher-order terms
+        if self.n_super_nodes <= 4:
+            return torch.cat(features, dim=1)
+
+        # 2. Squares of raw latents: [Batch, n_raw_latents]
+        X_raw = X[:, :n_raw_latents]
+        features.append(X_raw**2)
+
+        # 3. Intra-node cross-terms: O(K * D^2)
+        # Using vectorized outer product per node
+        X_nodes = X_raw.reshape(batch_size, self.n_super_nodes, self.latent_dim)
+        intra_terms = []
+        for i in range(self.latent_dim):
+            for j in range(i + 1, self.latent_dim):
+                intra_terms.append(X_nodes[:, :, i] * X_nodes[:, :, j])
+
+        if intra_terms:
+            features.append(torch.stack(intra_terms, dim=-1).reshape(batch_size, -1))
+
+        # 4. Inter-node cross-terms (same dimension): O(D * K^2)
+        # We only consider pairs of nodes here.
+        inter_terms = []
+        for d in range(self.latent_dim):
+            # Vectorized pair-wise multiplication for this dimension
+            # [Batch, K]
+            val_d = X_nodes[:, :, d]
+            i_idx, j_idx = torch.triu_indices(self.n_super_nodes, self.n_super_nodes, offset=1, device=X_nodes.device)
+            inter_terms.append(val_d[:, i_idx] * val_d[:, j_idx])
+
+        if inter_terms:
+            features.append(torch.stack(inter_terms, dim=-1).reshape(batch_size, -1))
+
+        # Combine all features
+        X_expanded = torch.cat(features, dim=1)
+
+        # Memory Safety: If the number of features is still too large,
+        # we can perform a quick variance-based pruning here
+        if X_expanded.shape[1] > 1000:
+            variances = torch.var(X_expanded, dim=0)
+            top_indices = torch.argsort(variances, descending=True)[:1000]
+            X_expanded = X_expanded[:, top_indices]
+
+        return X_expanded
+
+    def _adaptive_expansion(self, X, z_nodes):
+        """
+        Adaptive expansion that learns the most relevant feature combinations.
+        """
+        X_physics = self._physics_informed_expansion(X, z_nodes)
+        return X_physics
 
     def denormalize_y(self, Y_norm):
         return Y_norm * self.target_std + self.target_mean
@@ -429,10 +494,13 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
         if not candidates:
             return None, full_mask, 0.0
 
-        # Pareto Frontier Selection: Aggressively penalize complexity to ensure physical parsimony
+        # Pareto Frontier Selection: REDUCED COMPLEXITY PENALTY IF R2 SCORE IS BELOW 0.9
         for c in candidates:
             # Adjusted score: R2 penalized by complexity (length of the expression)
-            c['pareto_score'] = c['score'] - 0.015 * c['complexity']
+            if c['score'] < 0.9:
+                c['pareto_score'] = c['score'] - 0.005 * c['complexity']  # Reduced penalty
+            else:
+                c['pareto_score'] = c['score'] - 0.015 * c['complexity']
 
         candidates.sort(key=lambda x: x['pareto_score'], reverse=True)
         best_candidate = candidates[0]

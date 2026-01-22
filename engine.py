@@ -210,17 +210,33 @@ class SymbolicProxy(torch.nn.Module):
         super().__init__()
         self.n_super_nodes = n_super_nodes
         self.latent_dim = latent_dim
-        
+
         # 1. Initialize differentiable feature transformer
         from enhanced_symbolic import TorchFeatureTransformer, SymPyToTorch
         self.torch_transformer = TorchFeatureTransformer(transformer)
-        
+
         # 2. Initialize differentiable symbolic modules
         self.sym_modules = torch.nn.ModuleList()
         from symbolic import gp_to_sympy
-        
-        n_inputs = self.torch_transformer.x_poly_mean.size(0)
-        
+
+        # Calculate n_inputs as the number of features AFTER feature selection
+        # The number of inputs to SymPyToTorch should match what TorchFeatureTransformer.forward() outputs
+        # Since there might be inconsistencies in how the feature selection is handled,
+        # we'll determine the actual number of features by running a dummy forward pass
+        try:
+            dummy_input = torch.randn(1, n_super_nodes * latent_dim, dtype=self.torch_transformer.x_poly_mean.dtype, device=self.torch_transformer.x_poly_mean.device)
+            with torch.no_grad():
+                dummy_output = self.torch_transformer(dummy_input)
+                n_inputs = dummy_output.size(1)
+                print(f"DEBUG: Determined actual output size from TorchFeatureTransformer: {n_inputs}")
+        except Exception as e:
+            # Fallback to using the size of normalization parameters
+            if hasattr(self.torch_transformer, 'feature_mask') and self.torch_transformer.feature_mask is not None:
+                n_inputs = self.torch_transformer.feature_mask.size(0)
+            else:
+                n_inputs = self.torch_transformer.x_poly_mean.size(0)
+            print(f"DEBUG: Failed to determine output size from dummy forward pass, using fallback: {n_inputs}, error: {e}")
+
         for eq in equations:
             if eq is not None:
                 # Check if it's already a wrapped program with a sympy expression
@@ -228,16 +244,22 @@ class SymbolicProxy(torch.nn.Module):
                     sympy_expr = eq.sympy_expr
                 else:
                     sympy_expr = gp_to_sympy(str(eq))
-                
-                self.sym_modules.append(SymPyToTorch(sympy_expr, n_inputs))
+
+                # For Hamiltonian equations, we may need to handle them differently
+                if hasattr(eq, 'compute_derivatives'):
+                    # This is a Hamiltonian equation that computes derivatives differently
+                    # We'll handle this specially in the forward pass
+                    self.sym_modules.append(SymPyToTorch(sympy_expr, n_inputs))
+                else:
+                    self.sym_modules.append(SymPyToTorch(sympy_expr, n_inputs))
             else:
                 self.sym_modules.append(None)
-        
+
     def forward(self, z_flat):
         # z_flat: [Batch, K * D]
         # Ensure input is float32 for MPS stability
         z_flat = z_flat.to(torch.float32)
-        
+
         # 1. Differentiable feature transformation
         X_norm = self.torch_transformer(z_flat)
 
@@ -245,17 +267,25 @@ class SymbolicProxy(torch.nn.Module):
         y_preds = []
         for sym_mod in self.sym_modules:
             if sym_mod is not None:
-                # NEW: Safety check to match n_inputs
+                # At this point, X_norm has been transformed and masked by torch_transformer
+                # The torch_transformer applies the feature mask AFTER normalization
+                # So X_norm.size(1) should match the number of selected features
+                # But double-check and handle mismatches gracefully
                 if X_norm.size(1) != sym_mod.n_inputs:
+                    print(f"DEBUG: Tensor size mismatch in symbolic proxy: X_norm has {X_norm.size(1)} features but SymPyToTorch expects {sym_mod.n_inputs} features")
+                    # Adjust X_norm to match expected input size
                     if X_norm.size(1) > sym_mod.n_inputs:
                         X_input = X_norm[:, :sym_mod.n_inputs]
-                    else:
-                        padding = torch.zeros((X_norm.size(0), sym_mod.n_inputs - X_norm.size(1)), 
+                    elif X_norm.size(1) < sym_mod.n_inputs:
+                        # Pad with zeros to match expected size
+                        padding = torch.zeros((X_norm.size(0), sym_mod.n_inputs - X_norm.size(1)),
                                               device=X_norm.device, dtype=X_norm.dtype)
                         X_input = torch.cat([X_norm, padding], dim=1)
+                    else:
+                        X_input = X_norm
                 else:
                     X_input = X_norm
-                
+
                 y_preds.append(sym_mod(X_input))
             else:
                 y_preds.append(torch.zeros(z_flat.size(0), device=z_flat.device, dtype=torch.float32))
@@ -265,7 +295,7 @@ class SymbolicProxy(torch.nn.Module):
         # 3. Denormalize
         Y_pred = self.torch_transformer.denormalize_y(Y_norm_pred)
 
-        return Y_pred.to(z_flat.dtype)
+        return Y_pred.to(torch.float32)  # Ensure output is float32 for MPS stability
 
 class Trainer:
     def __init__(self, model, lr=5e-4, device='cpu', stats=None, align_anneal_epochs=1000,
@@ -290,13 +320,13 @@ class Trainer:
         # Learnable log-scaling for alignment to ensure it stays positive and stable
         self.log_align_scale = torch.nn.Parameter(torch.tensor(0.0, device=device))
 
-        # Manually re-balance initial log_vars for stability
+        # Manually re-balance initial log_vars for stability - PRIORITIZE RECONSTRUCTION
         with torch.no_grad():
             self.model.log_vars.fill_(0.0)
             # 2 is assign loss - set to 2.0 (exp(-2.0) ~= 0.13) to prevent initial dominance
             self.model.log_vars[2].fill_(2.0)
-            # 0 is rec loss - set to -1.0 (exp(1.0) ~= 2.7) to prioritize reconstruction
-            self.model.log_vars[0].fill_(-1.0)
+            # 0 is rec loss - set to -2.0 (exp(2.0) ~= 7.4) to prioritize reconstruction more strongly
+            self.model.log_vars[0].fill_(-2.0)
 
         # Significantly increase spatial and connectivity loss multipliers by 10x
         if hasattr(self.model.encoder.pooling, 'temporal_consistency_weight'):
@@ -631,24 +661,32 @@ class Trainer:
             for k in weights:
                 if k in balanced and raw_losses[k].item() != 0: weights[k] = balanced[k] / raw_losses[k]
 
-        # NEW: Reconstruction-First logic
-        # If reconstruction is poor, suppress assignment weight to prioritize physics over clustering
+        # NEW: Reconstruction-First logic - ENHANCED
+        # If reconstruction is poor, suppress structural weights to prioritize physics over clustering
         if raw_losses['rec'].item() > 0.1:
-            weights['assign'] = min(weights['assign'], 1.0)
+            weights['assign'] = min(weights['assign'], 0.1)  # Much lower weight
+            weights['ortho'] = min(weights['ortho'], 0.1)   # Suppress ortho loss
+            weights['sparsity'] = min(weights['sparsity'], 0.1)  # Suppress sparsity loss
+        else:
+            # Once reconstruction drops below 0.1, allow structural losses to resume
+            if raw_losses['rec'].item() < 0.1:
+                weights['assign'] = max(weights['assign'], torch.exp(-self.model.log_vars[2]).item())
+                weights['ortho'] = max(weights['ortho'], torch.exp(-self.model.log_vars[3]).item())
+                weights['sparsity'] = max(weights['sparsity'], torch.exp(-self.model.log_vars[11]).item())
 
         discovery_loss = sum(weights[k] * torch.clamp(raw_losses[k], 0, 100) + lvars[i] for i, k in enumerate(raw_losses.keys()) if k not in ['cons', 'l2', 'lvr'])
         discovery_loss += (weights['sym'] * (self.symbolic_weight - 1.0) * torch.clamp(loss_sym.to(torch.float32), 0, 100)) # Adjust sym weight
         discovery_loss += 1e-4 * torch.clamp(loss_curv.to(torch.float32), 0, 100)
 
-        loss = discovery_loss + (weights['l2'] * 1e-4 * torch.clamp(loss_l2, 0, 100) + lvars[4]) + (weights['lvr'] * 5e-2 * torch.clamp(loss_lvr, 0, 100) + lvars[5])
+        loss = discovery_loss + (weights['l2'] * 1e-4 * torch.clamp(loss_l2, 0, 100) + lvars[4]) + (weights['lvr'] * 0.5 * torch.clamp(loss_lvr, 0, 100) + lvars[5])  # Increased from 5e-2 to 0.5
         if compute_consistency: loss += (weights['cons'] * torch.clamp(loss_cons.to(torch.float32), 0, 100) + lvars[1])
 
-        # Add smoothing loss to the total loss
+        # Add smoothing loss to the total loss - INCREASED WEIGHT FOR DAMPING
         smooth_idx = list(raw_losses.keys()).index('smooth')  # This should be 15
         if smooth_idx < len(lvars):  # Make sure the index exists
-            loss += (weights['smooth'] * 5e-1 * torch.clamp(loss_smooth, 0, 100) + lvars[smooth_idx])
+            loss += (weights['smooth'] * 2.0 * torch.clamp(loss_smooth, 0, 100) + lvars[smooth_idx])  # Increased from 5e-1 to 2.0
         else:
-            loss += weights['smooth'] * 5e-1 * torch.clamp(loss_smooth, 0, 100)  # Just apply weight without log_var
+            loss += weights['smooth'] * 2.0 * torch.clamp(loss_smooth, 0, 100)  # Just apply weight without log_var - INCREASED
         
         loss = torch.clamp(loss + 0.1 * torch.sum(lvars**2), 0, 1e4)
         if not torch.isfinite(loss): loss = loss_rec if torch.isfinite(loss_rec) else torch.tensor(1.0, device=self.device, requires_grad=True)
