@@ -481,8 +481,8 @@ class Trainer:
         
         return tau, hard, tf_ratio, entropy_weight
 
-    def _compute_initial_recon_loss(self, batch_0, tau, hard, entropy_weight):
-        z_curr, s_0, losses_0, mu_0 = self.model.encode(batch_0.x, batch_0.edge_index, batch_0.batch, tau=tau, hard=hard)
+    def _compute_initial_recon_loss(self, batch_0, tau, hard, entropy_weight, epoch, max_epochs):
+        z_curr, s_0, losses_0, mu_0 = self.model.encode(batch_0.x, batch_0.edge_index, batch_0.batch, tau=tau, hard=hard, current_epoch=epoch, total_epochs=max_epochs)
 
         if torch.isnan(z_curr).any() or torch.isinf(z_curr).any():
             z_curr = torch.nan_to_num(z_curr, nan=0.0, posinf=1.0, neginf=-1.0)
@@ -651,7 +651,7 @@ class Trainer:
         tau, hard, tf_ratio, entropy_weight = self._get_schedules(epoch, max_epochs)
         batch_0 = Batch.from_data_list([data_list[0]]).to(self.device)
 
-        init_res = self._compute_initial_recon_loss(batch_0, tau, hard, entropy_weight)
+        init_res = self._compute_initial_recon_loss(batch_0, tau, hard, entropy_weight, epoch, max_epochs)
         z_curr, s_0, mu_0 = init_res['z_curr'], init_res['s_0'], init_res['mu_0']
         loss_rec, loss_assign = init_res['loss_rec'], init_res['loss_assign']
 
@@ -730,7 +730,7 @@ class Trainer:
 
             batch_t = Batch.from_data_list([data_list[t]]).to(self.device)
             # Pass s_prev for assignment persistence
-            z_t_target, s_t, losses_t, mu_t = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch, tau=tau, hard=hard, prev_assignments=s_prev)
+            z_t_target, s_t, losses_t, mu_t = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch, tau=tau, hard=hard, prev_assignments=s_prev, current_epoch=epoch, total_epochs=max_epochs)
             z_t_target = torch.nan_to_num(z_t_target)
             
             # Use normalized targets for stability
@@ -769,7 +769,7 @@ class Trainer:
             # Apply gradual alignment instead of hard gate
             # Always add alignment and MI losses with the calculated weight
             loss_align += 2.0 * alignment_weight * loss_align_component
-            loss_mi += alignment_weight * self.model.get_mi_loss(z_preds[t], mu_t_norm)
+            loss_mi += alignment_weight * 5.0 * self.model.get_mi_loss(z_preds[t], mu_t_norm)  # Increased by 5x as requested
 
             if t > 0:
                 # Add a small weight to the consistency term between assignments and positions

@@ -262,7 +262,7 @@ class GNNEncoder(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, x, edge_index, batch, tau=1.0, hard=False, prev_assignments=None):
+    def forward(self, x, edge_index, batch, tau=1.0, hard=False, prev_assignments=None, current_epoch=None, total_epochs=None):
         # Store initial positions for spatial pooling
         pos = x[:, :2]
         vel = x[:, 2:4] # Assume [pos_x, pos_y, vel_x, vel_y]
@@ -271,7 +271,7 @@ class GNNEncoder(nn.Module):
         x = self.ln2(torch.relu(self.gnn2(x, pos, vel, edge_index)))
 
         # Pool to K super-nodes preserving spatial features
-        pooled, s, assign_losses, mu = self.pooling(x, batch, pos=pos, tau=tau, hard=hard, prev_assignments=prev_assignments) # [batch_size, n_super_nodes, hidden_dim], [N, n_super_nodes], mu: [B, K, 2]
+        pooled, s, assign_losses, mu = self.pooling(x, batch, pos=pos, tau=tau, hard=hard, prev_assignments=prev_assignments, current_epoch=current_epoch, total_epochs=total_epochs) # [batch_size, n_super_nodes, hidden_dim], [N, n_super_nodes], mu: [B, K, 2]
         latent = self.output_layer(pooled) # [batch_size, n_super_nodes, latent_dim]
 
         # Apply learnable gain to prevent vanishing latents
@@ -455,6 +455,12 @@ class GNNDecoder(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),  # Additional layer for more capacity
             nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),  # Added extra layer as requested
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),  # Added extra layer as requested
+            nn.ReLU(),
             nn.LayerNorm(hidden_dim)
         )
 
@@ -577,7 +583,10 @@ class DiscoveryEngineModel(nn.Module):
 
         # Learnable loss log-variances for automatic loss balancing
         # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning, 8: sep, 9: conn, 10: sparsity, 11: mi, 12: sym, 13: var, 14: hinge, 15: smooth
-        self.log_vars = nn.Parameter(torch.zeros(16)) 
+        initial_log_vars = torch.zeros(16)
+        # Initialize rec loss (index 0) to -5.0 to heavily prioritize reconstruction from the start
+        initial_log_vars[0] = -5.0
+        self.log_vars = nn.Parameter(initial_log_vars) 
         
     def get_latent_variance_loss(self, z):
         """
@@ -607,8 +616,8 @@ class DiscoveryEngineModel(nn.Module):
         from common_losses import get_mi_loss as common_mi_loss
         return common_mi_loss(z, mu, self.mi_discriminator)
 
-    def encode(self, x, edge_index, batch, tau=1.0, hard=False, prev_assignments=None):
-        return self.encoder(x, edge_index, batch, tau=tau, hard=hard, prev_assignments=prev_assignments)
+    def encode(self, x, edge_index, batch, tau=1.0, hard=False, prev_assignments=None, current_epoch=None, total_epochs=None):
+        return self.encoder(x, edge_index, batch, tau=tau, hard=hard, prev_assignments=prev_assignments, current_epoch=current_epoch, total_epochs=total_epochs)
     
     def decode(self, z, s, batch, stats=None):
         return self.decoder(z, s, batch, stats=stats)
@@ -661,18 +670,9 @@ class DiscoveryEngineModel(nn.Module):
             rtol = 1e-3 + eps
             atol = 1e-5 + eps
 
-        # Use a more efficient solver during training, but accurate one for evaluation
-        if is_mps:
-            method = 'rk4'
-            # Fixed step size for MPS stability as requested
-            dt = (t[1] - t[0]).item() if len(t) > 1 else 0.01
-            options = {'step_size': dt}
-        elif self.training:
-            method = 'euler'  # Fastest fixed-step method during early training
-            options = None
-        else:
-            method = 'rk4'  # Faster than dopri5 but still reasonably accurate
-            options = None
+        # Use dopri5 with max_step=0.01 as requested for stability
+        method = 'dopri5'
+        options = {'max_step': 0.01}
 
         # Use the selected solver
         if self.hamiltonian and self.training:

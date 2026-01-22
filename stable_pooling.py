@@ -71,7 +71,7 @@ class StableHierarchicalPooling(nn.Module):
         """Manually set or update the sparsity weight."""
         self.current_sparsity_weight = weight
 
-    def forward(self, x, batch, pos=None, tau=1.0, hard=False, prev_assignments=None):
+    def forward(self, x, batch, pos=None, tau=1.0, hard=False, prev_assignments=None, current_epoch=None, total_epochs=None):
         """
         Forward pass of hierarchical pooling with enhanced stability.
 
@@ -82,6 +82,8 @@ class StableHierarchicalPooling(nn.Module):
             tau (float): Temperature for Gumbel-Softmax
             hard (bool): Whether to use hard sampling
             prev_assignments (Tensor, optional): Previous assignment matrix for consistency
+            current_epoch (int, optional): Current training epoch for hard assignment gate
+            total_epochs (int, optional): Total training epochs for hard assignment gate
 
         Returns:
             Tuple of (pooled_features, assignment_matrix, losses, super_node_positions)
@@ -116,13 +118,19 @@ class StableHierarchicalPooling(nn.Module):
 
         # NEW: Assignment Persistence - bias logits by previous assignments to stabilize flickering
         if prev_assignments is not None and prev_assignments.size(0) == x.size(0):
-            # persistence_gain = 50.0 to strongly favor previous identity - INCREASED FROM 10.0 TO 50.0
-            logits = logits + 50.0 * prev_assignments.detach()
+            # persistence_gain = 200.0 to strongly favor previous identity - INCREASED FROM 50.0 TO 200.0 AS REQUESTED
+            logits = logits + 200.0 * prev_assignments.detach()
 
         # Apply active_mask to logits (soft mask to allow for revival)
         # Use detach() to prevent inplace modification errors during backward pass
         mask = self.active_mask.detach().unsqueeze(0)
-        
+
+        # IMPLEMENT HARD ASSIGNMENT GATE: Force hard assignments during last 20% of training
+        if current_epoch is not None and total_epochs is not None:
+            progress = current_epoch / total_epochs
+            if progress >= 0.8:  # Last 20% of training
+                hard = True  # Force hard assignments to settle into discrete clusters
+
         # During training, use a softer mask to allow potential reactivation
         if self.training:
             # -5.0 is enough to suppress but allows much more gradient flow than -10.0

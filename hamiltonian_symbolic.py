@@ -122,11 +122,19 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
         X_norm = self.transformer.normalize_x(self.transformer.transform(aligned_latent_states))
         Y_norm = self.transformer.normalize_y(h_targets)
 
-        # Distill the Hamiltonian function H
+        # Distill the Hamiltonian function H with increased populations and generations for better kinetic energy discovery
         # If we still have derivative targets here, it's a fallback (not ideal for H discovery)
         # Ensure Y_norm is 1D for _distill_single_target
         y_target = Y_norm[:, 0] if Y_norm.ndim > 1 else Y_norm
+        # Increase populations and generations to better capture kinetic energy terms
+        original_populations = self.populations
+        original_generations = self.generations
+        self.populations = max(self.populations, 2000)  # Increase to ensure kinetic energy terms are found
+        self.generations = max(self.generations, 50)    # Increase to ensure convergence
         h_prog, h_mask, h_conf = self._distill_single_target(0, X_norm, y_target, 1, latent_dim)
+        # Restore original values
+        self.populations = original_populations
+        self.generations = original_generations
         
         if h_prog is None:
             return super().distill(latent_states, targets, n_super_nodes, latent_dim, box_size)

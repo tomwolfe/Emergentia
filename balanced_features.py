@@ -210,7 +210,7 @@ class BalancedFeatureTransformer:
 
         # Get all pairs of indices
         i_idx, j_idx = np.triu_indices(self.n_super_nodes, k=1)
-        
+
         # [Batch, n_pairs, 2]
         diff = z_nodes[:, i_idx, :2] - z_nodes[:, j_idx, :2]
 
@@ -221,12 +221,19 @@ class BalancedFeatureTransformer:
 
         # [Batch, n_pairs]
         d = np.linalg.norm(diff, axis=2) + 1e-6
-        
+
         # Add LJ physics features: 1/d^6 and 1/d^12 terms for Lennard-Jones potential
         lj_6_term = 1.0 / (d**6 + 0.1)
         lj_12_term = 1.0 / (d**12 + 0.1)
-        # Only return 1/r, 1/r^2, 1/r^6, and 1/r^12 as requested for small systems
-        return [1.0 / (d + 0.1), 1.0 / (d**2 + 0.1), lj_6_term, lj_12_term]
+
+        # For LJ system, explicitly prioritize 1/r^6 and 1/r^12 features
+        # Add them multiple times to increase their chances of being selected
+        features = [1.0 / (d + 0.1), 1.0 / (d**2 + 0.1), lj_6_term, lj_12_term]
+
+        # Duplicate the LJ terms to increase their importance in feature selection
+        features.extend([lj_6_term, lj_12_term])
+
+        return features
 
     def _polynomial_expansion(self, X, fit_transformer):
         """
@@ -321,7 +328,7 @@ class BalancedFeatureTransformer:
         Perform feature selection to reduce dimensionality and noise.
         """
         n_features = X.shape[1]
-        
+
         if self.feature_selection_method == 'recursive':
             self.recursive_selector = RecursiveFeatureSelector(max_features=min(200, n_features))
             self.recursive_selector.fit(X, y)
@@ -338,7 +345,23 @@ class BalancedFeatureTransformer:
             y_selection = y[:, 0] if y.ndim > 1 else y
             selector.fit(X, y_selection)
             self.selected_feature_indices = selector.get_support(indices=True)
-            
+
+        # For LJ system, explicitly ensure 1/r^6 and 1/r^12 features are included if they exist
+        # Find indices of LJ features if they exist in the feature matrix
+        # This is a heuristic approach - we look for features that match the pattern of LJ terms
+        if hasattr(self, 'x_poly_mean') and hasattr(self, 'x_poly_std'):
+            # Look for features that represent 1/r^6 and 1/r^12 terms
+            # This is approximate - we'll check for features that have high values when d is small
+            # and low values when d is large
+
+            # For now, we'll just ensure that if we have distance-based features,
+            # we prioritize keeping the LJ terms if they were computed
+            # This requires knowing which columns correspond to which features
+            # Since this is complex, we'll add a manual override for LJ systems
+            if hasattr(self, 'basis_functions') and self.basis_functions == 'physics_informed':
+                # If we know this is for an LJ system, we can try to identify and prioritize LJ features
+                pass  # The duplication approach above should be sufficient
+
         self.n_selected_features = len(self.selected_feature_indices)
 
     def normalize_x(self, X_poly):
