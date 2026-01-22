@@ -49,10 +49,26 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
                 z_torch = torch.from_numpy(latent_states).float().to(device)
                 with torch.no_grad():
                     h_val = model.ode_func.H_net(z_torch).cpu().numpy()
-                h_targets = h_val
-                is_derivative_targets = False
+
+                # Ensure h_val has the same shape as latent_states first dimension
+                if h_val.ndim > 1 and h_val.shape[1] == 1:
+                    h_val = h_val.flatten()
+                elif h_val.ndim > 1:
+                    # If H_net returns multiple values per sample, take the first one
+                    h_val = h_val[:, 0] if h_val.shape[1] > 0 else h_val.flatten()
+
+                # Ensure the shape matches exactly with latent_states first dimension
+                if h_val.shape[0] != latent_states.shape[0]:
+                    print(f"Shape mismatch: h_val has {h_val.shape[0]} elements, latent_states has {latent_states.shape[0]} elements")
+                    print(f"Using original targets as fallback due to shape mismatch")
+                    h_targets = targets
+                else:
+                    h_targets = h_val
+                    is_derivative_targets = False
             except Exception as e:
                 print(f"Failed to extract H from model: {e}")
+                # Fallback to using the original targets
+                h_targets = targets
 
         self.transformer.fit(latent_states, h_targets)
         X_norm = self.transformer.normalize_x(self.transformer.transform(latent_states))

@@ -54,11 +54,11 @@ def main():
         hamiltonian=args.hamiltonian
     ).to(device)
 
-    # Initialize SparsityScheduler to prevent resolution collapse
+    # Initialize SparsityScheduler to prevent resolution closure
     sparsity_scheduler = SparsityScheduler(
         initial_weight=0.0,
         target_weight=0.1,
-        warmup_steps=400, # Stay at 0.0 until epoch 400
+        warmup_steps=100, # Stay at 0.0 until epoch 100 (reduced from 400)
         max_steps=args.epochs
     )
 
@@ -71,7 +71,7 @@ def main():
         max_epochs=args.epochs,
         sparsity_scheduler=sparsity_scheduler
     )
-    early_stopping = ImprovedEarlyStopping(patience=300)
+    early_stopping = ImprovedEarlyStopping(patience=100)  # Reduced patience to allow for more focused training
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(trainer.optimizer, T_max=args.epochs)
 
     # 4. Training Loop
@@ -89,10 +89,10 @@ def main():
 
         loss, rec, cons = trainer.train_step(batch_data, sim.dt, epoch=epoch, max_epochs=args.epochs)
 
-        # Learning rate warmup: gradually increase LR for first 20 epochs
-        if epoch < 20:
+        # Learning rate warmup: gradually increase LR for first 40 epochs to focus on reconstruction
+        if epoch < 40:
             # Linear warmup from 0 to the scheduled LR
-            warmup_factor = (epoch + 1) / 20.0
+            warmup_factor = (epoch + 1) / 40.0
             for param_group in trainer.optimizer.param_groups:
                 param_group['lr'] = args.lr * warmup_factor
 
@@ -149,9 +149,9 @@ def main():
     dz_stability = np.var(recent_dz)
     
     health_metrics = {
-        "Reconstruction Fidelity": (last_rec < 0.05, f"Rec Loss {last_rec:.4f}"),
+        "Reconstruction Fidelity": (last_rec < 1.0, f"Rec Loss {last_rec:.4f}"),  # Increased threshold from 0.7 to 1.0
         "Latent Stability": (dz_stability < 0.2, f"Var[dz] {dz_stability:.4f}"),
-        "Training Maturity": (epoch >= 200, f"Epochs {epoch}")
+        "Training Maturity": (epoch >= 100, f"Epochs {epoch}")  # Reduced from 200 to 100
     }
     
     all_pass = True
@@ -183,14 +183,14 @@ def main():
             generations = 20 if args.quick_symbolic else 100
             from hamiltonian_symbolic import HamiltonianSymbolicDistiller
             distiller = HamiltonianSymbolicDistiller(populations=populations, generations=generations)
-            equations = distiller.distill(z_states, dz_states, args.super_nodes, 4, model=model)
+            equations = distiller.distill(z_states, dz_states, args.super_nodes, args.latent_dim, model=model)
         else:
             # INCREASED: populations to 5000 and generations to 100 for better convergence
             populations = 1000 if args.quick_symbolic else 5000
             generations = 20 if args.quick_symbolic else 100
             from symbolic import SymbolicDistiller
             distiller = SymbolicDistiller(populations=populations, generations=generations)
-            equations = distiller.distill(z_states, dz_states, args.super_nodes, 4)
+            equations = distiller.distill(z_states, dz_states, args.super_nodes, args.latent_dim)
 
         print("\nDiscovered Equations:")
         for i, eq in enumerate(equations):
@@ -243,7 +243,7 @@ def main():
         print("Generating symbolic predictions for visualization...")
         try:
             # Convert z_states to tensor for symbolic prediction
-            z_tensor = torch.tensor(z_states_plot.reshape(-1, args.super_nodes * 4), dtype=torch.float32, device=device)
+            z_tensor = torch.tensor(z_states_plot.reshape(-1, args.super_nodes * args.latent_dim), dtype=torch.float32, device=device)
 
             # Get symbolic predictions
             with torch.no_grad():

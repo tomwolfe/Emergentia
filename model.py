@@ -437,11 +437,15 @@ class GNNDecoder(nn.Module):
     def __init__(self, latent_dim, hidden_dim, out_features, box_size=10.0):
         super(GNNDecoder, self).__init__()
         self.box_size = box_size
+        # ENHANCED: Add more capacity to decoder to improve reconstruction fidelity
         self.shared_mlp = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
             nn.ReLU(),
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),  # Additional layer for more capacity
             nn.ReLU(),
             nn.LayerNorm(hidden_dim)
         )
@@ -450,17 +454,39 @@ class GNNDecoder(nn.Module):
         self.pre_pos_norm = nn.LayerNorm(hidden_dim)
         self.pre_vel_norm = nn.LayerNorm(hidden_dim)
 
-        # Position head: Maps to unconstrained range (will be denormalized by stats)
-        self.pos_head = nn.Linear(hidden_dim, 2)
+        # ENHANCED: Use deeper heads for position and velocity reconstruction
+        self.pos_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim//2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim//2, 2)
+        )
         # Initialize pos_head weights to prevent initial large offsets
-        nn.init.normal_(self.pos_head.weight, std=0.01)
-        nn.init.zeros_(self.pos_head.bias)
+        for layer in self.pos_head:
+            if isinstance(layer, nn.Linear):
+                nn.init.normal_(layer.weight, std=0.01)
+                nn.init.zeros_(layer.bias)
 
         # Velocity head: Maps to unconstrained Z-score values
-        self.vel_head = nn.Linear(hidden_dim, 2)
+        self.vel_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim//2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim//2, 2)
+        )
+        for layer in self.vel_head:
+            if isinstance(layer, nn.Linear):
+                nn.init.normal_(layer.weight, std=0.01)
+                nn.init.zeros_(layer.bias)
 
-        # Initialize weights using Xavier uniform
+        # Initialize weights using Xavier uniform with higher variance for better reconstruction
         self._initialize_weights()
+
+        # Initialize decoder layers with smaller weights to prevent initial large reconstruction errors
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                # Use smaller weights for decoder to start with conservative reconstructions
+                nn.init.xavier_uniform_(m.weight, gain=0.1)  # Reduced gain
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def _initialize_weights(self):
         """Initialize weights using Xavier uniform initialization."""

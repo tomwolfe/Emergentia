@@ -380,12 +380,12 @@ class Trainer:
         # Manually re-balance initial log_vars for stability - PRIORITIZE RECONSTRUCTION
         with torch.no_grad():
             self.model.log_vars.fill_(0.0)
-            # 0 is rec loss - set to -5.0 to prioritize reconstruction fidelity in first 100 epochs
-            self.model.log_vars[0].fill_(-5.0)
-            # 2 is assign loss - set to 5.0 to prevent initial dominance
-            self.model.log_vars[2].fill_(5.0)
-            # 10 is sparsity loss - set to 5.0 to encourage gradual sparsification
-            self.model.log_vars[10].fill_(5.0)
+            # 0 is rec loss - set to -7.0 to prioritize reconstruction fidelity in first 100 epochs (increased from -5.0)
+            self.model.log_vars[0].fill_(-7.0)
+            # 2 is assign loss - set to 6.0 to prevent initial dominance (increased from 5.0)
+            self.model.log_vars[2].fill_(6.0)
+            # 10 is sparsity loss - set to 6.0 to encourage gradual sparsification (increased from 5.0)
+            self.model.log_vars[10].fill_(6.0)
 
         # Significantly increase spatial and connectivity loss multipliers by 10x
         if hasattr(self.model.encoder.pooling, 'temporal_consistency_weight'):
@@ -617,18 +617,18 @@ class Trainer:
             if hasattr(self.model.encoder.pooling, 'set_sparsity_weight'):
                 self.model.encoder.pooling.set_sparsity_weight(new_weight)
 
-        is_stage1 = epoch < 50 # Reduced from 100
+        is_stage1 = epoch < 150 # Extended from 100 to focus more on reconstruction
         is_warmup = epoch < self.warmup_epochs
         if is_stage1:
             # During Stage 1 (Warmup), we freeze the adaptive balancer and
             # use fixed weights to encourage spatial coherence.
-            # Apply Reconstruction-First Warmup: set rec_loss weight to 1000x and others low
+            # Apply Reconstruction-First Warmup: set rec_loss weight to 100000x and others low
             with torch.no_grad():
-                self.model.log_vars.fill_(2.0)  # Set most weights to exp(-2) ≈ 0.13
-                # Set rec_loss weight to 1000x (exp(-(-6.9)) ≈ 1000)
-                self.model.log_vars[0].fill_(-6.9)
+                self.model.log_vars.fill_(3.0)  # Set most weights to exp(-3) ≈ 0.05
+                # Set rec_loss weight to 100000x (exp(-(-11.5)) ≈ 100000) - significantly increased
+                self.model.log_vars[0].fill_(-11.5)
                 # Set assign_loss weight to very low during initial phase
-                self.model.log_vars[2].fill_(5.0)
+                self.model.log_vars[2].fill_(7.0) # Increased from 6.0
 
         # ODE dynamics only start after warmup
         for p in self.model.ode_func.parameters(): p.requires_grad = not is_warmup
