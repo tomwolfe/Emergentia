@@ -247,8 +247,8 @@ class GNNEncoder(nn.Module):
         # Initialize weights using Xavier uniform
         self._initialize_weights()
 
-        # Add a learnable gain parameter to prevent vanishing latents - INCREASED FROM 1.0 TO 2.0
-        self.latent_gain = nn.Parameter(torch.ones(latent_dim) * 2.0)
+        # Add a learnable gain parameter to prevent vanishing latents - INCREASED FROM 2.0 TO 5.0
+        self.latent_gain = nn.Parameter(torch.ones(latent_dim) * 5.0)
 
         # Initialize output layer with higher variance to promote activity
         nn.init.normal_(self.output_layer[-1].weight, mean=0.0, std=2.0)
@@ -350,14 +350,19 @@ class HamiltonianODEFunc(nn.Module):
         self.n_super_nodes = n_super_nodes
         self.dissipative = dissipative
 
-        # Further simplified and faster Hamiltonian network
+        # ENHANCED: Increased capacity for Hamiltonian network - use full hidden_dim instead of fractions
         self.H_net = nn.Sequential(
-            nn.Linear(latent_dim * n_super_nodes, hidden_dim//4),  # Further reduced hidden size
+            nn.Linear(latent_dim * n_super_nodes, hidden_dim),  # Full hidden size instead of hidden_dim//4
             nn.SiLU(), # Faster activation function
-            nn.Linear(hidden_dim//4, hidden_dim//8),  # Additional hidden layer
+            nn.Linear(hidden_dim, hidden_dim),  # Full hidden size instead of hidden_dim//8
+            nn.SiLU(), # Additional activation
+            nn.Linear(hidden_dim, hidden_dim//2),  # Additional layer
             nn.Tanh(),  # Add Tanh activation to bound the Hamiltonian's energy and prevent runaway momentum
-            nn.Linear(hidden_dim//8, 1)
+            nn.Linear(hidden_dim//2, 1)
         )
+
+        # Add LayerNorm at the input to stabilize gradients
+        self.input_norm = nn.LayerNorm(latent_dim * n_super_nodes)
 
         if dissipative:
             # Small initial dissipation
@@ -380,12 +385,14 @@ class HamiltonianODEFunc(nn.Module):
         # We need to compute dH/dy. We use autograd.grad.
         # create_graph=True is necessary for backpropagating through the ODE solver (especially for adjoint)
         with torch.set_grad_enabled(True):
-            y_in = y.detach().requires_grad_(True)
+            # Apply input normalization to stabilize gradients
+            y_norm = self.input_norm(y)
+            y_in = y_norm.detach().requires_grad_(True)
             H_raw = self.H_net(y_in)
             # Add small L2 regularization on the output to prevent scaling to infinity
             H = H_raw.sum() + 0.01 * torch.sum(H_raw**2)
             dH = torch.autograd.grad(H, y_in, create_graph=True, allow_unused=True)[0]
-            
+
             if dH is None:
                 dH = torch.zeros_like(y_in)
             else:

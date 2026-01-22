@@ -373,7 +373,8 @@ class Trainer:
         self.enhanced_balancer = enhanced_balancer
         
         # Learnable log-scaling for alignment to ensure it stays positive and stable
-        self.log_align_scale = torch.nn.Parameter(torch.tensor(0.0, device=device))
+        # Initialize to a value that brings the initial alignment loss below 1.0
+        self.log_align_scale = torch.nn.Parameter(torch.tensor(-2.0, device=device))  # exp(-2) ≈ 0.13
 
         # Manually re-balance initial log_vars for stability - PRIORITIZE RECONSTRUCTION
         with torch.no_grad():
@@ -654,14 +655,31 @@ class Trainer:
         loss_conn = 10.0 * self.model.get_connectivity_loss(s_0, batch_0.edge_index)
         loss_ortho = self.model.get_ortho_loss(s_0)
         loss_var = self.model.get_latent_variance_loss(z_curr)
-        
+
         # Hinge loss to prevent latent variable shrinkage (force them to have some minimum magnitude)
         # Calculates norm for each [Batch, K] and applies hinge at 0.1
         loss_hinge = torch.mean(torch.relu(0.1 - torch.norm(z_preds, dim=-1)))
-        
+
         loss_align = torch.tensor(0.0, device=self.device)
         loss_mi = torch.tensor(0.0, device=self.device)
         loss_cons = torch.tensor(0.0, device=self.device)
+
+        # NEW: Implement "Hard Gate" for Alignment - suppress alignment and MI losses during warmup
+        # and when reconstruction loss is too high
+        # Need to define raw_losses first with initial values before using it
+        raw_losses = {'rec': loss_rec, 'cons': loss_cons, 'assign': loss_assign, 'ortho': loss_ortho, 'l2': loss_l2, 'lvr': loss_lvr, 'align': loss_align, 'pruning': loss_pruning, 'sep': loss_sep, 'conn': loss_conn, 'sparsity': loss_sparsity, 'mi': loss_mi, 'sym': loss_sym, 'var': loss_var, 'hinge': loss_hinge, 'smooth': loss_smooth}
+
+        # NEW: Latent Activity penalty to prevent static latent trap
+        if len(z_vel) > 0:
+            # Change from log penalty to Hinge Loss: explicitly forces latents to move if velocity drops below threshold
+            loss_activity = torch.relu(0.5 - torch.norm(z_vel, dim=-1)).mean()  # Hinge loss with threshold 0.5
+            raw_losses['activity'] = loss_activity
+        else:
+            # Calculate activity penalty using the model's method if z_vel is empty
+            loss_activity = self.model.get_activity_penalty(z_preds)
+            raw_losses['activity'] = loss_activity
+
+        alignment_suppressed = epoch < self.warmup_epochs or raw_losses['rec'] > 0.1
 
         s_prev, mu_prev, z_enc_prev = s_0, mu_0, z_curr
         mu_min = torch.tensor(self.stats['pos_min'], device=self.device, dtype=torch.float32) if self.stats else 0
@@ -708,8 +726,14 @@ class Trainer:
                 align_weight = min(1.0, (epoch - 20) / self.align_anneal_epochs)
             
             # Use learnable scale in log-space for alignment
-            loss_align += 2.0 * align_weight * self.criterion(z_preds[t, :, :, :d_align] * torch.exp(self.log_align_scale), mu_t_norm[:, :, :d_align])
-            loss_mi += self.model.get_mi_loss(z_preds[t], mu_t_norm)
+            # NEW: Use HuberLoss instead of MSELoss to reduce sensitivity to outliers
+            huber_loss = torch.nn.SmoothL1Loss(beta=0.1)  # delta=0.1 equivalent to beta=0.1 in SmoothL1Loss
+            loss_align_component = huber_loss(z_preds[t, :, :, :d_align] * torch.exp(self.log_align_scale), mu_t_norm[:, :, :d_align])
+
+            # Apply hard gate: only add alignment and MI losses if not suppressed
+            if not alignment_suppressed:
+                loss_align += 2.0 * align_weight * loss_align_component
+                loss_mi += self.model.get_mi_loss(z_preds[t], mu_t_norm)
 
             if t > 0:
                 # Add a small weight to the consistency term between assignments and positions
@@ -740,21 +764,28 @@ class Trainer:
             # Force structural losses to stay active during stage 1
             lvars[11], lvars[3], lvars[12] = 0.0, 0.0, 0.0
 
-        raw_losses = {'rec': loss_rec, 'cons': loss_cons, 'assign': loss_assign, 'ortho': loss_ortho, 'l2': loss_l2, 'lvr': loss_lvr, 'align': loss_align, 'pruning': loss_pruning, 'sep': loss_sep, 'conn': loss_conn, 'sparsity': loss_sparsity, 'mi': loss_mi, 'sym': loss_sym, 'var': loss_var, 'hinge': loss_hinge, 'smooth': loss_smooth}
-
-        # NEW: Latent Activity penalty to prevent static latent trap
-        if len(z_vel) > 0:
-            # Change from log penalty to Hinge Loss: explicitly forces latents to move if velocity drops below threshold
-            loss_activity = torch.relu(0.5 - torch.norm(z_vel, dim=-1)).mean()  # Hinge loss with threshold 0.5
-            raw_losses['activity'] = loss_activity
-        else:
-            # Calculate activity penalty using the model's method if z_vel is empty
-            loss_activity = self.model.get_activity_penalty(z_preds)
-            raw_losses['activity'] = loss_activity
-
         # Ensure all raw losses are float32 for stable balancing, especially on MPS
         for k in raw_losses:
             raw_losses[k] = raw_losses[k].to(torch.float32)
+
+        # Additionally, ensure all loss components are float32 before being used in calculations
+        loss_rec = loss_rec.to(torch.float32)
+        loss_cons = loss_cons.to(torch.float32)
+        loss_assign = loss_assign.to(torch.float32)
+        loss_ortho = loss_ortho.to(torch.float32)
+        loss_l2 = loss_l2.to(torch.float32)
+        loss_lvr = loss_lvr.to(torch.float32)
+        loss_align = loss_align.to(torch.float32)
+        loss_mi = loss_mi.to(torch.float32)
+        loss_pruning = loss_pruning.to(torch.float32)
+        loss_sparsity = loss_sparsity.to(torch.float32)
+        loss_sep = loss_sep.to(torch.float32)
+        loss_conn = loss_conn.to(torch.float32)
+        loss_sym = loss_sym.to(torch.float32)
+        loss_var = loss_var.to(torch.float32)
+        loss_hinge = loss_hinge.to(torch.float32)
+        loss_smooth = loss_smooth.to(torch.float32)
+        loss_activity = loss_activity.to(torch.float32)
 
         # Create weights for losses that have corresponding log_vars entries (first 16)
         base_keys = list(raw_losses.keys())[:16]  # Only first 16 keys that correspond to lvars
@@ -786,10 +817,10 @@ class Trainer:
                 weights['ortho'] = max(weights['ortho'], torch.exp(-self.model.log_vars[3]).item())
                 weights['sparsity'] = max(weights['sparsity'], torch.exp(-self.model.log_vars[11]).item())
 
-        # Dynamics warmup: Gradually introduce dynamics losses over 100 epochs after warmup
-        dynamics_factor = 1.0
+        # Dynamics warmup: Gradually introduce dynamics losses over 200 epochs after warmup
+        dynamics_factor = 0.0  # Start at 0.0 during warmup
         if epoch > self.warmup_epochs:
-            dynamics_factor = min(1.0, (epoch - self.warmup_epochs) / 100.0)
+            dynamics_factor = min(1.0, (epoch - self.warmup_epochs) / 200.0)  # Ramp over 200 epochs
 
         discovery_loss = sum(weights[k] * torch.clamp(raw_losses[k], -100, 100) + (lvars[i] if i < len(lvars) else 0.0) for i, k in enumerate(raw_losses.keys()) if k not in ['cons', 'l2', 'lvr'])
         discovery_loss += (weights['sym'] * (self.symbolic_weight - 1.0) * torch.clamp(loss_sym.to(torch.float32), 0, 100) * dynamics_factor) # Adjust sym weight with dynamics factor
@@ -801,11 +832,12 @@ class Trainer:
         # Add smoothing loss to the total loss - INCREASED WEIGHT FOR DAMPING
         smooth_idx = list(raw_losses.keys()).index('smooth')  # This should be 15
         if smooth_idx < len(lvars):  # Make sure the index exists
-            loss += (weights['smooth'] * 100.0 * torch.clamp(loss_smooth, 0, 100) + lvars[smooth_idx])  # Increased from 20.0 to 100.0
+            loss += (weights['smooth'] * 500.0 * torch.clamp(loss_smooth, 0, 100) + lvars[smooth_idx])  # Increased from 100.0 to 500.0
         else:
-            loss += weights['smooth'] * 100.0 * torch.clamp(loss_smooth, 0, 100)  # Just apply weight without log_var - INCREASED to 100.0
+            loss += weights['smooth'] * 500.0 * torch.clamp(loss_smooth, 0, 100)  # Just apply weight without log_var - INCREASED to 500.0
         
         loss = torch.clamp(loss + 0.1 * torch.sum(lvars**2), 0, 1e4)
+        loss = loss.to(torch.float32)  # Ensure final loss is float32 for MPS stability
         if not torch.isfinite(loss): loss = loss_rec if torch.isfinite(loss_rec) else torch.tensor(1.0, device=self.device, requires_grad=True)
 
         if self.enable_gradient_accumulation:
@@ -837,7 +869,7 @@ class Trainer:
 
             self.optimizer.step()
 
-        self.loss_tracker.update({'total': loss, 'rec_raw': loss_rec, 'cons_raw': loss_cons, 'assign': loss_assign, 'align': loss_align, 'mi': loss_mi, 'sym': loss_sym, 'lvar_raw': loss_var, 'curv_raw': loss_curv, 'hinge_raw': loss_hinge, 'smooth_raw': loss_smooth, 'lvars_mean': lvars.mean()}, weights=weights)
+        self.loss_tracker.update({'total': loss.to(torch.float32), 'rec_raw': loss_rec, 'cons_raw': loss_cons, 'assign': loss_assign, 'align': loss_align, 'mi': loss_mi, 'sym': loss_sym, 'lvar_raw': loss_var, 'curv_raw': loss_curv, 'hinge_raw': loss_hinge, 'smooth_raw': loss_smooth, 'lvars_mean': lvars.mean()}, weights=weights)
         
         if epoch % 100 == 0:
             print(f"  [Loss Detail] Rec: {loss_rec:.4f} | Cons: {loss_cons:.4f} | Assign: {loss_assign:.4f} | Ortho: {loss_ortho:.4f} | Align: {loss_align:.4f} | Sym: {loss_sym:.4f}")

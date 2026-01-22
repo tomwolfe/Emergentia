@@ -116,8 +116,8 @@ class StableHierarchicalPooling(nn.Module):
 
         # NEW: Assignment Persistence - bias logits by previous assignments to stabilize flickering
         if prev_assignments is not None and prev_assignments.size(0) == x.size(0):
-            # persistence_gain = 5.0 to strongly favor previous identity
-            logits = logits + 5.0 * prev_assignments.detach()
+            # persistence_gain = 10.0 to strongly favor previous identity - INCREASED FROM 5.0 TO 10.0
+            logits = logits + 10.0 * prev_assignments.detach()
 
         # Apply active_mask to logits (soft mask to allow for revival)
         # Use detach() to prevent inplace modification errors during backward pass
@@ -157,8 +157,8 @@ class StableHierarchicalPooling(nn.Module):
             revival_mask = (torch.rand_like(self.active_mask) < 0.2).float() * revival_candidate # Increased prob from 0.1
             effective_active = torch.clamp(current_active + revival_mask, 0, 1)
 
-            # Use a much slower EMA for smoothness as requested - REDUCED FROM 0.00001 TO 0.000001
-            ema_rate = 0.000001 # Decreased from 0.00001 to 0.000001 for much slower pruning
+            # Use a much faster EMA for quicker adaptation as requested - INCREASED FROM 0.000001 TO 0.01
+            ema_rate = 0.01 # Increased from 0.000001 to 0.01 for faster mask adaptation
             if hard:
                 ema_rate *= 0.5 # Even slower updates during hard sampling
 
