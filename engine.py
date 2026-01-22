@@ -895,7 +895,14 @@ class Trainer:
         self.loss_tracker.update({'total': loss.to(torch.float32), 'rec_raw': loss_rec, 'cons_raw': loss_cons, 'assign': loss_assign, 'align': loss_align, 'mi': loss_mi, 'sym': loss_sym, 'lvar_raw': loss_var, 'curv_raw': loss_curv, 'hinge_raw': loss_hinge, 'smooth_raw': loss_smooth, 'lvars_mean': lvars.mean()}, weights=weights)
         
         if epoch % 100 == 0:
-            print(f"  [Loss Detail] Rec: {loss_rec:.4f} | Cons: {loss_cons:.4f} | Assign: {loss_assign:.4f} | Ortho: {loss_ortho:.4f} | Align: {loss_align:.4f} | Sym: {loss_sym:.4f}")
+            # Grouped loss reporting
+            fidelity_loss = loss_rec + loss_cons
+            structural_loss = loss_assign + loss_ortho + loss_pruning + loss_sep + loss_conn + loss_sparsity
+            physical_loss = loss_align + loss_mi + loss_curv + loss_sym
+            reg_loss = loss_l2 + loss_lvr + loss_var + loss_hinge + loss_smooth + loss_activity
+            
+            print(f"  [Loss Meta] Fidelity: {fidelity_loss:.4f} | Structure: {structural_loss:.4f} | Physics: {physical_loss:.4f} | Reg: {reg_loss:.4f}")
+            print(f"  [Loss Detail] Rec: {loss_rec:.4f} | Cons: {loss_cons:.4f} | Assign: {loss_assign:.4f} | Align: {loss_align:.4f} | Sym: {loss_sym:.4f}")
 
         return loss.item(), loss_rec.item(), loss_cons.item() if compute_consistency else 0.0
 

@@ -212,6 +212,8 @@ class BalancedFeatureTransformer:
     def _compute_distance_features(self, z_nodes):
         """
         Compute distance-based features between super-nodes using vectorized operations.
+        Generalizes beyond LJ potential by providing a spectrum of power laws and
+        interaction terms that the symbolic regressor can choose from.
         """
         n_batch = z_nodes.shape[0]
         if self.n_super_nodes < 2:
@@ -230,17 +232,24 @@ class BalancedFeatureTransformer:
 
         # [Batch, n_pairs]
         d = np.linalg.norm(diff, axis=2) + 1e-6
-
-        # Add LJ physics features: 1/d^6 and 1/d^12 terms for Lennard-Jones potential
-        lj_6_term = 1.0 / (d**6 + 0.1)
-        lj_12_term = 1.0 / (d**12 + 0.1)
-
-        # For LJ system, explicitly prioritize 1/r^6 and 1/r^12 features
-        # Add them multiple times to increase their chances of being selected
-        features = [1.0 / (d + 0.1), 1.0 / (d**2 + 0.1), lj_6_term, lj_12_term]
-
-        # Duplicate the LJ terms to increase their importance in feature selection
-        features.extend([lj_6_term, lj_12_term])
+        
+        features = []
+        
+        # 1. Basic distance and inverse distance
+        features.append(d)
+        features.append(1.0 / (d + 0.1))
+        
+        # 2. Spectrum of power laws: 1/r^n
+        # Instead of just 6 and 12, provide a broader range
+        for n in [2, 3, 4, 6, 8, 10, 12]:
+            features.append(1.0 / (d**n + 0.1))
+            
+        # 3. Short-range interaction terms (Exponential/Yukawa-like)
+        features.append(np.exp(-d))
+        features.append(np.exp(-d) / (d + 0.1))
+        
+        # 4. Logarithmic interactions (2D gravity/electrostatics)
+        features.append(np.log(d + 0.1))
 
         return features
 

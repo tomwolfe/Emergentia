@@ -258,13 +258,25 @@ class TorchFeatureTransformer(torch.nn.Module):
 
         # [Batch, n_pairs]
         d = torch.norm(diff, dim=2) + 1e-6
+        
+        features = []
+        
+        # 1. Basic distance and inverse distance
+        features.append(d)
+        features.append(1.0 / (d + 0.1))
+        
+        # 2. Spectrum of power laws: 1/r^n
+        for n in [2, 3, 4, 6, 8, 10, 12]:
+            features.append(1.0 / (torch.pow(d, n) + 0.1))
+            
+        # 3. Short-range interaction terms (Exponential/Yukawa-like)
+        features.append(torch.exp(-d))
+        features.append(torch.exp(-d) / (d + 0.1))
+        
+        # 4. Logarithmic interactions (2D gravity/electrostatics)
+        features.append(torch.log(d + 0.1))
 
-        # LJ physics features: 1/d^6 and 1/d^12 terms
-        lj_6_term = 1.0 / (torch.pow(d, 6) + 0.1)
-        lj_12_term = 1.0 / (torch.pow(d, 12) + 0.1)
-
-        # Return 1/r, 1/r^2, 1/r^6, and 1/r^12 to match BalancedFeatureTransformer
-        return [1.0 / (d + 0.1), 1.0 / (d**2 + 0.1), lj_6_term, lj_12_term]
+        return features
 
     def _polynomial_expansion(self, X):
         """
@@ -370,6 +382,7 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
         self.opt_iterations = opt_iterations
         self.use_sindy_pruning = use_sindy_pruning
         self.sindy_threshold = sindy_threshold
+        self.all_candidates = [] # Store all candidates for Pareto front visualization
 
     def _sindy_select(self, X, y, threshold=0.05, max_iter=10):
         """
@@ -507,7 +520,9 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
                     is_stable = self.validate_stability(prog, X_gp[0])
 
                 if is_stable:
-                    candidates.append({'prog': prog, 'score': score, 'complexity': self.get_complexity(prog), 'p': p_coeff})
+                    candidate = {'prog': prog, 'score': score, 'complexity': self.get_complexity(prog), 'p': p_coeff, 'target_idx': i}
+                    candidates.append(candidate)
+                    self.all_candidates.append(candidate)
             except Exception as e:
                 print(f"    ! GP search failed for p={p_coeff}: {e}")
 

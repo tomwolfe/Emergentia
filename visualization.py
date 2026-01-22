@@ -134,3 +134,49 @@ def plot_training_history(loss_tracker, output_path='training_history.png'):
     plt.savefig(output_path, bbox_inches='tight')
     plt.close()
     print(f"Training history plot saved to {output_path}")
+
+def plot_symbolic_pareto(candidates, output_path='symbolic_pareto.png'):
+    """
+    Visualize the Pareto front of symbolic expressions (Complexity vs. Accuracy).
+    """
+    if not candidates:
+        return
+
+    plt.figure(figsize=(10, 6))
+    
+    # Extract data
+    complexities = [c['complexity'] for c in candidates]
+    scores = [c['score'] for c in candidates]
+    target_indices = [c.get('target_idx', 0) for c in candidates]
+    
+    # Color by target index if multiple targets
+    unique_targets = sorted(list(set(target_indices)))
+    colors = plt.cm.tab10(np.linspace(0, 1, len(unique_targets)))
+    
+    for idx, target in enumerate(unique_targets):
+        t_complexities = [c['complexity'] for c in candidates if c.get('target_idx', 0) == target]
+        t_scores = [c['score'] for c in candidates if c.get('target_idx', 0) == target]
+        
+        plt.scatter(t_complexities, t_scores, label=f'Target {target}', alpha=0.6, color=colors[idx])
+        
+        # Compute Pareto front for this target
+        if len(t_complexities) > 1:
+            points = sorted(zip(t_complexities, t_scores))
+            pareto_front = [points[0]]
+            for p in points[1:]:
+                if p[1] > pareto_front[-1][1]:
+                    pareto_front.append(p)
+            
+            px, py = zip(*pareto_front)
+            plt.step(px, py, where='post', color=colors[idx], linestyle='--', alpha=0.4)
+
+    plt.title("Symbolic Discovery Pareto Front")
+    plt.xlabel("Expression Complexity (Nodes)")
+    plt.ylabel("R^2 Score")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300)
+    plt.close()
+    print(f"Pareto front plot saved to {output_path}")

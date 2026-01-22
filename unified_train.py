@@ -228,6 +228,11 @@ def main():
         # Update trainer with symbolic proxy
         trainer.update_symbolic_proxy(equations, symbolic_transformer, weight=0.1, confidence=0.8)
 
+        # Plot Pareto Front
+        if hasattr(distiller, 'all_candidates'):
+            from visualization import plot_symbolic_pareto
+            plot_symbolic_pareto(distiller.all_candidates)
+
     # 6. Visualization - OPTIMIZED
     print("Visualizing results...")
     # Only compute assignments for a subset to reduce computation

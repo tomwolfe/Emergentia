@@ -44,41 +44,50 @@ class SpringMassSimulator:
                 mask = dist_sq[idx1, idx2] < self.radius**2
                 return list(zip(idx1[mask], idx2[mask]))
             else:
-                # For larger N, use tiling + KDTree for efficiency with PBC
-                # Tile the points in 3x3 to cover all possible periodic neighbors
-                L_x, L_y = self.box_size
-                offsets = np.array([
-                    [-L_x, -L_y], [-L_x, 0], [-L_x, L_y],
-                    [0, -L_y],    [0, 0],    [0, L_y],
-                    [L_x, -L_y],  [L_x, 0],  [L_x, L_y]
-                ])
+                # O(N) Cell-List implementation for larger N
+                L = np.array(self.box_size)
+                # Cell size must be at least the interaction radius
+                cell_size = self.radius
+                n_cells = np.floor(L / cell_size).astype(int)
+                n_cells = np.maximum(n_cells, 1)
+                actual_cell_size = L / n_cells
                 
-                all_pos = []
-                original_indices = []
-                for off in offsets:
-                    all_pos.append(pos + off)
-                    original_indices.append(np.arange(self.n_particles))
+                # Assign particles to cells
+                cell_indices = np.floor(pos / actual_cell_size).astype(int) % n_cells
                 
-                all_pos = np.concatenate(all_pos, axis=0)
-                original_indices = np.concatenate(original_indices, axis=0)
-                
-                # Query tree: find neighbors of original points (the middle tile) in all tiles
-                tree = KDTree(all_pos)
-                # Middle tile is at index offset 4 (0-based: 0,1,2,3,4...)
-                start_idx = 4 * self.n_particles
-                end_idx = 5 * self.n_particles
-                
-                # Use query_ball_point for each point in the middle tile
-                results = tree.query_ball_point(pos, self.radius)
+                # Build cell dictionary: (cell_x, cell_y) -> [particle_indices]
+                cells = {}
+                for i, (cx, cy) in enumerate(cell_indices):
+                    cell_key = (cx, cy)
+                    if cell_key not in cells:
+                        cells[cell_key] = []
+                    cells[cell_key].append(i)
                 
                 pairs = set()
-                for i, neighbors in enumerate(results):
-                    for n_idx in neighbors:
-                        j = original_indices[n_idx]
-                        if i < j:
-                            pairs.add((i, j))
-                        elif j < i:
-                            pairs.add((j, i))
+                # Iterate over filled cells
+                for (cx, cy), p_indices in cells.items():
+                    # Check neighbor cells (3x3 area, including periodic neighbors)
+                    for dx in [-1, 0, 1]:
+                        for dy in [-1, 0, 1]:
+                            nx, ny = (cx + dx) % n_cells[0], (cy + dy) % n_cells[1]
+                            neighbor_key = (nx, ny)
+                            
+                            if neighbor_key in cells:
+                                n_p_indices = cells[neighbor_key]
+                                
+                                for i in p_indices:
+                                    for j in n_p_indices:
+                                        if i < j:
+                                            # Check distance with MIC
+                                            diff = pos[i] - pos[j]
+                                            diff -= L * np.round(diff / L)
+                                            if np.sum(diff**2) < self.radius**2:
+                                                pairs.add((i, j))
+                                        elif j < i and neighbor_key != (cx, cy):
+                                            # If different cells, we already handled i < j case above? 
+                                            # Wait, the 3x3 loop will visit each pair twice if cells are different.
+                                            # Using i < j consistently across all neighbor checks is safer.
+                                            pass
                 return list(pairs)
         else:
             tree = KDTree(pos)
