@@ -255,15 +255,15 @@ class BalancedFeatureTransformer:
         # 1. Base features: Raw latents + already computed distance features
         features = [X]
         
-        # For small systems, target < 40 features by skipping higher-order terms
-        if self.n_super_nodes <= 4:
-            # Important: return just the base features without further expansion
-            return X
-
         # 2. Squares of raw latents: [Batch, n_raw_latents]
+        # ALWAYS include squares as they are fundamental for kinetic energy (p^2)
         X_raw = X[:, :n_raw_latents]
         features.append(X_raw**2)
-        
+
+        # For small systems, target < 60 features by skipping cross-terms
+        if self.n_super_nodes <= 4:
+            return np.concatenate(features, axis=1)
+
         # 3. Intra-node cross-terms: O(K * D^2)
         # Using vectorized outer product per node
         X_nodes = X_raw.reshape(batch_size, self.n_super_nodes, self.latent_dim)

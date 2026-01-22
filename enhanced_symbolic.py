@@ -259,8 +259,12 @@ class TorchFeatureTransformer(torch.nn.Module):
         # [Batch, n_pairs]
         d = torch.norm(diff, dim=2) + 1e-6
 
-        # Only return 1/r and 1/r^2 as requested for small systems
-        return [1.0 / (d + 0.1), 1.0 / (d**2 + 0.1)]
+        # LJ physics features: 1/d^6 and 1/d^12 terms
+        lj_6_term = 1.0 / (torch.pow(d, 6) + 0.1)
+        lj_12_term = 1.0 / (torch.pow(d, 12) + 0.1)
+
+        # Return 1/r, 1/r^2, 1/r^6, and 1/r^12 to match BalancedFeatureTransformer
+        return [1.0 / (d + 0.1), 1.0 / (d**2 + 0.1), lj_6_term, lj_12_term]
 
     def _polynomial_expansion(self, X):
         """
@@ -291,17 +295,17 @@ class TorchFeatureTransformer(torch.nn.Module):
         batch_size, n_total_features = X.shape
         n_raw_latents = self.n_super_nodes * self.latent_dim
 
-        # For small systems, target < 40 features by skipping higher-order terms
-        if self.n_super_nodes <= 4:
-            # Match BalancedFeatureTransformer: return just X
-            return X
-
         # 1. Base features: Raw latents + already computed distance features
         features = [X]
 
         # 2. Squares of raw latents: [Batch, n_raw_latents]
+        # ALWAYS include squares as they are fundamental for kinetic energy (p^2)
         X_raw = X[:, :n_raw_latents]
         features.append(X_raw**2)
+
+        # For small systems, target < 60 features by skipping cross-terms
+        if self.n_super_nodes <= 4:
+            return torch.cat(features, dim=1)
 
         # 3. Intra-node cross-terms: O(K * D^2)
         X_nodes = X_raw.reshape(batch_size, self.n_super_nodes, self.latent_dim)

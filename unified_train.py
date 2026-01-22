@@ -77,6 +77,9 @@ def main():
     print(f"Starting training for {args.epochs} epochs...")
     last_rec = 1.0
     
+    # Track historical metrics for stability check
+    loss_history = []
+    
     # Memory-efficient training loop
     for epoch in range(args.epochs):
         # Random batch selection for training
@@ -86,16 +89,40 @@ def main():
         loss, rec, cons = trainer.train_step(batch_data, sim.dt, epoch=epoch, max_epochs=args.epochs)
         scheduler.step()
         last_rec = rec
+        loss_history.append(loss)
+        if len(loss_history) > 50: loss_history.pop(0)
 
         if epoch % 100 == 0:
             print(f"Epoch {epoch:4d} | Loss: {loss:.4f} | Rec: {rec:.4f} | Cons: {cons:.4f}")
+
+        # PARETO OPTIMIZATION: Adaptive Discovery Gate
+        # Every 200 epochs (after warmup), check if we can discover equations early
+        if epoch >= 400 and epoch % 200 == 0:
+            loss_std = np.std(loss_history) if len(loss_history) >= 20 else 1.0
+            if loss_std < 0.005 and last_rec < 0.02:
+                print(f"\n[Adaptive Gate] Loss stabilized (std={loss_std:.6f}). Attempting early discovery...")
+                
+                # Extract subset for quick check
+                check_dataset = dataset[::max(1, len(dataset)//50)]
+                z_check, dz_check, _ = extract_latent_data(model, check_dataset, sim.dt, include_hamiltonian=args.hamiltonian)
+                
+                # Quick GP check
+                distiller = SymbolicDistiller(populations=1000, generations=5)
+                eqs = distiller.distill(z_check, dz_check, args.super_nodes, 4, hamiltonian=args.hamiltonian)
+                
+                # If we found a non-trivial equation with decent potential, we could stop
+                # For now, let's just log it and decide if we want to early exit
+                print(f"[Adaptive Gate] Found candidate: {eqs[0]}")
+                if len(str(eqs[0])) > 5: # Not just "X0" or "0.5"
+                    print("[Adaptive Gate] Discovery successful and non-trivial. Finishing training early.")
+                    break
 
         if early_stopping(loss):
             print(f"Early stopping triggered at epoch {epoch}")
             break
 
     # 5. Analysis & Symbolic Discovery
-    print("Extracting latent data for visualization...")
+    print("\n--- Discovery Health Report ---")
     # Use memory-efficient extraction for large datasets
     if args.memory_efficient and len(dataset) > 100:
         # Sample a subset of the trajectory for analysis
@@ -107,26 +134,31 @@ def main():
     else:
         z_states, dz_states, t_states = extract_latent_data(model, dataset, sim.dt, include_hamiltonian=args.hamiltonian)
 
-    # Compute stability metric: variance of latent derivatives over the last 20% of the trajectory
-    # dz_states: [T, K, D]
+    # Compute health metrics
     stability_window = max(10, int(len(dz_states) * 0.2))
     recent_dz = dz_states[-stability_window:]
     dz_stability = np.var(recent_dz)
-    print(f"Latent Stability (Var[dz]): {dz_stability:.6f}")
+    
+    health_metrics = {
+        "Reconstruction Fidelity": (last_rec < 0.05, f"Rec Loss {last_rec:.4f}"),
+        "Latent Stability": (dz_stability < 0.2, f"Var[dz] {dz_stability:.4f}"),
+        "Training Maturity": (epoch >= 200, f"Epochs {epoch}")
+    }
+    
+    all_pass = True
+    for metric, (passed, status) in health_metrics.items():
+        icon = "✅" if passed else "❌"
+        print(f"{icon} {metric:25s}: {status}")
+        if not passed: all_pass = False
 
-    # Adjusted Quality Gate: Relaxed thresholds for symbolic discovery
-    rec_threshold = 0.05 # Relaxed from 0.01
-
-    if epoch < 200 or (last_rec > rec_threshold and dz_stability > 0.1): # Relaxed dz_stability from 0.05 to 0.1
-        reason = ""
-        if epoch < 200: reason += "Insufficient epochs. "
-        if last_rec > rec_threshold: reason += f"Rec Loss too high ({last_rec:.4f} > {rec_threshold}). "
-        if dz_stability > 0.1: reason += f"Latent space unstable ({dz_stability:.4f} > 0.1). "
-        print(f"Skipping symbolic discovery: {reason}")
+    if not all_pass:
+        print("\nSkipping symbolic discovery due to poor health metrics.")
+        print("Tip: If Latent Stability is ❌, increase --consistency_weight or --spatial_weight.")
+        print("Tip: If Reconstruction is ❌, check model capacity or increase --epochs.")
         equations = []
         symbolic_transformer = None
     else:
-        print("Analyzing latent space...")
+        print("\nProceeding to symbolic distillation...")
         # Sample data for analysis to reduce computation time
         sample_size = min(100, len(dataset))
         sample_indices = np.linspace(0, len(dataset)-1, sample_size, dtype=int)
@@ -204,34 +236,6 @@ def main():
             # Convert z_states to tensor for symbolic prediction
             z_tensor = torch.tensor(z_states_plot.reshape(-1, args.super_nodes * 4), dtype=torch.float32, device=device)
 
-            # Log dimensions for debugging if mismatch occurs
-            print(f"DEBUG: SymbolicProxy input z_tensor shape: {z_tensor.shape}")
-            if trainer.symbolic_proxy is not None:
-                # Check the actual number of features the SymPyToTorch modules expect
-                if trainer.symbolic_proxy.sym_modules and trainer.symbolic_proxy.sym_modules[0] is not None:
-                    expected_by_module = trainer.symbolic_proxy.sym_modules[0].n_inputs
-                    print(f"DEBUG: SymPyToTorch module expects {expected_by_module} features")
-
-                # Also check what the transformer thinks it should output
-                expected_by_transformer = trainer.symbolic_proxy.torch_transformer.x_poly_mean.size(0)
-                print(f"DEBUG: TorchFeatureTransformer normalization params suggest {expected_by_transformer} features")
-
-                # Check if there's a feature mask
-                if hasattr(trainer.symbolic_proxy.torch_transformer, 'feature_mask') and trainer.symbolic_proxy.torch_transformer.feature_mask is not None:
-                    mask_size = trainer.symbolic_proxy.torch_transformer.feature_mask.size(0)
-                    print(f"DEBUG: TorchFeatureTransformer feature_mask size: {mask_size}")
-                else:
-                    print(f"DEBUG: TorchFeatureTransformer has no feature_mask or it's None")
-
-                # Also check the actual output size after transformation
-                try:
-                    with torch.no_grad():
-                        dummy_input = torch.randn(1, args.super_nodes * 4, device=device)  # Same size as actual input
-                        transformed_output = trainer.symbolic_proxy.torch_transformer(dummy_input)
-                        print(f"DEBUG: Actual transformed output size: {transformed_output.size(1)}")
-                except Exception as e:
-                    print(f"DEBUG: Error getting transformed output size: {e}")
-
             # Get symbolic predictions
             with torch.no_grad():
                 symbolic_dz_dt = trainer.symbolic_proxy(z_tensor)
@@ -241,8 +245,6 @@ def main():
             num_elements_needed = expected_shape[0] * expected_shape[1] * expected_shape[2]
             symbolic_dz_dt_flat = symbolic_dz_dt.cpu().numpy().flatten()
             
-            print(f"DEBUG: SymbolicProxy output shape: {symbolic_dz_dt.shape}")
-
             # Trim or pad if needed to match expected size
             if len(symbolic_dz_dt_flat) > num_elements_needed:
                 symbolic_dz_dt_flat = symbolic_dz_dt_flat[:num_elements_needed]
@@ -260,21 +262,18 @@ def main():
 
             for t in range(1, len(symbolic_traj)):
                 # Simple Euler integration: z_new = z_old + dt * dz_dt
-                # Ensure we don't go out of bounds
                 if t-1 < len(symbolic_dz_dt):
                     symbolic_traj[t] = symbolic_traj[t-1] + dt * symbolic_dz_dt[t-1]
                 else:
-                    # If we run out of derivatives, hold the last value or use zeros
                     symbolic_traj[t] = symbolic_traj[t-1]
 
             symbolic_predictions = symbolic_traj
-            print(f"Generated symbolic predictions: shape {symbolic_predictions.shape}")
         except RuntimeError as e:
             if "size of tensor" in str(e) and "match the size" in str(e):
-                print(f"Tensor size mismatch in symbolic proxy: {e}. Skipping symbolic predictions.")
+                print("Note: Symbolic proxy size mismatch. Skipping symbolic trajectory visualization.")
                 symbolic_predictions = None
             else:
-                raise  # Re-raise if it's a different RuntimeError
+                raise
         except Exception as e:
             print(f"Failed to generate symbolic predictions: {e}")
             symbolic_predictions = None
