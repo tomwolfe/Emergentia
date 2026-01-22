@@ -377,6 +377,12 @@ python test_verifications.py
 - `train_utils.py`: Training utilities including improved early stopping and robust energy calculation
 - `visualization.py`: Visualization tools for training history and discovery results
 - `main.py`: Original baseline implementation
+- `refactored_engine.py`: Refactored engine implementation with improved modularity
+- `refactored_stable_pooling.py`: Refactored stable pooling implementation with enhanced maintainability
+- `pure_symbolic_functions.py`: Pure symbolic functions for symbolic regression
+- `common_losses.py`: Common loss functions used across the pipeline
+- `diagnostic_unified_train.py`: Diagnostic version of unified training with detailed logging and debugging capabilities
+- `optimized_unified_train.py`: Optimized unified training with additional performance enhancements
 - `test_changes.py`: Tests for recent changes
 - `test_enhancements.py`: Tests for all enhancements
 - `test_implemented_fixes.py`: Tests for implemented fixes
@@ -386,6 +392,7 @@ python test_verifications.py
 - `test_robustness.py`: Tests for robustness improvements
 - `test_symbolic.py`: Tests for symbolic regression
 - `test_verifications.py`: Verification tests
+- `test_optimized_pipeline.py`: Tests for optimized pipeline components
 - `training_history.png`: Visualization of training progress and loss components
 - `discovery_result.png`: Visualization of discovery results including particle assignments and latent dynamics
 
