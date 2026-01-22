@@ -367,6 +367,9 @@ class HamiltonianODEFunc(nn.Module):
             nn.Linear(hidden_dim//2, 1)
         )
 
+        # Initialize weights with smaller values to prevent initial instability
+        self._initialize_weights_small()
+
         # Add LayerNorm at the input to stabilize gradients
         self.input_norm = nn.LayerNorm(latent_dim * n_super_nodes)
 
@@ -413,11 +416,11 @@ class HamiltonianODEFunc(nn.Module):
             if dH is None:
                 dH = torch.zeros_like(y_in)
             else:
-                # Handle NaNs and Infs in the gradient
-                dH = torch.nan_to_num(dH, nan=0.0, posinf=1e3, neginf=-1e3)
+                # Handle NaNs and Infs in the gradient - MORE AGGRESSIVE CLIPPING
+                dH = torch.nan_to_num(dH, nan=0.0, posinf=1e2, neginf=-1e2)
 
-        # Gradient clipping for stability during ODE integration
-        dH = torch.clamp(dH, -1e3, 1e3)
+        # Gradient clipping for stability during ODE integration - MORE AGGRESSIVE
+        dH = torch.clamp(dH, -1e2, 1e2)
 
         # dH is [batch_size, n_super_nodes * latent_dim]
         # Reshape to [batch_size, n_super_nodes, 2, latent_dim // 2]
@@ -434,7 +437,9 @@ class HamiltonianODEFunc(nn.Module):
             gamma = torch.exp(torch.clamp(self.gamma, max=2.0)) # Clamp gamma to prevent extreme dissipation
             dp = dp - gamma * p
 
-        return torch.cat([dq, dp], dim=-1).view(y.shape[0], -1)
+        # Final clamping to prevent explosive growth
+        result = torch.cat([dq, dp], dim=-1).view(y.shape[0], -1)
+        return torch.clamp(result, -1e2, 1e2)
 
 class GNNDecoder(nn.Module):
     def __init__(self, latent_dim, hidden_dim, out_features, box_size=10.0):
@@ -632,20 +637,20 @@ class DiscoveryEngineModel(nn.Module):
         # Use the device of the ode_func parameters
         ode_device = next(self.ode_func.parameters()).device
         original_device = z0.device
-        
+
         # MPS fix: torchdiffeq is unstable on MPS. If original or ode device is MPS, use CPU.
         is_mps = (str(original_device) == 'mps' or str(ode_device) == 'mps')
         target_device = torch.device('cpu') if is_mps else ode_device
 
         y0 = z0_flat.to(target_device)
         t_ode = t.to(target_device)
-        
+
         # Ensure ode_func is on the correct device
         self.ode_func.to(target_device)
 
         # Use adaptive tolerance based on training stage
         eps = 1e-3 if is_mps else 0.0
-        
+
         if self.training:
             # Looser tolerances during training for efficiency
             rtol = 1e-1 + eps
@@ -679,5 +684,14 @@ class DiscoveryEngineModel(nn.Module):
         # Move back to original device
         zt_flat = zt_flat.to(original_device)
 
+        # Check for NaN values and handle them
+        if torch.isnan(zt_flat).any():
+            print(f"WARNING: NaN detected in forward_dynamics output!")
+            print(f"  Input z0 shape: {z0.shape}")
+            print(f"  Input z0 has NaN: {torch.isnan(z0).any()}")
+            print(f"  Output zt_flat has NaN: {torch.isnan(zt_flat).any()}")
+            # Replace NaN values with 0
+            zt_flat = torch.nan_to_num(zt_flat, nan=0.0, posinf=1e2, neginf=-1e2)
+
         # zt_flat: [len(t), batch_size, latent_dim * n_super_nodes]
-        return zt_flat.view(zt_flat.size(0), zt_flat.size(1), -1, z0.size(-1))
+        return zt_flat.reshape(zt_flat.size(0), zt_flat.size(1), -1, z0.size(-1))

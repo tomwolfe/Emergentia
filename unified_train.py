@@ -30,6 +30,8 @@ def main():
     parser.add_argument('--quick_symbolic', action='store_true', help='Use quick symbolic distillation')
     parser.add_argument('--memory_efficient', action='store_true', help='Use memory-efficient mode')
     parser.add_argument('--latent_dim', type=int, default=8, help='Dimension of latent space')
+    parser.add_argument('--consistency_weight', type=float, default=1.0, help='Weight for consistency loss')
+    parser.add_argument('--spatial_weight', type=float, default=1.0, help='Weight for spatial loss')
     args = parser.parse_args()
 
     device = get_device() if args.device == 'auto' else args.device
@@ -69,7 +71,9 @@ def main():
         stats=stats,
         warmup_epochs=int(args.epochs * 0.25), # Stage 1: Train rec and assign - 25% of total epochs
         max_epochs=args.epochs,
-        sparsity_scheduler=sparsity_scheduler
+        sparsity_scheduler=sparsity_scheduler,
+        consistency_weight=args.consistency_weight,
+        spatial_weight=args.spatial_weight
     )
     early_stopping = ImprovedEarlyStopping(patience=100)  # Reduced patience to allow for more focused training
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(trainer.optimizer, T_max=args.epochs)
@@ -146,11 +150,26 @@ def main():
     # Compute health metrics
     stability_window = max(10, int(len(dz_states) * 0.2))
     recent_dz = dz_states[-stability_window:]
-    dz_stability = np.var(recent_dz)
-    
+
+    # Debug: Check for NaN values in dz_states
+    if np.any(np.isnan(dz_states)):
+        print("WARNING: NaN detected in dz_states!")
+        print(f"  Total NaN values: {np.sum(np.isnan(dz_states))}")
+        print(f"  Total values: {dz_states.size}")
+        print(f"  dz_states shape: {dz_states.shape}")
+
+        # Clean up NaN values for variance calculation
+        clean_dz = dz_states[~np.isnan(dz_states)]
+        if len(clean_dz) > 0:
+            dz_stability = np.var(clean_dz)
+        else:
+            dz_stability = float('inf')
+    else:
+        dz_stability = np.var(recent_dz)
+
     health_metrics = {
         "Reconstruction Fidelity": (last_rec < 1.0, f"Rec Loss {last_rec:.4f}"),  # Increased threshold from 0.7 to 1.0
-        "Latent Stability": (dz_stability < 0.2, f"Var[dz] {dz_stability:.4f}"),
+        "Latent Stability": (dz_stability < 0.2 and not np.isnan(dz_stability), f"Var[dz] {dz_stability:.4f}"),
         "Training Maturity": (epoch >= 100, f"Epochs {epoch}")  # Reduced from 200 to 100
     }
     

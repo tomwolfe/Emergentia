@@ -357,7 +357,7 @@ class Trainer:
     def __init__(self, model, lr=5e-4, device='cpu', stats=None, align_anneal_epochs=1000,
                  warmup_epochs=20, max_epochs=1000, sparsity_scheduler=None, hard_assignment_start=0.7,
                  skip_consistency_freq=2, enable_gradient_accumulation=False, grad_acc_steps=1,
-                 enhanced_balancer=None):
+                 enhanced_balancer=None, consistency_weight=1.0, spatial_weight=1.0):
         self.model = model.to(device)
         self.device = device
         self.loss_tracker = LossTracker()
@@ -372,7 +372,9 @@ class Trainer:
         self.enable_gradient_accumulation = enable_gradient_accumulation
         self.grad_acc_steps = grad_acc_steps
         self.enhanced_balancer = enhanced_balancer
-        
+        self.consistency_weight = consistency_weight
+        self.spatial_weight = spatial_weight
+
         # Learnable log-scaling for alignment to ensure it stays positive and stable
         # Initialize to a value that brings the initial alignment loss below 1.0
         self.log_align_scale = torch.nn.Parameter(torch.tensor(0.0, device=device))  # exp(0) = 1.0
@@ -493,7 +495,7 @@ class Trainer:
         loss_assign = (
             entropy_weight * losses_0['entropy'] +
             5.0 * losses_0['diversity'] + # Increased from 1.0
-            5.0 * losses_0['spatial'] + # Increased from 0.1
+            5.0 * self.spatial_weight * losses_0['spatial'] + # Increased from 0.1 and multiplied by spatial_weight
             1.0 * losses_0.get('collapse_prevention', 0.0) + # Increased from 0.1
             1.0 * losses_0.get('balance', 0.0) + # Increased from 0.1
             1.0 * losses_0.get('temporal_consistency', 0.0) # Increased from 0.1
@@ -737,7 +739,7 @@ class Trainer:
             loss_assign += (
                 entropy_weight * losses_t['entropy'] +
                 5.0 * losses_t['diversity'] +
-                5.0 * losses_t['spatial'] +
+                5.0 * self.spatial_weight * losses_t['spatial'] +
                 1.0 * losses_t.get('collapse_prevention', 0.0) +
                 1.0 * losses_t.get('balance', 0.0) +
                 1.0 * losses_t.get('temporal_consistency', 0.0)
@@ -843,7 +845,7 @@ class Trainer:
         discovery_loss += 1e-4 * torch.clamp(loss_curv.to(torch.float32), 0, 100)
 
         loss = discovery_loss + (weights['l2'] * 1e-6 * torch.clamp(loss_l2, 0, 100) + lvars[4]) + (weights['lvr'] * 0.1 * torch.clamp(loss_lvr, 0, 100) + lvars[5])  # Decr lvr (2.0->0.1)
-        if compute_consistency: loss += (weights['cons'] * torch.clamp(loss_cons.to(torch.float32), 0, 100) * dynamics_factor + lvars[1])
+        if compute_consistency: loss += (weights['cons'] * self.consistency_weight * torch.clamp(loss_cons.to(torch.float32), 0, 100) * dynamics_factor + lvars[1])
 
         # Add smoothing loss to the total loss - REDUCED WEIGHT
         smooth_idx = list(raw_losses.keys()).index('smooth')  # This should be 15

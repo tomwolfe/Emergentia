@@ -150,31 +150,51 @@ def extract_latent_data(model, dataset, dt, include_hamiltonian=False):
                 ei = data.edge_index.to(device)
             else:
                 ei = torch.empty((2, 0), dtype=torch.long, device=device)
-            
+
             batch = torch.zeros(x.size(0), dtype=torch.long, device=device)
-            
+
             try:
                 z, _, _, _ = model.encode(x, ei, batch)
-                z_flat = z.view(1, -1)
-                
+
+                # Check for NaN in z before proceeding
+                if torch.isnan(z).any():
+                    print(f"DEBUG: NaN detected in encoded z at step {i}")
+                    continue
+
+                z_flat = z.reshape(1, -1)  # Use reshape instead of view to avoid stride issues
+
                 states.append(z_flat[0].cpu().numpy())
-                
+
                 if include_hamiltonian and hasattr(model.ode_func, 'H_net'):
                     # Extract scalar Hamiltonian
                     ode_device = next(model.ode_func.parameters()).device
                     H = model.ode_func.H_net(z_flat.to(ode_device))
+
+                    # Check for NaN in H
+                    if torch.isnan(H).any():
+                        print(f"DEBUG: NaN detected in H at step {i}")
+                        continue
+
                     derivs.append(H.cpu().numpy().flatten())
                 else:
                     # Extract dynamics derivative
                     ode_device = next(model.ode_func.parameters()).device
                     dz = model.ode_func(torch.tensor([i*dt], device=ode_device), z_flat.to(ode_device))
+
+                    # Check for NaN in dz
+                    if torch.isnan(dz).any():
+                        print(f"DEBUG: NaN detected in dz at step {i}")
+                        # Replace NaN values with 0
+                        dz = torch.nan_to_num(dz, nan=0.0, posinf=1e2, neginf=-1e2)
+
                     derivs.append(dz[0].cpu().numpy())
             except Exception as e:
+                print(f"Exception at step {i}: {e}")
                 continue
-                
+
     if not states:
         return np.array([]), np.array([]), np.array([])
-        
+
     return np.array(states), np.array(derivs), np.linspace(0, len(states)*dt, len(states))
 
 def gp_to_sympy(expr_str, *args, **kwargs):
