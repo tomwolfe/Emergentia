@@ -2,18 +2,44 @@ import torch
 import numpy as np
 
 class ImprovedEarlyStopping:
-    def __init__(self, patience=50, min_delta=1e-4):
+    def __init__(self, patience=50, min_delta=1e-4, ignore_epochs=200, monitor_rec=False, rec_threshold=0.02):
         self.patience = patience
         self.min_delta = min_delta
+        self.ignore_epochs = ignore_epochs
+        self.monitor_rec = monitor_rec
+        self.rec_threshold = rec_threshold
         self.counter = 0
         self.best_loss = float('inf')
+        self.current_epoch = 0
 
-    def __call__(self, current_loss):
-        if current_loss < self.best_loss - self.min_delta:
-            self.best_loss = current_loss
-            self.counter = 0
+    def __call__(self, current_loss, rec_loss=None):
+        self.current_epoch += 1
+
+        # Ignore the first ignore_epochs epochs
+        if self.current_epoch <= self.ignore_epochs:
+            self.counter = 0  # Reset counter during ignored epochs
+            return False  # Don't trigger early stopping during ignored epochs
+
+        # If monitoring reconstruction loss, use it as the primary criterion
+        if self.monitor_rec and rec_loss is not None:
+            if rec_loss < self.rec_threshold:
+                # If reconstruction is good enough, use the main loss
+                if current_loss < self.best_loss - self.min_delta:
+                    self.best_loss = current_loss
+                    self.counter = 0
+                else:
+                    self.counter += 1
+            else:
+                # If reconstruction is not good enough, don't trigger early stopping
+                self.counter = 0
         else:
-            self.counter += 1
+            # Standard early stopping based on current_loss
+            if current_loss < self.best_loss - self.min_delta:
+                self.best_loss = current_loss
+                self.counter = 0
+            else:
+                self.counter += 1
+
         return self.counter >= self.patience
 
 def robust_energy(sim, pos, vel):

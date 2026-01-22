@@ -382,10 +382,10 @@ class Trainer:
         # Manually re-balance initial log_vars for stability - PRIORITIZE RECONSTRUCTION
         with torch.no_grad():
             self.model.log_vars.fill_(0.0)
-            # 0 is rec loss - set to -4.0 to reduce reconstruction dominance (decreased from -7.0)
-            self.model.log_vars[0].fill_(-4.0)
-            # 2 is assign loss - set to -1.0 to force diversity from epoch 0 (decreased from 6.0)
-            self.model.log_vars[2].fill_(-1.0)
+            # 0 is rec loss - set to -4.6 to give it weight of ~100.0 (exp(-(-4.6)) ≈ 100)
+            self.model.log_vars[0].fill_(-4.6)
+            # 2 is assign loss - set to 2.3 to give it weight of ~0.1 (exp(-2.3) ≈ 0.1)
+            self.model.log_vars[2].fill_(2.3)
             # 6 is alignment loss - set to -1.0 to force physical grounding from epoch 0 (was not set before)
             self.model.log_vars[6].fill_(-1.0)
             # 10 is sparsity loss - set to 6.0 to encourage gradual sparsification (increased from 5.0)
@@ -621,25 +621,25 @@ class Trainer:
             if hasattr(self.model.encoder.pooling, 'set_sparsity_weight'):
                 self.model.encoder.pooling.set_sparsity_weight(new_weight)
 
-        is_stage1 = epoch < 150 # Extended from 100 to focus more on reconstruction
+        is_stage1 = epoch < 200 # Stage 1: Epochs 0-199, freeze ode_func
+        is_stage2 = epoch >= 200 # Stage 2: Epochs 200+, unfreeze ode_func with sigmoid ramp
         is_warmup = epoch < self.warmup_epochs
         if is_stage1:
-            # During Stage 1 (Warmup), we freeze the adaptive balancer and
-            # use fixed weights to encourage spatial coherence.
-            # Apply Reconstruction-First Warmup: set rec_loss weight to 54x and others low
+            # During Stage 1 (Epochs 0-199), we freeze the ODE dynamics and focus on stable partitioning and reconstruction
+            # Apply Reconstruction-First Warmup: set rec_loss weight to high value and others low
             with torch.no_grad():
                 self.model.log_vars.fill_(3.0)  # Set most weights to exp(-3) ≈ 0.05
-                # Set rec_loss weight to 54x (exp(-(-4.0)) ≈ 54) - reduced from 100000x
-                self.model.log_vars[0].fill_(-4.0)
-                # Set assign_loss weight to -1.0 to force diversity from epoch 0
-                self.model.log_vars[2].fill_(-1.0) # Changed from 7.0
+                # Set rec_loss weight to high value (exp(-(-4.6)) ≈ 100) to prioritize reconstruction
+                self.model.log_vars[0].fill_(-4.6)  # Increased from -4.0 to -4.6 for 100x weight
+                # Set assign_loss weight to low value (exp(-2.3) ≈ 0.1) to prevent assignment dominance
+                self.model.log_vars[2].fill_(-2.3) # Changed from -1.0 to -2.3 for 0.1 weight
                 # Set alignment loss weight to -1.0 to force physical grounding from epoch 0
                 self.model.log_vars[6].fill_(-1.0) # Added
 
-        # ODE dynamics only start after warmup
-        for p in self.model.ode_func.parameters(): p.requires_grad = not is_warmup
+        # Two-stage training: Stage 1 freezes ODE, Stage 2 unfreezes it
+        for p in self.model.ode_func.parameters(): p.requires_grad = is_stage2
         if self.symbolic_proxy is not None:
-            for p in self.symbolic_proxy.parameters(): p.requires_grad = not is_warmup
+            for p in self.symbolic_proxy.parameters(): p.requires_grad = is_stage2
 
         if epoch > 0 and epoch % 50 == 0:
             if hasattr(self.model.encoder.pooling, 'apply_hard_revival'):
@@ -692,15 +692,16 @@ class Trainer:
         # NEW: Latent Activity penalty to prevent static latent trap
         if len(z_vel) > 0:
             # Change from log penalty to Hinge Loss: explicitly forces latents to move if velocity drops below threshold
-            loss_activity = torch.relu(0.5 - torch.norm(z_vel, dim=-1)).mean()  # Hinge loss with threshold 0.5
+            # Increase threshold to 1.0 to more strongly penalize low-velocity latents
+            loss_activity = torch.relu(1.0 - torch.norm(z_vel, dim=-1)).mean()  # Hinge loss with threshold 1.0
             raw_losses['activity'] = loss_activity
         else:
             # Calculate activity penalty using the model's method if z_vel is empty
             loss_activity = self.model.get_activity_penalty(z_preds)
             raw_losses['activity'] = loss_activity
 
-        # Increase activity loss weight by 10x to penalize static latent trajectories more heavily
-        raw_losses['activity'] = raw_losses['activity'] * 10.0
+        # Increase activity loss weight by 50x to penalize static latent trajectories much more heavily
+        raw_losses['activity'] = raw_losses['activity'] * 50.0
 
         # NEW: Gradual alignment annealing instead of hard gate
         # Calculate a gradual alignment weight that increases over time
@@ -835,17 +836,21 @@ class Trainer:
             for k in weights:
                 if k in balanced and raw_losses[k].item() != 0: weights[k] = balanced[k] / raw_losses[k]
 
-        # Dynamics warmup: Gradually introduce dynamics losses over 100 epochs after warmup (was 200)
-        dynamics_factor = 0.0  # Start at 0.0 during warmup
-        if epoch > self.warmup_epochs:
-            dynamics_factor = min(1.0, (epoch - self.warmup_epochs) / 100.0)  # Ramp over 100 epochs (was 200)
+        # Stage 2 sigmoid ramp: Introduce symbolic and consistency losses gradually after epoch 200
+        stage2_factor = 0.0  # Start at 0.0 during Stage 1
+        if is_stage2:
+            # Sigmoid ramp from epoch 200 onwards over 100 epochs
+            progress_in_stage2 = min(1.0, (epoch - 200) / 100.0)  # Progress from 0 to 1 over 100 epochs
+            import math
+            # Sigmoid function: 1 / (1 + exp(-6 * (x - 0.5))) scaled and shifted to smoothly transition
+            stage2_factor = 1.0 / (1 + math.exp(-12.0 * (progress_in_stage2 - 0.5)))  # Steeper sigmoid
 
         discovery_loss = sum(weights[k] * torch.clamp(raw_losses[k], -100, 100) + (lvars[i] if i < len(lvars) else 0.0) for i, k in enumerate(raw_losses.keys()) if k not in ['cons', 'l2', 'lvr'])
-        discovery_loss += (weights['sym'] * (self.symbolic_weight - 1.0) * torch.clamp(loss_sym.to(torch.float32), 0, 100) * dynamics_factor) # Adjust sym weight with dynamics factor
+        discovery_loss += (weights['sym'] * (self.symbolic_weight - 1.0) * torch.clamp(loss_sym.to(torch.float32), 0, 100) * stage2_factor) # Adjust sym weight with stage2 factor
         discovery_loss += 1e-4 * torch.clamp(loss_curv.to(torch.float32), 0, 100)
 
         loss = discovery_loss + (weights['l2'] * 1e-6 * torch.clamp(loss_l2, 0, 100) + lvars[4]) + (weights['lvr'] * 0.1 * torch.clamp(loss_lvr, 0, 100) + lvars[5])  # Decr lvr (2.0->0.1)
-        if compute_consistency: loss += (weights['cons'] * self.consistency_weight * torch.clamp(loss_cons.to(torch.float32), 0, 100) * dynamics_factor + lvars[1])
+        if compute_consistency: loss += (weights['cons'] * self.consistency_weight * torch.clamp(loss_cons.to(torch.float32), 0, 100) * stage2_factor + lvars[1])
 
         # Add smoothing loss to the total loss - REDUCED WEIGHT
         smooth_idx = list(raw_losses.keys()).index('smooth')  # This should be 15
@@ -866,7 +871,7 @@ class Trainer:
                     torch.nn.utils.clip_grad_norm_(self.model.decoder.parameters(), 1.0) # Increased from 0.1
 
                 # Additional clipping when dynamics are introduced to prevent momentum explosion
-                if epoch > self.warmup_epochs and dynamics_factor >= 0.95:  # Near full dynamics
+                if epoch > self.warmup_epochs and stage2_factor >= 0.95:  # Near full dynamics
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)  # Increased from 0.1
                 else:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0) # Increased from 0.5
@@ -880,7 +885,7 @@ class Trainer:
                 torch.nn.utils.clip_grad_norm_(self.model.decoder.parameters(), 1.0) # Increased from 0.1
 
             # Additional clipping when dynamics are introduced to prevent momentum explosion
-            if epoch > self.warmup_epochs and dynamics_factor >= 0.95:  # Near full dynamics
+            if epoch > self.warmup_epochs and stage2_factor >= 0.95:  # Near full dynamics
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)  # Increased from 0.1
             else:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0) # Increased from 0.5

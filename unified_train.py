@@ -75,7 +75,7 @@ def main():
         consistency_weight=args.consistency_weight,
         spatial_weight=args.spatial_weight
     )
-    early_stopping = ImprovedEarlyStopping(patience=100)  # Reduced patience to allow for more focused training
+    early_stopping = ImprovedEarlyStopping(patience=100, ignore_epochs=200, monitor_rec=True, rec_threshold=0.02)  # Modified to ignore first 200 epochs and monitor rec with 0.02 threshold
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(trainer.optimizer, T_max=args.epochs)
 
     # 4. Training Loop
@@ -130,7 +130,7 @@ def main():
                     print("[Adaptive Gate] Discovery successful and non-trivial. Finishing training early.")
                     break
 
-        if early_stopping(loss):
+        if early_stopping(loss, rec):
             print(f"Early stopping triggered at epoch {epoch}")
             break
 
@@ -197,16 +197,16 @@ def main():
 
         print("Performing symbolic distillation...")
         if args.hamiltonian:
-            # INCREASED: populations to 5000 and generations to 100 for better convergence
-            populations = 1000 if args.quick_symbolic else 5000
-            generations = 20 if args.quick_symbolic else 100
+            # INCREASED: populations to 10,000 and generations to 200 for better convergence
+            populations = 1000 if args.quick_symbolic else 10000
+            generations = 20 if args.quick_symbolic else 200
             from hamiltonian_symbolic import HamiltonianSymbolicDistiller
             distiller = HamiltonianSymbolicDistiller(populations=populations, generations=generations)
             equations = distiller.distill(z_states, dz_states, args.super_nodes, args.latent_dim, model=model)
         else:
-            # INCREASED: populations to 5000 and generations to 100 for better convergence
-            populations = 1000 if args.quick_symbolic else 5000
-            generations = 20 if args.quick_symbolic else 100
+            # INCREASED: populations to 10,000 and generations to 200 for better convergence
+            populations = 1000 if args.quick_symbolic else 10000
+            generations = 20 if args.quick_symbolic else 200
             from symbolic import SymbolicDistiller
             distiller = SymbolicDistiller(populations=populations, generations=generations)
             equations = distiller.distill(z_states, dz_states, args.super_nodes, args.latent_dim)

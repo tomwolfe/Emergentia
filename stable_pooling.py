@@ -42,7 +42,7 @@ class StableHierarchicalPooling(nn.Module):
         super(StableHierarchicalPooling, self).__init__()
         self.n_super_nodes = n_super_nodes
         self.pruning_threshold = pruning_threshold
-        self.temporal_consistency_weight = temporal_consistency_weight * 5  # Increased by factor of 5 as requested
+        self.temporal_consistency_weight = temporal_consistency_weight * 50  # Increased by factor of 50 (5x original * 10x additional) as requested
         self.collapse_prevention_weight = collapse_prevention_weight
         self.sparsity_weight = sparsity_weight
         self.min_active_super_nodes = min(max(1, min_active_super_nodes), n_super_nodes)
@@ -116,8 +116,8 @@ class StableHierarchicalPooling(nn.Module):
 
         # NEW: Assignment Persistence - bias logits by previous assignments to stabilize flickering
         if prev_assignments is not None and prev_assignments.size(0) == x.size(0):
-            # persistence_gain = 10.0 to strongly favor previous identity - INCREASED FROM 5.0 TO 10.0
-            logits = logits + 10.0 * prev_assignments.detach()
+            # persistence_gain = 50.0 to strongly favor previous identity - INCREASED FROM 10.0 TO 50.0
+            logits = logits + 50.0 * prev_assignments.detach()
 
         # Apply active_mask to logits (soft mask to allow for revival)
         # Use detach() to prevent inplace modification errors during backward pass
@@ -157,8 +157,8 @@ class StableHierarchicalPooling(nn.Module):
             revival_mask = (torch.rand_like(self.active_mask) < 0.2).float() * revival_candidate # Increased prob from 0.1
             effective_active = torch.clamp(current_active + revival_mask, 0, 1)
 
-            # Use a much faster EMA for quicker adaptation as requested - INCREASED FROM 0.05 TO 0.2
-            ema_rate = 0.2 # Increased from 0.05 to 0.2 for faster mask adaptation
+            # Use a much slower EMA for more stable updates - DECREASED FROM 0.2 TO 0.01
+            ema_rate = 0.01 # Decreased from 0.2 to 0.01 for slower, more stable mask adaptation
             if hard:
                 ema_rate *= 0.5 # Even slower updates during hard sampling
 
@@ -301,15 +301,22 @@ class StableHierarchicalPooling(nn.Module):
 
         if len(inactive_indices) > 0:
             print(f"  [Hard Revival] Reviving super-nodes: {inactive_indices}")
-            # Re-initialize the final layer weights for inactive nodes to force new exploration
+            # Re-initialize the assign_mlp weights for inactive nodes to force new exploration
             with torch.no_grad():
-                # self.assign_mlp[2] is the Linear(in_channels, n_super_nodes) layer
-                last_layer = self.assign_mlp[2]
+                # Re-initialize the entire assign_mlp for inactive nodes
                 for idx in inactive_indices:
-                    # Re-initialize the weights for the corresponding output row
+                    # Re-initialize the weights for the corresponding output row in the final layer
                     # We use a larger std to force exploration - INCREASED FROM 5.0 TO 10.0
-                    nn.init.normal_(last_layer.weight[idx], mean=0.0, std=10.0) # Increased std to 10.0 for more aggressive revival
-                    nn.init.constant_(last_layer.bias[idx], 0.0)
+                    nn.init.normal_(self.assign_mlp[2].weight[idx], mean=0.0, std=10.0) # Increased std to 10.0 for more aggressive revival
+                    nn.init.constant_(self.assign_mlp[2].bias[idx], 0.0)
+
+                # Also re-initialize the first layer weights for the inactive nodes
+                # This provides a more comprehensive reset of the assignment function
+                in_features = self.assign_mlp[0].weight.shape[1]
+                for idx in inactive_indices:
+                    nn.init.xavier_uniform_(self.assign_mlp[0].weight)
+                    if self.assign_mlp[0].bias is not None:
+                        nn.init.zeros_(self.assign_mlp[0].bias)
 
                 # Reset active mask for these nodes to allow them to compete immediately
                 self.active_mask[inactive_indices] = 1.0

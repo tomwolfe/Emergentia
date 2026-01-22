@@ -30,21 +30,21 @@ class EquivariantGNNLayer(MessagePassing):
         # Scalar message network
         self.phi_e = nn.Sequential(
             nn.Linear(2 * in_channels + 2, hidden_dim), # +2 for dist_sq and dot(v, r)
-            nn.SiLU(),
+            nn.Softplus(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
+            nn.Softplus(),
             nn.Linear(hidden_dim, hidden_dim)
         )
         # Vector message network (outputs a scalar weight for the rel_pos vector)
         self.phi_v = nn.Sequential(
             nn.Linear(2 * in_channels + 2, hidden_dim),
-            nn.SiLU(),
+            nn.Softplus(),
             nn.Linear(hidden_dim, 1)
         )
         # Node update network
         self.phi_h = nn.Sequential(
             nn.Linear(in_channels + hidden_dim + 1, hidden_dim), # +1 for vector message norm
-            nn.SiLU(),
+            nn.Softplus(),
             nn.Linear(hidden_dim, out_channels)
         )
         
@@ -297,7 +297,7 @@ class LatentODEFunc(nn.Module):
         # Process each super-node individually (phi network)
         self.phi = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim//4),  # Further reduced hidden size
-            nn.SiLU(),  # Faster activation
+            nn.Softplus(),  # Smoother activation for better derivatives
             nn.Linear(hidden_dim//4, hidden_dim//4)
         )
 
@@ -305,7 +305,7 @@ class LatentODEFunc(nn.Module):
         # This aggregates information from all super-nodes
         self.rho = nn.Sequential(
             nn.Linear(hidden_dim//4, hidden_dim//4),
-            nn.SiLU(),  # Faster activation
+            nn.Softplus(),  # Smoother activation for better derivatives
             nn.Linear(hidden_dim//4, latent_dim * n_super_nodes)
         )
 
@@ -359,9 +359,9 @@ class HamiltonianODEFunc(nn.Module):
         # ENHANCED: Increased capacity for Hamiltonian network - use full hidden_dim instead of fractions
         self.H_net = nn.Sequential(
             nn.Linear(latent_dim * n_super_nodes, hidden_dim),  # Full hidden size instead of hidden_dim//4
-            nn.SiLU(), # Faster activation function
+            nn.Softplus(), # Smoother activation function for better second derivatives
             nn.Linear(hidden_dim, hidden_dim),  # Full hidden size instead of hidden_dim//8
-            nn.SiLU(), # Additional activation
+            nn.Softplus(), # Additional activation
             nn.Linear(hidden_dim, hidden_dim//2),  # Additional layer
             nn.Tanh(),  # Add Tanh activation to bound the Hamiltonian's energy and prevent runaway momentum
             nn.Linear(hidden_dim//2, 1)
@@ -595,7 +595,8 @@ class DiscoveryEngineModel(nn.Module):
         # Calculate std across time dimension
         temporal_std = torch.std(z, dim=0)  # [B, K, D]
         # Encourage non-zero standard deviation to prevent static latents
-        activity_penalty = torch.mean(torch.relu(0.1 - temporal_std))
+        # Use a stricter threshold to prevent the model from finding static solutions
+        activity_penalty = torch.mean(torch.relu(0.5 - temporal_std))  # Increased threshold from 0.1 to 0.5
         return activity_penalty
 
     def get_mi_loss(self, z, mu):

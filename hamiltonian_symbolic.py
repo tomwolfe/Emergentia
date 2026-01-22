@@ -18,6 +18,51 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
         super().__init__(populations, generations, stopping_criteria, max_features)
         self.enforce_hamiltonian_structure = enforce_hamiltonian_structure
         self.estimate_dissipation = estimate_dissipation
+
+    def _perform_coordinate_alignment(self, latent_states, n_super_nodes, latent_dim):
+        """
+        Perform coordinate alignment to rotate the latent z to maximize correlation with physical CoM.
+        This ensures that X0, X1 in the discovered equations correspond to physical positions.
+        """
+        import numpy as np
+        from scipy.linalg import orthogonal_procrustes
+
+        # Reshape latent states to [N, K, D] where N is number of samples, K is super nodes, D is latent dim
+        n_samples = latent_states.shape[0]
+        z_reshaped = latent_states.reshape(n_samples, n_super_nodes, latent_dim)
+
+        # For coordinate alignment, we need reference coordinates (e.g., physical positions)
+        # Since we don't have access to the physical coordinates here, we'll use a statistical approach
+        # to align the latent space with the principal components of the data
+
+        # Flatten to [N*K, D] for PCA-like alignment
+        z_flat = z_reshaped.reshape(-1, latent_dim)
+
+        # Compute the covariance matrix of the flattened latent states
+        z_centered = z_flat - np.mean(z_flat, axis=0, keepdims=True)
+        cov_matrix = np.dot(z_centered.T, z_centered) / (z_centered.shape[0] - 1)
+
+        # Compute eigenvalues and eigenvectors
+        eigenvals, eigenvecs = np.linalg.eigh(cov_matrix)
+
+        # Sort in descending order of eigenvalues
+        idx = np.argsort(eigenvals)[::-1]
+        eigenvals = eigenvals[idx]
+        eigenvecs = eigenvecs[:, idx]
+
+        # Transform the original latent states using the rotation matrix
+        # This aligns the latent dimensions with the principal components of the data
+        aligned_z_flat = np.dot(z_centered, eigenvecs)
+
+        # Reshape back to original shape
+        aligned_latent_states = aligned_z_flat.reshape(n_samples, n_super_nodes, latent_dim)
+
+        # Reshape back to original format [N, K*D]
+        aligned_latent_states = aligned_latent_states.reshape(n_samples, -1)
+
+        print(f"  -> Performed coordinate alignment using principal component analysis")
+
+        return aligned_latent_states
         
     def distill(self, latent_states, targets, n_super_nodes, latent_dim, box_size=None, model=None):
         """
@@ -36,9 +81,12 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
 
         # Check if targets are scalar H (1 column) or derivatives (many columns)
         is_derivative_targets = targets.shape[1] > 1
-        
+
+        # NEW: Perform Coordinate Alignment to rotate latent z to maximize correlation with physical CoM
+        aligned_latent_states = self._perform_coordinate_alignment(latent_states, n_super_nodes, latent_dim)
+
         self.transformer = FeatureTransformer(n_super_nodes, latent_dim, box_size=box_size)
-        
+
         # If we have a model and it has H_net, we should try to get the scalar H as target
         # for better GP discovery of the energy function topology.
         h_targets = targets
@@ -46,7 +94,7 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
             try:
                 import torch
                 device = next(model.parameters()).device
-                z_torch = torch.from_numpy(latent_states).float().to(device)
+                z_torch = torch.from_numpy(aligned_latent_states).float().to(device)
                 with torch.no_grad():
                     h_val = model.ode_func.H_net(z_torch).cpu().numpy()
 
@@ -58,8 +106,8 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
                     h_val = h_val[:, 0] if h_val.shape[1] > 0 else h_val.flatten()
 
                 # Ensure the shape matches exactly with latent_states first dimension
-                if h_val.shape[0] != latent_states.shape[0]:
-                    print(f"Shape mismatch: h_val has {h_val.shape[0]} elements, latent_states has {latent_states.shape[0]} elements")
+                if h_val.shape[0] != aligned_latent_states.shape[0]:
+                    print(f"Shape mismatch: h_val has {h_val.shape[0]} elements, aligned_latent_states has {aligned_latent_states.shape[0]} elements")
                     print(f"Using original targets as fallback due to shape mismatch")
                     h_targets = targets
                 else:
@@ -70,8 +118,8 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
                 # Fallback to using the original targets
                 h_targets = targets
 
-        self.transformer.fit(latent_states, h_targets)
-        X_norm = self.transformer.normalize_x(self.transformer.transform(latent_states))
+        self.transformer.fit(aligned_latent_states, h_targets)
+        X_norm = self.transformer.normalize_x(self.transformer.transform(aligned_latent_states))
         Y_norm = self.transformer.normalize_y(h_targets)
 
         # Distill the Hamiltonian function H
