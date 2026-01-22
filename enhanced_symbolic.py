@@ -198,8 +198,24 @@ class TorchFeatureTransformer(torch.nn.Module):
             exp_dist = torch.exp(-torch.clamp(dists_flat, max=20.0))
             screened_coulomb = exp_dist / (dists_flat + 0.1)
             log_dist = torch.log(dists_flat + 1.0)
+
+            # NEW: Additional physics-inspired features (Synced with ImprovedFeatureTransformer)
+            sin_dist = torch.sin(dists_flat)
+            cos_dist = torch.cos(dists_flat)
+            sqrt_dist = torch.sqrt(dists_flat)
+            dist_times_inv = dists_flat * inv_dists_flat
+            dist_plus_inv = dists_flat + inv_dists_flat
             
-            features.extend([dists_flat, inv_dists_flat, inv_sq_dists_flat, exp_dist, screened_coulomb, log_dist])
+            features.extend([dists_flat, inv_dists_flat, inv_sq_dists_flat, 
+                           exp_dist, screened_coulomb, log_dist,
+                           sin_dist, cos_dist, sqrt_dist,
+                           dist_times_inv, dist_plus_inv])
+
+            # NEW: Explicit kinetic energy terms (p^2) for each node
+            half_d = self.latent_dim // 2
+            p_vars = z_nodes[:, :, half_d:]
+            ke_terms = torch.sum(p_vars**2, dim=-1) # [Batch, K]
+            features.append(ke_terms)
 
         X = torch.cat(features, dim=1)
         # Final clamp of linear features before polynomial expansion
@@ -207,16 +223,30 @@ class TorchFeatureTransformer(torch.nn.Module):
 
         poly_features = [X]
         n_latents = self.n_super_nodes * self.latent_dim
+        
+        # NEW: Sophisticated polynomial features synced with ImprovedFeatureTransformer
+        max_features_for_poly = min(20, n_latents)
 
-        for i in range(n_latents):
-            poly_features.append(X[:, i:i+1]**2)
-            node_idx = i // self.latent_dim
-            dim_idx = i % self.latent_dim
-            for j in range(i + 1, (node_idx + 1) * self.latent_dim):
-                poly_features.append(X[:, i:i+1] * X[:, j:j+1])
-            for other_node in range(node_idx + 1, self.n_super_nodes):
+        for i in range(max_features_for_poly):
+            valid_idx = i % n_latents
+            # Quadratic terms
+            poly_features.append(X[:, valid_idx:valid_idx+1]**2)
+            
+            node_idx = valid_idx // self.latent_dim
+            dim_idx = valid_idx % self.latent_dim
+            
+            # Cross terms with expanded range
+            for j in range(valid_idx + 1, min(valid_idx + 6, (node_idx + 1) * self.latent_dim)):
+                poly_features.append(X[:, valid_idx:valid_idx+1] * X[:, j:j+1])
+                
+            # Cross terms with other nodes
+            for other_node in range(node_idx + 1, min(node_idx + 5, self.n_super_nodes)):
                 other_idx = other_node * self.latent_dim + dim_idx
-                poly_features.append(X[:, i:i+1] * X[:, other_idx:other_idx+1])
+                poly_features.append(X[:, valid_idx:valid_idx+1] * X[:, other_idx:other_idx+1])
+
+            # NEW: Cubic terms for important features
+            if valid_idx % 3 == 0:
+                poly_features.append(X[:, valid_idx:valid_idx+1]**3)
 
         X_poly = torch.cat(poly_features, dim=1)
         # Final safety clamp

@@ -300,7 +300,7 @@ class Trainer:
 
         # Significantly increase spatial and connectivity loss multipliers by 10x
         if hasattr(self.model.encoder.pooling, 'temporal_consistency_weight'):
-            self.model.encoder.pooling.temporal_consistency_weight = 20.0 # Increased from 10.0
+            self.model.encoder.pooling.temporal_consistency_weight = 50.0 # Increased from 20.0
 
         # Symbolic-in-the-loop
         self.symbolic_proxy = None
@@ -538,7 +538,7 @@ class Trainer:
         loss_l2 = torch.mean(z_preds**2)
         z_vel = (z_preds[1:] - z_preds[:-1]) / dt
         loss_lvr = torch.mean((z_vel[1:] - z_vel[:-1])**2) if len(z_vel) > 1 else torch.tensor(0.0, device=self.device)
-        loss_lvr += 0.1 * torch.mean(z_vel**2) if len(z_vel) > 0 else torch.tensor(0.0, device=self.device)
+        loss_lvr += 0.5 * torch.mean(z_vel**2) if len(z_vel) > 0 else torch.tensor(0.0, device=self.device)
 
         # NEW: Latent smoothing loss to penalize high-frequency jitter
         loss_smooth = self._compute_latent_smoothing_loss(z_preds)
@@ -640,15 +640,15 @@ class Trainer:
         discovery_loss += (weights['sym'] * (self.symbolic_weight - 1.0) * torch.clamp(loss_sym.to(torch.float32), 0, 100)) # Adjust sym weight
         discovery_loss += 1e-4 * torch.clamp(loss_curv.to(torch.float32), 0, 100)
 
-        loss = discovery_loss + (weights['l2'] * 1e-4 * torch.clamp(loss_l2, 0, 100) + lvars[4]) + (weights['lvr'] * 1e-2 * torch.clamp(loss_lvr, 0, 100) + lvars[5])
+        loss = discovery_loss + (weights['l2'] * 1e-4 * torch.clamp(loss_l2, 0, 100) + lvars[4]) + (weights['lvr'] * 5e-2 * torch.clamp(loss_lvr, 0, 100) + lvars[5])
         if compute_consistency: loss += (weights['cons'] * torch.clamp(loss_cons.to(torch.float32), 0, 100) + lvars[1])
 
         # Add smoothing loss to the total loss
         smooth_idx = list(raw_losses.keys()).index('smooth')  # This should be 15
         if smooth_idx < len(lvars):  # Make sure the index exists
-            loss += (weights['smooth'] * 1e-1 * torch.clamp(loss_smooth, 0, 100) + lvars[smooth_idx])
+            loss += (weights['smooth'] * 5e-1 * torch.clamp(loss_smooth, 0, 100) + lvars[smooth_idx])
         else:
-            loss += weights['smooth'] * 1e-1 * torch.clamp(loss_smooth, 0, 100)  # Just apply weight without log_var
+            loss += weights['smooth'] * 5e-1 * torch.clamp(loss_smooth, 0, 100)  # Just apply weight without log_var
         
         loss = torch.clamp(loss + 0.1 * torch.sum(lvars**2), 0, 1e4)
         if not torch.isfinite(loss): loss = loss_rec if torch.isfinite(loss_rec) else torch.tensor(1.0, device=self.device, requires_grad=True)

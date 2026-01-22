@@ -204,6 +204,12 @@ def main():
             # Convert z_states to tensor for symbolic prediction
             z_tensor = torch.tensor(z_states_plot.reshape(-1, args.super_nodes * 4), dtype=torch.float32, device=device)
 
+            # Log dimensions for debugging if mismatch occurs
+            print(f"DEBUG: SymbolicProxy input z_tensor shape: {z_tensor.shape}")
+            if trainer.symbolic_proxy is not None:
+                expected_in = trainer.symbolic_proxy.torch_transformer.x_poly_mean.size(0)
+                print(f"DEBUG: SymbolicProxy expects {expected_in} features (pre-mask)")
+
             # Get symbolic predictions
             with torch.no_grad():
                 symbolic_dz_dt = trainer.symbolic_proxy(z_tensor)
@@ -212,6 +218,8 @@ def main():
             expected_shape = z_states_plot.shape
             num_elements_needed = expected_shape[0] * expected_shape[1] * expected_shape[2]
             symbolic_dz_dt_flat = symbolic_dz_dt.cpu().numpy().flatten()
+            
+            print(f"DEBUG: SymbolicProxy output shape: {symbolic_dz_dt.shape}")
 
             # Trim or pad if needed to match expected size
             if len(symbolic_dz_dt_flat) > num_elements_needed:

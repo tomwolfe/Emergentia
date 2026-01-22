@@ -37,6 +37,15 @@ Particle Dynamics → GNN Encoder → Super-Node Latents → Hamiltonian ODE →
                 Loss            Consistency      Constraints       Programming
 ```
 
+The architecture follows a clean, modular design where each component has a specific responsibility:
+- **Data Generation**: Implemented in `simulator.py` with various physics simulators
+- **Neural Network Model**: Implemented in `model.py` with GNN encoder and decoder
+- **Training Engine**: Implemented in `engine.py` with loss computation and optimization
+- **Symbolic Regression**: Implemented across `symbolic.py`, `enhanced_symbolic.py`, and `hamiltonian_symbolic.py`
+- **Stabilization**: Implemented in `stable_pooling.py` with sparsity scheduling
+- **Visualization**: Implemented in `visualization.py` with comprehensive plotting tools
+- **Main Pipeline**: Orchestrated in `unified_train.py` with all components integrated
+
 ## Results Visualization
 
 ![Training History](training_history.png)
@@ -69,31 +78,6 @@ Additional options for performance tuning:
 - `--sim`: Choose simulator ('spring' or 'lj' for Lennard-Jones)
 - `--hamiltonian`: Use Hamiltonian dynamics
 - `--lr`: Learning rate (default: 5e-4)
-
-### Fast Execution
-
-For faster execution with performance optimizations, use the optimized version:
-
-```bash
-python fast_train.py --epochs 500 --steps 100 --particles 6 --super_nodes 2
-```
-
-The optimized version includes:
-- Gradient accumulation for memory efficiency
-- Selective consistency loss computation
-- Efficient ODE solving with looser tolerances during training
-- Early stopping to prevent overfitting
-- Edge caching for faster data preparation
-
-### Original Version
-
-The original version is still available for reference:
-
-```bash
-python main.py --epochs 1000 --steps 200 --particles 8 --super_nodes 2
-```
-
-Note: The original version is significantly slower and may timeout with larger parameters.
 
 ### Basic Example
 
@@ -132,6 +116,12 @@ if len(latent_data[0]) > 0:
     print(f"H(z) = {equations[0]}")
 ```
 
+For a complete end-to-end example, run the unified training pipeline:
+
+```bash
+python unified_train.py --particles 8 --super_nodes 2 --epochs 100 --steps 200
+```
+
 ### Advanced Configuration
 
 ```python
@@ -162,9 +152,15 @@ trainer = Trainer(
     device='cuda' if torch.cuda.is_available() else 'cpu',
     stats=stats,
     warmup_epochs=50,  # Stage 1: Train rec and assign
-    max_epochs=500,
+    max_steps=500,
     sparsity_scheduler=sparsity_scheduler
 )
+```
+
+For production use, consider using the unified training pipeline which incorporates all these configurations:
+
+```bash
+python unified_train.py --particles 16 --super_nodes 4 --epochs 500 --steps 500 --sim lj --hamiltonian --memory_efficient --quick_symbolic
 ```
 
 ## Key Improvements Over Baseline
@@ -230,18 +226,10 @@ Where:
 
 ## Testing
 
-Run the test suite:
+Testing files are not included in the current project structure. To test the functionality, run the main training script:
 
 ```bash
-python -m pytest test_*.py -v
-```
-
-Or run individual tests:
-
-```bash
-python test_symbolic.py
-python test_ode.py
-python test_pareto.py
+python unified_train.py --epochs 100 --steps 50 --particles 6 --super_nodes 2
 ```
 
 ## Files Overview
@@ -254,12 +242,11 @@ python test_pareto.py
 - `engine.py`: Main training engine with loss computation and optimization
 - `stable_pooling.py`: Enhanced pooling with collapse prevention mechanisms
 - `balanced_features.py`: Physics-informed feature engineering
-- `optimized_symbolic.py`: Optimized symbolic dynamics with caching
+- `common_losses.py`: Common loss functions extracted to reduce duplication
+- `pure_symbolic_functions.py`: Pure functions extracted from symbolic processing modules
 - `train_utils.py`: Training utilities including early stopping and device management
 - `visualization.py`: Visualization tools for training history and discovery results
-- `unified_train.py`: Unified training pipeline with all improvements
-- `fast_train.py`: Fast training script with performance optimizations
-- `main.py`: Original baseline implementation
+- `unified_train.py`: Unified training pipeline with all improvements (main entry point)
 - `config.yaml`: Configuration file for the pipeline
 - `requirements.txt`: Project dependencies
 - `training_history.png`: Visualization of training progress and loss components
