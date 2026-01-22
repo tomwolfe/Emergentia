@@ -86,6 +86,16 @@ def main():
                                  dissipative=True,
                                  min_active_super_nodes=min_active).to(device)
 
+    # NEW: Weight initialization for GNN stability (critical for MPS)
+    def weights_init(m):
+        if isinstance(m, torch.nn.Linear):
+            torch.nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                torch.nn.init.zeros_(m.bias)
+    
+    model.apply(weights_init)
+    print("Model weights initialized with Xavier uniform")
+
     # NEW: Sparsity Scheduler to prevent resolution collapse
     from stable_pooling import SparsityScheduler
     sparsity_scheduler = SparsityScheduler(
@@ -104,7 +114,10 @@ def main():
 
     # Trainer now uses adaptive loss weighting, manual weights are deprecated
     # Optimized parameters for faster training
-    trainer = Trainer(model, lr=2e-4, device=device, stats=stats, sparsity_scheduler=sparsity_scheduler,
+    warmup_epochs = int(epochs * 0.2)
+    trainer = Trainer(model, lr=2e-4, device=device, stats=stats, 
+                      warmup_epochs=warmup_epochs, max_epochs=epochs,
+                      sparsity_scheduler=sparsity_scheduler,
                       skip_consistency_freq=3,  # Compute consistency loss every 3 epochs to save time
                       enable_gradient_accumulation=True,  # Use gradient accumulation for memory efficiency
                       grad_acc_steps=2,  # Accumulate gradients over 2 steps

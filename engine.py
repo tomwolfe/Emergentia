@@ -25,8 +25,9 @@ def prepare_data(pos, vel, radius=1.1, stats=None, device='cpu', cache_edges=Tru
     if stats is None:
         stats = compute_stats(pos, vel)
 
-    # Map pos to [-1, 1]
+    # Map pos to [-1, 1] and clip to prevent Tanh saturation
     pos_norm = 2.0 * (pos - stats['pos_min']) / stats['pos_range'] - 1.0
+    pos_norm = np.clip(pos_norm, -0.99, 0.99)
     vel_norm = (vel - stats['vel_mean']) / stats['vel_std']
 
     dataset = []
@@ -239,7 +240,7 @@ class SymbolicProxy(torch.nn.Module):
 
 class Trainer:
     def __init__(self, model, lr=5e-4, device='cpu', stats=None, align_anneal_epochs=1000,
-                 warmup_epochs=20, sparsity_scheduler=None, hard_assignment_start=0.7,
+                 warmup_epochs=20, max_epochs=1000, sparsity_scheduler=None, hard_assignment_start=0.7,
                  skip_consistency_freq=2, enable_gradient_accumulation=False, grad_acc_steps=1,
                  enhanced_balancer=None):
         self.model = model.to(device)
@@ -248,7 +249,8 @@ class Trainer:
         self.s_history = []
         self.max_s_history = 10
         self.align_anneal_epochs = align_anneal_epochs
-        self.warmup_epochs = warmup_epochs
+        # Cap warmup_epochs to 20% of max_epochs
+        self.warmup_epochs = min(warmup_epochs, int(max_epochs * 0.2))
         self.sparsity_scheduler = sparsity_scheduler
         self.hard_assignment_start = hard_assignment_start
         self.skip_consistency_freq = skip_consistency_freq  # Skip consistency loss every N epochs
@@ -320,8 +322,17 @@ class Trainer:
             if hasattr(self.model.encoder.pooling, 'set_sparsity_weight'):
                 self.model.encoder.pooling.set_sparsity_weight(new_weight)
 
-        # Stage-based curriculum: Stage 1 (0-200 epochs) freezes ODE/Symbolic and focuses on Recon/Align
-        is_stage1 = epoch < 200
+        # Stage 0: Grounding (0-50 epochs) - Prioritize Reconstruction and Alignment
+        if epoch < 50:
+            with torch.no_grad():
+                self.model.log_vars[0].fill_(-6.0)  # Maximum priority for reconstruction
+                self.model.log_vars[6].fill_(-5.0)  # Maximum priority for alignment
+                # Suppress other structural losses initially
+                self.model.log_vars[3].fill_(2.0)   # Ortho
+                self.model.log_vars[11].fill_(2.0)  # MI
+
+        # Stage-based curriculum: Stage 1 freezes ODE/Symbolic and focuses on Recon/Align
+        is_stage1 = epoch < self.warmup_epochs
         for p in self.model.ode_func.parameters():
             p.requires_grad = not is_stage1
         
@@ -337,7 +348,7 @@ class Trainer:
         # Determine if we should compute consistency loss based on frequency
         # Stage 1 skips consistency loss to focus on static reconstruction
         compute_consistency = (epoch >= self.warmup_epochs) and (not is_stage1)
-        if epoch > 200: # Only skip frequency after stage 1
+        if epoch > self.warmup_epochs: # Only skip frequency after stage 1
             compute_consistency = compute_consistency and (epoch % self.skip_consistency_freq == 0)
 
         # For gradient accumulation

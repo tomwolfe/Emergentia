@@ -386,15 +386,21 @@ class GNNDecoder(nn.Module):
     def __init__(self, latent_dim, hidden_dim, out_features, box_size=10.0):
         super(GNNDecoder, self).__init__()
         self.box_size = box_size
-        self.mlp = nn.Sequential(
+        self.shared_mlp = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
             nn.ReLU(),
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, out_features)
+            nn.LayerNorm(hidden_dim)
         )
+        # Position head: Maps to [-1, 1]
+        self.pos_head = nn.Sequential(
+            nn.Linear(hidden_dim, 2),
+            nn.Tanh()
+        )
+        # Velocity head: Maps to unconstrained Z-score values
+        self.vel_head = nn.Linear(hidden_dim, 2)
 
     def forward(self, z, s, batch, stats=None):
         # z: [batch_size, n_super_nodes, latent_dim]
@@ -406,11 +412,11 @@ class GNNDecoder(nn.Module):
         # Weighted sum: [N_total, n_super_nodes, 1] * [N_total, n_super_nodes, latent_dim]
         node_features_latent = torch.sum(s.unsqueeze(-1) * z_expanded, dim=1)
         
-        out = self.mlp(node_features_latent)
+        shared_out = self.shared_mlp(node_features_latent)
         
-        # Positions and velocities are reconstructed
-        pos_recon = out[:, :2]
-        vel_recon = out[:, 2:]
+        # Separate heads for position and velocity
+        pos_recon = self.pos_head(shared_out)
+        vel_recon = self.vel_head(shared_out)
 
         # Explicit denormalization using stats from trainer
         if stats is not None:

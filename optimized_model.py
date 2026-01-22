@@ -194,13 +194,19 @@ class OptimizedGNNDecoder(nn.Module):
         super(OptimizedGNNDecoder, self).__init__()
         self.box_size = box_size
         # Reduced hidden dimensions
-        self.mlp = nn.Sequential(
+        self.shared_mlp = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim//2),
             nn.ReLU(),
             nn.Linear(hidden_dim//2, hidden_dim//2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim//2, out_features)
+            nn.ReLU()
         )
+        # Position head: Maps to [-1, 1]
+        self.pos_head = nn.Sequential(
+            nn.Linear(hidden_dim//2, 2),
+            nn.Tanh()
+        )
+        # Velocity head: Maps to unconstrained Z-score values
+        self.vel_head = nn.Linear(hidden_dim//2, 2)
 
     def forward(self, z, s, batch, stats=None):
         # z: [batch_size, n_super_nodes, latent_dim]
@@ -212,11 +218,11 @@ class OptimizedGNNDecoder(nn.Module):
         # Weighted sum: [N_total, n_super_nodes, 1] * [N_total, n_super_nodes, latent_dim]
         node_features_latent = torch.sum(s.unsqueeze(-1) * z_expanded, dim=1)
 
-        out = self.mlp(node_features_latent)
+        shared_out = self.shared_mlp(node_features_latent)
         
-        # Positions and velocities are reconstructed
-        pos_recon = out[:, :2]
-        vel_recon = out[:, 2:]
+        # Separate heads for position and velocity
+        pos_recon = self.pos_head(shared_out)
+        vel_recon = self.vel_head(shared_out)
 
         # Explicit denormalization using stats from trainer
         if stats is not None:
@@ -275,7 +281,8 @@ class OptimizedDiscoveryEngineModel(nn.Module):
         """
         # Calculate variance across the feature dimension D for each super-node
         var = z.var(dim=-1).mean()
-        return -torch.log(var + 1e-6)
+        # Hinge variance loss: only penalize if std < 1.0
+        return torch.relu(1.0 - torch.sqrt(var + 1e-6))
 
     def get_mi_loss(self, z, mu):
         """
