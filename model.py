@@ -524,36 +524,16 @@ class DiscoveryEngineModel(nn.Module):
         Explicitly penalize low latent variance to prevent manifold collapse.
         z: [B, K, D] or [T, B, K, D]
         """
-        # Calculate variance across the feature dimension D for each super-node
-        # We want the latent space to be utilized, so we penalize low variance
-        var = z.var(dim=-1).mean()
-        # Hinge variance loss: only penalize if std < 1.0
-        # This prevents the infinite gradient singularity of -log(var)
-        return torch.relu(1.0 - torch.sqrt(var + 1e-6))
+        from common_losses import get_latent_variance_loss as common_latent_variance_loss
+        return common_latent_variance_loss(z)
 
     def get_mi_loss(self, z, mu):
         """
         Unsupervised alignment loss via Mutual Information Maximization (MINE).
         z: [B, K, D], mu: [B, K, 2]
         """
-        # Take first 2 dims of z for spatial alignment
-        z_spatial = z[:, :, :2]
-        
-        # Joint distribution
-        joint = self.mi_discriminator(z_spatial, mu)
-        
-        # Marginal distribution (shuffle mu across batch and super-nodes)
-        batch_size, n_k, _ = mu.shape
-        mu_shuffled = mu[torch.randperm(batch_size)]
-        # Also shuffle super-nodes to break local correlation
-        mu_shuffled = mu_shuffled[:, torch.randperm(n_k)]
-        
-        marginal = self.mi_discriminator(z_spatial, mu_shuffled)
-        
-        # MINE objective: I(Z; MU) >= E[joint] - log(E[exp(marginal)])
-        # We want to maximize this, so we minimize the negative
-        mi_est = torch.mean(joint) - torch.log(torch.mean(torch.exp(marginal)) + 1e-9)
-        return -mi_est
+        from common_losses import get_mi_loss as common_mi_loss
+        return common_mi_loss(z, mu, self.mi_discriminator)
 
     def encode(self, x, edge_index, batch, tau=1.0, hard=False, prev_assignments=None):
         return self.encoder(x, edge_index, batch, tau=tau, hard=hard, prev_assignments=prev_assignments)

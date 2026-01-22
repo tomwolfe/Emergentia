@@ -17,19 +17,8 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # Sanitized Symbolic Primitives
-def _safe_sqrt(x):
-    return np.sqrt(np.abs(x))
-
-def _safe_log(x):
-    return np.log(np.abs(x) + 1e-9)
-
-def _safe_div(x, y):
-    return np.where(np.abs(y) < 1e-9, 1.0, x / y)
-
-safe_sqrt = make_function(function=_safe_sqrt, name='sqrt', arity=1)
-safe_log = make_function(function=_safe_log, name='log', arity=1)
-safe_div = make_function(function=_safe_div, name='div', arity=2)
-safe_inv = make_function(function=lambda x: _safe_div(1.0, x), name='inv', arity=1)
+from pure_symbolic_functions import create_safe_functions
+safe_sqrt, safe_log, safe_div, safe_inv = create_safe_functions()
 
 class FeatureTransformer:
     """
