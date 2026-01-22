@@ -607,15 +607,17 @@ class DiscoveryEngineModel(nn.Module):
         t_ode = t.to(ode_device)
 
         # Use adaptive tolerance based on training stage to balance accuracy and efficiency
-        # During early training, looser tolerances are acceptable
+        # Add a small epsilon to prevent over-fitting to numerical noise on MPS
+        eps = 1e-3 if str(ode_device) == 'mps' or str(original_device) == 'mps' else 0.0
+        
         if self.training:
             # Looser tolerances during training for efficiency
-            rtol = 1e-1  # Much looser during early training for speed
-            atol = 1e-2
+            rtol = 1e-1 + eps
+            atol = 1e-2 + eps
         else:
             # Tighter tolerances during evaluation for accuracy
-            rtol = 1e-3
-            atol = 1e-5
+            rtol = 1e-3 + eps
+            atol = 1e-5 + eps
 
         # Use a more efficient solver during training, but accurate one for evaluation
         if self.training:

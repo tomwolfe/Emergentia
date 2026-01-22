@@ -73,8 +73,19 @@ def main():
     print("Extracting latent data for visualization...")
     z_states, dz_states, t_states = extract_latent_data(model, dataset, sim.dt, include_hamiltonian=args.hamiltonian)
 
-    if epoch < 100 or last_rec > 0.25:
-        print(f"Skipping symbolic discovery: Latent manifold not stabilized (Epoch: {epoch}, Rec Loss: {last_rec:.4f}).")
+    # Compute stability metric: variance of latent derivatives over the last 20% of the trajectory
+    # dz_states: [T, K, D]
+    stability_window = max(10, int(len(dz_states) * 0.2))
+    recent_dz = dz_states[-stability_window:]
+    dz_stability = np.var(recent_dz)
+    print(f"Latent Stability (Var[dz]): {dz_stability:.6f}")
+
+    if epoch < 100 or last_rec > 0.25 or dz_stability > 0.05:
+        reason = ""
+        if epoch < 100: reason += "Insufficient epochs. "
+        if last_rec > 0.25: reason += f"Rec Loss too high ({last_rec:.4f} > 0.25). "
+        if dz_stability > 0.05: reason += f"Latent space unstable ({dz_stability:.4f} > 0.05). "
+        print(f"Skipping symbolic discovery: {reason}")
         equations = []
     else:
         print("Analyzing latent space...")

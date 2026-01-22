@@ -265,13 +265,13 @@ class Trainer:
 
         # Manually re-balance initial log_vars for stability
         with torch.no_grad():
-            self.model.log_vars[0].fill_(-4.0)  # Even higher priority for reconstruction
+            self.model.log_vars[0].fill_(-5.0)  # Very high priority for reconstruction
             self.model.log_vars[1].fill_(2.0)   # Lower initial priority for consistency
             self.model.log_vars[2].fill_(2.0)   # Lower initial priority for assignment
             self.model.log_vars[3].fill_(4.0)   # Lower initial priority for ortho
             self.model.log_vars[4].fill_(4.0)   # Lower initial priority for l2
             self.model.log_vars[5].fill_(2.0)   # Moderate priority for lvr
-            self.model.log_vars[6].fill_(6.0)   # Lower initial priority for alignment
+            self.model.log_vars[6].fill_(5.0)   # Lower initial priority for alignment
             self.model.log_vars[7].fill_(4.0)   # Lower initial priority for pruning
             self.model.log_vars[8].fill_(4.0)   # Lower initial priority for sep
             self.model.log_vars[9].fill_(4.0)   # Lower initial priority for conn
@@ -279,6 +279,10 @@ class Trainer:
             self.model.log_vars[11].fill_(6.0)  # Lower initial priority for mi
             self.model.log_vars[12].fill_(4.0)  # Lower initial priority for sym
             self.model.log_vars[13].fill_(4.0)  # Lower initial priority for var
+
+        # Significantly increase temporal consistency weight
+        if hasattr(self.model.encoder.pooling, 'temporal_consistency_weight'):
+            self.model.encoder.pooling.temporal_consistency_weight = 5.0
 
         # Symbolic-in-the-loop
         self.symbolic_proxy = None
@@ -295,22 +299,28 @@ class Trainer:
         else:
             self.mps_ode_on_cpu = False
 
-        # Separate H_net parameters to apply specific weight decay
+        # Separate H_net and GNNEncoder.assign_mlp parameters to apply specific weight decay
         h_net_params = []
+        assign_mlp_params = []
         other_params = []
         
         if hasattr(self.model.ode_func, 'H_net'):
             h_net_params = list(self.model.ode_func.H_net.parameters())
-            h_ids = {id(p) for p in h_net_params}
-            other_params = [p for p in self.model.parameters() if id(p) not in h_ids]
-        else:
-            other_params = list(self.model.parameters())
+        
+        if hasattr(self.model.encoder.pooling, 'assign_mlp'):
+            assign_mlp_params = list(self.model.encoder.pooling.assign_mlp.parameters())
+
+        h_ids = {id(p) for p in h_net_params}
+        assign_ids = {id(p) for p in assign_mlp_params}
+        other_params = [p for p in self.model.parameters() if id(p) not in h_ids and id(p) not in assign_ids]
 
         param_groups = [
             {'params': other_params, 'weight_decay': 1e-5},
         ]
         if h_net_params:
             param_groups.append({'params': h_net_params, 'weight_decay': 1e-3})
+        if assign_mlp_params:
+            param_groups.append({'params': assign_mlp_params, 'weight_decay': 1e-2}) # Penalize rapid assignment changes
 
         self.optimizer = optim.Adam(param_groups, lr=lr)
         self.criterion = torch.nn.MSELoss().to(device)
@@ -358,10 +368,11 @@ class Trainer:
         # Enhanced assignment loss including stability terms
         loss_assign = (
             entropy_weight * losses_0['entropy'] + 
-            0.5 * losses_0['diversity'] + 
+            2.0 * losses_0['diversity'] + 
             0.1 * losses_0['spatial'] +
             0.1 * losses_0.get('collapse_prevention', 0.0) +
-            0.1 * losses_0.get('balance', 0.0)
+            0.1 * losses_0.get('balance', 0.0) +
+            1.0 * losses_0.get('temporal_consistency', 0.0)
         )
         
         initial_results = {
@@ -511,10 +522,11 @@ class Trainer:
             
             loss_assign += (
                 entropy_weight * losses_t['entropy'] + 
-                0.5 * losses_t['diversity'] + 
+                2.0 * losses_t['diversity'] + 
                 0.1 * losses_t['spatial'] +
                 0.1 * losses_t.get('collapse_prevention', 0.0) + 
-                0.1 * losses_t.get('balance', 0.0)
+                0.1 * losses_t.get('balance', 0.0) +
+                1.0 * losses_t.get('temporal_consistency', 0.0)
             )
             loss_pruning += losses_t['pruning']
             loss_sparsity += losses_t['sparsity']
@@ -525,7 +537,13 @@ class Trainer:
             # mu_t is already in normalized range [-1, 1] because it's computed from normalized x
             mu_t_norm = mu_t 
             d_align = min(self.model.encoder.latent_dim // 2 if self.model.hamiltonian else 2, 2)
-            loss_align += 2.0 * self.criterion(z_preds[t, :, :, :d_align], mu_t_norm[:, :, :d_align])
+            
+            # Soft-start for alignment loss: keep at 0 for first 100 epochs, then anneal in
+            align_weight = 0.0
+            if epoch > 100:
+                align_weight = min(1.0, (epoch - 100) / self.align_anneal_epochs)
+            
+            loss_align += 2.0 * align_weight * self.criterion(z_preds[t, :, :, :d_align], mu_t_norm[:, :, :d_align])
             loss_mi += self.model.get_mi_loss(z_preds[t], mu_t_norm)
 
             if t > 0:
