@@ -52,7 +52,7 @@ class StableHierarchicalPooling(nn.Module):
             nn.ReLU(),
             nn.Linear(in_channels, n_super_nodes)
         )
-        self.scaling = nn.Parameter(torch.tensor(1.0))
+        self.scaling = nn.Parameter(torch.tensor(0.1))
 
         # Mask to track active super-nodes (not directly optimized by backprop)
         self.register_buffer('active_mask', torch.ones(n_super_nodes))

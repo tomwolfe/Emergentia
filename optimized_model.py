@@ -222,6 +222,11 @@ class OptimizedGNNDecoder(nn.Module):
             nn.Linear(hidden_dim//2, hidden_dim//2),
             nn.ReLU()
         )
+
+        # Add LayerNorm before the heads to prevent large latent values from saturating Tanh
+        self.pre_pos_norm = nn.LayerNorm(hidden_dim//2)
+        self.pre_vel_norm = nn.LayerNorm(hidden_dim//2)
+
         # Position head: Maps to [-1, 1]
         self.pos_head = nn.Sequential(
             nn.Linear(hidden_dim//2, 2),
@@ -241,10 +246,14 @@ class OptimizedGNNDecoder(nn.Module):
         node_features_latent = torch.sum(s.unsqueeze(-1) * z_expanded, dim=1)
 
         shared_out = self.shared_mlp(node_features_latent)
-        
+
+        # Apply LayerNorm before the heads to prevent large latent values from saturating Tanh
+        pos_input = self.pre_pos_norm(shared_out)
+        vel_input = self.pre_vel_norm(shared_out)
+
         # Separate heads for position and velocity
-        pos_recon = self.pos_head(shared_out)
-        vel_recon = self.vel_head(shared_out)
+        pos_recon = self.pos_head(pos_input)
+        vel_recon = self.vel_head(vel_input)
 
         # Explicit denormalization using stats from trainer
         if stats is not None:
@@ -252,11 +261,11 @@ class OptimizedGNNDecoder(nn.Module):
             pos_range = torch.tensor(stats['pos_range'], device=pos_recon.device, dtype=pos_recon.dtype)
             # Map [-1, 1] back to original range
             pos_recon = 0.5 * (pos_recon + 1.0) * pos_range + pos_min
-            
+
             vel_mean = torch.tensor(stats['vel_mean'], device=vel_recon.device, dtype=vel_recon.dtype)
             vel_std = torch.tensor(stats['vel_std'], device=vel_recon.device, dtype=vel_recon.dtype)
             vel_recon = vel_recon * vel_std + vel_mean
-        
+
         return torch.cat([pos_recon, vel_recon], dim=-1)
 
 
@@ -290,13 +299,20 @@ class OptimizedDiscoveryEngineModel(nn.Module):
         # Maintain the same number of log vars as the original model to be compatible with trainer
         # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning, 8: sep, 9: conn, 10: sparsity, 11: mi, 12: sym, 13: var
         lvars = torch.zeros(14)
-        lvars[0] = -5.0 # High priority for reconstruction
-        lvars[1] = 0.5  # Consistency
-        lvars[2] = 0.5  # Assignment
-        lvars[3] = 0.0  # Ortho
-        lvars[6] = -3.0 # Start align immediately with high weight
-        lvars[12] = 2.0 # Suppress symbolic significantly initially
-        lvars[13] = 1.0 # Suppress latent variance loss more initially
+        lvars[0] = -2.0 # High priority for reconstruction
+        lvars[1] = 2.0  # Low initial priority for consistency
+        lvars[2] = 2.0  # Low initial priority for assignment
+        lvars[3] = 2.0  # Low initial priority for ortho
+        lvars[4] = 2.0  # Low initial priority for l2
+        lvars[5] = 2.0  # Low initial priority for lvr
+        lvars[6] = 2.0  # Low initial priority for align (was -3.0)
+        lvars[7] = 2.0  # Low initial priority for pruning
+        lvars[8] = 2.0  # Low initial priority for sep
+        lvars[9] = 2.0  # Low initial priority for conn
+        lvars[10] = 2.0 # Low initial priority for sparsity
+        lvars[11] = 2.0 # Low initial priority for mi (was not set)
+        lvars[12] = 2.0 # Low initial priority for sym
+        lvars[13] = 2.0 # Low initial priority for var
         self.log_vars = nn.Parameter(lvars) 
         
     def get_latent_variance_loss(self, z):

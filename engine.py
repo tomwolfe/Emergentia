@@ -265,15 +265,20 @@ class Trainer:
 
         # Manually re-balance initial log_vars for stability
         with torch.no_grad():
-            self.model.log_vars[0].fill_(-5.0)  # High priority for reconstruction
+            self.model.log_vars[0].fill_(-2.0)  # High priority for reconstruction
             self.model.log_vars[1].fill_(2.0)   # Lower initial priority for consistency
             self.model.log_vars[2].fill_(2.0)   # Lower initial priority for assignment
             self.model.log_vars[3].fill_(2.0)   # Lower initial priority for ortho
             self.model.log_vars[4].fill_(2.0)   # Lower initial priority for l2
-            self.model.log_vars[6].fill_(-3.0)  # High priority for alignment
+            self.model.log_vars[5].fill_(2.0)   # Lower initial priority for lvr
+            self.model.log_vars[6].fill_(2.0)   # Lower initial priority for alignment (changed from -3.0)
+            self.model.log_vars[7].fill_(2.0)   # Lower initial priority for pruning
+            self.model.log_vars[8].fill_(2.0)   # Lower initial priority for sep
+            self.model.log_vars[9].fill_(2.0)   # Lower initial priority for conn
+            self.model.log_vars[10].fill_(2.0)  # Lower initial priority for sparsity
             self.model.log_vars[11].fill_(2.0)  # Lower initial priority for mi
             self.model.log_vars[12].fill_(2.0)  # Lower initial priority for sym
-            self.model.log_vars[13].fill_(2.0)  # Suppress latent variance loss more to prevent explosion
+            self.model.log_vars[13].fill_(2.0)  # Lower initial priority for var
 
         # Symbolic-in-the-loop
         self.symbolic_proxy = None
@@ -333,13 +338,13 @@ class Trainer:
             if hasattr(self.model.encoder.pooling, 'set_sparsity_weight'):
                 self.model.encoder.pooling.set_sparsity_weight(new_weight)
 
-        # Stage 0: Grounding (0-40 epochs) - Prioritize Reconstruction and Alignment
+        # Stage 0: Grounding (0 to warmup_epochs) - Prioritize Reconstruction over Alignment
         # Zero out auxiliary losses during warmup to allow GNN to find basic spatial mapping first
-        is_warmup = epoch < 40
+        is_warmup = epoch < self.warmup_epochs
         if is_warmup:
             with torch.no_grad():
                 self.model.log_vars[0].fill_(-7.0)  # Maximum priority for reconstruction
-                self.model.log_vars[6].fill_(-6.0)  # Maximum priority for alignment
+                self.model.log_vars[6].fill_(4.0)   # Suppress alignment during warmup to focus on reconstruction first
                 # Suppress other structural losses initially
                 self.model.log_vars[3].fill_(4.0)   # Ortho - higher to suppress more
                 self.model.log_vars[11].fill_(4.0)  # MI - higher to suppress more
@@ -389,8 +394,8 @@ class Trainer:
         # 3. Decaying Teacher Forcing Ratio (more aggressive decay)
         tf_ratio = max(0.0, 0.8 * (1.0 - epoch / (0.5 * max_epochs + 1e-9)))  # Faster decay
 
-        # 4. Alignment weight - Boosted in Stage 1
-        align_weight = 5.0 if is_stage1 else 1.0
+        # 4. Alignment weight - Removed hardcoded multiplier to rely solely on log_vars
+        align_weight = 1.0
 
         # 5. Adaptive Entropy Weight: Doubled growth rate to force discrete clusters
         # Point 1: Addressing "Blurry" Meso-scale
@@ -551,15 +556,16 @@ class Trainer:
             s_prev = s_t
             mu_prev = mu_t
 
-        # Normalization - account for sampling every other step
+        # Normalization - account for sampling every other step and number of super nodes
+        n_super_nodes = self.model.encoder.n_super_nodes
         loss_rec /= (seq_len // 2)
         loss_cons /= ((seq_len // 2) - 1) if (not is_warmup and compute_consistency) else 1
         loss_assign /= (seq_len // 2)
         loss_pruning /= (seq_len // 2)
         loss_sparsity /= (seq_len // 2)
         loss_ortho /= (seq_len // 2)
-        loss_align /= (seq_len // 2)
-        loss_mi /= (seq_len // 2)
+        loss_align /= (seq_len // 2) * n_super_nodes  # Also normalize by number of super nodes
+        loss_mi /= (seq_len // 2) * n_super_nodes    # Also normalize by number of super nodes
         loss_sep /= (seq_len // 2)
         loss_conn /= (seq_len // 2)
 
@@ -614,18 +620,35 @@ class Trainer:
 
         weights = raw_weights
 
-        discovery_loss = (weights['rec'] * loss_rec + lvars[0]) + \
-                         (weights['assign'] * loss_assign + lvars[2]) + \
-                         (weights['ortho'] * loss_ortho + lvars[3]) + \
-                         (weights['align'] * loss_align + lvars[6]) + \
-                         (weights['pruning'] * loss_pruning + lvars[7]) + \
-                         (weights['sep'] * loss_sep + lvars[8]) + \
-                         (weights['conn'] * loss_conn + lvars[9]) + \
-                         (weights['sparsity'] * loss_sparsity + lvars[10]) + \
-                         (weights['mi'] * loss_mi + lvars[11]) + \
-                         (weights['sym'] * self.symbolic_weight * loss_sym + lvars[12]) + \
-                         (weights['var'] * loss_var + lvars[13]) + \
-                         (1e-4 * loss_curv)
+        # Clamp individual loss components to prevent gradient explosion and cast to float32 for MPS stability
+        loss_rec_clamped = torch.clamp(loss_rec.to(torch.float32), min=0.0, max=100.0)
+        loss_assign_clamped = torch.clamp(loss_assign.to(torch.float32), min=0.0, max=100.0)
+        loss_ortho_clamped = torch.clamp(loss_ortho.to(torch.float32), min=0.0, max=100.0)
+        loss_align_clamped = torch.clamp(loss_align.to(torch.float32), min=0.0, max=100.0)
+        loss_pruning_clamped = torch.clamp(loss_pruning.to(torch.float32), min=0.0, max=100.0)
+        loss_sep_clamped = torch.clamp(loss_sep.to(torch.float32), min=0.0, max=100.0)
+        loss_conn_clamped = torch.clamp(loss_conn.to(torch.float32), min=0.0, max=100.0)
+        loss_sparsity_clamped = torch.clamp(loss_sparsity.to(torch.float32), min=0.0, max=100.0)
+        loss_mi_clamped = torch.clamp(loss_mi.to(torch.float32), min=0.0, max=100.0)
+        loss_sym_clamped = torch.clamp(loss_sym.to(torch.float32), min=0.0, max=100.0)
+        loss_var_clamped = torch.clamp(loss_var.to(torch.float32), min=0.0, max=100.0)
+        loss_curv_clamped = torch.clamp(loss_curv.to(torch.float32), min=0.0, max=100.0)
+
+        discovery_loss = (weights['rec'] * loss_rec_clamped + lvars[0]) + \
+                         (weights['assign'] * loss_assign_clamped + lvars[2]) + \
+                         (weights['ortho'] * loss_ortho_clamped + lvars[3]) + \
+                         (weights['align'] * loss_align_clamped + lvars[6]) + \
+                         (weights['pruning'] * loss_pruning_clamped + lvars[7]) + \
+                         (weights['sep'] * loss_sep_clamped + lvars[8]) + \
+                         (weights['conn'] * loss_conn_clamped + lvars[9]) + \
+                         (weights['sparsity'] * loss_sparsity_clamped + lvars[10]) + \
+                         (weights['mi'] * loss_mi_clamped + lvars[11]) + \
+                         (weights['sym'] * self.symbolic_weight * loss_sym_clamped + lvars[12]) + \
+                         (weights['var'] * loss_var_clamped + lvars[13]) + \
+                         (1e-4 * loss_curv_clamped)
+
+        # Clamp discovery_loss to prevent explosion
+        discovery_loss = torch.clamp(discovery_loss, min=0.0, max=1000.0)
 
         if is_warmup:
             loss = discovery_loss
@@ -635,17 +658,25 @@ class Trainer:
             if not torch.isfinite(loss_l2): loss_l2 = torch.tensor(0.0, device=self.device)
             if not torch.isfinite(loss_lvr): loss_lvr = torch.tensor(0.0, device=self.device)
 
+            # Clamp consistency losses as well
+            loss_cons_clamped = torch.clamp(loss_cons, min=0.0, max=100.0)
+            loss_l2_clamped = torch.clamp(loss_l2, min=0.0, max=100.0)
+            loss_lvr_clamped = torch.clamp(loss_lvr, min=0.0, max=100.0)
+
             # Only add consistency loss if we computed it
             if compute_consistency:
-                loss = discovery_loss + (weights['cons'] * loss_cons + lvars[1]) + \
-                       (weights['l2'] * 1e-4 * loss_l2 + lvars[4]) + \
-                       (weights['lvr'] * 1e-4 * loss_lvr + lvars[5])
+                loss = discovery_loss + (weights['cons'] * loss_cons_clamped + lvars[1]) + \
+                       (weights['l2'] * 1e-4 * loss_l2_clamped + lvars[4]) + \
+                       (weights['lvr'] * 1e-4 * loss_lvr_clamped + lvars[5])
             else:
-                loss = discovery_loss + (weights['l2'] * 1e-4 * loss_l2 + lvars[4]) + \
-                       (weights['lvr'] * 1e-4 * loss_lvr + lvars[5])
+                loss = discovery_loss + (weights['l2'] * 1e-4 * loss_l2_clamped + lvars[4]) + \
+                       (weights['lvr'] * 1e-4 * loss_lvr_clamped + lvars[5])
 
         # Add L2 regularization on lvars to prevent them from growing indefinitely
         loss += 0.1 * torch.sum(lvars**2)
+
+        # Numerical stability for MPS: clamp total loss to prevent explosion
+        loss = torch.clamp(loss, min=0.0, max=1e4)
 
         if not torch.isfinite(loss):
             # Try to recover by ignoring non-finite components

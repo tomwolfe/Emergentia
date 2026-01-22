@@ -115,8 +115,8 @@ def main():
 
     # Trainer now uses adaptive loss weighting, manual weights are deprecated
     # Optimized parameters for faster training
-    warmup_epochs = int(epochs * 0.2)
-    trainer = Trainer(model, lr=2e-4, device=device, stats=stats, 
+    warmup_epochs = 50  # Increased warmup epochs to 50 as requested
+    trainer = Trainer(model, lr=2e-4, device=device, stats=stats,
                       warmup_epochs=warmup_epochs, max_epochs=epochs,
                       sparsity_scheduler=sparsity_scheduler,
                       skip_consistency_freq=3,  # Compute consistency loss every 3 epochs to save time
