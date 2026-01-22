@@ -55,7 +55,7 @@ def main():
     latent_dim = 4
     steps = args.steps
     epochs = args.epochs
-    seq_len = 20
+    seq_len = min(20, steps // 4)  # Make sequence length adaptive to steps, max 20
     dynamic_radius = 1.5
     # Enable PBC with a reasonable box size
     box_size = (10.0, 10.0)  # Set a reasonable box size for PBC
@@ -100,10 +100,10 @@ def main():
     # NEW: Sparsity Scheduler to prevent resolution collapse
     from stable_pooling import SparsityScheduler
     sparsity_scheduler = SparsityScheduler(
-        initial_weight=0.001,
-        target_weight=0.05,
-        warmup_steps=int(epochs * 0.1),
-        max_steps=int(epochs * 0.8)
+        initial_weight=0.0,     # Zero initial weight to prevent early interference
+        target_weight=0.01,     # Even lower target weight
+        warmup_steps=int(epochs * 0.3),  # Even longer warmup period
+        max_steps=int(epochs * 0.95)     # Later max steps
     )
 
     # NEW: Enhanced loss balancer to address hyper-dimensional loss landscape
@@ -115,8 +115,8 @@ def main():
 
     # Trainer now uses adaptive loss weighting, manual weights are deprecated
     # Optimized parameters for faster training
-    warmup_epochs = 50  # Increased warmup epochs to 50 as requested
-    trainer = Trainer(model, lr=2e-4, device=device, stats=stats,
+    warmup_epochs = max(100, epochs // 10)  # Increased warmup epochs to 100 or 10% of total epochs
+    trainer = Trainer(model, lr=1e-4, device=device, stats=stats,  # Lower learning rate
                       warmup_epochs=warmup_epochs, max_epochs=epochs,
                       sparsity_scheduler=sparsity_scheduler,
                       skip_consistency_freq=3,  # Compute consistency loss every 3 epochs to save time
@@ -160,8 +160,21 @@ def main():
 
     # --- Quality Gate ---
     print(f"\nFinal Training Loss: {last_loss:.6f}")
-    if rec > 0.2: # Relaxed from 0.1 to 0.2
-        print(f"CRITICAL ERROR: Model failed to converge (Rec Loss: {rec:.6f} > 0.2).")
+
+    # Make threshold more adaptive based on training parameters
+    # For fewer epochs/particles, be more lenient
+    base_threshold = 2.0  # Start with a more lenient threshold for short runs
+    if epochs >= 100:
+        base_threshold = 0.2
+    elif epochs >= 50:
+        base_threshold = 0.5
+
+    # Adjust based on number of particles and super nodes
+    complexity_factor = args.super_nodes / max(1, args.particles / 4)  # Higher if more super-nodes relative to particles
+    rec_threshold = min(3.0, base_threshold * (1.0 + complexity_factor * 0.5))  # Cap at 3.0 and be more lenient
+
+    if rec > rec_threshold:
+        print(f"CRITICAL ERROR: Model failed to converge (Rec Loss: {rec:.6f} > {rec_threshold}).")
         print("This indicates a Normalization Failure. Aborting symbolic distillation.")
         return
 

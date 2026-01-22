@@ -265,20 +265,20 @@ class Trainer:
 
         # Manually re-balance initial log_vars for stability
         with torch.no_grad():
-            self.model.log_vars[0].fill_(-2.0)  # High priority for reconstruction
-            self.model.log_vars[1].fill_(2.0)   # Lower initial priority for consistency
-            self.model.log_vars[2].fill_(2.0)   # Lower initial priority for assignment
-            self.model.log_vars[3].fill_(2.0)   # Lower initial priority for ortho
-            self.model.log_vars[4].fill_(2.0)   # Lower initial priority for l2
-            self.model.log_vars[5].fill_(2.0)   # Lower initial priority for lvr
-            self.model.log_vars[6].fill_(2.0)   # Lower initial priority for alignment (changed from -3.0)
-            self.model.log_vars[7].fill_(2.0)   # Lower initial priority for pruning
-            self.model.log_vars[8].fill_(2.0)   # Lower initial priority for sep
-            self.model.log_vars[9].fill_(2.0)   # Lower initial priority for conn
-            self.model.log_vars[10].fill_(2.0)  # Lower initial priority for sparsity
-            self.model.log_vars[11].fill_(2.0)  # Lower initial priority for mi
-            self.model.log_vars[12].fill_(2.0)  # Lower initial priority for sym
-            self.model.log_vars[13].fill_(2.0)  # Lower initial priority for var
+            self.model.log_vars[0].fill_(-3.0)  # Very high priority for reconstruction
+            self.model.log_vars[1].fill_(3.0)   # Lower initial priority for consistency
+            self.model.log_vars[2].fill_(3.0)   # Lower initial priority for assignment
+            self.model.log_vars[3].fill_(3.0)   # Lower initial priority for ortho
+            self.model.log_vars[4].fill_(3.0)   # Lower initial priority for l2
+            self.model.log_vars[5].fill_(3.0)   # Lower initial priority for lvr
+            self.model.log_vars[6].fill_(3.0)   # Lower initial priority for alignment (changed from -3.0)
+            self.model.log_vars[7].fill_(3.0)   # Lower initial priority for pruning
+            self.model.log_vars[8].fill_(3.0)   # Lower initial priority for sep
+            self.model.log_vars[9].fill_(3.0)   # Lower initial priority for conn
+            self.model.log_vars[10].fill_(3.0)  # Lower initial priority for sparsity
+            self.model.log_vars[11].fill_(3.0)  # Lower initial priority for mi
+            self.model.log_vars[12].fill_(3.0)  # Lower initial priority for sym
+            self.model.log_vars[13].fill_(3.0)  # Lower initial priority for var
 
         # Symbolic-in-the-loop
         self.symbolic_proxy = None
@@ -343,11 +343,16 @@ class Trainer:
         is_warmup = epoch < self.warmup_epochs
         if is_warmup:
             with torch.no_grad():
-                self.model.log_vars[0].fill_(-7.0)  # Maximum priority for reconstruction
-                self.model.log_vars[6].fill_(4.0)   # Suppress alignment during warmup to focus on reconstruction first
+                self.model.log_vars[0].fill_(-8.0)  # Maximum priority for reconstruction
+                self.model.log_vars[6].fill_(5.0)   # Suppress alignment during warmup to focus on reconstruction first
                 # Suppress other structural losses initially
-                self.model.log_vars[3].fill_(4.0)   # Ortho - higher to suppress more
-                self.model.log_vars[11].fill_(4.0)  # MI - higher to suppress more
+                self.model.log_vars[3].fill_(5.0)   # Ortho - higher to suppress more
+                self.model.log_vars[11].fill_(5.0)  # MI - higher to suppress more
+                # Also suppress other losses during warmup
+                self.model.log_vars[1].fill_(5.0)   # Consistency
+                self.model.log_vars[2].fill_(5.0)   # Assignment
+                self.model.log_vars[7].fill_(5.0)   # Pruning
+                self.model.log_vars[10].fill_(5.0)  # Sparsity
 
         # Stage-based curriculum: Stage 1 freezes ODE/Symbolic and focuses on Recon/Align
         is_stage1 = epoch < self.warmup_epochs
@@ -397,9 +402,9 @@ class Trainer:
         # 4. Alignment weight - Removed hardcoded multiplier to rely solely on log_vars
         align_weight = 1.0
 
-        # 5. Adaptive Entropy Weight: Doubled growth rate to force discrete clusters
+        # 5. Adaptive Entropy Weight: More conservative growth to prevent early instability
         # Point 1: Addressing "Blurry" Meso-scale
-        entropy_weight = 1.0 + 5.0 * progress  # Increased from 1.5 to 5.0 for harder assignments
+        entropy_weight = 0.5 + 2.0 * progress  # Reduced from 5.0 to 2.0 for more gradual assignments
 
         # Warmup logic
         is_warmup = epoch < self.warmup_epochs
@@ -698,15 +703,15 @@ class Trainer:
             # Perform optimizer step only at the end of accumulation cycle
             if ((epoch + 1) % self.grad_acc_steps == 0) or (epoch == max_epochs - 1):
                 # Increased gradient clipping for better stability
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                torch.nn.utils.clip_grad_value_(self.model.parameters(), clip_value=0.5)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+                torch.nn.utils.clip_grad_value_(self.model.parameters(), clip_value=0.1)
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
         else:
             loss.backward()
             # Increased gradient clipping for better stability
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            torch.nn.utils.clip_grad_value_(self.model.parameters(), clip_value=0.5)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+            torch.nn.utils.clip_grad_value_(self.model.parameters(), clip_value=0.1)
             self.optimizer.step()
 
         # Update loss tracker for logging
