@@ -166,29 +166,39 @@ def enhance_physical_mapping(model, dataset, pos_raw, vel_raw, tau=0.1, device='
     return np.array(all_corrs)
 
 class LossTracker:
-    """Tracks running averages of loss components to help with balancing."""
+    """Tracks running averages and full history of loss components to help with balancing and visualization."""
     def __init__(self, alpha=0.9):
         self.alpha = alpha
         self.history = {}
         self.weights = {}
+        self.history_list = {}  # Store full history for plotting
+        self.weights_list = {}
 
     def update(self, components, weights=None):
         for k, v in components.items():
             val = v.item() if hasattr(v, 'item') else v
             if k not in self.history:
                 self.history[k] = val
+                self.history_list[k] = [val]
             else:
                 self.history[k] = self.alpha * self.history[k] + (1 - self.alpha) * val
+                self.history_list[k].append(val)
         
         if weights is not None:
             for k, v in weights.items():
                 val = v.item() if hasattr(v, 'item') else v
                 if k not in self.weights:
                     self.weights[k] = val
+                    self.weights_list[k] = [val]
                 else:
                     self.weights[k] = self.alpha * self.weights[k] + (1 - self.alpha) * val
+                    self.weights_list[k].append(val)
 
     def get_stats(self):
+        # For plotting, we return the history lists
+        return {**self.history_list, **{f"w_{k}": v for k, v in self.weights_list.items()}}
+
+    def get_running_averages(self):
         return {**self.history, **{f"w_{k}": v for k, v in self.weights.items()}}
 
 class SymbolicProxy(torch.nn.Module):
@@ -262,27 +272,31 @@ class Trainer:
         self.enable_gradient_accumulation = enable_gradient_accumulation
         self.grad_acc_steps = grad_acc_steps
         self.enhanced_balancer = enhanced_balancer
+        
+        # Learnable scaling for alignment to prevent scale mismatch
+        self.align_scale = torch.nn.Parameter(torch.tensor(1.0, device=device))
 
         # Manually re-balance initial log_vars for stability
         with torch.no_grad():
             self.model.log_vars[0].fill_(-5.0)  # Very high priority for reconstruction
-            self.model.log_vars[1].fill_(2.0)   # Lower initial priority for consistency
-            self.model.log_vars[2].fill_(2.0)   # Lower initial priority for assignment
+            self.model.log_vars[1].fill_(1.0)   # Higher priority for consistency (increased from 2.0)
+            self.model.log_vars[2].fill_(1.0)   # Higher priority for assignment (increased from 2.0)
             self.model.log_vars[3].fill_(4.0)   # Lower initial priority for ortho
             self.model.log_vars[4].fill_(4.0)   # Lower initial priority for l2
             self.model.log_vars[5].fill_(2.0)   # Moderate priority for lvr
-            self.model.log_vars[6].fill_(5.0)   # Lower initial priority for alignment
+            self.model.log_vars[6].fill_(6.0)   # Lower initial priority for alignment (decreased priority)
             self.model.log_vars[7].fill_(4.0)   # Lower initial priority for pruning
             self.model.log_vars[8].fill_(4.0)   # Lower initial priority for sep
             self.model.log_vars[9].fill_(4.0)   # Lower initial priority for conn
             self.model.log_vars[10].fill_(4.0)  # Lower initial priority for sparsity
-            self.model.log_vars[11].fill_(6.0)  # Lower initial priority for mi
+            self.model.log_vars[11].fill_(5.0)  # Lower initial priority for mi (increased priority from 6.0)
             self.model.log_vars[12].fill_(4.0)  # Lower initial priority for sym
             self.model.log_vars[13].fill_(4.0)  # Lower initial priority for var
+            self.model.log_vars[14].fill_(2.0)  # Moderate priority for hinge to prevent shrinkage
 
         # Significantly increase temporal consistency weight
         if hasattr(self.model.encoder.pooling, 'temporal_consistency_weight'):
-            self.model.encoder.pooling.temporal_consistency_weight = 5.0
+            self.model.encoder.pooling.temporal_consistency_weight = 10.0 # Increased from 5.0
 
         # Symbolic-in-the-loop
         self.symbolic_proxy = None
@@ -316,6 +330,7 @@ class Trainer:
 
         param_groups = [
             {'params': other_params, 'weight_decay': 1e-5},
+            {'params': [self.align_scale], 'lr': 1e-3}, # Specific learning rate for scale
         ]
         if h_net_params:
             param_groups.append({'params': h_net_params, 'weight_decay': 1e-3})
@@ -368,11 +383,11 @@ class Trainer:
         # Enhanced assignment loss including stability terms
         loss_assign = (
             entropy_weight * losses_0['entropy'] + 
-            2.0 * losses_0['diversity'] + 
+            5.0 * losses_0['diversity'] + # Increased from 2.0
             0.1 * losses_0['spatial'] +
-            0.1 * losses_0.get('collapse_prevention', 0.0) +
-            0.1 * losses_0.get('balance', 0.0) +
-            1.0 * losses_0.get('temporal_consistency', 0.0)
+            1.0 * losses_0.get('collapse_prevention', 0.0) + # Increased from 0.1
+            1.0 * losses_0.get('balance', 0.0) + # Increased from 0.1
+            2.0 * losses_0.get('temporal_consistency', 0.0) # Increased from 1.0
         )
         
         initial_results = {
@@ -472,7 +487,7 @@ class Trainer:
         if self.symbolic_proxy is not None:
             for p in self.symbolic_proxy.parameters(): p.requires_grad = not is_stage1
 
-        if epoch > 0 and epoch % 50 == 0:
+        if epoch > 0 and epoch % 100 == 0:
             if hasattr(self.model.encoder.pooling, 'apply_hard_revival'):
                 self.model.encoder.pooling.apply_hard_revival()
 
@@ -502,6 +517,11 @@ class Trainer:
         loss_conn = self.model.get_connectivity_loss(s_0, batch_0.edge_index)
         loss_ortho = self.model.get_ortho_loss(s_0)
         loss_var = self.model.get_latent_variance_loss(z_curr)
+        
+        # Hinge loss to prevent latent variable shrinkage (force them to have some minimum magnitude)
+        # Calculates norm for each [Batch, K] and applies hinge at 0.1
+        loss_hinge = torch.mean(torch.relu(0.1 - torch.norm(z_preds, dim=-1)))
+        
         loss_align = torch.tensor(0.0, device=self.device)
         loss_mi = torch.tensor(0.0, device=self.device)
         loss_cons = torch.tensor(0.0, device=self.device)
@@ -522,11 +542,11 @@ class Trainer:
             
             loss_assign += (
                 entropy_weight * losses_t['entropy'] + 
-                2.0 * losses_t['diversity'] + 
+                5.0 * losses_t['diversity'] + 
                 0.1 * losses_t['spatial'] +
-                0.1 * losses_t.get('collapse_prevention', 0.0) + 
-                0.1 * losses_t.get('balance', 0.0) +
-                1.0 * losses_t.get('temporal_consistency', 0.0)
+                1.0 * losses_t.get('collapse_prevention', 0.0) + 
+                1.0 * losses_t.get('balance', 0.0) +
+                2.0 * losses_t.get('temporal_consistency', 0.0)
             )
             loss_pruning += losses_t['pruning']
             loss_sparsity += losses_t['sparsity']
@@ -543,7 +563,8 @@ class Trainer:
             if epoch > 100:
                 align_weight = min(1.0, (epoch - 100) / self.align_anneal_epochs)
             
-            loss_align += 2.0 * align_weight * self.criterion(z_preds[t, :, :, :d_align], mu_t_norm[:, :, :d_align])
+            # Use learnable scale for alignment
+            loss_align += 2.0 * align_weight * self.criterion(z_preds[t, :, :, :d_align] * self.align_scale, mu_t_norm[:, :, :d_align])
             loss_mi += self.model.get_mi_loss(z_preds[t], mu_t_norm)
 
             if t > 0:
@@ -561,7 +582,7 @@ class Trainer:
         lvars = torch.clamp(self.model.log_vars, min=-6.0, max=5.0)
         if is_warmup: lvars[11], lvars[3], lvars[12] = 5.0, 5.0, 5.0
 
-        raw_losses = {'rec': loss_rec, 'cons': loss_cons, 'assign': loss_assign, 'ortho': loss_ortho, 'l2': loss_l2, 'lvr': loss_lvr, 'align': loss_align, 'pruning': loss_pruning, 'sep': loss_sep, 'conn': loss_conn, 'sparsity': loss_sparsity, 'mi': loss_mi, 'sym': loss_sym, 'var': loss_var}
+        raw_losses = {'rec': loss_rec, 'cons': loss_cons, 'assign': loss_assign, 'ortho': loss_ortho, 'l2': loss_l2, 'lvr': loss_lvr, 'align': loss_align, 'pruning': loss_pruning, 'sep': loss_sep, 'conn': loss_conn, 'sparsity': loss_sparsity, 'mi': loss_mi, 'sym': loss_sym, 'var': loss_var, 'hinge': loss_hinge}
         
         weights = {k: torch.exp(-lvars[i]) for i, k in enumerate(raw_losses.keys())}
         if self.enhanced_balancer:
@@ -590,7 +611,7 @@ class Trainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
             self.optimizer.step()
 
-        self.loss_tracker.update({'total': loss, 'rec_raw': loss_rec, 'cons_raw': loss_cons, 'assign': loss_assign, 'align': loss_align, 'mi': loss_mi, 'sym': loss_sym, 'lvar_raw': loss_var, 'curv_raw': loss_curv, 'lvars_mean': lvars.mean()}, weights=weights)
+        self.loss_tracker.update({'total': loss, 'rec_raw': loss_rec, 'cons_raw': loss_cons, 'assign': loss_assign, 'align': loss_align, 'mi': loss_mi, 'sym': loss_sym, 'lvar_raw': loss_var, 'curv_raw': loss_curv, 'hinge_raw': loss_hinge, 'lvars_mean': lvars.mean()}, weights=weights)
         
         if epoch % 100 == 0:
             print(f"  [Loss Detail] Rec: {loss_rec:.4f} | Cons: {loss_cons:.4f} | Assign: {loss_assign:.4f} | Ortho: {loss_ortho:.4f} | Align: {loss_align:.4f} | Sym: {loss_sym:.4f}")

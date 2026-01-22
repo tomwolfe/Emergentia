@@ -516,9 +516,8 @@ class DiscoveryEngineModel(nn.Module):
         self.mi_discriminator = MIDiscriminator(min(latent_dim, 2), 2, hidden_dim)
 
         # Learnable loss log-variances for automatic loss balancing
-        # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning, 8: sep, 9: conn, 10: sparsity, 11: mi, 12: sym, 13: var
-        # Initialize log_vars[0] (rec) to a high priority value, others to low weight to force reconstruction first
-        lvars = torch.zeros(14)
+        # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning, 8: sep, 9: conn, 10: sparsity, 11: mi, 12: sym, 13: var, 14: hinge
+        lvars = torch.zeros(15)
         lvars[0] = -5.0 # Very high priority for reconstruction initially
         lvars[1] = 5.0  # Very low initial priority for consistency
         lvars[2] = 5.0  # Very low initial priority for assignment
@@ -533,6 +532,7 @@ class DiscoveryEngineModel(nn.Module):
         lvars[11] = 5.0 # Very low initial priority for mi
         lvars[12] = 5.0 # Very low initial priority for sym
         lvars[13] = 5.0 # Very low initial priority for var
+        lvars[14] = 5.0 # Very low initial priority for hinge
         self.log_vars = nn.Parameter(lvars) 
         
     def get_latent_variance_loss(self, z):

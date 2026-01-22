@@ -51,12 +51,41 @@ def plot_discovery_results(model, dataset, pos_raw, s, z_states, assignments, ou
 
 def plot_training_history(loss_tracker, output_path='training_history.png'):
     stats = loss_tracker.get_stats()
-    plt.figure(figsize=(10, 6))
+    plt.figure(figsize=(12, 8))
+    
+    # Plot raw losses
+    plt.subplot(2, 1, 1)
     for k, v in stats.items():
-        if not k.startswith('w_') and k != 'total':
-            plt.plot(v, label=k)
-    plt.title("Training Loss Components")
+        if not k.startswith('w_') and k != 'total' and not k.endswith('_raw'):
+            if len(v) > 0:
+                plt.plot(v, label=k, alpha=0.7)
+    
+    # Also plot some key _raw losses if they exist
+    for k in ['rec_raw', 'cons_raw', 'hinge_raw']:
+        if k in stats and len(stats[k]) > 0:
+            plt.plot(stats[k], label=k, linestyle='--', alpha=0.5)
+
+    plt.title("Training Loss Components (History)")
     plt.yscale('log')
-    plt.legend()
-    plt.savefig(output_path)
+    plt.xlabel("Update Step")
+    plt.ylabel("Loss Value")
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize='small')
+    plt.grid(True, which="both", ls="-", alpha=0.2)
+
+    # Plot weights
+    plt.subplot(2, 1, 2)
+    for k, v in stats.items():
+        if k.startswith('w_'):
+            if len(v) > 0:
+                plt.plot(v, label=k)
+    plt.title("Loss Balancing Weights")
+    plt.yscale('log')
+    plt.xlabel("Update Step")
+    plt.ylabel("Weight Value")
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize='small')
+    plt.grid(True, which="both", ls="-", alpha=0.2)
+
+    plt.tight_layout()
+    plt.savefig(output_path, bbox_inches='tight')
     plt.close()
+    print(f"Training history plot saved to {output_path}")

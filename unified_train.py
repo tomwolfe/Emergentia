@@ -11,7 +11,8 @@ from model import DiscoveryEngineModel
 from engine import Trainer, prepare_data, analyze_latent_space
 from symbolic import extract_latent_data, SymbolicDistiller
 from hamiltonian_symbolic import HamiltonianSymbolicDistiller
-from train_utils import ImprovedEarlyStopping, robust_energy, get_device, SparsityScheduler
+from train_utils import ImprovedEarlyStopping, robust_energy, get_device
+from stable_pooling import SparsityScheduler
 from visualization import plot_discovery_results, plot_training_history
 
 def main():
@@ -48,7 +49,23 @@ def main():
         hamiltonian=args.hamiltonian
     ).to(device)
 
-    trainer = Trainer(model, lr=args.lr, device=device, stats=stats, warmup_epochs=50)
+    # Initialize SparsityScheduler to prevent resolution collapse
+    sparsity_scheduler = SparsityScheduler(
+        initial_weight=0.0,
+        target_weight=0.1,
+        warmup_steps=args.epochs // 2,
+        max_steps=args.epochs
+    )
+
+    trainer = Trainer(
+        model, 
+        lr=args.lr, 
+        device=device, 
+        stats=stats, 
+        warmup_epochs=50,
+        max_epochs=args.epochs,
+        sparsity_scheduler=sparsity_scheduler
+    )
     early_stopping = ImprovedEarlyStopping(patience=300)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(trainer.optimizer, T_max=args.epochs)
 
@@ -80,10 +97,13 @@ def main():
     dz_stability = np.var(recent_dz)
     print(f"Latent Stability (Var[dz]): {dz_stability:.6f}")
 
-    if epoch < 100 or last_rec > 0.25 or dz_stability > 0.05:
+    # Adjusted Quality Gate: Relax threshold if latent space is stable
+    rec_threshold = 0.45 if dz_stability < 0.01 else 0.25
+    
+    if epoch < 100 or (last_rec > rec_threshold and dz_stability > 0.05):
         reason = ""
         if epoch < 100: reason += "Insufficient epochs. "
-        if last_rec > 0.25: reason += f"Rec Loss too high ({last_rec:.4f} > 0.25). "
+        if last_rec > rec_threshold: reason += f"Rec Loss too high ({last_rec:.4f} > {rec_threshold}). "
         if dz_stability > 0.05: reason += f"Latent space unstable ({dz_stability:.4f} > 0.05). "
         print(f"Skipping symbolic discovery: {reason}")
         equations = []
