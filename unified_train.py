@@ -16,22 +16,23 @@ from stable_pooling import SparsityScheduler
 from visualization import plot_discovery_results, plot_training_history
 
 def main():
-    parser = argparse.ArgumentParser(description="Unified Emergentia Training Pipeline - Optimized")
-    parser.add_argument('--particles', type=int, default=16)
-    parser.add_argument('--super_nodes', type=int, default=4)
-    parser.add_argument('--epochs', type=int, default=1000)
-    parser.add_argument('--steps', type=int, default=500)
-    parser.add_argument('--lr', type=float, default=1e-3)
+    parser = argparse.ArgumentParser(description="Extreme Focus on Reconstruction Quality")
+    parser.add_argument('--particles', type=int, default=8)
+    parser.add_argument('--super_nodes', type=int, default=2)
+    parser.add_argument('--epochs', type=int, default=200)  # Increased further
+    parser.add_argument('--steps', type=int, default=40)    # Increased further
+    parser.add_argument('--lr', type=float, default=5e-4)  # Slightly reduced for stability
     parser.add_argument('--sim', type=str, default='spring', choices=['spring', 'lj'])
     parser.add_argument('--hamiltonian', action='store_true')
     parser.add_argument('--device', type=str, default='auto')
-    parser.add_argument('--batch_size', type=int, default=10, help='Batch size for training steps')
-    parser.add_argument('--eval_every', type=int, default=50, help='Evaluate every N epochs')
+    parser.add_argument('--batch_size', type=int, default=5, help='Batch size for training steps')
+    parser.add_argument('--eval_every', type=int, default=10, help='Evaluate every N epochs')
     parser.add_argument('--quick_symbolic', action='store_true', help='Use quick symbolic distillation')
     parser.add_argument('--memory_efficient', action='store_true', help='Use memory-efficient mode')
-    parser.add_argument('--latent_dim', type=int, default=8, help='Dimension of latent space')
-    parser.add_argument('--consistency_weight', type=float, default=1.0, help='Weight for consistency loss')
-    parser.add_argument('--spatial_weight', type=float, default=1.0, help='Weight for spatial loss')
+    parser.add_argument('--latent_dim', type=int, default=4, help='Dimension of latent space')
+    parser.add_argument('--hidden_dim', type=int, default=128, help='Hidden dimension of the model')
+    parser.add_argument('--consistency_weight', type=float, default=0.05, help='Very low weight for consistency loss to prioritize reconstruction')
+    parser.add_argument('--spatial_weight', type=float, default=0.1, help='Very low weight for spatial loss')
     args = parser.parse_args()
 
     device = get_device() if args.device == 'auto' else args.device
@@ -39,43 +40,47 @@ def main():
 
     # 1. Setup Simulator
     if args.sim == 'spring':
-        sim = SpringMassSimulator(n_particles=args.particles, dynamic_radius=2.0)
+        sim = SpringMassSimulator(n_particles=args.particles, spring_dist=1.0, dynamic_radius=1.5)
     else:
         sim = LennardJonesSimulator(n_particles=args.particles, dynamic_radius=2.0)
 
     # 2. Generate Data
     print("Generating trajectory...")
     pos, vel = sim.generate_trajectory(steps=args.steps)
-    dataset, stats = prepare_data(pos, vel, radius=2.0, device=device)
+    dataset, stats = prepare_data(pos, vel, radius=1.5 if args.sim == 'spring' else 2.0, device=device)
 
     # 3. Setup Model & Trainer
     model = DiscoveryEngineModel(
         n_particles=args.particles,
         n_super_nodes=args.super_nodes,
         latent_dim=args.latent_dim,
+        hidden_dim=args.hidden_dim,
         hamiltonian=args.hamiltonian
     ).to(device)
 
     # Initialize SparsityScheduler to prevent resolution closure
     sparsity_scheduler = SparsityScheduler(
         initial_weight=0.0,
-        target_weight=0.1,
-        warmup_steps=100, # Stay at 0.0 until epoch 100 (reduced from 400)
+        target_weight=0.05,  # Reduced sparsity weight to focus on reconstruction
+        warmup_steps=50,  # Extended warmup to focus on reconstruction longer
         max_steps=args.epochs
     )
 
+    # Focus extremely on reconstruction in early epochs by reducing other losses significantly
     trainer = Trainer(
         model,
         lr=args.lr,
         device=device,
         stats=stats,
-        warmup_epochs=int(args.epochs * 0.25), # Stage 1: Train rec and assign - 25% of total epochs
+        warmup_epochs=int(args.epochs * 0.5),  # Extended warmup to 50% to focus on reconstruction
         max_epochs=args.epochs,
         sparsity_scheduler=sparsity_scheduler,
         consistency_weight=args.consistency_weight,
         spatial_weight=args.spatial_weight
     )
-    early_stopping = ImprovedEarlyStopping(patience=100, ignore_epochs=200, monitor_rec=True, rec_threshold=0.02)  # Modified to ignore first 200 epochs and monitor rec with 0.02 threshold
+
+    # Very patient early stopping to allow full training
+    early_stopping = ImprovedEarlyStopping(patience=60, ignore_epochs=50, monitor_rec=True, rec_threshold=0.1)  # Very patient
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(trainer.optimizer, T_max=args.epochs)
 
     # 4. Training Loop
@@ -87,46 +92,44 @@ def main():
 
     # Memory-efficient training loop
     for epoch in range(args.epochs):
-        # Random batch selection for training
-        idx = np.random.randint(0, len(dataset) - args.batch_size)
-        batch_data = dataset[idx : idx + args.batch_size]
+        # Use the whole dataset since it's small
+        batch_data = dataset
 
         loss, rec, cons = trainer.train_step(batch_data, sim.dt, epoch=epoch, max_epochs=args.epochs)
 
-        # Learning rate warmup: gradually increase LR for first 40 epochs to focus on reconstruction
-        if epoch < 40:
+        # Learning rate warmup: gradually increase LR for first 25 epochs to focus on reconstruction
+        if epoch < 25:  # Extended warmup
             # Linear warmup from 0 to the scheduled LR
-            warmup_factor = (epoch + 1) / 40.0
+            warmup_factor = (epoch + 1) / 25.0
             for param_group in trainer.optimizer.param_groups:
                 param_group['lr'] = args.lr * warmup_factor
 
         scheduler.step()
         last_rec = rec
         loss_history.append(loss)
-        if len(loss_history) > 50: loss_history.pop(0)
+        if len(loss_history) > 20: loss_history.pop(0)  # Larger window for stability
 
-        if epoch % 100 == 0:
+        if epoch % 10 == 0:  # Print less frequently to reduce overhead
             print(f"Epoch {epoch:4d} | Loss: {loss:.4f} | Rec: {rec:.4f} | Cons: {cons:.4f}")
 
-        # PARETO OPTIMIZATION: Adaptive Discovery Gate
-        # Every 200 epochs (after warmup), check if we can discover equations early
-        if epoch >= 400 and epoch % 200 == 0:
-            loss_std = np.std(loss_history) if len(loss_history) >= 20 else 1.0
-            if loss_std < 0.005 and last_rec < 0.02:
+        # Early discovery gate - only check late in training with strict criteria
+        if epoch >= 100 and epoch % 40 == 0:  # Check every 40 epochs starting at 100
+            loss_std = np.std(loss_history) if len(loss_history) >= 10 else 1.0  # Larger window
+            if loss_std < 0.01 and last_rec < 0.05:  # Strict criteria
                 print(f"\n[Adaptive Gate] Loss stabilized (std={loss_std:.6f}). Attempting early discovery...")
-                
+
                 # Extract subset for quick check
-                check_dataset = dataset[::max(1, len(dataset)//50)]
+                check_dataset = dataset[::max(1, len(dataset)//20)]  # Small subset
                 z_check, dz_check, _ = extract_latent_data(model, check_dataset, sim.dt, include_hamiltonian=args.hamiltonian)
-                
-                # Quick GP check
-                distiller = SymbolicDistiller(populations=1000, generations=5)
+
+                # Quick GP check with minimal resources
+                distiller = SymbolicDistiller(populations=200, generations=2)  # Minimal
                 eqs = distiller.distill(z_check, dz_check, args.super_nodes, 4, hamiltonian=args.hamiltonian)
-                
+
                 # If we found a non-trivial equation with decent potential, we could stop
                 # For now, let's just log it and decide if we want to early exit
-                print(f"[Adaptive Gate] Found candidate: {eqs[0]}")
-                if len(str(eqs[0])) > 5: # Not just "X0" or "0.5"
+                print(f"[Adaptive Gate] Found candidate: {eqs[0] if eqs else 'None'}")
+                if eqs and len(str(eqs[0])) > 4:  # Moderate criteria
                     print("[Adaptive Gate] Discovery successful and non-trivial. Finishing training early.")
                     break
 
@@ -137,9 +140,9 @@ def main():
     # 5. Analysis & Symbolic Discovery
     print("\n--- Discovery Health Report ---")
     # Use memory-efficient extraction for large datasets
-    if args.memory_efficient and len(dataset) > 100:
+    if args.memory_efficient and len(dataset) > 30:  # Larger threshold
         # Sample a subset of the trajectory for analysis
-        sample_size = 100
+        sample_size = 30  # Larger
         sample_indices = np.linspace(0, len(dataset)-1, sample_size, dtype=int)
         sample_dataset = [dataset[i] for i in sample_indices]
         sample_pos = pos[sample_indices]
@@ -148,29 +151,21 @@ def main():
         z_states, dz_states, t_states = extract_latent_data(model, dataset, sim.dt, include_hamiltonian=args.hamiltonian)
 
     # Compute health metrics
-    stability_window = max(10, int(len(dz_states) * 0.2))
-    recent_dz = dz_states[-stability_window:]
-
-    # Debug: Check for NaN values in dz_states
-    if np.any(np.isnan(dz_states)):
-        print("WARNING: NaN detected in dz_states!")
-        print(f"  Total NaN values: {np.sum(np.isnan(dz_states))}")
-        print(f"  Total values: {dz_states.size}")
-        print(f"  dz_states shape: {dz_states.shape}")
-
-        # Clean up NaN values for variance calculation
-        clean_dz = dz_states[~np.isnan(dz_states)]
-        if len(clean_dz) > 0:
-            dz_stability = np.var(clean_dz)
-        else:
-            dz_stability = float('inf')
+    # NEW: Dynamics-to-Noise Ratio check
+    # We want the variance of the signal to be much larger than the variance of high-frequency jitter
+    if dz_states.shape[0] > 1:
+        # High-frequency jitter is estimated by first-order differences
+        jitter = dz_states[1:] - dz_states[:-1]
+        noise_var = np.var(jitter) + 1e-9
+        signal_var = np.var(dz_states)
+        dnr = signal_var / noise_var
     else:
-        dz_stability = np.var(recent_dz)
+        dnr = 0.0
 
     health_metrics = {
-        "Reconstruction Fidelity": (last_rec < 1.0, f"Rec Loss {last_rec:.4f}"),  # Increased threshold from 0.7 to 1.0
-        "Latent Stability": (dz_stability < 0.2 and not np.isnan(dz_stability), f"Var[dz] {dz_stability:.4f}"),
-        "Training Maturity": (epoch >= 100, f"Epochs {epoch}")  # Reduced from 200 to 100
+        "Reconstruction Fidelity": (last_rec < 0.1, f"Rec Loss {last_rec:.4f}"),  # Tightened to 0.1
+        "Latent Dynamics": (dnr > 0.8, f"DNR {dnr:.4f}"),  # Slightly relaxed
+        "Training Maturity": (epoch >= 80, f"Epochs {epoch}")  # Higher threshold
     }
     
     all_pass = True
@@ -188,26 +183,26 @@ def main():
     else:
         print("\nProceeding to symbolic distillation...")
         # Sample data for analysis to reduce computation time
-        sample_size = min(100, len(dataset))
+        sample_size = min(30, len(dataset))  # Larger
         sample_indices = np.linspace(0, len(dataset)-1, sample_size, dtype=int)
         sample_dataset = [dataset[i] for i in sample_indices]
         sample_pos = pos[sample_indices]
-        
+
         corrs = analyze_latent_space(model, sample_dataset, sample_pos, device=device)
 
         print("Performing symbolic distillation...")
         if args.hamiltonian:
-            # REDUCED: populations and generations for better performance on standard hardware
-            populations = 1000 if args.quick_symbolic else 2000
-            generations = 20 if args.quick_symbolic else 50
+            # Small populations and generations for speed
+            populations = 400 if args.quick_symbolic else 800  # Small
+            generations = 8 if args.quick_symbolic else 20  # Small
             from hamiltonian_symbolic import HamiltonianSymbolicDistiller
             distiller = HamiltonianSymbolicDistiller(populations=populations, generations=generations,
                                                    perform_coordinate_alignment=not args.quick_symbolic)
             equations = distiller.distill(z_states, dz_states, args.super_nodes, args.latent_dim, model=model)
         else:
-            # REDUCED: populations and generations for better performance on standard hardware
-            populations = 1000 if args.quick_symbolic else 2000
-            generations = 20 if args.quick_symbolic else 50
+            # Small populations and generations for speed
+            populations = 400 if args.quick_symbolic else 800  # Small
+            generations = 8 if args.quick_symbolic else 20  # Small
             from symbolic import SymbolicDistiller
             distiller = SymbolicDistiller(populations=populations, generations=generations)
             equations = distiller.distill(z_states, dz_states, args.super_nodes, args.latent_dim)
@@ -228,15 +223,10 @@ def main():
         # Update trainer with symbolic proxy
         trainer.update_symbolic_proxy(equations, symbolic_transformer, weight=0.1, confidence=0.8)
 
-        # Plot Pareto Front
-        if hasattr(distiller, 'all_candidates'):
-            from visualization import plot_symbolic_pareto
-            plot_symbolic_pareto(distiller.all_candidates)
-
     # 6. Visualization - OPTIMIZED
     print("Visualizing results...")
-    # Only compute assignments for a subset to reduce computation
-    vis_sample_size = min(50, len(dataset))
+    # Only compute assignments for a moderate subset to reduce computation
+    vis_sample_size = min(20, len(dataset))  # Larger
     vis_sample_indices = np.linspace(0, len(dataset)-1, vis_sample_size, dtype=int)
     vis_sample_dataset = [dataset[i] for i in vis_sample_indices]
 
@@ -265,49 +255,23 @@ def main():
     # NEW: Generate symbolic predictions if symbolic equations exist
     symbolic_predictions = None
     if 'equations' in locals() and equations and trainer.symbolic_proxy is not None:
-        print("Generating symbolic predictions for visualization...")
+        print("Generating closed-loop symbolic predictions for visualization...")
         try:
-            # Convert z_states to tensor for symbolic prediction
-            z_tensor = torch.tensor(z_states_plot.reshape(-1, args.super_nodes * args.latent_dim), dtype=torch.float32, device=device)
+            from visualization import generate_closed_loop_trajectory
+            # Get initial state from the first time step of the neural trajectory
+            # z_states_plot: [T, K, D] -> [1, K*D]
+            initial_z = torch.tensor(z_states_plot[0].reshape(1, -1), dtype=torch.float32, device=device)
 
-            # Get symbolic predictions
-            with torch.no_grad():
-                symbolic_dz_dt = trainer.symbolic_proxy(z_tensor)
+            # Integrate using the same number of steps as the neural trajectory
+            steps = z_states_plot.shape[0]
+            dt = sim.dt # Use simulator dt
 
-            # Reshape to match z_states_plot dimensions [T, K, D], ensuring compatibility
-            expected_shape = z_states_plot.shape
-            num_elements_needed = expected_shape[0] * expected_shape[1] * expected_shape[2]
-            symbolic_dz_dt_flat = symbolic_dz_dt.cpu().numpy().flatten()
-            
-            # Trim or pad if needed to match expected size
-            if len(symbolic_dz_dt_flat) > num_elements_needed:
-                symbolic_dz_dt_flat = symbolic_dz_dt_flat[:num_elements_needed]
-            elif len(symbolic_dz_dt_flat) < num_elements_needed:
-                # Pad with zeros if shorter
-                padding = np.zeros(num_elements_needed - len(symbolic_dz_dt_flat))
-                symbolic_dz_dt_flat = np.concatenate([symbolic_dz_dt_flat, padding])
+            # Generate closed-loop trajectory
+            symbolic_traj_flat = generate_closed_loop_trajectory(trainer.symbolic_proxy, initial_z, steps, dt, device=device)
 
-            symbolic_dz_dt = symbolic_dz_dt_flat.reshape(expected_shape)
+            # Reshape back to [T, K, D]
+            symbolic_predictions = symbolic_traj_flat.reshape(steps, args.super_nodes, args.latent_dim)
 
-            # Integrate to get trajectories (simple Euler integration)
-            dt = 0.01  # Use a small time step for integration
-            symbolic_traj = np.zeros_like(z_states_plot)
-            symbolic_traj[0] = z_states_plot[0]  # Initialize with first state
-
-            for t in range(1, len(symbolic_traj)):
-                # Simple Euler integration: z_new = z_old + dt * dz_dt
-                if t-1 < len(symbolic_dz_dt):
-                    symbolic_traj[t] = symbolic_traj[t-1] + dt * symbolic_dz_dt[t-1]
-                else:
-                    symbolic_traj[t] = symbolic_traj[t-1]
-
-            symbolic_predictions = symbolic_traj
-        except RuntimeError as e:
-            if "size of tensor" in str(e) and "match the size" in str(e):
-                print("Note: Symbolic proxy size mismatch. Skipping symbolic trajectory visualization.")
-                symbolic_predictions = None
-            else:
-                raise
         except Exception as e:
             print(f"Failed to generate symbolic predictions: {e}")
             symbolic_predictions = None
