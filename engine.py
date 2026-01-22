@@ -6,11 +6,16 @@ from model import DiscoveryEngineModel
 import numpy as np
 from scipy.spatial import KDTree
 
-def compute_stats(pos, vel):
+def compute_stats(pos, vel, box_size=None):
     # pos, vel: [T, N, 2]
     # Use min-max for positions to keep them in a fixed range
-    pos_min = pos.min(axis=(0, 1))
-    pos_max = pos.max(axis=(0, 1))
+    if box_size is not None:
+        pos_min = np.zeros(2)
+        pos_max = np.array(box_size)
+    else:
+        pos_min = pos.min(axis=(0, 1))
+        pos_max = pos.max(axis=(0, 1))
+        
     pos_range = np.maximum(pos_max - pos_min, 1e-6)
     
     vel_mean = vel.mean(axis=(0, 1))
@@ -18,12 +23,12 @@ def compute_stats(pos, vel):
     return {'pos_min': pos_min, 'pos_max': pos_max, 'pos_range': pos_range,
             'vel_mean': vel_mean, 'vel_std': vel_std}
 
-def prepare_data(pos, vel, radius=1.1, stats=None, device='cpu', cache_edges=True):
+def prepare_data(pos, vel, radius=1.1, stats=None, device='cpu', cache_edges=True, box_size=None):
     # pos, vel: [T, N, 2]
     T, N, _ = pos.shape
 
     if stats is None:
-        stats = compute_stats(pos, vel)
+        stats = compute_stats(pos, vel, box_size=box_size)
 
     # Map pos to [-1, 1] and clip to prevent Tanh saturation
     pos_norm = 2.0 * (pos - stats['pos_min']) / stats['pos_range'] - 1.0
@@ -328,9 +333,9 @@ class Trainer:
             if hasattr(self.model.encoder.pooling, 'set_sparsity_weight'):
                 self.model.encoder.pooling.set_sparsity_weight(new_weight)
 
-        # Stage 0: Grounding (0-100 epochs) - Prioritize Reconstruction and Alignment
+        # Stage 0: Grounding (0-40 epochs) - Prioritize Reconstruction and Alignment
         # Zero out auxiliary losses during warmup to allow GNN to find basic spatial mapping first
-        is_warmup = epoch < 100
+        is_warmup = epoch < 40
         if is_warmup:
             with torch.no_grad():
                 self.model.log_vars[0].fill_(-7.0)  # Maximum priority for reconstruction

@@ -25,8 +25,9 @@ class OptimizedEquivariantGNNLayer(MessagePassing):
     Optimized E(n)-equivariant GNN Layer with reduced computational overhead.
     Uses simplified message passing and fewer parameters.
     """
-    def __init__(self, in_channels, out_channels, hidden_dim=32):  # Reduced hidden_dim
+    def __init__(self, in_channels, out_channels, hidden_dim=32, box_size=None):  # Added box_size
         super(OptimizedEquivariantGNNLayer, self).__init__(aggr='add')
+        self.box_size = box_size
         # Reduced parameter count
         self.phi_e = nn.Sequential(
             nn.Linear(2 * in_channels + 2, hidden_dim), # +2 for dist_sq and dot(v, r)
@@ -55,6 +56,26 @@ class OptimizedEquivariantGNNLayer(MessagePassing):
     def forward(self, x, pos, vel, edge_index):
         # x: [N, in_channels], pos: [N, 2], vel: [N, 2]
         rel_pos = pos[edge_index[0]] - pos[edge_index[1]]
+        
+        # Apply Minimum Image Convention for PBC
+        if self.box_size is not None:
+            # We assume box_size is a tensor of shape [2] or [1, 2]
+            # If pos is normalized to [-1, 1], box_size in normalized units is 2.0
+            # BUT we should probably pass the box_size in the same units as pos.
+            # In prepare_data, pos is normalized to [-1, 1] using stats.
+            # So the effective box_size in normalized units is (original_box_size / stats['pos_range']) * 2.0
+            # Actually, it's easier to just assume the box is mapped to [-1, 1] exactly if pos covers the whole box.
+            # If stats['pos_range'] is the box size, then effective_box = 2.0.
+            
+            # For now, let's assume box_size passed here is in normalized units.
+            # In most cases, it will be 2.0 if the particles cover the whole box.
+            if isinstance(self.box_size, (float, int)):
+                box = torch.tensor([self.box_size, self.box_size], device=pos.device, dtype=pos.dtype)
+            else:
+                box = torch.as_tensor(self.box_size, device=pos.device, dtype=pos.dtype)
+            
+            rel_pos = rel_pos - box * torch.round(rel_pos / box)
+
         rel_vel = vel[edge_index[0]] - vel[edge_index[1]]
 
         dist_sq = torch.sum(rel_pos**2, dim=-1, keepdim=True)
@@ -91,12 +112,13 @@ class OptimizedEquivariantGNNLayer(MessagePassing):
 
 
 class OptimizedGNNEncoder(nn.Module):
-    def __init__(self, node_features, hidden_dim, latent_dim, n_super_nodes, min_active_super_nodes=2):
+    def __init__(self, node_features, hidden_dim, latent_dim, n_super_nodes, min_active_super_nodes=2, box_size=None):
         super(OptimizedGNNEncoder, self).__init__()
+        self.box_size = box_size
         # Use optimized layers with fewer parameters
-        self.gnn1 = OptimizedEquivariantGNNLayer(node_features, hidden_dim, hidden_dim//2)
+        self.gnn1 = OptimizedEquivariantGNNLayer(node_features, hidden_dim, hidden_dim//2, box_size=box_size)
         self.ln1 = nn.LayerNorm(hidden_dim)
-        self.gnn2 = OptimizedEquivariantGNNLayer(hidden_dim, hidden_dim, hidden_dim//2)
+        self.gnn2 = OptimizedEquivariantGNNLayer(hidden_dim, hidden_dim, hidden_dim//2, box_size=box_size)
         self.ln2 = nn.LayerNorm(hidden_dim)
         self.n_super_nodes = n_super_nodes
         self.latent_dim = latent_dim
@@ -241,7 +263,10 @@ class OptimizedGNNDecoder(nn.Module):
 class OptimizedDiscoveryEngineModel(nn.Module):
     def __init__(self, n_particles, n_super_nodes, node_features=4, latent_dim=4, hidden_dim=64, hamiltonian=False, dissipative=True, min_active_super_nodes=2, box_size=10.0):
         super(OptimizedDiscoveryEngineModel, self).__init__()
-        self.encoder = OptimizedGNNEncoder(node_features, hidden_dim, latent_dim, n_super_nodes, min_active_super_nodes=min_active_super_nodes)
+        # Determine normalized box size for GNN layers
+        # If pos is mapped to [-1, 1], the box size in normalized space is 2.0
+        normalized_box = 2.0 
+        self.encoder = OptimizedGNNEncoder(node_features, hidden_dim, latent_dim, n_super_nodes, min_active_super_nodes=min_active_super_nodes, box_size=normalized_box)
 
         if hamiltonian:
             self.ode_func = OptimizedHamiltonianODEFunc(latent_dim, n_super_nodes, hidden_dim, dissipative=dissipative)
@@ -343,8 +368,8 @@ class OptimizedDiscoveryEngineModel(nn.Module):
         # Use adaptive tolerance based on training stage to balance accuracy and efficiency
         if self.training:
             # Much looser tolerances during early training for efficiency
-            rtol = 1e-1  # Was 1e-3, now 1e-1 for speed
-            atol = 1e-2  # Was 1e-5, now 1e-2 for speed
+            rtol = 1e-2  # Slightly tighter than 1e-1
+            atol = 1e-3  # Slightly tighter than 1e-2
         else:
             # Tighter tolerances during evaluation for accuracy
             rtol = 1e-3
@@ -352,7 +377,7 @@ class OptimizedDiscoveryEngineModel(nn.Module):
 
         # Use a more efficient solver during training
         if self.training:
-            method = 'euler'  # Fastest fixed-step method during training
+            method = 'midpoint'  # Better than euler for Hamiltonian systems
         else:
             method = 'rk4'  # Reasonably accurate for evaluation
 
