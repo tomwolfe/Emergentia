@@ -52,7 +52,7 @@ class StableHierarchicalPooling(nn.Module):
             nn.ReLU(),
             nn.Linear(in_channels, n_super_nodes)
         )
-        self.scaling = nn.Parameter(torch.tensor(20.0)) # Increased to 20.0 for stronger symmetry breaking
+        self.scaling = nn.Parameter(torch.tensor(5.0)) # Reduced from 20.0 to 5.0 to prevent softmax saturation
         self.register_buffer('active_mask', torch.ones(n_super_nodes))
 
         # Track previous assignments for temporal consistency
@@ -227,7 +227,7 @@ class StableHierarchicalPooling(nn.Module):
 
         assign_losses = {
             'entropy': entropy,
-            'diversity': diversity_loss * 200.0, # Increased from 20x to 200x as requested
+            'diversity': diversity_loss * 1.0, # Reduced from 200x to 1x to prevent loss dominance
             'spatial': spatial_loss,
             'pruning': pruning_loss,
             'sparsity': sparsity_loss * self.current_sparsity_weight,
@@ -308,7 +308,7 @@ class StableHierarchicalPooling(nn.Module):
                 for idx in inactive_indices:
                     # Re-initialize the weights for the corresponding output row
                     # We use a larger std to force exploration
-                    nn.init.normal_(last_layer.weight[idx], mean=0.0, std=1.0) # Increased std to 1.0
+                    nn.init.normal_(last_layer.weight[idx], mean=0.0, std=2.0) # Increased std to 2.0 for aggressive revival
                     nn.init.constant_(last_layer.bias[idx], 0.0)
 
                 # Reset active mask for these nodes to allow them to compete immediately

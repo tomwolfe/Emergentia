@@ -485,12 +485,12 @@ class Trainer:
         
         # Enhanced assignment loss including stability terms
         loss_assign = (
-            entropy_weight * losses_0['entropy'] + 
-            1.0 * losses_0['diversity'] + # Weight was already increased by 5x inside pooling layer
-            5.0 * losses_0['spatial'] + # Increased from 1.0 to 5.0 (total 50x from original 0.1)
-            5.0 * losses_0.get('collapse_prevention', 0.0) + # Increased from 2.0 to 5.0
-            5.0 * losses_0.get('balance', 0.0) + # Increased from 2.0 to 5.0
-            10.0 * losses_0.get('temporal_consistency', 0.0) # Increased from 5.0 to 10.0
+            entropy_weight * losses_0['entropy'] +
+            1.0 * losses_0['diversity'] + # Reduced from 200x to 1x in pooling layer
+            0.1 * losses_0['spatial'] + # Reduced from 5.0 to 0.1 to prevent dominance
+            0.1 * losses_0.get('collapse_prevention', 0.0) + # Reduced from 5.0 to 0.1
+            0.1 * losses_0.get('balance', 0.0) + # Reduced from 5.0 to 0.1
+            0.1 * losses_0.get('temporal_consistency', 0.0) # Reduced from 10.0 to 0.1
         )
         
         initial_results = {
@@ -682,12 +682,12 @@ class Trainer:
             loss_rec += self.criterion(recon_t, batch_t.x)
             
             loss_assign += (
-                entropy_weight * losses_t['entropy'] + 
-                1.0 * losses_t['diversity'] + 
-                5.0 * losses_t['spatial'] + 
-                5.0 * losses_t.get('collapse_prevention', 0.0) + 
-                5.0 * losses_t.get('balance', 0.0) +
-                10.0 * losses_t.get('temporal_consistency', 0.0)
+                entropy_weight * losses_t['entropy'] +
+                1.0 * losses_t['diversity'] +
+                0.1 * losses_t['spatial'] +
+                0.1 * losses_t.get('collapse_prevention', 0.0) +
+                0.1 * losses_t.get('balance', 0.0) +
+                0.1 * losses_t.get('temporal_consistency', 0.0)
             )
             loss_pruning += losses_t['pruning']
             loss_sparsity += losses_t['sparsity']
@@ -742,8 +742,8 @@ class Trainer:
 
         # NEW: Latent Activity penalty to prevent static latent trap
         if len(z_vel) > 0:
-            # INCREASED: Multiplier from 0.1 to 5.0 to strongly penalize static latents
-            loss_activity = -5.0 * torch.log(z_vel.pow(2).mean() + 1e-6)
+            # Change from log penalty to Hinge Loss: explicitly forces latents to move if velocity drops below threshold
+            loss_activity = torch.relu(0.5 - torch.norm(z_vel, dim=-1)).mean()  # Hinge loss with threshold 0.5
             raw_losses['activity'] = loss_activity
 
         # Ensure all raw losses are float32 for stable balancing, especially on MPS
@@ -780,12 +780,17 @@ class Trainer:
                 weights['ortho'] = max(weights['ortho'], torch.exp(-self.model.log_vars[3]).item())
                 weights['sparsity'] = max(weights['sparsity'], torch.exp(-self.model.log_vars[11]).item())
 
+        # Dynamics warmup: Gradually introduce dynamics losses over 100 epochs after warmup
+        dynamics_factor = 1.0
+        if epoch > self.warmup_epochs:
+            dynamics_factor = min(1.0, (epoch - self.warmup_epochs) / 100.0)
+
         discovery_loss = sum(weights[k] * torch.clamp(raw_losses[k], -100, 100) + (lvars[i] if i < len(lvars) else 0.0) for i, k in enumerate(raw_losses.keys()) if k not in ['cons', 'l2', 'lvr'])
-        discovery_loss += (weights['sym'] * (self.symbolic_weight - 1.0) * torch.clamp(loss_sym.to(torch.float32), 0, 100)) # Adjust sym weight
+        discovery_loss += (weights['sym'] * (self.symbolic_weight - 1.0) * torch.clamp(loss_sym.to(torch.float32), 0, 100) * dynamics_factor) # Adjust sym weight with dynamics factor
         discovery_loss += 1e-4 * torch.clamp(loss_curv.to(torch.float32), 0, 100)
 
         loss = discovery_loss + (weights['l2'] * 1e-6 * torch.clamp(loss_l2, 0, 100) + lvars[4]) + (weights['lvr'] * 2.0 * torch.clamp(loss_lvr, 0, 100) + lvars[5])  # Decr l2 (1e-4->1e-6), Incr lvr (0.5->2.0)
-        if compute_consistency: loss += (weights['cons'] * torch.clamp(loss_cons.to(torch.float32), 0, 100) + lvars[1])
+        if compute_consistency: loss += (weights['cons'] * torch.clamp(loss_cons.to(torch.float32), 0, 100) * dynamics_factor + lvars[1])
 
         # Add smoothing loss to the total loss - INCREASED WEIGHT FOR DAMPING
         smooth_idx = list(raw_losses.keys()).index('smooth')  # This should be 15
@@ -803,7 +808,13 @@ class Trainer:
                 # Specific clipping for reconstruction head during stage 1 to prevent dominance
                 if is_stage1:
                     torch.nn.utils.clip_grad_norm_(self.model.decoder.parameters(), 0.1)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+
+                # Additional clipping when dynamics are introduced to prevent momentum explosion
+                if epoch > self.warmup_epochs and dynamics_factor >= 0.95:  # Near full dynamics
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.1)  # Reduced from 0.5
+                else:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
         else:
@@ -811,7 +822,13 @@ class Trainer:
             # Specific clipping for reconstruction head during stage 1 to prevent dominance
             if is_stage1:
                 torch.nn.utils.clip_grad_norm_(self.model.decoder.parameters(), 0.1)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+
+            # Additional clipping when dynamics are introduced to prevent momentum explosion
+            if epoch > self.warmup_epochs and dynamics_factor >= 0.95:  # Near full dynamics
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.1)  # Reduced from 0.5
+            else:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+
             self.optimizer.step()
 
         self.loss_tracker.update({'total': loss, 'rec_raw': loss_rec, 'cons_raw': loss_cons, 'assign': loss_assign, 'align': loss_align, 'mi': loss_mi, 'sym': loss_sym, 'lvar_raw': loss_var, 'curv_raw': loss_curv, 'hinge_raw': loss_hinge, 'smooth_raw': loss_smooth, 'lvars_mean': lvars.mean()}, weights=weights)

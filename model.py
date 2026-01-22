@@ -350,7 +350,9 @@ class HamiltonianODEFunc(nn.Module):
         self.H_net = nn.Sequential(
             nn.Linear(latent_dim * n_super_nodes, hidden_dim//4),  # Further reduced hidden size
             nn.SiLU(), # Faster activation function
-            nn.Linear(hidden_dim//4, 1)
+            nn.Linear(hidden_dim//4, hidden_dim//8),  # Additional hidden layer
+            nn.Tanh(),  # Add Tanh activation to bound the Hamiltonian's energy and prevent runaway momentum
+            nn.Linear(hidden_dim//8, 1)
         )
 
         if dissipative:

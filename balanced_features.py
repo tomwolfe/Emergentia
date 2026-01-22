@@ -222,8 +222,11 @@ class BalancedFeatureTransformer:
         # [Batch, n_pairs]
         d = np.linalg.norm(diff, axis=2) + 1e-6
         
-        # Only return 1/r and 1/r^2 as requested for small systems
-        return [1.0 / (d + 0.1), 1.0 / (d**2 + 0.1)]
+        # Add LJ physics features: 1/d^6 and 1/d^12 terms for Lennard-Jones potential
+        lj_6_term = 1.0 / (d**6 + 0.1)
+        lj_12_term = 1.0 / (d**12 + 0.1)
+        # Only return 1/r, 1/r^2, 1/r^6, and 1/r^12 as requested for small systems
+        return [1.0 / (d + 0.1), 1.0 / (d**2 + 0.1), lj_6_term, lj_12_term]
 
     def _polynomial_expansion(self, X, fit_transformer):
         """
