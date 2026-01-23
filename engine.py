@@ -699,37 +699,52 @@ class Trainer:
 
         # INTEGRATION OPTIMIZATION: 
         # Use a chunked integration approach to balance between teacher forcing and performance
+        # NEW: Gradual Integration Schedule - start with a few steps and increase
+        target_integration_steps = seq_len
         if not is_warmup:
+            # Gradually increase integration length from 4 steps to full seq_len over 100 epochs
+            progress_after_warmup = min(1.0, (epoch - self.warmup_epochs) / 100.0)
+            target_integration_steps = max(4, int(progress_after_warmup * seq_len))
+
             if tf_ratio == 0:
-                # Full integration in one go
-                t_span = torch.linspace(0, (seq_len - 1) * dt, seq_len, device=self.device)
-                z_preds = self.model.forward_dynamics(z_curr, t_span) # [T, B, K, D]
+                # Full integration up to target steps
+                t_span = torch.linspace(0, (target_integration_steps - 1) * dt, target_integration_steps, device=self.device)
+                z_preds_integrated = self.model.forward_dynamics(z_curr, t_span) # [T_target, B, K, D]
+                
+                # If target < seq_len, we pad with ground truth for the remaining steps to maintain loss shapes
+                if target_integration_steps < seq_len:
+                    z_preds = torch.cat([z_preds_integrated, z_all_target[target_integration_steps:]], dim=0)
+                else:
+                    z_preds = z_preds_integrated
             else:
                 # Chunked integration: group steps to reduce odeint calls
-                # For example, if seq_len=100 and chunk_size=10, we do 10 calls instead of 100
                 chunk_size = 10 if self.device == 'mps' else 5
                 z_preds_list = [z_curr]
                 z_step = z_curr
                 
-                for i in range(1, seq_len, chunk_size):
-                    end_idx = min(i + chunk_size, seq_len)
+                # Only integrate up to target_integration_steps
+                for i in range(1, target_integration_steps, chunk_size):
+                    end_idx = min(i + chunk_size, target_integration_steps)
                     actual_chunk = end_idx - i
                     
-                    # Decide whether to use teacher forcing for this chunk
                     if np.random.random() < tf_ratio:
                         z_step = z_all_target[i-1]
                     
                     t_span_chunk = torch.linspace(0, actual_chunk * dt, actual_chunk + 1, device=self.device)
                     z_chunk_preds = self.model.forward_dynamics(z_step, t_span_chunk)
                     
-                    # z_chunk_preds is [actual_chunk + 1, B, K, D]
-                    # We skip the first one as it's the starting point
                     for j in range(1, actual_chunk + 1):
                         z_preds_list.append(z_chunk_preds[j])
                     
                     z_step = z_chunk_preds[-1]
                 
-                z_preds = torch.stack(z_preds_list[:seq_len])
+                z_preds_integrated = torch.stack(z_preds_list)
+                
+                # Pad if necessary
+                if len(z_preds_integrated) < seq_len:
+                    z_preds = torch.cat([z_preds_integrated, z_all_target[len(z_preds_integrated):]], dim=0)
+                else:
+                    z_preds = z_preds_integrated[:seq_len]
         else:
             # Warmup: just use targets
             z_preds = z_all_target
@@ -810,11 +825,14 @@ class Trainer:
         loss_align = 2.0 * alignment_weight * huber_loss(z_clamped * torch.exp(self.log_align_scale), mu_clamped)
         
         # MI loss is harder to batch because it involves shuffling, but we can do it
-        # for all processed steps at once
-        loss_mi = alignment_weight * 5.0 * self.model.get_mi_loss(
-            z_processed.view(-1, self.model.encoder.n_super_nodes, self.model.encoder.latent_dim),
-            mu_processed.view(-1, self.model.encoder.n_super_nodes, 2)
-        )
+        # OPTIMIZATION: Only compute MI loss every 5 epochs OR during late stages
+        if epoch % 5 == 0 or epoch > int(max_epochs * 0.75):
+            loss_mi = alignment_weight * 5.0 * self.model.get_mi_loss(
+                z_processed.view(-1, self.model.encoder.n_super_nodes, self.model.encoder.latent_dim),
+                mu_processed.view(-1, self.model.encoder.n_super_nodes, 2)
+            )
+        else:
+            loss_mi = torch.tensor(0.0, device=self.device)
 
         # Vectorized consistency and assignment stability
         if len(processed_indices) > 1:

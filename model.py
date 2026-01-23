@@ -640,7 +640,7 @@ class DiscoveryEngineModel(nn.Module):
         s_j = s[col]
         return torch.mean((s_i - s_j)**2)
     
-    def forward_dynamics(self, z0, t):
+    def forward_dynamics(self, z0, t, step_size=None):
         # z0: [batch_size, n_super_nodes, latent_dim]
         z0_flat = z0.reshape(z0.size(0), -1).to(torch.float32)
         t = t.to(torch.float32)
@@ -666,14 +666,18 @@ class DiscoveryEngineModel(nn.Module):
         # Use adaptive tolerance based on training stage
         eps = 1e-3 if is_mps else 0.0
 
-        if self.training:
-            # Tighter step size for better accuracy with LJ potential
-            step_size = 0.002
-        else:
-            # Tighter tolerances during evaluation for accuracy
-            rtol = 1e-3 + eps
-            atol = 1e-5 + eps
-            step_size = 0.0005
+        if step_size is None:
+            if self.training:
+                # Tighter step size for better accuracy with LJ potential, but respect t intervals
+                # If t intervals are smaller than 0.002, use them as step size
+                if len(t) > 1:
+                    dt_span = (t[1] - t[0]).item()
+                    step_size = min(0.002, dt_span)
+                else:
+                    step_size = 0.002
+            else:
+                # Tighter tolerances during evaluation for accuracy
+                step_size = 0.0005
 
         method = 'rk4'
         options = {'step_size': step_size}

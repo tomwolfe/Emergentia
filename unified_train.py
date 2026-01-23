@@ -49,7 +49,21 @@ def main():
     pos, vel = sim.generate_trajectory(steps=args.steps)
     dataset_list, stats = prepare_data(pos, vel, radius=1.5 if args.sim == 'spring' else 2.0, device=device)
     
-    # Pre-batch dataset to avoid overhead in training loop
+    # OPTIMIZATION: Pre-batch windows of the trajectory to avoid overhead in training loop
+    print(f"Pre-batching windows (size {args.batch_size})...")
+    pre_batched_windows = []
+    if len(dataset_list) > args.batch_size:
+        for i in range(len(dataset_list) - args.batch_size + 1):
+            window = dataset_list[i : i + args.batch_size]
+            batch = Batch.from_data_list(window).to(device)
+            batch.seq_len = args.batch_size
+            pre_batched_windows.append(batch)
+    else:
+        full_batch = Batch.from_data_list(dataset_list).to(device)
+        full_batch.seq_len = len(dataset_list)
+        pre_batched_windows.append(full_batch)
+
+    # Full dataset for analysis
     dataset = Batch.from_data_list(dataset_list).to(device)
     dataset.seq_len = len(dataset_list)
 
@@ -96,12 +110,8 @@ def main():
 
     # Memory-efficient training loop
     for epoch in range(args.epochs):
-        # OPTIMIZATION: Use sub-windows of the trajectory to respect batch_size and speed up ODE integration
-        if len(dataset_list) > args.batch_size:
-            start_idx = np.random.randint(0, len(dataset_list) - args.batch_size)
-            batch_data = dataset_list[start_idx : start_idx + args.batch_size]
-        else:
-            batch_data = dataset_list # Use the list for consistency
+        # OPTIMIZATION: Use pre-batched windows to speed up training
+        batch_data = pre_batched_windows[np.random.randint(0, len(pre_batched_windows))]
 
         loss, rec, cons = trainer.train_step(batch_data, sim.dt, epoch=epoch, max_epochs=args.epochs)
 

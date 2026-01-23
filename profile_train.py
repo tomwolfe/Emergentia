@@ -40,8 +40,10 @@ def profile_train():
 
     # 3. Profile train_step
     print("Starting warmup...")
-    # Use a window of 20 steps as in the optimized unified_train.py
-    batch_data = dataset_list[:20]
+    # OPTIMIZATION: Use pre-batched data for profiling
+    batch_data = Batch.from_data_list(dataset_list[:20]).to(device)
+    batch_data.seq_len = 20
+    
     for _ in range(5):
         trainer.train_step(batch_data, sim.dt, epoch=100, max_epochs=400) # Past warmup
     
