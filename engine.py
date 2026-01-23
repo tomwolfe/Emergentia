@@ -629,8 +629,8 @@ class Trainer:
             loss_multipliers[5] = 0.01 # lvr
             loss_multipliers[12] = 0.0 # sym
             # Prioritize reconstruction and structural stability
-            loss_multipliers[0] = 50.0 # rec
-            loss_multipliers[2] = 10.0 # assign
+            loss_multipliers[0] = 100.0 # rec (Increased from 50)
+            loss_multipliers[2] = 5.0   # assign (Decreased from 10)
             loss_multipliers[6] = 20.0 # align
             loss_multipliers[9] = 20.0 # conn
             loss_multipliers[16] = 50.0 # anchor
@@ -865,10 +865,19 @@ class Trainer:
             raw_losses[k] = raw_losses[k].to(torch.float32)
 
         base_keys = list(raw_losses.keys())[:17]
-        weights = {k: torch.exp(-lvars[i]) * loss_multipliers[i] for i, k in enumerate(base_keys)}
-        if 'activity' in raw_losses: weights['activity'] = 1.0
+        
+        # Use fixed weights for the first 75% of training to ensure stability
+        if epoch < int(max_epochs * 0.75):
+            weights = {k: 1.0 for k in base_keys}
+            weights['rec'] = 100.0 if is_stage1 else 10.0
+            weights['assign'] = 10.0
+            weights['anchor'] = 10.0
+            if 'activity' in raw_losses: weights['activity'] = 50.0
+        else:
+            weights = {k: torch.exp(-lvars[i]) * loss_multipliers[i] for i, k in enumerate(base_keys)}
+            if 'activity' in raw_losses: weights['activity'] = 1.0
 
-        if self.enhanced_balancer and not is_stage1:
+        if self.enhanced_balancer and not is_stage1 and epoch >= int(max_epochs * 0.75):
             balanced = self.enhanced_balancer.get_balanced_losses(raw_losses, self.model.parameters())
             for k in weights:
                 if k in balanced and raw_losses[k].item() != 0: weights[k] = balanced[k] / raw_losses[k]
@@ -880,17 +889,32 @@ class Trainer:
             import math
             stage2_factor = 1.0 / (1 + math.exp(-12.0 * (progress_in_stage2 - 0.5)))
 
-        discovery_loss = sum(weights[k] * torch.clamp(raw_losses[k], -100, 100) + (lvars[i] if i < len(lvars) else 0.0) for i, k in enumerate(raw_losses.keys()) if k not in ['cons', 'l2', 'lvr'])
+        discovery_loss = torch.tensor(0.0, device=self.device)
+        use_log_vars = (epoch >= int(max_epochs * 0.75))
+        
+        for i, k in enumerate(raw_losses.keys()):
+            if k not in ['cons', 'l2', 'lvr', 'activity']:
+                term = weights[k] * torch.clamp(raw_losses[k], 0, 100)
+                if use_log_vars and i < len(lvars):
+                    term = term + lvars[i]
+                discovery_loss += term
+
         discovery_loss += (weights['sym'] * (self.symbolic_weight - 1.0) * torch.clamp(loss_sym.to(torch.float32), 0, 100) * stage2_factor)
         discovery_loss += 1e-4 * torch.clamp(loss_curv.to(torch.float32), 0, 100)
 
-        loss = discovery_loss + (weights['l2'] * 1e-6 * torch.clamp(loss_l2, 0, 100) + lvars[4]) + (weights['lvr'] * 0.1 * torch.clamp(loss_lvr, 0, 100) + lvars[5])
-        if compute_consistency: loss += (weights['cons'] * self.consistency_weight * torch.clamp(loss_cons.to(torch.float32), 0, 100) * stage2_factor + lvars[1])
+        # Main loss terms with their own log_vars
+        loss = discovery_loss 
+        loss += (weights['l2'] * 1e-6 * torch.clamp(loss_l2, 0, 100) + (lvars[4] if use_log_vars else 0.0))
+        loss += (weights['lvr'] * 0.1 * torch.clamp(loss_lvr, 0, 100) + (lvars[5] if use_log_vars else 0.0))
+        
+        if compute_consistency: 
+            loss += (weights['cons'] * self.consistency_weight * torch.clamp(loss_cons.to(torch.float32), 0, 100) * stage2_factor + (lvars[1] if use_log_vars else 0.0))
 
         smooth_idx = 15
-        loss += (weights['smooth'] * 10.0 * torch.clamp(loss_smooth, 0, 100) + lvars[smooth_idx])
+        loss += (weights['smooth'] * 10.0 * torch.clamp(loss_smooth, 0, 100) + (lvars[smooth_idx] if use_log_vars else 0.0))
         
-        loss = torch.clamp(loss + 0.1 * torch.sum(lvars**2), 0, 1e4)
+        # Ensure loss stays positive and doesn't explode
+        loss = torch.clamp(loss + 0.1 * torch.sum(lvars**2), 1e-4, 1e5)
         loss = loss.to(torch.float32)
         if not torch.isfinite(loss): loss = loss_rec if torch.isfinite(loss_rec) else torch.tensor(1.0, device=self.device, requires_grad=True)
 
@@ -913,20 +937,6 @@ class Trainer:
         self.loss_tracker.update({'total': loss.to(torch.float32), 'rec_raw': loss_rec, 'cons_raw': loss_cons, 'assign': loss_assign, 'align': loss_align, 'mi': loss_mi, 'sym': loss_sym, 'lvar_raw': loss_var, 'curv_raw': loss_curv, 'hinge_raw': loss_hinge, 'smooth_raw': loss_smooth, 'anchor_raw': loss_anchor, 'lvars_mean': lvars.mean()}, weights=weights)
         
         if epoch % 100 == 0:
-            fidelity_loss = loss_rec + loss_cons
-            structural_loss = loss_assign + loss_ortho + loss_pruning + loss_sep + loss_conn + loss_sparsity
-            physical_loss = loss_align + loss_mi + loss_curv + loss_sym + loss_anchor
-            reg_loss = loss_l2 + loss_lvr + loss_var + loss_hinge + loss_smooth + loss_activity
-            
-            print(f"  [Loss Meta] Fidelity: {fidelity_loss:.4f} | Structure: {structural_loss:.4f} | Physics: {physical_loss:.4f} | Reg: {reg_loss:.4f}")
-            print(f"  [Loss Detail] Rec: {loss_rec:.4f} | Cons: {loss_cons:.4f} | Assign: {loss_assign:.4f} | Align: {loss_align:.4f} | Anchor: {loss_anchor:.4f} | Sym: {loss_sym:.4f}")
-
-        return loss.item(), loss_rec.item(), loss_cons.item() if compute_consistency else 0.0
-
-        self.loss_tracker.update({'total': loss.to(torch.float32), 'rec_raw': loss_rec, 'cons_raw': loss_cons, 'assign': loss_assign, 'align': loss_align, 'mi': loss_mi, 'sym': loss_sym, 'lvar_raw': loss_var, 'curv_raw': loss_curv, 'hinge_raw': loss_hinge, 'smooth_raw': loss_smooth, 'anchor_raw': loss_anchor, 'lvars_mean': lvars.mean()}, weights=weights)
-        
-        if epoch % 100 == 0:
-            # Grouped loss reporting
             fidelity_loss = loss_rec + loss_cons
             structural_loss = loss_assign + loss_ortho + loss_pruning + loss_sep + loss_conn + loss_sparsity
             physical_loss = loss_align + loss_mi + loss_curv + loss_sym + loss_anchor

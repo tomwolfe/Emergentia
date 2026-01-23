@@ -94,6 +94,24 @@ def plot_discovery_results(model, dataset, pos_raw, s, z_states, assignments, ou
     plt.savefig(output_path, dpi=300)
     print(f"Results visualization saved to {output_path}")
 
+def generate_closed_loop_trajectory(symbolic_proxy, z0, steps, dt, device='cpu'):
+    """
+    Generate a trajectory by iteratively applying the symbolic proxy (closed-loop).
+    """
+    symbolic_proxy.eval()
+    traj = [z0]
+    curr_z = z0
+    
+    with torch.no_grad():
+        for _ in range(steps - 1):
+            # For Hamiltonian, we can use a simple Euler step or better integration
+            # For now, let's use the forward method of the proxy which should return dz/dt
+            dz_dt = symbolic_proxy(curr_z)
+            curr_z = curr_z + dz_dt * dt
+            traj.append(curr_z)
+            
+    return torch.cat(traj, dim=0).cpu().numpy()
+
 def plot_training_history(loss_tracker, output_path='training_history.png'):
     stats = loss_tracker.get_stats()
     plt.figure(figsize=(12, 8))

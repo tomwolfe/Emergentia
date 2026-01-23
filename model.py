@@ -279,9 +279,7 @@ class GNNEncoder(nn.Module):
 
         # Remove tanh activation to prevent the 'wall' effect seen in the trajectories
         # Instead, use LayerNorm followed by a small Linear layer with std=0.1 initialization
-        latent = latent.transpose(-2, -1)  # [batch_size, latent_dim, n_super_nodes]
-        latent = nn.functional.layer_norm(latent, normalized_shape=latent.shape[-2:])
-        latent = latent.transpose(-2, -1)  # [batch_size, n_super_nodes, latent_dim]
+        latent = nn.functional.layer_norm(latent, normalized_shape=(self.latent_dim,))
 
         return latent, s, assign_losses, mu
 
