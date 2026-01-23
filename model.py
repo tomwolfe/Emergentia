@@ -250,9 +250,9 @@ class GNNEncoder(nn.Module):
         # Add a learnable gain parameter to prevent vanishing latents - REDUCED FROM 5.0 TO 1.0
         self.latent_gain = nn.Parameter(torch.ones(latent_dim) * 1.0)
 
-        # Initialize output layer with higher variance to promote activity
-        nn.init.normal_(self.output_layer[-1].weight, mean=0.0, std=2.0)
-        nn.init.normal_(self.output_layer[-1].bias, mean=0.0, std=2.0)
+        # Initialize output layer to spread out initial latent states
+        nn.init.normal_(self.output_layer[-1].weight, mean=0.0, std=1.0)
+        nn.init.zeros_(self.output_layer[-1].bias)
 
     def _initialize_weights(self):
         """Initialize weights using Xavier uniform initialization."""
@@ -376,11 +376,11 @@ class HamiltonianODEFunc(nn.Module):
             self.gamma = nn.Parameter(torch.full((n_super_nodes, 1), -5.0)) # log space
 
     def _initialize_weights_small(self):
-        """Initialize weights with smaller standard deviation to prevent initial spikes."""
+        """Initialize weights using orthogonal initialization for hidden layers to prevent vanishing gradients."""
         for m in self.H_net.modules():
             if isinstance(m, nn.Linear):
-                # Initialize with larger std (0.2) to kickstart dynamics (changed from 0.01)
-                nn.init.normal_(m.weight, mean=0.0, std=0.2)
+                # Use orthogonal initialization to maintain gradient flow
+                nn.init.orthogonal_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
@@ -607,7 +607,7 @@ class DiscoveryEngineModel(nn.Module):
         temporal_std = torch.std(z, dim=0)  # [B, K, D]
         # Encourage non-zero standard deviation to prevent static latents
         # Use a stricter threshold to prevent the model from finding static solutions
-        activity_penalty = torch.mean(torch.relu(0.5 - temporal_std))  # Increased threshold from 0.1 to 0.5
+        activity_penalty = torch.mean(torch.relu(1.0 - temporal_std))  # Increased threshold from 0.5 to 1.0
         return activity_penalty
 
     def get_mi_loss(self, z, mu):

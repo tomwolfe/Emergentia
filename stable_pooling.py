@@ -157,6 +157,17 @@ class StableHierarchicalPooling(nn.Module):
 
         avg_s = s.mean(dim=0)
 
+        # COMPETITIVE DROPOUT: Randomly zero out most active super-node during training to force distribution
+        if self.training and torch.rand(1).item() < 0.1:
+            most_active_idx = torch.argmax(avg_s)
+            # Create a mask to zero out the most active super-node
+            dropout_mask = torch.ones_like(s)
+            dropout_mask[:, most_active_idx] = 0.0
+            s = s * dropout_mask
+            # Re-normalize to ensure probabilities sum to 1
+            s = s / (s.sum(dim=-1, keepdim=True) + 1e-9)
+            avg_s = s.mean(dim=0)
+
         # Update assignment history for future revival decisions
         self.assignment_history.copy_(0.9 * self.assignment_history + 0.1 * avg_s.detach())
         self.history_counter += 1
@@ -289,10 +300,14 @@ class StableHierarchicalPooling(nn.Module):
 
     def _compute_balance_loss(self, avg_assignments):
         """
-        Compute loss to encourage balanced usage of super-nodes using KL divergence.
+        Compute loss to encourage balanced usage of super-nodes using KL divergence
+        and a Max-Min penalty to prevent single super-node dominance.
         """
         from common_losses import compute_balance_loss as common_balance_loss
-        return common_balance_loss(avg_assignments, self.n_super_nodes)
+        loss = common_balance_loss(avg_assignments, self.n_super_nodes)
+        # Harsher Diversity: penalize difference between most and least used super-nodes
+        loss += (avg_assignments.max() - avg_assignments.min())
+        return loss
 
     def apply_hard_revival(self):
         """

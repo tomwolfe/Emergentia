@@ -884,6 +884,10 @@ class Trainer:
         loss_align /= (norm_factor * self.model.encoder.n_super_nodes)
         loss_mi /= (norm_factor * self.model.encoder.n_super_nodes)
 
+        # Clamp log_vars for l2 and lvr to a minimum of 0.0 (weight <= 1.0) to prevent crushing dynamics
+        with torch.no_grad():
+            self.model.log_vars[4:6].clamp_(min=0.0)
+            
         lvars = torch.clamp(self.model.log_vars, min=-6.0, max=5.0)
         
         raw_losses = {
@@ -894,18 +898,21 @@ class Trainer:
             'anchor': loss_anchor
         }
 
-        # Activity penalty
+        # Activity penalty: Force the model to utilize latent space
         if len(z_vel) > 0:
             loss_activity = torch.relu(1.0 - torch.norm(z_vel, dim=-1)).mean()
-            raw_losses['activity'] = loss_activity * 50.0
+            raw_losses['activity'] = loss_activity * 1000.0
         else:
             loss_activity = self.model.get_activity_penalty(z_preds)
-            raw_losses['activity'] = loss_activity * 50.0
+            raw_losses['activity'] = loss_activity * 1000.0
 
         for k in raw_losses:
             raw_losses[k] = raw_losses[k].to(torch.float32)
 
         base_keys = list(raw_losses.keys())[:17]
+        
+        # Regularization Freeze: 30% of total epochs
+        is_reg_freeze = epoch < (max_epochs * 0.3)
         
         # Use fixed weights for the first 75% of training to ensure stability
         if epoch < int(max_epochs * 0.75):
@@ -913,10 +920,16 @@ class Trainer:
             weights['rec'] = 100.0 if is_stage1 else 10.0
             weights['assign'] = 10.0
             weights['anchor'] = 10.0
-            if 'activity' in raw_losses: weights['activity'] = 50.0
+            if 'activity' in raw_losses: weights['activity'] = 1.0 # Multiplied by 1000.0 in raw_losses
         else:
             weights = {k: torch.exp(-lvars[i]) * loss_multipliers[i] for i, k in enumerate(base_keys)}
             if 'activity' in raw_losses: weights['activity'] = 1.0
+
+        # Apply Regularization Freeze
+        if is_reg_freeze:
+            weights['l2'] = 0.0
+            weights['lvr'] = 0.0
+            weights['smooth'] = 0.0
 
         if self.enhanced_balancer and not is_stage1 and epoch >= int(max_epochs * 0.75):
             balanced = self.enhanced_balancer.get_balanced_losses(raw_losses, self.model.parameters())
@@ -934,7 +947,7 @@ class Trainer:
         use_log_vars = (epoch >= int(max_epochs * 0.75))
         
         for i, k in enumerate(raw_losses.keys()):
-            if k not in ['cons', 'l2', 'lvr', 'activity']:
+            if k not in ['cons', 'l2', 'lvr']: # Activity is now included in discovery_loss
                 term = weights[k] * torch.clamp(raw_losses[k], 0, 100)
                 if use_log_vars and i < len(lvars):
                     term = term + lvars[i]
@@ -945,14 +958,20 @@ class Trainer:
 
         # Main loss terms with their own log_vars
         loss = discovery_loss 
-        loss += (weights['l2'] * 1e-6 * torch.clamp(loss_l2, 0, 100) + (lvars[4] if use_log_vars else 0.0))
-        loss += (weights['lvr'] * 0.1 * torch.clamp(loss_lvr, 0, 100) + (lvars[5] if use_log_vars else 0.0))
+        
+        # Regularization Freeze: Ensure weights are 0.0 during freeze phase
+        l2_weight = weights['l2'] * 1e-6
+        lvr_weight = weights['lvr'] * 0.1
+        smooth_weight = weights['smooth'] * 100.0
+        
+        loss += (l2_weight * torch.clamp(loss_l2, 0, 100) + (lvars[4] if use_log_vars else 0.0))
+        loss += (lvr_weight * torch.clamp(loss_lvr, 0, 100) + (lvars[5] if use_log_vars else 0.0))
         
         if compute_consistency: 
             loss += (weights['cons'] * self.consistency_weight * torch.clamp(loss_cons.to(torch.float32), 0, 100) * stage2_factor + (lvars[1] if use_log_vars else 0.0))
 
         smooth_idx = 15
-        loss += (weights['smooth'] * 100.0 * torch.clamp(loss_smooth, 0, 100) + (lvars[smooth_idx] if use_log_vars else 0.0))
+        loss += (smooth_weight * torch.clamp(loss_smooth, 0, 100) + (lvars[smooth_idx] if use_log_vars else 0.0))
         
         # Ensure loss stays positive and doesn't explode
         loss = torch.clamp(loss + 0.1 * torch.sum(lvars**2), 1e-4, 1e5)

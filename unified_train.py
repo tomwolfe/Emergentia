@@ -32,7 +32,7 @@ def main():
     parser.add_argument('--memory_efficient', action='store_true', help='Use memory-efficient mode')
     parser.add_argument('--latent_dim', type=int, default=8, help='Dimension of latent space')
     parser.add_argument('--hidden_dim', type=int, default=128, help='Hidden dimension of the model')
-    parser.add_argument('--consistency_weight', type=float, default=0.1, help='Weight for consistency loss')
+    parser.add_argument('--consistency_weight', type=float, default=0.001, help='Weight for consistency loss')
     parser.add_argument('--spatial_weight', type=float, default=0.1, help='Very low weight for spatial loss')
     parser.add_argument('--sym_weight', type=float, default=1.0, help='Weight for symbolic loss')
     parser.add_argument('--min_active', type=int, default=4, help='Minimum active super-nodes')
