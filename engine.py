@@ -384,7 +384,7 @@ class Trainer:
 
         # Significantly increase spatial and connectivity loss multipliers by 10x
         if hasattr(self.model.encoder.pooling, 'temporal_consistency_weight'):
-            self.model.encoder.pooling.temporal_consistency_weight = 50.0 # Increased from 20.0
+            self.model.encoder.pooling.temporal_consistency_weight = 5.0 # Reduced from 50.0 to allow discovery
 
         # Symbolic-in-the-loop
         self.symbolic_proxy = None
@@ -430,11 +430,11 @@ class Trainer:
             {'params': [self.model.log_vars], 'lr': 1e-1}, # Increased from 1e-2
         ]
         if h_net_params:
-            param_groups.append({'params': h_net_params, 'weight_decay': 1e-2}) # Increased from 1e-3
+            param_groups.append({'params': h_net_params, 'weight_decay': 1e-5}) # Reduced from 1e-2 to allow complexity
         if assign_mlp_params:
-            param_groups.append({'params': assign_mlp_params, 'weight_decay': 1e-2}) # Penalize rapid assignment changes
+            param_groups.append({'params': assign_mlp_params, 'weight_decay': 1e-3}) # Reduced from 1e-2
         if output_layer_params:
-            param_groups.append({'params': output_layer_params, 'weight_decay': 1e-2}) # Prevent high-frequency latent oscillations
+            param_groups.append({'params': output_layer_params, 'weight_decay': 1e-3}) # Reduced from 1e-2
 
         self.optimizer = optim.Adam(param_groups, lr=lr)
         self.criterion = torch.nn.MSELoss().to(device)

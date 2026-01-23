@@ -667,16 +667,13 @@ class DiscoveryEngineModel(nn.Module):
         eps = 1e-3 if is_mps else 0.0
 
         if self.training:
-            # Looser tolerances during training for efficiency
-            rtol = 1e-1 + eps
-            atol = 1e-2 + eps
-            # For training, use a larger step size for rk4 to speed up
-            step_size = 0.05 
+            # Tighter step size for better accuracy with LJ potential
+            step_size = 0.002
         else:
             # Tighter tolerances during evaluation for accuracy
             rtol = 1e-3 + eps
             atol = 1e-5 + eps
-            step_size = 0.01
+            step_size = 0.0005
 
         method = 'rk4'
         options = {'step_size': step_size}

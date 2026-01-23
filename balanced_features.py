@@ -432,13 +432,29 @@ class BalancedFeatureTransformer:
                 jd[i*self.latent_dim : i*self.latent_dim+2] = diff / d
                 jd[j*self.latent_dim : j*self.latent_dim+2] = -diff / d
                 
-                # d, 1/(d+0.1), 1/(d^2+0.1), exp(-d), screened, log
+                # 1. Basic distance and inverse distance
+                # d
                 jac_list.append(jd.reshape(1, -1))
+                # 1.0 / (d + 0.1)
                 jac_list.append((-1.0 / (d + 0.1)**2 * jd).reshape(1, -1))
-                jac_list.append((-2.0 * d / (d**2 + 0.1)**2 * jd).reshape(1, -1))
+                
+                # 2. Spectrum of power laws: 1.0 / (d**n + 0.1)
+                for n in [2, 3, 4, 6, 8, 10, 12]:
+                    # d/dz [1 / (d^n + 0.1)] = -1 / (d^n + 0.1)^2 * n * d^(n-1) * d(d)/dz
+                    j_pow = (-n * d**(n-1) / (d**n + 0.1)**2 * jd).reshape(1, -1)
+                    jac_list.append(j_pow)
+                    
+                # 3. Short-range interaction terms
+                # np.exp(-d)
                 jac_list.append((-np.exp(-d) * jd).reshape(1, -1))
-                jac_list.append(((-np.exp(-d)/(d + 0.1) - np.exp(-d)/(d + 0.1)**2) * jd).reshape(1, -1))
-                jac_list.append((1.0 / (d + 1.0) * jd).reshape(1, -1))
+                # np.exp(-d) / (d + 0.1)
+                # d/dz [e^-d / (d+0.1)] = [(-e^-d)(d+0.1) - (e^-d)(1)] / (d+0.1)^2 * d(d)/dz
+                j_screened = ((-np.exp(-d)*(d + 0.1) - np.exp(-d)) / (d + 0.1)**2 * jd).reshape(1, -1)
+                jac_list.append(j_screened)
+                
+                # 4. Logarithmic interactions
+                # np.log(d + 0.1)
+                jac_list.append((1.0 / (d + 0.1) * jd).reshape(1, -1))
 
         X_base_jac = np.vstack(jac_list)
         

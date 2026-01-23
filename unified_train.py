@@ -76,7 +76,7 @@ def main():
         lr=args.lr,
         device=device,
         stats=stats,
-        warmup_epochs=int(args.epochs * 0.5),  # Extended warmup to 50% to focus on reconstruction
+        warmup_epochs=int(args.epochs * 0.25),  # Aligned with stage1_end
         max_epochs=args.epochs,
         sparsity_scheduler=sparsity_scheduler,
         consistency_weight=args.consistency_weight,
@@ -132,7 +132,7 @@ def main():
 
                 # Quick GP check with minimal resources
                 distiller = SymbolicDistiller(populations=200, generations=2)  # Minimal
-                eqs = distiller.distill(z_check, dz_check, args.super_nodes, 4, hamiltonian=args.hamiltonian)
+                eqs = distiller.distill(z_check, dz_check, args.super_nodes, args.latent_dim, hamiltonian=args.hamiltonian)
 
                 # If we found a non-trivial equation with decent potential, we could stop
                 # For now, let's just log it and decide if we want to early exit
@@ -200,17 +200,17 @@ def main():
 
         print("Performing symbolic distillation...")
         if args.hamiltonian:
-            # Small populations and generations for speed
-            populations = 400 if args.quick_symbolic else 800  # Small
-            generations = 8 if args.quick_symbolic else 20  # Small
+            # Increased populations and generations for better discovery
+            populations = 400 if args.quick_symbolic else 2000
+            generations = 10 if args.quick_symbolic else 50
             from hamiltonian_symbolic import HamiltonianSymbolicDistiller
             distiller = HamiltonianSymbolicDistiller(populations=populations, generations=generations,
                                                    perform_coordinate_alignment=not args.quick_symbolic)
             equations = distiller.distill(z_states, dz_states, args.super_nodes, args.latent_dim, model=model)
         else:
-            # Small populations and generations for speed
-            populations = 400 if args.quick_symbolic else 800  # Small
-            generations = 8 if args.quick_symbolic else 20  # Small
+            # Increased populations and generations for better discovery
+            populations = 400 if args.quick_symbolic else 2000
+            generations = 10 if args.quick_symbolic else 50
             from symbolic import SymbolicDistiller
             distiller = SymbolicDistiller(populations=populations, generations=generations)
             equations = distiller.distill(z_states, dz_states, args.super_nodes, args.latent_dim)
@@ -225,7 +225,7 @@ def main():
             symbolic_transformer = distiller.transformer
         else:
             from symbolic import FeatureTransformer
-            symbolic_transformer = FeatureTransformer(args.super_nodes, 4)
+            symbolic_transformer = FeatureTransformer(args.super_nodes, args.latent_dim)
             symbolic_transformer.fit(z_states, dz_states)
 
         # Update trainer with symbolic proxy
@@ -258,7 +258,7 @@ def main():
 
     # Extract z_states for visualization using the same indices
     vis_z_states, _, _ = extract_latent_data(model, vis_sample_dataset, sim.dt, include_hamiltonian=args.hamiltonian)
-    z_states_plot = vis_z_states.reshape(-1, args.super_nodes, 4) if len(vis_z_states) > 0 else np.zeros((vis_sample_size, args.super_nodes, 4))
+    z_states_plot = vis_z_states.reshape(-1, args.super_nodes, args.latent_dim) if len(vis_z_states) > 0 else np.zeros((vis_sample_size, args.super_nodes, args.latent_dim))
 
     # NEW: Generate symbolic predictions if symbolic equations exist
     symbolic_predictions = None
