@@ -500,11 +500,10 @@ class GNNDecoder(nn.Module):
         # Initialize weights using Xavier uniform with higher variance for better reconstruction
         self._initialize_weights()
 
-        # Initialize decoder layers with smaller weights to prevent initial large reconstruction errors
+        # Initialize decoder layers with standard weights for better initial reconstruction
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                # Use smaller weights for decoder to start with conservative reconstructions
-                nn.init.xavier_uniform_(m.weight, gain=0.1)  # Reduced gain
+                nn.init.xavier_uniform_(m.weight, gain=1.0) 
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
@@ -645,7 +644,7 @@ class DiscoveryEngineModel(nn.Module):
     
     def forward_dynamics(self, z0, t):
         # z0: [batch_size, n_super_nodes, latent_dim]
-        z0_flat = z0.view(z0.size(0), -1).to(torch.float32)
+        z0_flat = z0.reshape(z0.size(0), -1).to(torch.float32)
         t = t.to(torch.float32)
 
         # Use the device of the ode_func parameters

@@ -129,8 +129,8 @@ class StableHierarchicalPooling(nn.Module):
 
         # NEW: Assignment Persistence - bias logits by previous assignments to stabilize flickering
         if prev_assignments is not None and prev_assignments.size(0) == x.size(0):
-            # persistence_gain = 200.0 to strongly favor previous identity - INCREASED FROM 50.0 TO 200.0 AS REQUESTED
-            logits = logits + 200.0 * prev_assignments.detach()
+            # persistence_gain = 10.0 to favor previous identity without locking it too hard
+            logits = logits + 10.0 * prev_assignments.detach()
 
         # Apply active_mask to logits (soft mask to allow for revival)
         # Use detach() to prevent inplace modification errors during backward pass
