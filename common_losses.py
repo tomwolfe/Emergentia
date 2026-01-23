@@ -41,8 +41,10 @@ def get_mi_loss(z, mu, mi_discriminator):
     marginal = mi_discriminator(z_spatial, mu_shuffled)
 
     # MINE objective: I(Z; MU) >= E[joint] - log(E[exp(marginal)])
-    # We want to maximize this, so we minimize the negative
-    mi_est = torch.mean(joint) - torch.log(torch.mean(torch.exp(marginal)) + 1e-9)
+    # Use logsumexp for numerical stability
+    # log(mean(exp(marginal))) = logsumexp(marginal) - log(N)
+    log_mean_exp_marginal = torch.logsumexp(marginal.flatten(), dim=0) - torch.log(torch.tensor(marginal.numel(), dtype=torch.float, device=marginal.device))
+    mi_est = torch.mean(joint) - log_mean_exp_marginal
     return -mi_est
 
 

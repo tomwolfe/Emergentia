@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+from torch_geometric.data import Data, Batch
 import sympy as sp
 import re
 from gplearn.genetic import SymbolicRegressor
@@ -88,7 +89,7 @@ class SymbolicDistiller:
                                  max_samples=0.9, n_jobs=-1, random_state=42, verbose=0)
 
     def _select_features(self, X, y):
-        # Sample data if it's too large for mutual_info_regression
+        # Sample data if it's too large
         if X.shape[0] > 1000:
             indices = np.random.choice(X.shape[0], 1000, replace=False)
             X_sample = X[indices]
@@ -97,14 +98,30 @@ class SymbolicDistiller:
             X_sample = X
             y_sample = y
 
+        # 1. Fast F-test pass to narrow down candidates
         f_scores, _ = f_regression(X_sample, y_sample)
+        f_scores = np.nan_to_num(f_scores)
         
-        # mutual_info_regression is slow; using sampled data improves performance significantly
-        mi_scores = mutual_info_regression(X_sample, y_sample, random_state=42)
+        # 2. Only run slow Mutual Information on top candidates (e.g., top 50)
+        # to find non-linear relationships without checking every feature
+        top_k_f = min(50, X.shape[1])
+        top_f_indices = np.argsort(f_scores)[-top_k_f:]
         
-        combined = 0.5 * (f_scores / (f_scores.max() + 1e-9)) + 0.5 * (mi_scores / (mi_scores.max() + 1e-9))
+        mi_scores_subset = mutual_info_regression(X_sample[:, top_f_indices], y_sample, random_state=42)
+        
+        # Combine scores
+        combined_scores = np.zeros(X.shape[1])
+        combined_scores[top_f_indices] = 0.5 * (f_scores[top_f_indices] / (f_scores[top_f_indices].max() + 1e-9)) + \
+                                         0.5 * (mi_scores_subset / (mi_scores_subset.max() + 1e-9))
+        
+        # For those not in top_k_f, use only f_score (but scaled down)
+        remaining_mask = np.ones(X.shape[1], dtype=bool)
+        remaining_mask[top_f_indices] = False
+        if f_scores.max() > 0:
+            combined_scores[remaining_mask] = 0.3 * (f_scores[remaining_mask] / (f_scores.max() + 1e-9))
+        
         mask = np.zeros(X.shape[1], dtype=bool)
-        mask[np.argsort(combined)[-self.max_features:]] = True
+        mask[np.argsort(combined_scores)[-self.max_features:]] = True
         return mask
 
     def validate_stability(self, program, X_sample):
@@ -175,61 +192,49 @@ class SymbolicDistiller:
 
 def extract_latent_data(model, dataset, dt, include_hamiltonian=False):
     model.eval()
-    states, derivs = [], []
     device = next(model.parameters()).device
+    
+    # 1. Batch the entire dataset for fast encoding
+    if isinstance(dataset, list):
+        full_batch = Batch.from_data_list(dataset).to(device)
+        seq_len = len(dataset)
+    else:
+        full_batch = dataset.to(device)
+        seq_len = getattr(full_batch, 'seq_len', 1)
+    
     with torch.no_grad():
-        for i, data in enumerate(dataset):
-            x = data.x.to(device)
-            if hasattr(data, 'edge_index') and data.edge_index is not None:
-                ei = data.edge_index.to(device)
-            else:
-                ei = torch.empty((2, 0), dtype=torch.long, device=device)
+        # Encode all steps at once
+        z_all, _, _, _ = model.encode(full_batch.x, full_batch.edge_index, full_batch.batch)
+        
+        # Check for NaN in z before proceeding
+        if torch.isnan(z_all).any():
+            print("DEBUG: NaN detected in encoded z")
+            z_all = torch.nan_to_num(z_all)
 
-            batch = torch.zeros(x.size(0), dtype=torch.long, device=device)
+        # Reshape to [T, K*D]
+        z_flat = z_all.reshape(seq_len, -1)
+        
+        ode_device = next(model.ode_func.parameters()).device
+        z_torch = z_flat.to(ode_device)
+        
+        if include_hamiltonian and hasattr(model.ode_func, 'H_net'):
+            # Extract scalar Hamiltonian for all steps at once
+            H_all = model.ode_func.H_net(z_torch)
+            derivs = H_all.cpu().numpy()
+        else:
+            # Extract dynamics derivative for all steps at once
+            # Most ODE functions support batched inputs
+            t_span = torch.zeros(1, device=ode_device) # Time-invariant assumption for distillation
+            dz_all = model.ode_func(t_span, z_torch)
+            
+            if torch.isnan(dz_all).any():
+                dz_all = torch.nan_to_num(dz_all)
+            
+            derivs = dz_all.cpu().numpy()
 
-            try:
-                z, _, _, _ = model.encode(x, ei, batch)
+        states = z_flat.cpu().numpy()
 
-                # Check for NaN in z before proceeding
-                if torch.isnan(z).any():
-                    print(f"DEBUG: NaN detected in encoded z at step {i}")
-                    continue
-
-                z_flat = z.reshape(1, -1)  # Use reshape instead of view to avoid stride issues
-
-                states.append(z_flat[0].cpu().numpy())
-
-                if include_hamiltonian and hasattr(model.ode_func, 'H_net'):
-                    # Extract scalar Hamiltonian
-                    ode_device = next(model.ode_func.parameters()).device
-                    H = model.ode_func.H_net(z_flat.to(ode_device))
-
-                    # Check for NaN in H
-                    if torch.isnan(H).any():
-                        print(f"DEBUG: NaN detected in H at step {i}")
-                        continue
-
-                    derivs.append(H.cpu().numpy().flatten())
-                else:
-                    # Extract dynamics derivative
-                    ode_device = next(model.ode_func.parameters()).device
-                    dz = model.ode_func(torch.tensor([i*dt], device=ode_device), z_flat.to(ode_device))
-
-                    # Check for NaN in dz
-                    if torch.isnan(dz).any():
-                        print(f"DEBUG: NaN detected in dz at step {i}")
-                        # Replace NaN values with 0
-                        dz = torch.nan_to_num(dz, nan=0.0, posinf=1e2, neginf=-1e2)
-
-                    derivs.append(dz[0].cpu().numpy())
-            except Exception as e:
-                print(f"Exception at step {i}: {e}")
-                continue
-
-    if not states:
-        return np.array([]), np.array([]), np.array([])
-
-    return np.array(states), np.array(derivs), np.linspace(0, len(states)*dt, len(states))
+    return states, derivs, np.linspace(0, seq_len * dt, seq_len)
 
 def gp_to_sympy(expr_str, *args, **kwargs):
     local_dict = {

@@ -801,26 +801,45 @@ class Trainer:
             mu_processed.view(-1, self.model.encoder.n_super_nodes, 2)
         )
 
-        # Consistency and assignment stability still need a loop or shifted tensor
-        for i, t in enumerate(processed_indices):
-            if t > 0:
-                s_t = s_all[t*nodes_per_step : (t+1)*nodes_per_step]
-                s_prev = s_all[(t-1)*nodes_per_step : t*nodes_per_step]
-                mu_t = mu_all[t]
-                mu_prev = mu_all[t-1]
-                z_target_t = z_all_target[t]
-                z_target_prev = z_all_target[t-1]
-                
-                loss_assign += self.criterion(s_t, s_prev) + 10.0 * self.criterion(mu_t, mu_prev) + 0.5 * self.criterion(z_target_t, z_target_prev)
-                if compute_consistency and not is_warmup:
-                    loss_cons += self.criterion(z_preds[t], z_target_t)
+        # Vectorized consistency and assignment stability
+        if len(processed_indices) > 1:
+            # Shifted indices for calculating differences [1, 2, ..., T-1] and [0, 1, ..., T-2]
+            # to compute loss between consecutive PROCESSED steps
+            curr_idx = processed_indices[1:]
+            prev_idx = processed_indices[:-1]
+            
+            # Slices for s_all
+            # s_all is [T*N, K]
+            s_curr = s_all.view(seq_len, nodes_per_step, -1)[curr_idx]
+            s_prev = s_all.view(seq_len, nodes_per_step, -1)[prev_idx]
+            
+            # Slices for mu_all and z_all_target
+            # mu_all: [T, B, K, 2], z_all_target: [T, B, K, D]
+            mu_curr = mu_all[curr_idx]
+            mu_prev = mu_all[prev_idx]
+            z_t_curr = z_all_target[curr_idx]
+            z_t_prev = z_all_target[prev_idx]
+            
+            loss_assign += (
+                self.criterion(s_curr, s_prev) + 
+                10.0 * self.criterion(mu_curr, mu_prev) + 
+                0.5 * self.criterion(z_t_curr, z_t_prev)
+            )
+            
+            if compute_consistency and not is_warmup:
+                # z_preds: [T, B, K, D]
+                z_p_curr = z_preds[curr_idx]
+                loss_cons = self.criterion(z_p_curr, z_t_curr)
 
-                loss_rec /= processed_steps
-        cons_steps = processed_steps - 1
-        if cons_steps > 0 and compute_consistency and not is_warmup:
-            loss_cons /= cons_steps
-
-        for l in [loss_assign, loss_pruning, loss_sparsity, loss_ortho, loss_sep, loss_conn, loss_anchor]: l /= processed_steps
+        # Normalize losses
+        loss_assign = loss_assign / processed_steps
+        loss_pruning = loss_pruning / processed_steps
+        loss_sparsity = loss_sparsity / processed_steps
+        loss_ortho = loss_ortho / processed_steps
+        loss_sep = loss_sep / processed_steps
+        loss_conn = loss_conn / processed_steps
+        loss_anchor = loss_anchor / processed_steps
+            
         loss_align /= (processed_steps * self.model.encoder.n_super_nodes)
         loss_mi /= (processed_steps * self.model.encoder.n_super_nodes)
 
