@@ -157,6 +157,7 @@ class TorchFeatureTransformer(torch.nn.Module):
         self.include_dists = transformer.include_dists
         self.box_size = transformer.box_size
         self.basis_functions = getattr(transformer, 'basis_functions', 'physics_informed')
+        self.include_raw_latents = getattr(transformer, 'include_raw_latents', False)
 
         # Register FULL buffers for normalization parameters
         # We now store full buffers and apply masking in forward() to avoid shape mismatches
@@ -192,7 +193,9 @@ class TorchFeatureTransformer(torch.nn.Module):
         batch_size = z_flat.size(0)
         z_nodes = z_flat.view(batch_size, self.n_super_nodes, self.latent_dim)
 
-        features = [z_flat]
+        features = []
+        if self.include_raw_latents:
+            features.append(z_flat)
 
         if self.include_dists and self.basis_functions != 'polynomial_only':
             # Compute distance features using the same logic as BalancedFeatureTransformer
@@ -208,11 +211,11 @@ class TorchFeatureTransformer(torch.nn.Module):
         if self.basis_functions == 'polynomial':
             X_expanded = self._polynomial_expansion(X)
         elif self.basis_functions == 'physics_informed':
-            X_expanded = self._physics_informed_expansion(X, z_nodes)
+            X_expanded = self._physics_informed_expansion(X, z_flat)
         elif self.basis_functions == 'adaptive':
-            X_expanded = self._adaptive_expansion(X, z_nodes)
+            X_expanded = self._adaptive_expansion(X, z_flat)
         else:
-            X_expanded = self._physics_informed_expansion(X, z_nodes)
+            X_expanded = self._physics_informed_expansion(X, z_flat)
 
         # Final safety clip and NaN handling
         X_expanded = torch.nan_to_num(X_expanded, nan=0.0, posinf=1e9, neginf=-1e9)
@@ -299,7 +302,7 @@ class TorchFeatureTransformer(torch.nn.Module):
 
         return torch.cat(features, dim=1)
 
-    def _physics_informed_expansion(self, X, z_nodes):
+    def _physics_informed_expansion(self, X, z_flat):
         """
         Perform physics-informed polynomial expansion with cross-terms.
         Matches BalancedFeatureTransformer logic.
@@ -307,12 +310,12 @@ class TorchFeatureTransformer(torch.nn.Module):
         batch_size, n_total_features = X.shape
         n_raw_latents = self.n_super_nodes * self.latent_dim
 
-        # 1. Base features: Raw latents + already computed distance features
+        # 1. Base features: (Optional raw latents) + distance features
         features = [X]
 
         # 2. Squares of raw latents: [Batch, n_raw_latents]
         # ALWAYS include squares as they are fundamental for kinetic energy (p^2)
-        X_raw = X[:, :n_raw_latents]
+        X_raw = z_flat
         features.append(X_raw**2)
 
         # NEW: Explicit sum of squares of momentum dims (p^2) per super-node
@@ -356,11 +359,11 @@ class TorchFeatureTransformer(torch.nn.Module):
 
         return X_expanded
 
-    def _adaptive_expansion(self, X, z_nodes):
+    def _adaptive_expansion(self, X, z_flat):
         """
         Adaptive expansion that learns the most relevant feature combinations.
         """
-        X_physics = self._physics_informed_expansion(X, z_nodes)
+        X_physics = self._physics_informed_expansion(X, z_flat)
         return X_physics
 
     def denormalize_y(self, Y_norm):

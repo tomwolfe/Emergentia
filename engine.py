@@ -645,25 +645,24 @@ class Trainer:
                 self.model.encoder.pooling.apply_hard_revival()
 
         compute_consistency = (epoch >= self.warmup_epochs) and (epoch % self.skip_consistency_freq == 0)
-        if self.enable_gradient_accumulation: self.optimizer.zero_grad(set_to_none=True)
+        self.optimizer.zero_grad(set_to_none=True)
 
         tau, hard, tf_ratio, entropy_weight = self._get_schedules(epoch, max_epochs)
         
         # OPTIMIZATION: Use pre-batched data if provided
         if isinstance(data_list, Batch):
             full_batch = data_list
-            # For pre-batched data, we need to know the sequence length
-            # Assuming seq_len is stored in full_batch or can be inferred
+            # For multi-trajectory batching, we need both seq_len and trajectory batch_size
             if hasattr(full_batch, 'seq_len'):
                 seq_len = full_batch.seq_len
+                batch_size = full_batch.num_graphs // seq_len
             else:
-                # Infer seq_len if possible (e.g., from num_graphs)
                 seq_len = getattr(full_batch, 'num_graphs', 1)
+                batch_size = 1
         else:
             full_batch = Batch.from_data_list(data_list).to(self.device)
             seq_len = len(data_list)
-        
-        batch_size = 1 # Assuming single trajectory batch for now based on unified_train.py
+            batch_size = 1
 
         # Encode everything in one go
         z_all_target, s_all, losses_all, mu_all = self.model.encode(
@@ -673,11 +672,24 @@ class Trainer:
         
         # Reshape to [T, B, K, D]
         z_all_target = z_all_target.reshape(seq_len, batch_size, self.model.encoder.n_super_nodes, -1)
-        s_all = s_all.reshape(seq_len * batch_size * (full_batch.num_nodes // seq_len), -1) # s is [N_total, K]
-        # mu_all is [B_total, K, 2] -> [T, B, K, 2]
+        
+        # Correctly reshape s_all and mu_all to handle multiple trajectories
+        num_nodes_total = full_batch.num_nodes
+        nodes_per_traj_step = num_nodes_total // (seq_len * batch_size)
+        
+        # s_all is [num_nodes_total, K]
+        # mu_all is [seq_len * batch_size, K, 2]
         mu_all = mu_all.reshape(seq_len, batch_size, self.model.encoder.n_super_nodes, 2)
 
-        z_curr = z_all_target[0]
+        z_curr = z_all_target[0] # [B, K, D]
+        
+        # Initial reconstruction loss for the first step of all trajectories in the batch
+        s_0 = s_all.view(seq_len, batch_size, nodes_per_traj_step, -1)[0].reshape(-1, self.model.encoder.n_super_nodes)
+        batch_idx_0 = torch.arange(batch_size, device=self.device).repeat_interleave(nodes_per_traj_step)
+        
+        recon_0 = self.model.decode(z_curr, s_0, batch_idx_0, stats=None)
+        x_target_0 = full_batch.x.view(seq_len, batch_size, nodes_per_traj_step, -1)[0].reshape(-1, 4)
+        loss_rec = self.criterion(recon_0, x_target_0)
         s_0 = s_all[:full_batch.num_nodes // seq_len]
         
         # Initial reconstruction loss
@@ -765,7 +777,14 @@ class Trainer:
         loss_sep = losses_all.get('separation', torch.tensor(0.0, device=self.device))
         
         # Connectivity and ortho losses for step 0
-        loss_conn = 10.0 * self.model.get_connectivity_loss(s_0, full_batch.edge_index[:, full_batch.edge_index[0] < (full_batch.num_nodes // seq_len)])
+        nodes_per_traj = full_batch.num_nodes // batch_size
+        s_0 = s_all.view(seq_len, batch_size, nodes_per_traj_step, -1)[0].reshape(-1, self.model.encoder.n_super_nodes)
+        
+        # Correctly get edges for step 0 across all trajectories in the batch
+        # This is tricky because edge_index is global for the whole Batch
+        # But we only want edges within the first step of each trajectory
+        loss_conn = 10.0 * self.model.get_connectivity_loss(s_0, full_batch.edge_index[:, full_batch.edge_index[0] < (batch_size * nodes_per_traj_step)])
+        
         loss_ortho = self.model.get_ortho_loss(s_0)
         loss_var = self.model.get_latent_variance_loss(z_curr)
         loss_hinge = torch.mean(torch.relu(0.1 - torch.norm(z_preds, dim=-1)))
@@ -779,23 +798,22 @@ class Trainer:
         processed_indices = [t for t in range(seq_len) if (t % 2 == 0 or t == seq_len - 1)]
         processed_steps = len(processed_indices)
         
-        # OPTIMIZATION: Batch decode all processed steps
+        # OPTIMIZATION: Batch decode all processed steps across all trajectories
         # z_preds is [T, B, K, D]
-        z_batch = z_preds[processed_indices].view(-1, self.model.encoder.n_super_nodes, self.model.encoder.latent_dim) # [processed_steps, K, D]
+        z_batch = z_preds[processed_indices].view(-1, self.model.encoder.n_super_nodes, self.model.encoder.latent_dim) # [processed_steps * B, K, D]
         
         # Prepare s_batch and x_target_batch
-        nodes_per_step = full_batch.num_nodes // seq_len
-        s_indices = []
-        x_indices = []
-        for t in processed_indices:
-            s_indices.extend(range(t*nodes_per_step, (t+1)*nodes_per_step))
-            x_indices.extend(range(t*nodes_per_step, (t+1)*nodes_per_step))
+        # We need to pick nodes for each processed step and each trajectory
+        # s_all is [T*B*N_p, K]
+        s_reshaped = s_all.view(seq_len, batch_size, nodes_per_traj_step, -1)
+        s_batch = s_reshaped[processed_indices].reshape(-1, self.model.encoder.n_super_nodes)
         
-        s_batch = s_all[s_indices] # [processed_steps * N, K]
-        x_target_batch = full_batch.x[x_indices] # [processed_steps * N, 4]
+        x_reshaped = full_batch.x.view(seq_len, batch_size, nodes_per_traj_step, -1)
+        x_target_batch = x_reshaped[processed_indices].reshape(-1, 4)
         
-        # Create a batch index for the combined decode [0,0...0, 1,1...1, ..., P,P...P]
-        decode_batch_idx = torch.arange(processed_steps, device=self.device).repeat_interleave(nodes_per_step)
+        # Create a batch index for the combined decode
+        # Each z in z_batch [processed_steps * B, K, D] corresponds to nodes_per_traj_step nodes
+        decode_batch_idx = torch.arange(processed_steps * batch_size, device=self.device).repeat_interleave(nodes_per_traj_step)
         
         recon_all = self.model.decode(z_batch, s_batch, decode_batch_idx, stats=None)
         loss_rec = self.criterion(recon_all, x_target_batch)
@@ -813,10 +831,10 @@ class Trainer:
         d_align = min(self.model.encoder.latent_dim // 2 if self.model.hamiltonian else 2, 2)
         huber_loss = torch.nn.SmoothL1Loss(beta=0.1)
 
-        # Batch compute anchor and alignment if possible
-        # mu_all is [T, B, K, 2]
-        mu_processed = mu_all[processed_indices].view(processed_steps, self.model.encoder.n_super_nodes, 2)
-        z_processed = z_preds[processed_indices].view(processed_steps, self.model.encoder.n_super_nodes, -1)
+        # Batch compute anchor and alignment
+        # mu_all: [T, B, K, 2], z_preds: [T, B, K, D]
+        mu_processed = mu_all[processed_indices].view(-1, self.model.encoder.n_super_nodes, 2)
+        z_processed = z_preds[processed_indices].view(-1, self.model.encoder.n_super_nodes, self.model.encoder.latent_dim)
         
         loss_anchor = self.criterion(z_processed[:, :, :2], mu_processed)
         
@@ -824,30 +842,20 @@ class Trainer:
         mu_clamped = torch.clamp(mu_processed[:, :, :d_align], -1.0, 1.0)
         loss_align = 2.0 * alignment_weight * huber_loss(z_clamped * torch.exp(self.log_align_scale), mu_clamped)
         
-        # MI loss is harder to batch because it involves shuffling, but we can do it
-        # OPTIMIZATION: Only compute MI loss every 5 epochs OR during late stages
+        # MI loss
         if epoch % 5 == 0 or epoch > int(max_epochs * 0.75):
-            loss_mi = alignment_weight * 5.0 * self.model.get_mi_loss(
-                z_processed.view(-1, self.model.encoder.n_super_nodes, self.model.encoder.latent_dim),
-                mu_processed.view(-1, self.model.encoder.n_super_nodes, 2)
-            )
+            loss_mi = alignment_weight * 5.0 * self.model.get_mi_loss(z_processed, mu_processed)
         else:
             loss_mi = torch.tensor(0.0, device=self.device)
 
         # Vectorized consistency and assignment stability
         if len(processed_indices) > 1:
-            # Shifted indices for calculating differences [1, 2, ..., T-1] and [0, 1, ..., T-2]
-            # to compute loss between consecutive PROCESSED steps
             curr_idx = processed_indices[1:]
             prev_idx = processed_indices[:-1]
             
-            # Slices for s_all
-            # s_all is [T*N, K]
-            s_curr = s_all.view(seq_len, nodes_per_step, -1)[curr_idx]
-            s_prev = s_all.view(seq_len, nodes_per_step, -1)[prev_idx]
+            s_curr = s_reshaped[curr_idx]
+            s_prev = s_reshaped[prev_idx]
             
-            # Slices for mu_all and z_all_target
-            # mu_all: [T, B, K, 2], z_all_target: [T, B, K, D]
             mu_curr = mu_all[curr_idx]
             mu_prev = mu_all[prev_idx]
             z_t_curr = z_all_target[curr_idx]
@@ -860,21 +868,21 @@ class Trainer:
             )
             
             if compute_consistency and not is_warmup:
-                # z_preds: [T, B, K, D]
                 z_p_curr = z_preds[curr_idx]
                 loss_cons = self.criterion(z_p_curr, z_t_curr)
 
-        # Normalize losses
-        loss_assign = loss_assign / processed_steps
-        loss_pruning = loss_pruning / processed_steps
-        loss_sparsity = loss_sparsity / processed_steps
-        loss_ortho = loss_ortho / processed_steps
-        loss_sep = loss_sep / processed_steps
-        loss_conn = loss_conn / processed_steps
-        loss_anchor = loss_anchor / processed_steps
+        # Normalize losses by number of steps AND trajectory batch size
+        norm_factor = processed_steps * batch_size
+        loss_assign = loss_assign / norm_factor
+        loss_pruning = loss_pruning / norm_factor
+        loss_sparsity = loss_sparsity / norm_factor
+        loss_ortho = loss_ortho / norm_factor
+        loss_sep = loss_sep / norm_factor
+        loss_conn = loss_conn / norm_factor
+        loss_anchor = loss_anchor / norm_factor
             
-        loss_align /= (processed_steps * self.model.encoder.n_super_nodes)
-        loss_mi /= (processed_steps * self.model.encoder.n_super_nodes)
+        loss_align /= (norm_factor * self.model.encoder.n_super_nodes)
+        loss_mi /= (norm_factor * self.model.encoder.n_super_nodes)
 
         lvars = torch.clamp(self.model.log_vars, min=-6.0, max=5.0)
         
@@ -965,7 +973,6 @@ class Trainer:
             if epoch > self.warmup_epochs and stage2_factor >= 0.95: torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
             else: torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
-            self.optimizer.zero_grad() # Added to clear gradients
 
         self.loss_tracker.update({'total': loss.to(torch.float32), 'rec_raw': loss_rec, 'cons_raw': loss_cons, 'assign': loss_assign, 'align': loss_align, 'mi': loss_mi, 'sym': loss_sym, 'lvar_raw': loss_var, 'curv_raw': loss_curv, 'hinge_raw': loss_hinge, 'smooth_raw': loss_smooth, 'anchor_raw': loss_anchor, 'lvars_mean': lvars.mean()}, weights=weights)
         

@@ -663,23 +663,20 @@ class DiscoveryEngineModel(nn.Module):
         if next(self.ode_func.parameters()).device != target_device:
             self.ode_func.to(target_device)
 
-        # Use adaptive tolerance based on training stage
-        eps = 1e-3 if is_mps else 0.0
-
+        # Tighter step size for better accuracy with LJ potential, but respect t intervals
         if step_size is None:
             if self.training:
-                # Tighter step size for better accuracy with LJ potential, but respect t intervals
-                # If t intervals are smaller than 0.002, use them as step size
+                # Midpoint is 2nd order, rk4 is 4th order. Midpoint is 2x faster.
+                # For discovery, midpoint is usually sufficient.
                 if len(t) > 1:
                     dt_span = (t[1] - t[0]).item()
-                    step_size = min(0.002, dt_span)
+                    step_size = min(0.005, dt_span) # Slightly larger step size for midpoint
                 else:
-                    step_size = 0.002
+                    step_size = 0.005
             else:
-                # Tighter tolerances during evaluation for accuracy
-                step_size = 0.0005
+                step_size = 0.001
 
-        method = 'rk4'
+        method = 'midpoint' if self.training else 'rk4'
         options = {'step_size': step_size}
 
         # Use the selected solver

@@ -133,10 +133,15 @@ class SymbolicDistiller:
         except:
             return False
 
-    def _distill_single_target(self, i, X, y, targets_shape_1=None, latent_states_shape_1=None, is_hamiltonian=False):
+    def _distill_single_target(self, i, X, y, targets_shape_1=None, latent_states_shape_1=None, is_hamiltonian=False, skip_deep_search=False):
         print(f"    -> [Target {i}] Selecting top {self.max_features} features...")
         mask = self._select_features(X, y)
         X_sel = X[:, mask]
+        
+        # Display selected feature names if available
+        if hasattr(self, 'transformer') and hasattr(self.transformer, 'feature_names'):
+            names = [self.transformer.feature_names[j] for j in np.where(mask)[0]]
+            print(f"    -> [Target {i}] Selected features: {names}")
         
         print(f"    -> [Target {i}] Fitting LassoCV for baseline...")
         lasso = LassoCV(cv=5).fit(X_sel, y)
@@ -149,9 +154,11 @@ class SymbolicDistiller:
             if np.sum(coeffs > 1e-3) == 1 and np.max(coeffs) > 0.9:
                 is_identity = True
         
-        if lasso_score > 0.999:
+        # Soften Lasso gate: allow GP even if Lasso is very good, unless it's nearly perfect
+        # Also, IMPORTANT: Use relative indices (j) for the Lasso expression because it will be executed on X_sel
+        if lasso_score > 0.9999:
             print(f"    -> [Target {i}] Lasso found near-perfect fit (R2={lasso_score:.4f}). Skipping GP.")
-            return OptimizedExpressionProgram(str(sp.simplify(sum(c*sp.Symbol(f'X{np.where(mask)[0][j]}') for j, c in enumerate(lasso.coef_)) + lasso.intercept_))), mask, lasso_score
+            return OptimizedExpressionProgram(str(sp.simplify(sum(c*sp.Symbol(f'X{j}') for j, c in enumerate(lasso.coef_)) + lasso.intercept_))), mask, lasso_score
             
         # Initial GP search
         print(f"    -> [Target {i}] Starting initial GP search (Pop: {self.populations}, Gen: {self.generations}, Samples: 90%)...")
@@ -163,18 +170,18 @@ class SymbolicDistiller:
         # PHYSICALITY GATE: Trigger Deep Search if score is low or result is trivial
         is_gp_trivial = re.match(r'^X\d+$', program_str) or re.match(r'^neg\(X\d+\)$', program_str) or len(program_str) < 5
         
-        if (score < 0.8) or (is_gp_trivial and score < 0.95) or is_identity:
-            p_deep = min(self.populations * 2, 5000) # Capped at 5000 to save RAM
-            g_deep = min(self.generations * 2, 100)  # Capped at 100 to save time
+        if not skip_deep_search and ((score < 0.9) or (is_gp_trivial and score < 0.99) or is_identity):
+            p_deep = min(self.populations * 4, 10000) 
+            g_deep = min(self.generations * 4, 200)  
             print(f"    -> [Target {i}] Physicality Gate triggered. Starting Deep Search (Pop: {p_deep}, Gen: {g_deep})...")
-            est = self._get_regressor(p_deep, g_deep, parsimony=0.01).fit(X_sel, y)
+            est = self._get_regressor(p_deep, g_deep, parsimony=0.005).fit(X_sel, y)
             score = est.score(X_sel, y)
             program_str = str(est._program)
             print(f"    -> [Target {i}] Deep Search R2: {score:.4f}")
             
         return OptimizedExpressionProgram(program_str), mask, score
 
-    def distill(self, latent_states, targets, n_super_nodes, latent_dim, box_size=None, hamiltonian=False):
+    def distill(self, latent_states, targets, n_super_nodes, latent_dim, box_size=None, hamiltonian=False, quick=False):
         self.transformer = FeatureTransformer(n_super_nodes, latent_dim, box_size=box_size)
         self.transformer.fit(latent_states, targets)
         X_norm = self.transformer.normalize_x(self.transformer.transform(latent_states))
@@ -184,10 +191,10 @@ class SymbolicDistiller:
             # Regress a SINGLE target: the scalar Hamiltonian H
             # We assume the first column of targets is H if hamiltonian=True is passed
             # or that extract_latent_data was called with include_hamiltonian=True
-            res, mask, score = self._distill_single_target(0, X_norm, Y_norm[:, 0], 1, latent_dim, is_hamiltonian=True)
+            res, mask, score = self._distill_single_target(0, X_norm, Y_norm[:, 0], 1, latent_dim, is_hamiltonian=True, skip_deep_search=quick)
             return [res]
         
-        results = Parallel(n_jobs=-1)(delayed(self._distill_single_target)(i, X_norm, Y_norm[:, i], targets.shape[1], latent_dim) for i in range(targets.shape[1]))
+        results = Parallel(n_jobs=-1)(delayed(self._distill_single_target)(i, X_norm, Y_norm[:, i], targets.shape[1], latent_dim, skip_deep_search=quick) for i in range(targets.shape[1]))
         return [r[0] for r in results]
 
 def extract_latent_data(model, dataset, dt, include_hamiltonian=False):

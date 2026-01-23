@@ -104,7 +104,8 @@ class BalancedFeatureTransformer:
     """
     
     def __init__(self, n_super_nodes, latent_dim, include_dists=True, box_size=None, 
-                 basis_functions='physics_informed', max_degree=2, feature_selection_method='recursive'):
+                 basis_functions='physics_informed', max_degree=2, feature_selection_method='recursive',
+                 include_raw_latents=False):
         """
         Initialize the balanced feature transformer.
 
@@ -116,6 +117,7 @@ class BalancedFeatureTransformer:
             basis_functions (str): Type of basis functions ('physics_informed', 'polynomial', 'adaptive')
             max_degree (int): Maximum degree for polynomial features
             feature_selection_method (str): Method for feature selection ('recursive', 'mutual_info', 'f_test', 'lasso')
+            include_raw_latents (bool): Whether to include raw linear latents (often leads to trivial H=z0)
         """
         self.n_super_nodes = n_super_nodes
         self.latent_dim = latent_dim
@@ -124,6 +126,7 @@ class BalancedFeatureTransformer:
         self.basis_functions = basis_functions
         self.max_degree = max_degree
         self.feature_selection_method = feature_selection_method
+        self.include_raw_latents = include_raw_latents
         
         # Normalization parameters
         self.z_mean = None
@@ -137,6 +140,7 @@ class BalancedFeatureTransformer:
         self.selected_feature_indices = None
         self.n_selected_features = None
         self.recursive_selector = None
+        self.feature_names = []
         
         # For polynomial features
         self.poly_transformer = None
@@ -183,27 +187,56 @@ class BalancedFeatureTransformer:
             
         z_nodes = z_flat_clipped.reshape(-1, self.n_super_nodes, self.latent_dim)
 
-        # Use normalized latents instead of raw ones in the feature set
-        features = [z_flat_norm]
+        # Use normalized latents instead of raw ones in the feature set if requested
+        features = []
+        if self.include_raw_latents:
+            features.append(z_flat_norm)
+        
+        # Generate base names
+        if fit_transformer:
+            base_names = []
+            if self.include_raw_latents:
+                base_names.extend([f"z{i}" for i in range(self.n_super_nodes * self.latent_dim)])
         
         if self.include_dists and self.basis_functions != 'polynomial_only':
             dist_features = self._compute_distance_features(z_nodes)
             if dist_features:
                 features.extend(dist_features)
+                if fit_transformer:
+                    # Logic for distance feature names must match _compute_distance_features
+                    i_idx, j_idx = np.triu_indices(self.n_super_nodes, k=1)
+                    for i, j in zip(i_idx, j_idx):
+                        pair = f"({i},{j})"
+                        base_names.append(f"d{pair}")
+                        base_names.append(f"1/d{pair}")
+                        for n in [2, 3, 4, 6, 8, 10, 12]:
+                            base_names.append(f"1/d{pair}^{n}")
+                        base_names.append(f"exp(-d{pair})")
+                        base_names.append(f"exp(-d{pair})/d")
+                        base_names.append(f"log(d{pair})")
 
         X = np.hstack(features)
         # Final safety clip before expansion
         X = np.clip(X, -1e6, 1e6)
 
         # Apply basis function expansion based on configuration
+        raw_latent_names = [f"z{i}" for i in range(self.n_super_nodes * self.latent_dim)] if fit_transformer else None
+        
         if self.basis_functions == 'polynomial':
             X_expanded = self._polynomial_expansion(X, fit_transformer)
+            if fit_transformer:
+                # PolynomialFeatures.get_feature_names_out is standard
+                self.feature_names = self.poly_transformer.get_feature_names_out(base_names)
         elif self.basis_functions == 'physics_informed':
-            X_expanded = self._physics_informed_expansion(X)
+            X_expanded, expanded_names = self._physics_informed_expansion(X, z_flat_norm, base_names if fit_transformer else None, raw_latent_names)
+            if fit_transformer:
+                self.feature_names = expanded_names
         elif self.basis_functions == 'adaptive':
             X_expanded = self._adaptive_expansion(X, fit_transformer)
         else:
-            X_expanded = self._physics_informed_expansion(X)
+            X_expanded, expanded_names = self._physics_informed_expansion(X, z_flat_norm, base_names if fit_transformer else None, raw_latent_names)
+            if fit_transformer:
+                self.feature_names = expanded_names
 
         # Final safety clip and NaN handling
         X_expanded = np.nan_to_num(X_expanded, nan=0.0, posinf=1e9, neginf=-1e9)
@@ -269,7 +302,7 @@ class BalancedFeatureTransformer:
         
         return X_poly
 
-    def _physics_informed_expansion(self, X):
+    def _physics_informed_expansion(self, X, z_flat_norm, base_names=None, raw_latent_names=None):
         """
         Perform physics-informed polynomial expansion with cross-terms.
         Includes a memory safety check and vectorization for performance.
@@ -277,13 +310,17 @@ class BalancedFeatureTransformer:
         batch_size, n_total_features = X.shape
         n_raw_latents = self.n_super_nodes * self.latent_dim
         
-        # 1. Base features: Raw latents + already computed distance features
+        # 1. Base features: (Optional raw latents) + distance features
         features = [X]
+        names = list(base_names) if base_names is not None else None
         
         # 2. Squares of raw latents: [Batch, n_raw_latents]
         # ALWAYS include squares as they are fundamental for kinetic energy (p^2)
-        X_raw = X[:, :n_raw_latents]
+        X_raw = z_flat_norm
         features.append(X_raw**2)
+        if names is not None and raw_latent_names is not None:
+            for i in range(n_raw_latents):
+                names.append(f"{raw_latent_names[i]}^2")
 
         # NEW: Explicit sum of squares of momentum dims (p^2) per super-node
         # Assuming last half of latent_dim are momentum dims
@@ -291,10 +328,14 @@ class BalancedFeatureTransformer:
         X_nodes = X_raw.reshape(batch_size, self.n_super_nodes, self.latent_dim)
         p_sq_sum = (X_nodes[:, :, d_sub:]**2).sum(axis=2) # [Batch, K]
         features.append(p_sq_sum)
+        if names is not None:
+            for k in range(self.n_super_nodes):
+                names.append(f"p{k}^2_sum")
 
         # For small systems, target < 60 features by skipping cross-terms
         if self.n_super_nodes <= 4:
-            return np.concatenate(features, axis=1)
+            X_res = np.concatenate(features, axis=1)
+            return X_res, names
 
         # 3. Intra-node cross-terms: O(K * D^2)
         # Using vectorized outer product per node
@@ -303,9 +344,18 @@ class BalancedFeatureTransformer:
         for i in range(self.latent_dim):
             for j in range(i + 1, self.latent_dim):
                 intra_terms.append(X_nodes[:, :, i] * X_nodes[:, :, j])
+                if names is not None:
+                    # This name generation is slightly complex due to vectorization across K
+                    # We'll just use a generic name for these
+                    pass
         
         if intra_terms:
             features.append(np.stack(intra_terms, axis=-1).reshape(batch_size, -1))
+            if names is not None:
+                for i in range(self.latent_dim):
+                    for j in range(i + 1, self.latent_dim):
+                        for k in range(self.n_super_nodes):
+                            names.append(f"z{k*self.latent_dim+i}*z{k*self.latent_dim+j}")
                     
         # 4. Inter-node cross-terms (same dimension): O(D * K^2)
         # We only consider pairs of nodes here.
@@ -316,6 +366,9 @@ class BalancedFeatureTransformer:
             val_d = X_nodes[:, :, d]
             i_idx, j_idx = np.triu_indices(self.n_super_nodes, k=1)
             inter_terms.append(val_d[:, i_idx] * val_d[:, j_idx])
+            if names is not None:
+                for i, j in zip(i_idx, j_idx):
+                    names.append(f"z{i*self.latent_dim+d}*z{j*self.latent_dim+d}")
             
         if inter_terms:
             features.append(np.stack(inter_terms, axis=-1).reshape(batch_size, -1))
@@ -329,8 +382,10 @@ class BalancedFeatureTransformer:
             variances = np.var(X_expanded, axis=0)
             top_indices = np.argsort(variances)[-1000:]
             X_expanded = X_expanded[:, top_indices]
+            if names is not None:
+                names = [names[idx] for idx in top_indices]
             
-        return X_expanded
+        return X_expanded, names
 
     def _adaptive_expansion(self, X, fit_transformer):
         """

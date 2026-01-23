@@ -104,7 +104,7 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
 
         return aligned_latent_states
         
-    def distill(self, latent_states, targets, n_super_nodes, latent_dim, box_size=None, model=None):
+    def distill(self, latent_states, targets, n_super_nodes, latent_dim, box_size=None, model=None, quick=False):
         """
         Distill symbolic equations, enforcing Hamiltonian structure and estimating dissipation.
         
@@ -115,9 +115,10 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
             latent_dim: Latent dimension per super-node
             box_size: PBC box size
             model: Optional DiscoveryEngineModel to extract parameters from
+            quick: Whether to perform quick distillation (skip deep search)
         """
         if not self.enforce_hamiltonian_structure or latent_dim % 2 != 0:
-            return super().distill(latent_states, targets, n_super_nodes, latent_dim, box_size)
+            return super().distill(latent_states, targets, n_super_nodes, latent_dim, box_size, quick=quick)
 
         # Check if targets are scalar H (1 column) or derivatives (many columns)
         is_derivative_targets = targets.shape[1] > 1
@@ -129,7 +130,7 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
             aligned_latent_states = latent_states
 
         print(f"  -> Initializing FeatureTransformer...")
-        self.transformer = FeatureTransformer(n_super_nodes, latent_dim, box_size=box_size)
+        self.transformer = FeatureTransformer(n_super_nodes, latent_dim, box_size=box_size, include_raw_latents=False)
 
         # If we have a model and it has H_net, we should try to get the scalar H as target
         # for better GP discovery of the energy function topology.
@@ -169,18 +170,9 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
         # Distill the Hamiltonian function H
         y_target = Y_norm[:, 0] if Y_norm.ndim > 1 else Y_norm
         
-        # Ensure minimum search depth for Hamiltonian but respect lower values if quick mode is used
-        original_populations = self.populations
-        original_generations = self.generations
-        self.populations = max(self.populations, 500)
-        self.generations = max(self.generations, 10)
-        
+        # Ensure reasonable search depth but respect user settings
         print(f"  -> Starting symbolic regression for Hamiltonian (Pop: {self.populations}, Gen: {self.generations})...")
-        h_prog, h_mask, h_conf = self._distill_single_target(0, X_norm, y_target, 1, latent_dim)
-        
-        # Restore original values
-        self.populations = original_populations
-        self.generations = original_generations
+        h_prog, h_mask, h_conf = self._distill_single_target(0, X_norm, y_target, 1, latent_dim, skip_deep_search=quick)
         
         if h_prog is None:
             return super().distill(latent_states, targets, n_super_nodes, latent_dim, box_size)

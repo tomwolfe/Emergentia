@@ -25,7 +25,8 @@ def main():
     parser.add_argument('--sim', type=str, default='spring', choices=['spring', 'lj'])
     parser.add_argument('--hamiltonian', action='store_true')
     parser.add_argument('--device', type=str, default='auto')
-    parser.add_argument('--batch_size', type=int, default=5, help='Batch size for training steps')
+    parser.add_argument('--batch_size', type=int, default=5, help='Sequence length of each window')
+    parser.add_argument('--traj_batch_size', type=int, default=4, help='Number of trajectories to process in parallel')
     parser.add_argument('--eval_every', type=int, default=10, help='Evaluate every N epochs')
     parser.add_argument('--quick_symbolic', action='store_true', help='Use quick symbolic distillation')
     parser.add_argument('--memory_efficient', action='store_true', help='Use memory-efficient mode')
@@ -49,19 +50,15 @@ def main():
     pos, vel = sim.generate_trajectory(steps=args.steps)
     dataset_list, stats = prepare_data(pos, vel, radius=1.5 if args.sim == 'spring' else 2.0, device=device)
     
-    # OPTIMIZATION: Pre-batch windows of the trajectory to avoid overhead in training loop
-    print(f"Pre-batching windows (size {args.batch_size})...")
-    pre_batched_windows = []
+    # OPTIMIZATION: Store raw windows of the trajectory to allow flexible batching
+    print(f"Preparing windows (size {args.batch_size})...")
+    pre_batched_windows_raw = []
     if len(dataset_list) > args.batch_size:
         for i in range(len(dataset_list) - args.batch_size + 1):
             window = dataset_list[i : i + args.batch_size]
-            batch = Batch.from_data_list(window).to(device)
-            batch.seq_len = args.batch_size
-            pre_batched_windows.append(batch)
+            pre_batched_windows_raw.append(window)
     else:
-        full_batch = Batch.from_data_list(dataset_list).to(device)
-        full_batch.seq_len = len(dataset_list)
-        pre_batched_windows.append(full_batch)
+        pre_batched_windows_raw.append(dataset_list)
 
     # Full dataset for analysis
     dataset = Batch.from_data_list(dataset_list).to(device)
@@ -110,8 +107,18 @@ def main():
 
     # Memory-efficient training loop
     for epoch in range(args.epochs):
-        # OPTIMIZATION: Use pre-batched windows to speed up training
-        batch_data = pre_batched_windows[np.random.randint(0, len(pre_batched_windows))]
+        # OPTIMIZATION: Sample multiple windows and batch them together
+        if args.traj_batch_size > 1:
+            indices = np.random.randint(0, len(pre_batched_windows_raw), size=args.traj_batch_size)
+            sampled_data = []
+            for i in indices:
+                sampled_data.extend(pre_batched_windows_raw[i])
+            batch_data = Batch.from_data_list(sampled_data).to(device)
+            batch_data.seq_len = args.batch_size
+        else:
+            window = pre_batched_windows_raw[np.random.randint(0, len(pre_batched_windows_raw))]
+            batch_data = Batch.from_data_list(window).to(device)
+            batch_data.seq_len = args.batch_size
 
         loss, rec, cons = trainer.train_step(batch_data, sim.dt, epoch=epoch, max_epochs=args.epochs)
 
@@ -216,14 +223,14 @@ def main():
             from hamiltonian_symbolic import HamiltonianSymbolicDistiller
             distiller = HamiltonianSymbolicDistiller(populations=populations, generations=generations,
                                                    perform_coordinate_alignment=not args.quick_symbolic)
-            equations = distiller.distill(z_states, dz_states, args.super_nodes, args.latent_dim, model=model)
+            equations = distiller.distill(z_states, dz_states, args.super_nodes, args.latent_dim, model=model, quick=args.quick_symbolic)
         else:
             # Increased populations and generations for better discovery
             populations = 400 if args.quick_symbolic else 2000
             generations = 10 if args.quick_symbolic else 50
             from symbolic import SymbolicDistiller
             distiller = SymbolicDistiller(populations=populations, generations=generations)
-            equations = distiller.distill(z_states, dz_states, args.super_nodes, args.latent_dim)
+            equations = distiller.distill(z_states, dz_states, args.super_nodes, args.latent_dim, quick=args.quick_symbolic)
 
         print("\nDiscovered Equations:")
         for i, eq in enumerate(equations):
@@ -239,7 +246,8 @@ def main():
             symbolic_transformer.fit(z_states, dz_states)
 
         # Update trainer with symbolic proxy
-        trainer.update_symbolic_proxy(equations, symbolic_transformer, weight=0.1, confidence=0.8)
+        confidence = np.mean(distiller.confidences) if hasattr(distiller, 'confidences') else 0.8
+        trainer.update_symbolic_proxy(equations, symbolic_transformer, weight=0.1, confidence=confidence)
 
     # 6. Visualization - OPTIMIZED
     print("Visualizing results...")
