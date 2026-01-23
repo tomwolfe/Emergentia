@@ -96,8 +96,12 @@ def main():
 
     # Memory-efficient training loop
     for epoch in range(args.epochs):
-        # Use the whole dataset since it's small
-        batch_data = dataset
+        # OPTIMIZATION: Use sub-windows of the trajectory to respect batch_size and speed up ODE integration
+        if len(dataset_list) > args.batch_size:
+            start_idx = np.random.randint(0, len(dataset_list) - args.batch_size)
+            batch_data = dataset_list[start_idx : start_idx + args.batch_size]
+        else:
+            batch_data = dataset_list # Use the list for consistency
 
         loss, rec, cons = trainer.train_step(batch_data, sim.dt, epoch=epoch, max_epochs=args.epochs)
 

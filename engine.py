@@ -698,26 +698,41 @@ class Trainer:
         loss_sym = self._compute_symbolic_loss(z_curr, is_warmup)
 
         # INTEGRATION OPTIMIZATION: 
-        # If tf_ratio is 0 and not warmup, we can integrate the whole sequence in one odeint call
-        if not is_warmup and tf_ratio == 0:
-            t_span = torch.linspace(0, (seq_len - 1) * dt, seq_len, device=self.device)
-            z_preds = self.model.forward_dynamics(z_curr, t_span) # [T, B, K, D]
-        else:
-            # Fallback to step-by-step for teacher forcing or warmup
-            z_preds_list = [z_curr]
-            z_step = z_curr
-            for t in range(1, seq_len):
-                if not is_warmup and np.random.random() < tf_ratio:
-                    z_step = z_all_target[t]
+        # Use a chunked integration approach to balance between teacher forcing and performance
+        if not is_warmup:
+            if tf_ratio == 0:
+                # Full integration in one go
+                t_span = torch.linspace(0, (seq_len - 1) * dt, seq_len, device=self.device)
+                z_preds = self.model.forward_dynamics(z_curr, t_span) # [T, B, K, D]
+            else:
+                # Chunked integration: group steps to reduce odeint calls
+                # For example, if seq_len=100 and chunk_size=10, we do 10 calls instead of 100
+                chunk_size = 10 if self.device == 'mps' else 5
+                z_preds_list = [z_curr]
+                z_step = z_curr
                 
-                if not is_warmup:
-                    t_span = torch.tensor([0, dt], device=self.device)
-                    z_next_seq = self.model.forward_dynamics(z_step, t_span)
-                    z_step = z_next_seq[1]
-                else:
-                    z_step = z_all_target[t]
-                z_preds_list.append(z_step)
-            z_preds = torch.stack(z_preds_list)
+                for i in range(1, seq_len, chunk_size):
+                    end_idx = min(i + chunk_size, seq_len)
+                    actual_chunk = end_idx - i
+                    
+                    # Decide whether to use teacher forcing for this chunk
+                    if np.random.random() < tf_ratio:
+                        z_step = z_all_target[i-1]
+                    
+                    t_span_chunk = torch.linspace(0, actual_chunk * dt, actual_chunk + 1, device=self.device)
+                    z_chunk_preds = self.model.forward_dynamics(z_step, t_span_chunk)
+                    
+                    # z_chunk_preds is [actual_chunk + 1, B, K, D]
+                    # We skip the first one as it's the starting point
+                    for j in range(1, actual_chunk + 1):
+                        z_preds_list.append(z_chunk_preds[j])
+                    
+                    z_step = z_chunk_preds[-1]
+                
+                z_preds = torch.stack(z_preds_list[:seq_len])
+        else:
+            # Warmup: just use targets
+            z_preds = z_all_target
 
         loss_l2 = torch.mean(z_preds**2)
         

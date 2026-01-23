@@ -646,18 +646,22 @@ class DiscoveryEngineModel(nn.Module):
         t = t.to(torch.float32)
 
         # Use the device of the ode_func parameters
-        ode_device = next(self.ode_func.parameters()).device
+        # Optimization: Cache the device to avoid repeated calls
+        if not hasattr(self, '_ode_device'):
+            self._ode_device = next(self.ode_func.parameters()).device
+        ode_device = self._ode_device
         original_device = z0.device
 
         # MPS fix: torchdiffeq is unstable on MPS. If original or ode device is MPS, use CPU.
         is_mps = (str(original_device) == 'mps' or str(ode_device) == 'mps')
         target_device = torch.device('cpu') if is_mps else ode_device
 
-        y0 = z0_flat.to(target_device)
-        t_ode = t.to(target_device)
+        y0 = z0_flat if z0_flat.device == target_device else z0_flat.to(target_device)
+        t_ode = t if t.device == target_device else t.to(target_device)
 
-        # Ensure ode_func is on the correct device
-        self.ode_func.to(target_device)
+        # Ensure ode_func is on the correct device - only if necessary
+        if next(self.ode_func.parameters()).device != target_device:
+            self.ode_func.to(target_device)
 
         # Use adaptive tolerance based on training stage
         eps = 1e-3 if is_mps else 0.0
@@ -666,25 +670,27 @@ class DiscoveryEngineModel(nn.Module):
             # Looser tolerances during training for efficiency
             rtol = 1e-1 + eps
             atol = 1e-2 + eps
+            # For training, use a larger step size for rk4 to speed up
+            step_size = 0.05 
         else:
             # Tighter tolerances during evaluation for accuracy
             rtol = 1e-3 + eps
             atol = 1e-5 + eps
+            step_size = 0.01
 
-        # Use rk4 with fixed step_size=0.01 for consistent gradient flow as requested
         method = 'rk4'
-        options = {'step_size': 0.01}
+        options = {'step_size': step_size}
 
         # Use the selected solver
         if self.hamiltonian and self.training:
             # Use adjoint method to save memory when training Hamiltonian
-            # The adjoint method is more memory efficient for backpropagating through ODEs
             zt_flat = odeint_adjoint(self.ode_func, y0, t_ode, method=method, options=options)
         else:
             zt_flat = odeint(self.ode_func, y0, t_ode, method=method, options=options)
 
-        # Move back to original device
-        zt_flat = zt_flat.to(original_device)
+        # Move back to original device only if necessary
+        if zt_flat.device != original_device:
+            zt_flat = zt_flat.to(original_device)
 
         # Check for NaN values and handle them
         if torch.isnan(zt_flat).any():
