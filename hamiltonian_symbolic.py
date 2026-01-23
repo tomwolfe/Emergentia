@@ -178,16 +178,24 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
         print(f"  -> Fitting FeatureTransformer to {aligned_latent_states.shape[0]} samples...")
         self.transformer.fit(aligned_latent_states, v_targets)
         
-        # Prune p-related features from the potential search to ensure H(q,p) = T(p) + V(q)
-        # We identify features that contain "p" or "z" with indices >= d_sub in each node
+        # STRICT COORDINATE SEPARATION: Prune p-related features from the potential search
+        # Potential V(q) MUST NOT see any momentum-related features or raw latents
         q_mask = np.ones(len(self.transformer.feature_names), dtype=bool)
         for idx, name in enumerate(self.transformer.feature_names):
-            if "p" in name: q_mask[idx] = False
-            # Check for raw latents corresponding to momentum
-            for k in range(n_super_nodes):
-                for d in range(d_sub, latent_dim):
-                    if f"z{k*latent_dim + d}" in name:
-                        q_mask[idx] = False
+            # 1. Exclude any feature with "p" in the name (physical velocity/momentum)
+            if "p" in name: 
+                q_mask[idx] = False
+                continue
+            
+            # 2. Exclude raw latents corresponding to momentum: (i % latent_dim) >= (latent_dim // 2)
+            import re
+            # Find all z{index} patterns in the feature name
+            z_indices = re.findall(r'z(\d+)', name)
+            for z_idx_str in z_indices:
+                z_idx = int(z_idx_str)
+                if (z_idx % latent_dim) >= d_sub:
+                    q_mask[idx] = False
+                    break
         
         X_all = self.transformer.transform(aligned_latent_states)
         

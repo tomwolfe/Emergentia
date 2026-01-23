@@ -94,7 +94,7 @@ def main():
         lr=args.lr,
         device=device,
         stats=stats,
-        warmup_epochs=int(args.epochs * 0.25),  # Aligned with stage1_end
+        warmup_epochs=int(args.epochs * 0.1),  # Reduced from 0.25
         max_epochs=args.epochs,
         sparsity_scheduler=sparsity_scheduler,
         consistency_weight=args.consistency_weight,

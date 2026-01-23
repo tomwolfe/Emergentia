@@ -146,8 +146,9 @@ class StableHierarchicalPooling(nn.Module):
         if self.training:
             # -5.0 is enough to suppress but allows much more gradient flow than -10.0
             # Also add a small random exploration factor to logits of inactive nodes
-            # INCREASED: More noise for inactive nodes to encourage exploration (0.1 -> 0.5)
-            exploration = torch.randn_like(logits) * 0.5 * (1.0 - mask)
+            # INCREASED: More noise during first 100 epochs to force utilization of all super-nodes
+            noise_scale = 2.0 if (current_epoch is not None and current_epoch < 100) else 0.5
+            exploration = torch.randn_like(logits) * noise_scale * (1.0 - mask)
             logits = logits + (mask - 1.0) * 5.0 + exploration
         else:
             # Harder mask during inference
@@ -306,7 +307,8 @@ class StableHierarchicalPooling(nn.Module):
         from common_losses import compute_balance_loss as common_balance_loss
         loss = common_balance_loss(avg_assignments, self.n_super_nodes)
         # Harsher Diversity: penalize difference between most and least used super-nodes
-        loss += (avg_assignments.max() - avg_assignments.min())
+        # INCREASED: Stronger penalty on max assignments to prevent resolution collapse
+        loss += 5.0 * (avg_assignments.max() - avg_assignments.min())
         return loss
 
     def apply_hard_revival(self):

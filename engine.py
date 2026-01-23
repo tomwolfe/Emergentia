@@ -613,11 +613,16 @@ class Trainer:
                 self.model.encoder.pooling.set_sparsity_weight(new_weight)
 
         # Make stages relative to max_epochs
-        stage1_end = int(max_epochs * 0.25)
+        stage1_end = int(max_epochs * 0.15) # Reduced from 0.25 to start dynamics earlier
         stage2_start = stage1_end
         
         is_stage1 = epoch < stage1_end # Stage 1: Focus on reconstruction and structure
         is_stage2 = epoch >= stage2_start # Stage 2: Unfreeze ode_func with sigmoid ramp
+        
+        # Override warmup to 10% of total epochs if it was set to something else
+        if self.warmup_epochs > int(max_epochs * 0.1):
+            self.warmup_epochs = int(max_epochs * 0.1)
+            
         is_warmup = epoch < self.warmup_epochs
 
         # Multiplier tensor for Stage 1 masking
@@ -625,9 +630,10 @@ class Trainer:
         if is_stage1:
             # Mask out dynamics-related losses during Stage 1
             loss_multipliers[1] = 0.0  # cons
-            loss_multipliers[4] = 0.01 # l2
-            loss_multipliers[5] = 0.01 # lvr
+            loss_multipliers[4] = 0.0001 # l2 - Reduced by 100x from 0.01
+            loss_multipliers[5] = 0.0001 # lvr - Reduced by 100x from 0.01
             loss_multipliers[12] = 0.0 # sym
+            loss_multipliers[15] = 0.01 # smooth - Reduced by 100x from 1.0 (implicit)
             # Prioritize reconstruction and structural stability
             loss_multipliers[0] = 100.0 # rec (Increased from 50)
             loss_multipliers[2] = 5.0   # assign (Decreased from 10)
@@ -644,7 +650,8 @@ class Trainer:
             if hasattr(self.model.encoder.pooling, 'apply_hard_revival'):
                 self.model.encoder.pooling.apply_hard_revival()
 
-        compute_consistency = (epoch >= self.warmup_epochs) and (epoch % self.skip_consistency_freq == 0)
+        # Start consistency much earlier (halfway through warmup)
+        compute_consistency = (epoch >= (self.warmup_epochs // 2)) and (epoch % self.skip_consistency_freq == 0)
         self.optimizer.zero_grad(set_to_none=True)
 
         tau, hard, tf_ratio, entropy_weight = self._get_schedules(epoch, max_epochs)
@@ -960,9 +967,10 @@ class Trainer:
         loss = discovery_loss 
         
         # Regularization Freeze: Ensure weights are 0.0 during freeze phase
-        l2_weight = weights['l2'] * 1e-6
-        lvr_weight = weights['lvr'] * 0.1
-        smooth_weight = weights['smooth'] * 100.0
+        # Reduced by 100x as requested
+        l2_weight = weights['l2'] * 1e-8 # From 1e-6
+        lvr_weight = weights['lvr'] * 0.001 # From 0.1
+        smooth_weight = weights['smooth'] * 1.0 # From 100.0
         
         loss += (l2_weight * torch.clamp(loss_l2, 0, 100) + (lvars[4] if use_log_vars else 0.0))
         loss += (lvr_weight * torch.clamp(loss_lvr, 0, 100) + (lvars[5] if use_log_vars else 0.0))
