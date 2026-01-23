@@ -476,7 +476,8 @@ class GNNDecoder(nn.Module):
         self.pos_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim//2),
             nn.ReLU(),
-            nn.Linear(hidden_dim//2, 2)
+            nn.Linear(hidden_dim//2, 2),
+            nn.Tanh()
         )
         # Initialize pos_head weights to prevent initial large offsets
         for layer in self.pos_head:
@@ -670,9 +671,9 @@ class DiscoveryEngineModel(nn.Module):
                 # For discovery, midpoint is usually sufficient.
                 if len(t) > 1:
                     dt_span = (t[1] - t[0]).item()
-                    step_size = min(0.005, dt_span) # Slightly larger step size for midpoint
+                    step_size = min(0.001, dt_span) # Reduced from 0.005 for stability
                 else:
-                    step_size = 0.005
+                    step_size = 0.001
             else:
                 step_size = 0.001
 

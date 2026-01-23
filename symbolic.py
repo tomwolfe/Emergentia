@@ -181,8 +181,8 @@ class SymbolicDistiller:
             
         return OptimizedExpressionProgram(program_str), mask, score
 
-    def distill(self, latent_states, targets, n_super_nodes, latent_dim, box_size=None, hamiltonian=False, quick=False):
-        self.transformer = FeatureTransformer(n_super_nodes, latent_dim, box_size=box_size)
+    def distill(self, latent_states, targets, n_super_nodes, latent_dim, box_size=None, hamiltonian=False, quick=False, sim_type=None):
+        self.transformer = FeatureTransformer(n_super_nodes, latent_dim, box_size=box_size, sim_type=sim_type)
         self.transformer.fit(latent_states, targets)
         X_norm = self.transformer.normalize_x(self.transformer.transform(latent_states))
         Y_norm = self.transformer.normalize_y(targets)

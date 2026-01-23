@@ -105,7 +105,7 @@ class BalancedFeatureTransformer:
     
     def __init__(self, n_super_nodes, latent_dim, include_dists=True, box_size=None, 
                  basis_functions='physics_informed', max_degree=2, feature_selection_method='recursive',
-                 include_raw_latents=False):
+                 include_raw_latents=False, sim_type=None):
         """
         Initialize the balanced feature transformer.
 
@@ -118,6 +118,7 @@ class BalancedFeatureTransformer:
             max_degree (int): Maximum degree for polynomial features
             feature_selection_method (str): Method for feature selection ('recursive', 'mutual_info', 'f_test', 'lasso')
             include_raw_latents (bool): Whether to include raw linear latents (often leads to trivial H=z0)
+            sim_type (str): Type of simulation ('spring', 'lj', etc.)
         """
         self.n_super_nodes = n_super_nodes
         self.latent_dim = latent_dim
@@ -127,6 +128,7 @@ class BalancedFeatureTransformer:
         self.max_degree = max_degree
         self.feature_selection_method = feature_selection_method
         self.include_raw_latents = include_raw_latents
+        self.sim_type = sim_type
         
         # Normalization parameters
         self.z_mean = None
@@ -203,17 +205,17 @@ class BalancedFeatureTransformer:
             if dist_features:
                 features.extend(dist_features)
                 if fit_transformer:
-                    # Logic for distance feature names must match _compute_distance_features
-                    i_idx, j_idx = np.triu_indices(self.n_super_nodes, k=1)
-                    for i, j in zip(i_idx, j_idx):
-                        pair = f"({i},{j})"
-                        base_names.append(f"d{pair}")
-                        base_names.append(f"1/d{pair}")
+                    if self.sim_type == 'lj':
+                        for n in [1, 2, 4, 6, 8, 10, 12]:
+                            base_names.append(f"sum_inv_d{n}")
+                    else:
+                        base_names.append("sum_d")
+                        base_names.append("sum_inv_d")
                         for n in [2, 3, 4, 6, 8, 10, 12]:
-                            base_names.append(f"1/d{pair}^{n}")
-                        base_names.append(f"exp(-d{pair})")
-                        base_names.append(f"exp(-d{pair})/d")
-                        base_names.append(f"log(d{pair})")
+                            base_names.append(f"sum_inv_d{n}")
+                        base_names.append("sum_exp_d")
+                        base_names.append("sum_yukawa_d")
+                        base_names.append("sum_log_d")
 
         X = np.hstack(features)
         # Final safety clip before expansion
@@ -244,9 +246,9 @@ class BalancedFeatureTransformer:
 
     def _compute_distance_features(self, z_nodes):
         """
-        Compute distance-based features between super-nodes using vectorized operations.
-        Generalizes beyond LJ potential by providing a spectrum of power laws and
-        interaction terms that the symbolic regressor can choose from.
+        Compute symmetric sums of distance-based features over all pairs of super-nodes.
+        This provides O(1) features regardless of the number of particles, which is
+        essential for symbolic discovery in N-body systems.
         """
         n_batch = z_nodes.shape[0]
         if self.n_super_nodes < 2:
@@ -266,25 +268,32 @@ class BalancedFeatureTransformer:
         # [Batch, n_pairs]
         d = np.linalg.norm(diff, axis=2) + 1e-6
         
-        features = []
+        aggregated_features = []
         
-        # 1. Basic distance and inverse distance
-        features.append(d)
-        features.append(1.0 / (d + 0.1))
+        # We compute the features for EACH pair and then SUM them across the pair dimension (axis 1)
+        # This creates "Global Symmetric Features"
         
-        # 2. Spectrum of power laws: 1/r^n
-        # Instead of just 6 and 12, provide a broader range
-        for n in [2, 3, 4, 6, 8, 10, 12]:
-            features.append(1.0 / (d**n + 0.1))
+        if self.sim_type == 'lj':
+            # For LJ, include common power laws but exclude exponential/log to focus search
+            for n in [1, 2, 4, 6, 8, 10, 12]:
+                aggregated_features.append((1.0 / (d**n + 1e-4)).sum(axis=1, keepdims=True))
+        else:
+            # 1. Basic distance and inverse distance
+            aggregated_features.append(d.sum(axis=1, keepdims=True))
+            aggregated_features.append((1.0 / (d + 1e-4)).sum(axis=1, keepdims=True))
             
-        # 3. Short-range interaction terms (Exponential/Yukawa-like)
-        features.append(np.exp(-d))
-        features.append(np.exp(-d) / (d + 0.1))
-        
-        # 4. Logarithmic interactions (2D gravity/electrostatics)
-        features.append(np.log(d + 0.1))
+            # 2. Spectrum of power laws: 1/r^n
+            for n in [2, 3, 4, 6, 8, 10, 12]:
+                aggregated_features.append((1.0 / (d**n + 1e-4)).sum(axis=1, keepdims=True))
+                
+            # 3. Short-range interaction terms (Exponential/Yukawa-like)
+            aggregated_features.append(np.exp(-d).sum(axis=1, keepdims=True))
+            aggregated_features.append((np.exp(-d) / (d + 1e-4)).sum(axis=1, keepdims=True))
+            
+            # 4. Logarithmic interactions (2D gravity/electrostatics)
+            aggregated_features.append(np.log(d + 1e-4).sum(axis=1, keepdims=True))
 
-        return features
+        return aggregated_features
 
     def _polynomial_expansion(self, X, fit_transformer):
         """
@@ -474,6 +483,15 @@ class BalancedFeatureTransformer:
         
         if self.include_dists:
             i_idx, j_idx = np.triu_indices(self.n_super_nodes, k=1)
+            
+            # Initialize sum jacobians
+            jd_sum = np.zeros(n_latents)
+            j_inv_d_sum = np.zeros(n_latents)
+            j_pow_sums = {n: np.zeros(n_latents) for n in [2, 3, 4, 6, 8, 10, 12]}
+            j_exp_sum = np.zeros(n_latents)
+            j_yukawa_sum = np.zeros(n_latents)
+            j_log_sum = np.zeros(n_latents)
+
             for i, j in zip(i_idx, j_idx):
                 diff = z_nodes[i, :2] - z_nodes[j, :2]
                 if self.box_size is not None:
@@ -482,34 +500,37 @@ class BalancedFeatureTransformer:
                 
                 d = np.linalg.norm(diff) + 1e-9
                 
-                # d(d)/dz
-                jd = np.zeros(n_latents)
-                jd[i*self.latent_dim : i*self.latent_dim+2] = diff / d
-                jd[j*self.latent_dim : j*self.latent_dim+2] = -diff / d
+                # Gradient of d(i,j) with respect to all latents
+                jd_pair = np.zeros(n_latents)
+                jd_pair[i*self.latent_dim : i*self.latent_dim+2] = diff / d
+                jd_pair[j*self.latent_dim : j*self.latent_dim+2] = -diff / d
                 
-                # 1. Basic distance and inverse distance
-                # d
-                jac_list.append(jd.reshape(1, -1))
-                # 1.0 / (d + 0.1)
-                jac_list.append((-1.0 / (d + 0.1)**2 * jd).reshape(1, -1))
+                # Sum the jacobians of individual terms
+                jd_sum += jd_pair
+                j_inv_d_sum += -1.0 / (d + 1e-4)**2 * jd_pair
                 
-                # 2. Spectrum of power laws: 1.0 / (d**n + 0.1)
                 for n in [2, 3, 4, 6, 8, 10, 12]:
-                    # d/dz [1 / (d^n + 0.1)] = -1 / (d^n + 0.1)^2 * n * d^(n-1) * d(d)/dz
-                    j_pow = (-n * d**(n-1) / (d**n + 0.1)**2 * jd).reshape(1, -1)
-                    jac_list.append(j_pow)
+                    j_pow_sums[n] += -n * d**(n-1) / (d**n + 1e-4)**2 * jd_pair
                     
-                # 3. Short-range interaction terms
-                # np.exp(-d)
-                jac_list.append((-np.exp(-d) * jd).reshape(1, -1))
-                # np.exp(-d) / (d + 0.1)
-                # d/dz [e^-d / (d+0.1)] = [(-e^-d)(d+0.1) - (e^-d)(1)] / (d+0.1)^2 * d(d)/dz
-                j_screened = ((-np.exp(-d)*(d + 0.1) - np.exp(-d)) / (d + 0.1)**2 * jd).reshape(1, -1)
-                jac_list.append(j_screened)
-                
-                # 4. Logarithmic interactions
-                # np.log(d + 0.1)
-                jac_list.append((1.0 / (d + 0.1) * jd).reshape(1, -1))
+                j_exp_sum += -np.exp(-d) * jd_pair
+                j_yukawa_sum += ((-np.exp(-d)*(d + 1e-4) - np.exp(-d)) / (d + 1e-4)**2 * jd_pair)
+                j_log_sum += 1.0 / (d + 1e-4) * jd_pair
+
+            # Add aggregated jacobians to list based on sim_type
+            if self.sim_type == 'lj':
+                for n in [1, 2, 4, 6, 8, 10, 12]:
+                    if n == 1:
+                        jac_list.append(j_inv_d_sum.reshape(1, -1))
+                    else:
+                        jac_list.append(j_pow_sums[n].reshape(1, -1))
+            else:
+                jac_list.append(jd_sum.reshape(1, -1))
+                jac_list.append(j_inv_d_sum.reshape(1, -1))
+                for n in [2, 3, 4, 6, 8, 10, 12]:
+                    jac_list.append(j_pow_sums[n].reshape(1, -1))
+                jac_list.append(j_exp_sum.reshape(1, -1))
+                jac_list.append(j_yukawa_sum.reshape(1, -1))
+                jac_list.append(j_log_sum.reshape(1, -1))
 
         X_base_jac = np.vstack(jac_list)
         
@@ -605,8 +626,8 @@ class AdaptiveFeatureTransformer(BalancedFeatureTransformer):
                 if self.best_interaction_type == 'inverse':
                     all_dist_features.extend([
                         d,
-                        1.0 / (d + 0.1),
-                        1.0 / (d**2 + 0.1)
+                        1.0 / (d + 1e-4),
+                        1.0 / (d**2 + 1e-4)
                     ])
                 elif self.best_interaction_type == 'exponential':
                     all_dist_features.extend([
@@ -629,8 +650,8 @@ class AdaptiveFeatureTransformer(BalancedFeatureTransformer):
                 else:  # Default to inverse
                     all_dist_features.extend([
                         d,
-                        1.0 / (d + 0.1),
-                        1.0 / (d**2 + 0.1)
+                        1.0 / (d + 1e-4),
+                        1.0 / (d**2 + 1e-4)
                     ])
 
         if all_dist_features:

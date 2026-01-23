@@ -104,7 +104,7 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
 
         return aligned_latent_states
         
-    def distill(self, latent_states, targets, n_super_nodes, latent_dim, box_size=None, model=None, quick=False):
+    def distill(self, latent_states, targets, n_super_nodes, latent_dim, box_size=None, model=None, quick=False, sim_type=None):
         """
         Distill symbolic equations, enforcing Hamiltonian structure and estimating dissipation.
         
@@ -116,9 +116,10 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
             box_size: PBC box size
             model: Optional DiscoveryEngineModel to extract parameters from
             quick: Whether to perform quick distillation (skip deep search)
+            sim_type: Type of simulation ('spring', 'lj', etc.)
         """
         if not self.enforce_hamiltonian_structure or latent_dim % 2 != 0:
-            return super().distill(latent_states, targets, n_super_nodes, latent_dim, box_size, quick=quick)
+            return super().distill(latent_states, targets, n_super_nodes, latent_dim, box_size, quick=quick, sim_type=sim_type)
 
         # Check if targets are scalar H (1 column) or derivatives (many columns)
         is_derivative_targets = targets.shape[1] > 1
@@ -130,7 +131,7 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
             aligned_latent_states = latent_states
 
         print(f"  -> Initializing FeatureTransformer...")
-        self.transformer = FeatureTransformer(n_super_nodes, latent_dim, box_size=box_size, include_raw_latents=False)
+        self.transformer = FeatureTransformer(n_super_nodes, latent_dim, box_size=box_size, include_raw_latents=False, sim_type=sim_type)
 
         # If we have a model and it has H_net, we should try to get the scalar H as target
         # for better GP discovery of the energy function topology.

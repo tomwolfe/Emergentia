@@ -384,7 +384,7 @@ class Trainer:
 
         # Significantly increase spatial and connectivity loss multipliers by 10x
         if hasattr(self.model.encoder.pooling, 'temporal_consistency_weight'):
-            self.model.encoder.pooling.temporal_consistency_weight = 5.0 # Reduced from 50.0 to allow discovery
+            self.model.encoder.pooling.temporal_consistency_weight = 1.0 # Reduced from 5.0 to allow discovery
 
         # Symbolic-in-the-loop
         self.symbolic_proxy = None
@@ -484,9 +484,9 @@ class Trainer:
         
         # Enhanced assignment loss including stability terms
         loss_assign = (
-            entropy_weight * losses_0['entropy'] +
-            5.0 * losses_0['diversity'] + # Increased from 1.0
-            5.0 * self.spatial_weight * losses_0['spatial'] + # Increased from 0.1 and multiplied by spatial_weight
+            (2.0 * entropy_weight) * losses_0['entropy'] +
+            10.0 * losses_0['diversity'] +
+            5.0 * self.spatial_weight * losses_0['spatial'] +
             1.0 * losses_0.get('collapse_prevention', 0.0) + # Increased from 0.1
             1.0 * losses_0.get('balance', 0.0) + # Increased from 0.1
             1.0 * losses_0.get('temporal_consistency', 0.0) # Increased from 0.1
@@ -640,7 +640,7 @@ class Trainer:
         if self.symbolic_proxy is not None:
             for p in self.symbolic_proxy.parameters(): p.requires_grad = is_stage2
 
-        if epoch > 0 and epoch % 50 == 0:
+        if epoch > 0 and epoch % 100 == 0:
             if hasattr(self.model.encoder.pooling, 'apply_hard_revival'):
                 self.model.encoder.pooling.apply_hard_revival()
 
@@ -698,8 +698,8 @@ class Trainer:
         
         # Assignment loss for step 0
         loss_assign = (
-            entropy_weight * losses_all['entropy'] +
-            5.0 * losses_all['diversity'] +
+            (2.0 * entropy_weight) * losses_all['entropy'] +
+            10.0 * losses_all['diversity'] +
             5.0 * self.spatial_weight * losses_all['spatial'] +
             1.0 * losses_all.get('collapse_prevention', 0.0) +
             1.0 * losses_all.get('balance', 0.0) +
@@ -952,7 +952,7 @@ class Trainer:
             loss += (weights['cons'] * self.consistency_weight * torch.clamp(loss_cons.to(torch.float32), 0, 100) * stage2_factor + (lvars[1] if use_log_vars else 0.0))
 
         smooth_idx = 15
-        loss += (weights['smooth'] * 10.0 * torch.clamp(loss_smooth, 0, 100) + (lvars[smooth_idx] if use_log_vars else 0.0))
+        loss += (weights['smooth'] * 100.0 * torch.clamp(loss_smooth, 0, 100) + (lvars[smooth_idx] if use_log_vars else 0.0))
         
         # Ensure loss stays positive and doesn't explode
         loss = torch.clamp(loss + 0.1 * torch.sum(lvars**2), 1e-4, 1e5)
