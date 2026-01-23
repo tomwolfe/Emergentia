@@ -88,7 +88,7 @@ class SymbolicDistiller:
                                  function_set=('add', 'sub', 'mul', safe_div, safe_sqrt, safe_log, 'abs', 'neg', safe_inv, square, inv_square),
                                  max_samples=0.9, n_jobs=-1, random_state=42, verbose=0)
 
-    def _select_features(self, X, y):
+    def _select_features(self, X, y, sim_type=None):
         # Sample data if it's too large
         if X.shape[0] > 1000:
             indices = np.random.choice(X.shape[0], 1000, replace=False)
@@ -121,6 +121,16 @@ class SymbolicDistiller:
             combined_scores[remaining_mask] = 0.3 * (f_scores[remaining_mask] / (f_scores.max() + 1e-9))
         
         mask = np.zeros(X.shape[1], dtype=bool)
+        
+        # Physics-First filter: for LJ systems, protect d6 and d12 terms
+        protected_indices = []
+        if sim_type == 'lj' and hasattr(self, 'transformer') and hasattr(self.transformer, 'feature_names'):
+            for idx, name in enumerate(self.transformer.feature_names):
+                if 'sum_inv_d6' in name or 'sum_inv_d12' in name:
+                    protected_indices.append(idx)
+                    combined_scores[idx] = 10.0 # Force protection
+                    print(f"    -> [Physics-First] Protecting feature: {name}")
+
         mask[np.argsort(combined_scores)[-self.max_features:]] = True
         return mask
 
@@ -133,9 +143,9 @@ class SymbolicDistiller:
         except:
             return False
 
-    def _distill_single_target(self, i, X, y, targets_shape_1=None, latent_states_shape_1=None, is_hamiltonian=False, skip_deep_search=False):
+    def _distill_single_target(self, i, X, y, targets_shape_1=None, latent_states_shape_1=None, is_hamiltonian=False, skip_deep_search=False, sim_type=None):
         print(f"    -> [Target {i}] Selecting top {self.max_features} features...")
-        mask = self._select_features(X, y)
+        mask = self._select_features(X, y, sim_type=sim_type)
         X_sel = X[:, mask]
         
         # Display selected feature names if available
@@ -191,10 +201,10 @@ class SymbolicDistiller:
             # Regress a SINGLE target: the scalar Hamiltonian H
             # We assume the first column of targets is H if hamiltonian=True is passed
             # or that extract_latent_data was called with include_hamiltonian=True
-            res, mask, score = self._distill_single_target(0, X_norm, Y_norm[:, 0], 1, latent_dim, is_hamiltonian=True, skip_deep_search=quick)
+            res, mask, score = self._distill_single_target(0, X_norm, Y_norm[:, 0], 1, latent_dim, is_hamiltonian=True, skip_deep_search=quick, sim_type=sim_type)
             return [res]
         
-        results = Parallel(n_jobs=-1)(delayed(self._distill_single_target)(i, X_norm, Y_norm[:, i], targets.shape[1], latent_dim, skip_deep_search=quick) for i in range(targets.shape[1]))
+        results = Parallel(n_jobs=-1)(delayed(self._distill_single_target)(i, X_norm, Y_norm[:, i], targets.shape[1], latent_dim, skip_deep_search=quick, sim_type=sim_type) for i in range(targets.shape[1]))
         return [r[0] for r in results]
 
 def extract_latent_data(model, dataset, dt, include_hamiltonian=False):

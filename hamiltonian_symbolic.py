@@ -131,6 +131,8 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
             aligned_latent_states = latent_states
 
         print(f"  -> Initializing FeatureTransformer...")
+        # For Hamiltonian discovery, we force V(q) to only depend on q-based features (distances)
+        # and we'll handle the p^2 term analytically
         self.transformer = FeatureTransformer(n_super_nodes, latent_dim, box_size=box_size, include_raw_latents=False, sim_type=sim_type)
 
         # If we have a model and it has H_net, we should try to get the scalar H as target
@@ -163,83 +165,104 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
                 print(f"    -> Failed to extract H from model: {e}")
                 h_targets = targets
 
-        print(f"  -> Fitting FeatureTransformer to {aligned_latent_states.shape[0]} samples...")
-        self.transformer.fit(aligned_latent_states, h_targets)
-        X_norm = self.transformer.normalize_x(self.transformer.transform(aligned_latent_states))
-        Y_norm = self.transformer.normalize_y(h_targets)
+        # STRUCTURAL FIX: Enforce H = sum(p^2/2) + V(q)
+        # We calculate the kinetic energy term and subtract it from the target H to get V(q)
+        d_sub = latent_dim // 2
+        z_reshaped = aligned_latent_states.reshape(-1, n_super_nodes, latent_dim)
+        p_vals = z_reshaped[:, :, d_sub:]
+        ke_term = 0.5 * np.sum(p_vals**2, axis=(1, 2))
+        
+        # Target for GP is now the potential V(q)
+        v_targets = h_targets - ke_term
 
-        # Distill the Hamiltonian function H
+        print(f"  -> Fitting FeatureTransformer to {aligned_latent_states.shape[0]} samples...")
+        self.transformer.fit(aligned_latent_states, v_targets)
+        
+        # Prune p-related features from the potential search to ensure H(q,p) = T(p) + V(q)
+        # We identify features that contain "p" or "z" with indices >= d_sub in each node
+        q_mask = np.ones(len(self.transformer.feature_names), dtype=bool)
+        for idx, name in enumerate(self.transformer.feature_names):
+            if "p" in name: q_mask[idx] = False
+            # Check for raw latents corresponding to momentum
+            for k in range(n_super_nodes):
+                for d in range(d_sub, latent_dim):
+                    if f"z{k*latent_dim + d}" in name:
+                        q_mask[idx] = False
+        
+        X_all = self.transformer.transform(aligned_latent_states)
+        
+        # Manually normalize all features before slicing
+        # This avoids the IndexError since normalize_x would already slice by its own selected indices
+        X_norm_full = (X_all - self.transformer.x_poly_mean) / self.transformer.x_poly_std
+        X_norm = X_norm_full[:, q_mask]
+        
+        # Temporarily update transformer feature names to reflect only q-features for the GP search
+        original_names = self.transformer.feature_names
+        self.transformer.feature_names = [n for i, n in enumerate(original_names) if q_mask[i]]
+        
+        Y_norm = self.transformer.normalize_y(v_targets)
+
+        # Distill the Potential function V
         y_target = Y_norm[:, 0] if Y_norm.ndim > 1 else Y_norm
         
         # Ensure reasonable search depth but respect user settings
-        print(f"  -> Starting symbolic regression for Hamiltonian (Pop: {self.populations}, Gen: {self.generations})...")
-        h_prog, h_mask, h_conf = self._distill_single_target(0, X_norm, y_target, 1, latent_dim, skip_deep_search=quick)
+        print(f"  -> Starting symbolic regression for Potential V(q) (Pop: {self.populations}, Gen: {self.generations})...")
+        v_prog, v_mask_relative, v_conf = self._distill_single_target(0, X_norm, y_target, 1, latent_dim, skip_deep_search=quick, sim_type=sim_type)
         
-        if h_prog is None:
+        # Map relative mask back to absolute indices
+        q_indices = np.where(q_mask)[0]
+        v_mask = q_indices[v_mask_relative]
+        
+        if v_prog is None:
             return super().distill(latent_states, targets, n_super_nodes, latent_dim, box_size)
 
-        # Validate Hamiltonian stability before accepting
-        # Check for NaNs or Infs on the training buffer
+        # Validate Potential stability
         try:
-            h_pred = h_prog.execute(X_norm[:, h_mask])
-            if not np.all(np.isfinite(h_pred)):
-                print("Warning: Discovered Hamiltonian produces NaNs/Infs. Reducing confidence.")
-                h_conf *= 0.1
+            v_pred = v_prog.execute(X_norm[:, v_mask_relative])
+            if not np.all(np.isfinite(v_pred)):
+                print("Warning: Discovered Potential produces NaNs/Infs. Reducing confidence.")
+                v_conf *= 0.1
         except Exception as e:
-            print(f"Warning: Failed to validate Hamiltonian stability: {e}")
-            h_conf = 0.0
+            print(f"Warning: Failed to validate Potential stability: {e}")
+            v_conf = 0.0
             
         # Estimate dissipation coefficients γ
         dissipation_coeffs = np.zeros(n_super_nodes)
         if self.estimate_dissipation:
             if model is not None and hasattr(model.ode_func, 'gamma'):
-                # Extract directly from model
                 import torch
                 dissipation_coeffs = torch.exp(model.ode_func.gamma).detach().cpu().numpy().flatten()
-            elif is_derivative_targets or targets.shape[1] > 1:
-                # Estimate from residual of dp/dt = -dH/dq - γp
-                # This requires computing numerical gradients of the discovered H
-                dissipation_coeffs = self._estimate_gamma_from_residuals(
-                    h_prog, h_mask, latent_states, targets, n_super_nodes, latent_dim
-                )
 
         # Wrap it in a class that can compute derivatives
-        # Try to compute analytical gradients for the Hamiltonian
         try:
             from symbolic import gp_to_sympy
             import sympy as sp
             
-            # Convert discovered program to SymPy
-            expr_str = str(h_prog)
-            n_vars = X_norm.shape[1]  # Number of selected features
+            expr_str = str(v_prog)
+            n_vars = X_norm.shape[1] # Number of q-features
             sympy_expr = gp_to_sympy(expr_str)
             
-            # Compute analytical gradients with respect to the input features X0, X1, ...
-            # These X variables correspond to the masked features
             sympy_vars = [sp.Symbol(f'X{i}') for i in range(n_vars)]
             grad_funcs = []
             for var in sympy_vars:
-                # sp.diff computes the analytical derivative
                 grad_expr = sp.diff(sympy_expr, var)
-                # lambdify for fast numerical evaluation
                 grad_funcs.append(sp.lambdify(sympy_vars, grad_expr, 'numpy'))
                 
             ham_eq = HamiltonianEquation(
-                h_prog, h_mask, n_super_nodes, latent_dim, 
+                v_prog, v_mask, n_super_nodes, latent_dim, 
                 dissipation_coeffs=dissipation_coeffs,
                 sympy_expr=sympy_expr,
-                grad_funcs=grad_funcs
+                grad_funcs=grad_funcs,
+                enforce_separable=True # New flag
             )
-            print(f"  -> Successfully enabled analytical gradients for discovered Hamiltonian.")
+            print(f"  -> Successfully enabled analytical gradients for discovered Potential.")
         except Exception as e:
             print(f"  -> Fallback to numerical gradients: {e}")
-            ham_eq = HamiltonianEquation(h_prog, h_mask, n_super_nodes, latent_dim, dissipation_coeffs)
+            ham_eq = HamiltonianEquation(v_prog, v_mask, n_super_nodes, latent_dim, dissipation_coeffs, enforce_separable=True)
 
-        self.feature_masks = [h_mask]
-        self.confidences = [h_conf]
-        
-        # Store the feature mask in the transformer for later use by TorchFeatureTransformer
-        self.transformer.selected_feature_indices = h_mask
+        self.feature_masks = [v_mask]
+        self.confidences = [v_conf]
+        self.transformer.selected_feature_indices = v_mask
         
         return [ham_eq]
 
@@ -300,7 +323,7 @@ class HamiltonianEquation:
     Supports both numerical and analytical gradients.
     """
     def __init__(self, h_prog, feature_mask, n_super_nodes, latent_dim, 
-                 dissipation_coeffs=None, sympy_expr=None, grad_funcs=None):
+                 dissipation_coeffs=None, sympy_expr=None, grad_funcs=None, enforce_separable=False):
         self.h_prog = h_prog
         self.feature_mask = feature_mask
         self.n_super_nodes = n_super_nodes
@@ -309,6 +332,7 @@ class HamiltonianEquation:
         self.sympy_expr = sympy_expr
         self.grad_funcs = grad_funcs # List of lambdified functions for each input feature
         self.length_ = getattr(h_prog, 'length_', 1)
+        self.enforce_separable = enforce_separable
 
     def execute(self, X):
         return self.h_prog.execute(X)
@@ -322,6 +346,10 @@ class HamiltonianEquation:
         d_sub = self.latent_dim // 2
         dzdt = np.zeros(n_total)
         
+        # dH/dz = dV/dz + dT/dz
+        # If enforce_separable=True, H = V(q) + sum(p^2/2)
+        # -> dT/dq = 0, dT/dp = p
+        
         # If we have analytical gradients, use them for much higher precision
         if self.grad_funcs is not None:
             # We must use the transformer to get the selected features
@@ -332,7 +360,7 @@ class HamiltonianEquation:
             # and then slice it to the selected features
             dX_dz = transformer.transform_jacobian(z) # [n_selected, n_latents]
             
-            # dH/dX: gradients of H with respect to its input features (masked ones)
+            # dH/dX: gradients of H (or V) with respect to its input features (masked ones)
             dH_dX = np.zeros(X_n.shape[1])
             for i, grad_f in enumerate(self.grad_funcs):
                 if grad_f is not None:
@@ -343,12 +371,11 @@ class HamiltonianEquation:
                     except:
                         pass
             
-            # dH/dz = dH/dX @ dX_dz
-            # Account for normalization: dH/dz = (dH/dX_norm / X_std_selected) @ dX_dz
-            # transformer.x_poly_std is the FULL array now, so we must slice it
+            # dV/dz = dV/dX @ dX_dz
+            # Account for normalization: dV/dz = (dV/dX_norm / X_std_selected) @ dX_dz
             x_std_selected = transformer.x_poly_std[self.feature_mask]
-            dH_dX_norm = dH_dX / x_std_selected
-            dH_dz = dH_dX_norm @ dX_dz
+            dV_dX_norm = dH_dX / x_std_selected
+            dV_dz = dV_dX_norm @ dX_dz
             
             for k in range(self.n_super_nodes):
                 q_start = k * self.latent_dim
@@ -356,18 +383,23 @@ class HamiltonianEquation:
                 p_start = q_end
                 p_end = p_start + d_sub
                 
-                # dq/dt = ∂H/∂p
-                dzdt[q_start:q_end] = dH_dz[p_start:p_end]
+                # dq/dt = ∂H/∂p = ∂V/∂p + ∂T/∂p
+                if self.enforce_separable:
+                    # ∂V/∂p = 0 by construction of features, ∂T/∂p = p
+                    dzdt[q_start:q_end] = z[p_start:p_end]
+                else:
+                    dzdt[q_start:q_end] = dV_dz[p_start:p_end]
                 
-                # dp/dt = -∂H/∂q - γp
+                # dp/dt = -∂H/∂q - γp = -(∂V/∂q + ∂T/∂q) - γp
+                # ∂T/∂q = 0
                 gamma = self.dissipation_coeffs[k]
-                dzdt[p_start:p_end] = -dH_dz[q_start:q_end] - gamma * z[p_start:p_end]
+                dzdt[p_start:p_end] = -dV_dz[q_start:q_end] - gamma * z[p_start:p_end]
                 
             return dzdt
 
         # Fallback to numerical gradients
         eps = 1e-4
-        def get_H(state):
+        def get_V(state):
             X_p = transformer.transform(state.reshape(1, -1))
             X_n = transformer.normalize_x(X_p)
             return self.h_prog.execute(X_n[:, self.feature_mask])[0]
@@ -379,13 +411,16 @@ class HamiltonianEquation:
             p_end = p_start + d_sub
             
             # dq/dt = ∂H/∂p
-            for i in range(d_sub):
-                idx = p_start + i
-                z_plus = z.copy()
-                z_minus = z.copy()
-                z_plus[idx] += eps
-                z_minus[idx] -= eps
-                dzdt[q_start + i] = (get_H(z_plus) - get_H(z_minus)) / (2 * eps)
+            if self.enforce_separable:
+                dzdt[q_start:q_end] = z[p_start:p_end]
+            else:
+                for i in range(d_sub):
+                    idx = p_start + i
+                    z_plus = z.copy()
+                    z_minus = z.copy()
+                    z_plus[idx] += eps
+                    z_minus[idx] -= eps
+                    dzdt[q_start + i] = (get_V(z_plus) - get_V(z_minus)) / (2 * eps)
                 
             # dp/dt = -∂H/∂q - γp
             gamma = self.dissipation_coeffs[k]
@@ -396,8 +431,8 @@ class HamiltonianEquation:
                 z_plus[idx] += eps
                 z_minus[idx] -= eps
                 
-                # Conservative part: -dH/dq
-                dp_dt_cons = -(get_H(z_plus) - get_H(z_minus)) / (2 * eps)
+                # Conservative part: -∂V/∂q
+                dp_dt_cons = -(get_V(z_plus) - get_V(z_minus)) / (2 * eps)
                 
                 # Dissipative part: -γp
                 dp_dt_diss = -gamma * z[p_start + i]
@@ -408,4 +443,5 @@ class HamiltonianEquation:
 
     def __str__(self):
         gamma_str = f", γ={self.dissipation_coeffs}" if np.any(self.dissipation_coeffs > 0) else ""
-        return f"HamiltonianH({self.h_prog}{gamma_str})"
+        prefix = "SeparableHamiltonian" if self.enforce_separable else "HamiltonianH"
+        return f"{prefix}(V={self.h_prog}{gamma_str}, T=p^2/2)"

@@ -607,7 +607,7 @@ class DiscoveryEngineModel(nn.Module):
         temporal_std = torch.std(z, dim=0)  # [B, K, D]
         # Encourage non-zero standard deviation to prevent static latents
         # Use a stricter threshold to prevent the model from finding static solutions
-        activity_penalty = torch.mean(torch.relu(1.0 - temporal_std))  # Increased threshold from 0.5 to 1.0
+        activity_penalty = torch.mean(torch.relu(2.0 - temporal_std))  # Increased threshold from 1.0 to 2.0
         return activity_penalty
 
     def get_mi_loss(self, z, mu):

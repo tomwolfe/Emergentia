@@ -172,9 +172,9 @@ def main():
     # 5. Analysis & Symbolic Discovery
     print("\n--- Discovery Health Report ---")
     # Use memory-efficient extraction for large datasets
-    if args.memory_efficient and len(dataset) > 30:  # Larger threshold
+    if args.memory_efficient and len(dataset) > 200:  # Larger threshold
         # Sample a subset of the trajectory for analysis
-        sample_size = 30  # Larger
+        sample_size = 200  # Larger
         sample_indices = np.linspace(0, len(dataset)-1, sample_size, dtype=int)
         sample_dataset = [dataset[i] for i in sample_indices]
         sample_pos = pos[sample_indices]
@@ -203,7 +203,7 @@ def main():
     # Proceed to symbolic distillation regardless of health
     print("\nProceeding to symbolic distillation...")
     # Sample data for analysis to reduce computation time
-    sample_size = min(30, len(dataset))
+    sample_size = min(200, len(dataset))
     sample_indices = np.linspace(0, len(dataset)-1, sample_size, dtype=int)
     sample_dataset = [dataset[i] for i in sample_indices]
     sample_pos = pos[sample_indices]

@@ -761,7 +761,7 @@ class Trainer:
             # Warmup: just use targets
             z_preds = z_all_target
 
-        loss_l2 = torch.mean(z_preds**2)
+        loss_l2 = torch.mean(z_preds**2) * 0.1
         
         dt_reg = max(dt, 0.01) 
         z_vel = (z_preds[1:] - z_preds[:-1]) / dt
@@ -786,8 +786,8 @@ class Trainer:
         loss_conn = 10.0 * self.model.get_connectivity_loss(s_0, full_batch.edge_index[:, full_batch.edge_index[0] < (batch_size * nodes_per_traj_step)])
         
         loss_ortho = self.model.get_ortho_loss(s_0)
-        loss_var = self.model.get_latent_variance_loss(z_curr)
-        loss_hinge = torch.mean(torch.relu(0.1 - torch.norm(z_preds, dim=-1)))
+        loss_var = self.model.get_latent_variance_loss(z_curr) * 0.1
+        loss_hinge = torch.mean(torch.relu(0.1 - torch.norm(z_preds, dim=-1))) * 0.1
 
         loss_align = torch.tensor(0.0, device=self.device)
         loss_mi = torch.tensor(0.0, device=self.device)

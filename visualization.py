@@ -97,20 +97,47 @@ def plot_discovery_results(model, dataset, pos_raw, s, z_states, assignments, ou
 def generate_closed_loop_trajectory(symbolic_proxy, z0, steps, dt, device='cpu'):
     """
     Generate a trajectory by iteratively applying the symbolic proxy (closed-loop).
+    Uses high-quality RK45 integration from scipy for stability.
     """
-    symbolic_proxy.eval()
-    traj = [z0]
-    curr_z = z0
+    from scipy.integrate import solve_ivp
     
-    with torch.no_grad():
-        for _ in range(steps - 1):
-            # For Hamiltonian, we can use a simple Euler step or better integration
-            # For now, let's use the forward method of the proxy which should return dz/dt
-            dz_dt = symbolic_proxy(curr_z)
-            curr_z = curr_z + dz_dt * dt
-            traj.append(curr_z)
+    symbolic_proxy.eval()
+    # z0: [1, K*D]
+    z0_np = z0.detach().cpu().numpy().flatten()
+    
+    def ode_func(t, y):
+        # y: [K*D]
+        y_torch = torch.from_numpy(y).float().to(device).unsqueeze(0)
+        with torch.no_grad():
+            dz_dt = symbolic_proxy(y_torch)
+        return dz_dt.cpu().numpy().flatten()
+    
+    t_span = (0, (steps - 1) * dt)
+    t_eval = np.linspace(0, (steps - 1) * dt, steps)
+    
+    try:
+        # Use RK45 for robust integration of symbolic discovery results
+        sol = solve_ivp(ode_func, t_span, z0_np, t_eval=t_eval, method='RK45', rtol=1e-3, atol=1e-6)
+        
+        # If integration fails or returns fewer steps than requested, pad or fallback
+        if sol.status < 0 or sol.y.shape[1] < steps:
+            print(f"Warning: solve_ivp failed or truncated (status={sol.status}). Falling back to Euler.")
+            raise ValueError("solve_ivp failed")
             
-    return torch.cat(traj, dim=0).cpu().numpy()
+        # sol.y: [K*D, T] -> [T, K*D]
+        return sol.y.T
+        
+    except Exception as e:
+        # Fallback to simple Euler if RK45 fails (common if symbolic laws are unstable)
+        traj = [z0_np.reshape(1, -1)]
+        curr_z = z0_np
+        for _ in range(steps - 1):
+            dz_dt = ode_func(0, curr_z)
+            curr_z = curr_z + dz_dt * dt
+            # Clip to prevent divergence in visualization
+            curr_z = np.clip(curr_z, -1e3, 1e3)
+            traj.append(curr_z.reshape(1, -1))
+        return np.concatenate(traj, axis=0)
 
 def plot_training_history(loss_tracker, output_path='training_history.png'):
     stats = loss_tracker.get_stats()
