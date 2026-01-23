@@ -245,12 +245,16 @@ python unified_train.py --epochs 100 --steps 50 --particles 6 --super_nodes 2
 - `common_losses.py`: Common loss functions extracted to reduce duplication
 - `pure_symbolic_functions.py`: Pure functions extracted from symbolic processing modules
 - `train_utils.py`: Training utilities including early stopping and device management
-- `visualization.py`: Visualization tools for training history and discovery results
+- `visualization.py`: Comprehensive visualization tools for training history, discovery results, and symbolic validation
 - `unified_train.py`: Unified training pipeline with all improvements (main entry point)
+- `validate_discovery.py`: Closed-loop validation of discovered equations with forecast horizon analysis
+- `profile_train.py`: Performance profiling tools for training optimization
+- `test_mps_ode.py`: MPS (Apple Silicon) compatibility tests for ODE integration
 - `config.yaml`: Configuration file for the pipeline
 - `requirements.txt`: Project dependencies
 - `training_history.png`: Visualization of training progress and loss components
 - `discovery_result.png`: Visualization of discovery results including particle assignments and latent dynamics
+- `results/`: Directory for storing experiment results, models, and validation reports
 
 ## Contributing
 

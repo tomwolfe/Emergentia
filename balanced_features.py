@@ -473,13 +473,15 @@ class BalancedFeatureTransformer:
         """
         n_latents = self.n_super_nodes * self.latent_dim
         z_nodes = z_flat.reshape(self.n_super_nodes, self.latent_dim)
+        z_flat_norm = (z_flat - self.z_mean) / self.z_std if self.z_mean is not None else z_flat
         
         # 1. Base features Jacobian (Latents + Distances)
-        # Match normalization in transform(): d(z_norm)/dz = 1/z_std
-        if self.z_std is not None:
-            jac_list = [np.diag(1.0 / self.z_std)]
-        else:
-            jac_list = [np.eye(n_latents)]
+        jac_list = []
+        if self.include_raw_latents:
+            if self.z_std is not None:
+                jac_list.append(np.diag(1.0 / self.z_std))
+            else:
+                jac_list.append(np.eye(n_latents))
         
         if self.include_dists:
             i_idx, j_idx = np.triu_indices(self.n_super_nodes, k=1)
@@ -538,35 +540,49 @@ class BalancedFeatureTransformer:
         # Original features
         poly_jacs = [X_base_jac]
         
-        # Squares of raw latents
+        # Squares of normalized latents
+        # d(z_norm^2)/dz = 2 * z_norm * d(z_norm)/dz = 2 * z_norm * (1/z_std)
+        z_norm_jac = np.diag(1.0 / self.z_std) if self.z_std is not None else np.eye(n_latents)
         for i in range(n_latents):
-            poly_jacs.append((2 * z_flat[i] * X_base_jac[i]).reshape(1, -1))
+            poly_jacs.append((2 * z_flat_norm[i] * z_norm_jac[i]).reshape(1, -1))
             
-        # Intra-node cross-terms
-        for node_idx in range(self.n_super_nodes):
-            start_idx = node_idx * self.latent_dim
-            for i in range(self.latent_dim):
-                for j in range(i + 1, self.latent_dim):
-                    idx_i = start_idx + i
-                    idx_j = start_idx + j
-                    # d(zi*zj)/dz = zi*d(zj)/dz + zj*d(zi)/dz
-                    jd_cross = z_flat[idx_i] * X_base_jac[idx_j] + z_flat[idx_j] * X_base_jac[idx_i]
-                    poly_jacs.append(jd_cross.reshape(1, -1))
-                    
-        # Inter-node cross-terms (same dimension)
-        for dim_idx in range(self.latent_dim):
-            for i in range(self.n_super_nodes):
-                for j in range(i + 1, self.n_super_nodes):
-                    idx_i = i * self.latent_dim + dim_idx
-                    idx_j = j * self.latent_dim + dim_idx
-                    jd_cross = z_flat[idx_i] * X_base_jac[idx_j] + z_flat[idx_j] * X_base_jac[idx_i]
-                    poly_jacs.append(jd_cross.reshape(1, -1))
+        # Sum of squares of momentum dims (p^2) per super-node
+        d_sub = self.latent_dim // 2
+        for k in range(self.n_super_nodes):
+            p_sq_jac = np.zeros(n_latents)
+            for d in range(d_sub, self.latent_dim):
+                idx = k * self.latent_dim + d
+                p_sq_jac += 2 * z_flat_norm[idx] * z_norm_jac[idx]
+            poly_jacs.append(p_sq_jac.reshape(1, -1))
+
+        if self.n_super_nodes > 4:
+            # Intra-node cross-terms
+            for node_idx in range(self.n_super_nodes):
+                start_idx = node_idx * self.latent_dim
+                for i in range(self.latent_dim):
+                    for j in range(i + 1, self.latent_dim):
+                        idx_i = start_idx + i
+                        idx_j = start_idx + j
+                        # d(zi_n*zj_n)/dz = zi_n*d(zj_n)/dz + zj_n*d(zi_n)/dz
+                        jd_cross = z_flat_norm[idx_i] * z_norm_jac[idx_j] + z_flat_norm[idx_j] * z_norm_jac[idx_i]
+                        poly_jacs.append(jd_cross.reshape(1, -1))
+                        
+            # Inter-node cross-terms (same dimension)
+            for dim_idx in range(self.latent_dim):
+                for i in range(self.n_super_nodes):
+                    for j in range(i + 1, self.n_super_nodes):
+                        idx_i = i * self.latent_dim + dim_idx
+                        idx_j = j * self.latent_dim + dim_idx
+                        jd_cross = z_flat_norm[idx_i] * z_norm_jac[idx_j] + z_flat_norm[idx_j] * z_norm_jac[idx_i]
+                        poly_jacs.append(jd_cross.reshape(1, -1))
                     
         X_expanded_jac = np.vstack(poly_jacs)
         
         # Apply feature selection if indices are present
         if self.selected_feature_indices is not None:
-            return X_expanded_jac[self.selected_feature_indices]
+            # We need to make sure we don't exceed the number of rows in X_expanded_jac
+            valid_indices = self.selected_feature_indices[self.selected_feature_indices < X_expanded_jac.shape[0]]
+            return X_expanded_jac[valid_indices]
         return X_expanded_jac
 
     def get_n_features(self):

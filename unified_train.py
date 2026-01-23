@@ -2,6 +2,7 @@ import torch
 import numpy as np
 import argparse
 import os
+import json
 from datetime import datetime
 import matplotlib.pyplot as plt
 from torch_geometric.data import Batch
@@ -169,63 +170,136 @@ def main():
             print(f"Early stopping triggered at epoch {epoch}")
             break
 
+        # Automated Revival Strategy: check if super-nodes are under-utilized
+        if epoch > 0 and epoch % 50 == 0:
+            active_count = (model.encoder.pooling.active_mask > 0.5).sum().item()
+            if active_count < args.super_nodes:
+                print(f"\n[Revival Check] Only {active_count}/{args.super_nodes} super-nodes active. Triggering hard revival...")
+                model.encoder.pooling.apply_hard_revival()
+                # Temporarily reduce sparsity weight to allow exploration
+                if trainer.sparsity_scheduler:
+                    trainer.sparsity_scheduler.current_step = max(0, trainer.sparsity_scheduler.current_step - 100)
+
     # 5. Analysis & Symbolic Discovery
     print("\n--- Discovery Health Report ---")
-    # Use memory-efficient extraction for large datasets
-    if args.memory_efficient and len(dataset) > 200:  # Larger threshold
-        # Sample a subset of the trajectory for analysis
-        sample_size = 200  # Larger
-        sample_indices = np.linspace(0, len(dataset)-1, sample_size, dtype=int)
-        sample_dataset = [dataset[i] for i in sample_indices]
-        sample_pos = pos[sample_indices]
-        z_states, dz_states, t_states = extract_latent_data(model, sample_dataset, sim.dt, include_hamiltonian=args.hamiltonian)
-    else:
-        z_states, dz_states, t_states = extract_latent_data(model, dataset, sim.dt, include_hamiltonian=args.hamiltonian)
-
-    # Compute health metrics
-    # NEW: Dynamics-to-Noise Ratio check
-    # We want the variance of the signal to be much larger than the variance of high-frequency jitter
-    if dz_states.shape[0] > 1:
-        # High-frequency jitter is estimated by first-order differences
-        jitter = dz_states[1:] - dz_states[:-1]
-        noise_var = np.var(jitter) + 1e-9
-        signal_var = np.var(dz_states)
-        dnr = signal_var / noise_var
-    else:
-        dnr = 0.0
-
-    health_metrics = {
-        "Reconstruction Fidelity": (last_rec < 0.6, f"Rec Loss {last_rec:.4f}"),  # Relaxed from 0.4
-        "Latent Dynamics": (dnr > 0.5, f"DNR {dnr:.4f}"),  # Relaxed from 0.8
-        "Training Maturity": (epoch >= int(args.epochs * 0.8), f"Epochs {epoch}")  # Relative maturity
-    }
     
-    # Proceed to symbolic distillation regardless of health
-    print("\nProceeding to symbolic distillation...")
-    # Sample data for analysis to reduce computation time
+    # Extract data for analysis
+    z_states, dz_states, t_states = extract_latent_data(model, dataset, sim.dt, include_hamiltonian=args.hamiltonian)
+    
+    # 1. Calculate Correlation Matrix between latents and physical CoM
+    print("Calculating Correlation Matrix...")
     sample_size = min(200, len(dataset))
     sample_indices = np.linspace(0, len(dataset)-1, sample_size, dtype=int)
     sample_dataset = [dataset[i] for i in sample_indices]
     sample_pos = pos[sample_indices]
-
     corrs = analyze_latent_space(model, sample_dataset, sample_pos, device=device)
+    
+    print("\nLatent-Physical Correlation Matrix (max correlation per super-node):")
+    for k in range(args.super_nodes):
+        max_corr = np.max(corrs[k])
+        print(f"  Super-node {k}: {max_corr:.4f}")
 
-    print("Performing symbolic distillation...")
+    # 2. Calculate Flicker Rate (mean change in assignments S)
+    print("\nCalculating Flicker Rate...")
+    model.eval()
+    s_list = []
+    with torch.no_grad():
+        for data in dataset_list:
+            batch = Batch.from_data_list([data]).to(device)
+            _, s, _, _ = model.encode(batch.x, batch.edge_index, batch.batch)
+            s_list.append(s.cpu())
+    
+    s_all = torch.stack(s_list) # [T, N, K]
+    flicker_rate = torch.mean(torch.abs(s_all[1:] - s_all[:-1])).item()
+    print(f"  Mean Flicker Rate: {flicker_rate:.6f}")
+
+    # 3. Perform Symbolic Distillation using EnhancedSymbolicDistiller
+    print("\nPerforming enhanced symbolic distillation...")
+    from enhanced_symbolic import EnhancedSymbolicDistiller, PhysicsAwareSymbolicDistiller
+    
     if args.hamiltonian:
-        # Use user-defined population and generations
-        from hamiltonian_symbolic import HamiltonianSymbolicDistiller
-        distiller = HamiltonianSymbolicDistiller(populations=args.pop, generations=args.gen,
-                                               perform_coordinate_alignment=not args.quick_symbolic)
-        equations = distiller.distill(z_states, dz_states, args.super_nodes, args.latent_dim, model=model, quick=args.quick_symbolic, sim_type=args.sim)
+        distiller = PhysicsAwareSymbolicDistiller(
+            populations=args.pop, 
+            generations=args.gen,
+            secondary_optimization=True
+        )
     else:
-        # Use user-defined population and generations
-        from symbolic import SymbolicDistiller
-        distiller = SymbolicDistiller(populations=args.pop, generations=args.gen)
-        equations = distiller.distill(z_states, dz_states, args.super_nodes, args.latent_dim, quick=args.quick_symbolic, sim_type=args.sim)
+        distiller = EnhancedSymbolicDistiller(
+            populations=args.pop, 
+            generations=args.gen,
+            secondary_optimization=True
+        )
+        
+    equations = distiller.distill(z_states, dz_states, args.super_nodes, args.latent_dim)
+    
     print("\nDiscovered Equations:")
     for i, eq in enumerate(equations):
         target = "H" if args.hamiltonian else f"dz_{i}/dt"
         print(f"{target} = {eq}")
+
+    # 4. Calculate Symbolic R2
+    print("\nCalculating Symbolic R2...")
+    symbolic_r2s = []
+    # We need to transform z_states to the same feature space used by the distiller
+    X_poly = distiller.transformer.transform(z_states)
+    X_norm = distiller.transformer.normalize_x(X_poly)
+    Y_norm_true = distiller.transformer.normalize_y(dz_states)
+    
+    for i, eq in enumerate(equations):
+        if eq is not None:
+            if hasattr(eq, 'compute_derivatives'):
+                # Hamiltonian case: compute_derivatives returns full dz/dt
+                dz_pred = []
+                for j in range(len(z_states)):
+                    dz_pred.append(eq.compute_derivatives(z_states[j], distiller.transformer))
+                y_pred_full = np.array(dz_pred)
+                # Compute R2 for each dimension and average
+                r2s = []
+                for d in range(dz_states.shape[1]):
+                    var_true = np.sum((dz_states[:, d] - np.mean(dz_states[:, d]))**2)
+                    if var_true < 1e-6:
+                        # If variance is too low, use MSE or a different metric
+                        r2 = 1.0 - np.mean((dz_states[:, d] - y_pred_full[:, d])**2)
+                    else:
+                        r2 = 1 - np.sum((dz_states[:, d] - y_pred_full[:, d])**2) / (var_true + 1e-9)
+                    r2s.append(r2)
+                r2 = np.mean(r2s)
+                symbolic_r2s.append(r2)
+                print(f"  Hamiltonian Symbolic R2 (mean across dims): {r2:.4f}")
+                print(f"  Sample dz_true (first 5): {dz_states[:5, 0]}")
+                print(f"  Sample dz_pred (first 5): {y_pred_full[:5, 0]}")
+            else:
+                y_pred = eq.execute(X_norm)
+                y_true = Y_norm_true[:, i]
+                r2 = 1 - np.sum((y_true - y_pred)**2) / (np.sum((y_true - np.mean(y_true))**2) + 1e-9)
+                symbolic_r2s.append(r2)
+                print(f"  Equation {i} R2: {r2:.4f}")
+        else:
+            symbolic_r2s.append(0.0)
+
+    # 5. Symbolic Parsimony Score
+    def get_complexity(expr):
+        if hasattr(expr, 'length_'): return expr.length_
+        return len(str(expr))
+        
+    parsimony_scores = []
+    for i, eq in enumerate(equations):
+        if eq is not None:
+            # Use max(0, r2) for parsimony calculation to avoid negative scores
+            score = get_complexity(eq) / (max(0.01, symbolic_r2s[i]) + 1e-6)
+            parsimony_scores.append(score)
+            print(f"  Equation {i} Parsimony Score: {score:.4f}")
+
+    # Output Health Check JSON (simulated with print for now)
+    health_check = {
+        "Symbolic Parsimony": np.mean(parsimony_scores) if parsimony_scores else 0,
+        "Latent Correlation": np.mean([np.max(corrs[k]) for k in range(args.super_nodes)]),
+        "Flicker Rate": flicker_rate,
+        "Symbolic R2": np.mean(symbolic_r2s) if symbolic_r2s else 0
+    }
+    print("\n--- Final Health Check ---")
+    for k, v in health_check.items():
+        print(f"{k}: {v:.4f}")
 
     # Create symbolic transformer and update trainer with symbolic proxy
     if hasattr(distiller, 'transformer'):
@@ -295,6 +369,40 @@ def main():
 
     plot_discovery_results(model, vis_sample_dataset, pos[vis_sample_indices], s_heatmap, z_states_plot, assignments, symbolic_predictions=symbolic_predictions)
     plot_training_history(trainer.loss_tracker)
+
+    # 7. Save Results for Validation
+    print("\nSaving results...")
+    results_dir = "./results"
+    os.makedirs(results_dir, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_save_path = os.path.join(results_dir, f"model_{timestamp}.pt")
+    torch.save(model.state_dict(), model_save_path)
+    
+    config_data = {
+        'particles': args.particles,
+        'super_nodes': args.super_nodes,
+        'latent_dim': args.latent_dim,
+        'hidden_dim': args.hidden_dim,
+        'hamiltonian': args.hamiltonian,
+        'min_active': args.min_active,
+        'sim': args.sim,
+        'dt': sim.dt
+    }
+    
+    discovery_data = {
+        'config': config_data,
+        'equations': [str(eq) for eq in equations],
+        'health_check': health_check,
+        'model_path': model_save_path
+    }
+    
+    results_json_path = os.path.join(results_dir, f"discovery_{timestamp}.json")
+    with open(results_json_path, 'w') as f:
+        json.dump(discovery_data, f, indent=4)
+    
+    print(f"Results saved to {results_json_path}")
+    print(f"Model saved to {model_save_path}")
 
 if __name__ == "__main__":
     main()
