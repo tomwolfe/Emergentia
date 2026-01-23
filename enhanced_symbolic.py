@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from gplearn.genetic import SymbolicRegressor
 from gplearn.functions import make_function
-from symbolic import SymbolicDistiller, FeatureTransformer, gp_to_sympy
+from symbolic import SymbolicDistiller, FeatureTransformer, gp_to_sympy, OptimizedExpressionProgram
 from balanced_features import BalancedFeatureTransformer
 from hamiltonian_symbolic import HamiltonianSymbolicDistiller
 import sympy as sp
@@ -163,8 +163,8 @@ class TorchFeatureTransformer(torch.nn.Module):
         # We now store full buffers and apply masking in forward() to avoid shape mismatches
         self.register_buffer('x_poly_mean', torch.from_numpy(transformer.x_poly_mean).float())
         self.register_buffer('x_poly_std', torch.from_numpy(transformer.x_poly_std).float())
-        self.register_buffer('target_mean', torch.from_numpy(transformer.target_mean).float())
-        self.register_buffer('target_std', torch.from_numpy(transformer.target_std).float())
+        self.register_buffer('target_mean', torch.tensor(transformer.target_mean).float())
+        self.register_buffer('target_std', torch.tensor(transformer.target_std).float())
 
         # Register feature selection mask to match distillation dimensions
         if hasattr(transformer, 'selected_feature_indices') and transformer.selected_feature_indices is not None:
@@ -419,43 +419,55 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
             
         return mask
 
-    def _distill_single_target(self, i, X_norm, Y_norm, targets_shape_1, latent_states_shape_1):
+    def _distill_single_target(self, i, X_norm, Y_norm, targets_shape_1=None, latent_states_shape_1=None, is_hamiltonian=False, skip_deep_search=False, sim_type=None):
         print(f"Selecting features for target_{i} (Input dim: {X_norm.shape[1]})...")
+        y_target = Y_norm[:, i] if Y_norm.ndim > 1 else Y_norm
 
         variances = np.var(X_norm, axis=0)
         valid_indices = np.where(variances > 1e-6)[0]
         X_pruned = X_norm[:, valid_indices]
 
+        # Get names for valid features
+        valid_names = None
+        if hasattr(self, 'transformer') and hasattr(self.transformer, 'feature_names'):
+            valid_names = [self.transformer.feature_names[j] for j in valid_indices]
+
         # Use SINDy-style pruning if enabled
         if self.use_sindy_pruning:
-            sindy_mask = self._sindy_select(X_pruned, Y_norm[:, i], threshold=self.sindy_threshold)
+            sindy_mask = self._sindy_select(X_pruned, y_target, threshold=self.sindy_threshold)
             print(f"  -> SINDy pruned {len(valid_indices)} to {np.sum(sindy_mask)} features.")
             # If SINDy was too aggressive, fall back to variance-based valid_indices
             if np.sum(sindy_mask) < 2:
                 print("  -> SINDy too aggressive, using standard selection.")
-                mask_pruned = self._select_features(X_pruned, Y_norm[:, i])
+                mask_pruned = self._select_features(X_pruned, y_target, sim_type=sim_type, feature_names=valid_names)
             else:
                 X_sindy = X_pruned[:, sindy_mask]
+                sindy_names = [valid_names[j] for j in np.where(sindy_mask)[0]] if valid_names else None
                 # Further refine with standard feature selector to reach max_features
-                refinement_mask = self._select_features(X_sindy, Y_norm[:, i])
+                refinement_mask = self._select_features(X_sindy, y_target, sim_type=sim_type, feature_names=sindy_names)
                 mask_pruned = np.zeros(len(valid_indices), dtype=bool)
                 mask_pruned[np.where(sindy_mask)[0][refinement_mask]] = True
         else:
-            mask_pruned = self._select_features(X_pruned, Y_norm[:, i])
+            mask_pruned = self._select_features(X_pruned, y_target, sim_type=sim_type, feature_names=valid_names)
 
         full_mask = np.zeros(X_norm.shape[1], dtype=bool)
         full_mask[valid_indices[mask_pruned]] = True
 
         X_selected = X_norm[:, full_mask]
         print(f"  -> Target_{i}: Reduced to {X_selected.shape[1]} informative variables.")
+        
+        # Display selected feature names if available
+        if hasattr(self, 'transformer') and hasattr(self.transformer, 'feature_names'):
+            names = [self.transformer.feature_names[j] for j in np.where(full_mask)[0]]
+            print(f"  -> Target_{i} Selected features: {names}")
 
         if X_selected.shape[1] == 0:
             return np.zeros((X_norm.shape[0], 1)), full_mask, 0.0
 
         from sklearn.linear_model import RidgeCV
         ridge = RidgeCV(alphas=[1e-4, 1e-3, 1e-2, 1e-1, 1, 10])
-        ridge.fit(X_selected, Y_norm[:, i])
-        linear_score = ridge.score(X_selected, Y_norm[:, i])
+        ridge.fit(X_selected, y_target)
+        linear_score = ridge.score(X_selected, y_target)
 
         if linear_score > 0.9999:
             print(f"  -> Target_{i}: High linear fit (R2={linear_score:.3f}). Using linear model.")
@@ -470,7 +482,6 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
                     if abs(model.intercept_) > 1e-6:
                         terms.append(f"{model.intercept_:.6f}")
                     
-                    # Sort coefficients to find most important ones if many are small
                     coeffs = model.coef_
                     for idx, coef in enumerate(coeffs):
                         if abs(coef) > 1e-6:
@@ -510,7 +521,7 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
             try:
                 # Force float64 for stability
                 X_gp = X_selected.astype(np.float64)
-                y_gp = Y_norm[:, i].astype(np.float64)
+                y_gp = y_target.astype(np.float64)
                 
                 est.fit(X_gp, y_gp)
                 prog = est._program
@@ -560,10 +571,10 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
         if best_candidate['score'] < 0.85:
             print(f"  -> Escalating distillation for target_{i}...")
             est = self._get_regressor(self.populations, self.generations, parsimony=best_candidate['p'])
-            est.fit(X_selected, Y_norm[:, i])
+            est.fit(X_selected, y_target)
             # For the escalated model, we also check if it's better Pareto-wise
             esc_prog = est._program
-            esc_score = est.score(X_selected, Y_norm[:, i])
+            esc_score = est.score(X_selected, y_target)
             esc_complexity = self.get_complexity(esc_prog)
             esc_pareto = esc_score - 0.015 * esc_complexity
 
@@ -572,12 +583,12 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
 
         # Apply secondary optimization if enabled
         if self.secondary_optimization:
-            optimized_prog = self._optimize_constants(best_candidate['prog'], X_selected, Y_norm[:, i])
+            optimized_prog = self._optimize_constants(best_candidate['prog'], X_selected, y_target)
             if optimized_prog:
                 # Evaluate the optimized program
                 try:
                     y_pred = optimized_prog.execute(X_selected)
-                    opt_score = 1 - ((Y_norm[:, i] - y_pred)**2).sum() / (((Y_norm[:, i] - Y_norm[:, i].mean())**2).sum() + 1e-9)
+                    opt_score = 1 - ((y_target - y_pred)**2).sum() / (((y_target - y_target.mean())**2).sum() + 1e-9)
                     
                     # Check if optimization improved the score
                     if opt_score > best_candidate['score']:
@@ -587,6 +598,52 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
                 except:
                     # If optimization failed, keep the original
                     pass
+
+        # NEW: Physics-Guided Search for LJ systems
+        if sim_type == 'lj' and hasattr(self, 'transformer') and hasattr(self.transformer, 'feature_names'):
+            try:
+                # Find indices of d6 and d12 in X_selected
+                d6_idx, d12_idx = -1, -1
+                selected_names = [self.transformer.feature_names[j] for j in np.where(full_mask)[0]]
+                for idx, name in enumerate(selected_names):
+                    if 'sum_inv_d6' in name: d6_idx = idx
+                    if 'sum_inv_d12' in name: d12_idx = idx
+                
+                if d6_idx != -1 and d12_idx != -1:
+                    print(f"  -> [Physics-Guided] Testing LJ physical form (1/r^6, 1/r^12)...")
+                    from sklearn.linear_model import Ridge
+                    X_lj = X_selected[:, [d6_idx, d12_idx]]
+                    model_lj = Ridge(alpha=1e-6).fit(X_lj, y_target)
+                    score_lj = model_lj.score(X_lj, y_target)
+                    
+                    if score_lj > best_candidate['score'] * 0.98: # Allow slightly lower score for physical correctness
+                        print(f"  -> [Physics-Guided] LJ form found high fit: {score_lj:.4f}. Using physical model.")
+                        # Construct symbolic string
+                        orig_d6 = np.where(full_mask)[0][d6_idx]
+                        orig_d12 = np.where(full_mask)[0][d12_idx]
+                        expr_lj = f"add(mul({model_lj.coef_[0]:.6f}, X{orig_d6}), mul({model_lj.coef_[1]:.6f}, X{orig_d12}))"
+                        if abs(model_lj.intercept_) > 1e-6:
+                            expr_lj = f"add({expr_lj}, {model_lj.intercept_:.6f})"
+                        
+                        # REFINE: Apply secondary optimization to these physical constants
+                        refined_prog = self._optimize_constants(OptimizedExpressionProgram(expr_lj), X_selected, y_target)
+                        if refined_prog:
+                            y_pred_refined = refined_prog.execute(X_selected)
+                            score_refined = 1 - ((y_target - y_pred_refined)**2).sum() / (((y_target - y_target.mean())**2).sum() + 1e-9)
+                            print(f"  -> [Physics-Guided] Secondary optimization refined LJ score to: {score_refined:.4f}")
+                            best_candidate = {
+                                'prog': refined_prog,
+                                'score': score_refined,
+                                'complexity': 5
+                            }
+                        else:
+                            best_candidate = {
+                                'prog': OptimizedExpressionWrapper(expr_lj, best_candidate['prog']),
+                                'score': score_lj,
+                                'complexity': 5
+                            }
+            except Exception as e:
+                print(f"  -> Physics-Guided search failed: {e}")
 
         # Confidence now accounts for both accuracy and parsimony
         confidence = max(0, best_candidate['score'] - 0.01 * best_candidate['complexity'])
@@ -772,17 +829,27 @@ class OptimizedExpressionWrapper:
         
         return self.original_program.execute(X)
 
+    def __str__(self):
+        return self.expr_str
 
-class PhysicsAwareSymbolicDistiller(HamiltonianSymbolicDistiller):
+
+class PhysicsAwareSymbolicDistiller(EnhancedSymbolicDistiller, HamiltonianSymbolicDistiller):
     """
     Physics-aware symbolic distiller that incorporates domain knowledge about physical constants.
     """
     
     def __init__(self, populations=2000, generations=40, stopping_criteria=0.001, max_features=12,
                  secondary_optimization=True, physics_constants=None):
-        super().__init__(populations, generations, stopping_criteria, max_features)
-        self.secondary_optimization = secondary_optimization
+        # We call EnhancedSymbolicDistiller's init which calls SymbolicDistiller's init
+        # We don't need to call HamiltonianSymbolicDistiller's init as it doesn't have one 
+        # (it uses the base class init)
+        EnhancedSymbolicDistiller.__init__(self, populations, generations, stopping_criteria, max_features, 
+                                          secondary_optimization=secondary_optimization)
         self.physics_constants = physics_constants or {}
+        # HamiltonianSymbolicDistiller attributes
+        self.enforce_hamiltonian_structure = True
+        self.perform_coordinate_alignment = False
+        self.estimate_dissipation = True
         
     def _distill_with_hamiltonian_structure(self, X_norm, Y_norm, n_super_nodes, latent_dim):
         """

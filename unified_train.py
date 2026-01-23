@@ -183,8 +183,9 @@ def main():
     # 5. Analysis & Symbolic Discovery
     print("\n--- Discovery Health Report ---")
     
-    # Extract data for analysis
-    z_states, dz_states, t_states = extract_latent_data(model, dataset, sim.dt, include_hamiltonian=args.hamiltonian)
+    # Extract data for analysis: h_targets for distillation, dz_states for validation
+    z_states, h_targets, t_states = extract_latent_data(model, dataset, sim.dt, include_hamiltonian=args.hamiltonian)
+    _, dz_states, _ = extract_latent_data(model, dataset, sim.dt, include_hamiltonian=False)
     
     # 1. Calculate Correlation Matrix between latents and physical CoM
     print("Calculating Correlation Matrix...")
@@ -230,7 +231,7 @@ def main():
             secondary_optimization=True
         )
         
-    equations = distiller.distill(z_states, dz_states, args.super_nodes, args.latent_dim)
+    equations = distiller.distill(z_states, h_targets, args.super_nodes, args.latent_dim, sim_type=args.sim)
     
     print("\nDiscovered Equations:")
     for i, eq in enumerate(equations):
@@ -256,12 +257,18 @@ def main():
                 # Compute R2 for each dimension and average
                 r2s = []
                 for d in range(dz_states.shape[1]):
-                    var_true = np.sum((dz_states[:, d] - np.mean(dz_states[:, d]))**2)
-                    if var_true < 1e-6:
-                        # If variance is too low, use MSE or a different metric
-                        r2 = 1.0 - np.mean((dz_states[:, d] - y_pred_full[:, d])**2)
+                    y_true_d = dz_states[:, d]
+                    y_pred_d = y_pred_full[:, d]
+                    var_true = np.var(y_true_d)
+                    
+                    if var_true < 1e-4:
+                        # For low variance, use Relative MSE as a proxy for quality
+                        # Score = 1 - (MSE / (mean_magnitude^2 + eps))
+                        mse = np.mean((y_true_d - y_pred_d)**2)
+                        mean_mag = np.mean(np.abs(y_true_d))
+                        r2 = 1.0 - mse / (mean_mag**2 + 1e-6)
                     else:
-                        r2 = 1 - np.sum((dz_states[:, d] - y_pred_full[:, d])**2) / (var_true + 1e-9)
+                        r2 = 1 - np.sum((y_true_d - y_pred_d)**2) / (len(y_true_d) * var_true + 1e-9)
                     r2s.append(r2)
                 r2 = np.mean(r2s)
                 symbolic_r2s.append(r2)

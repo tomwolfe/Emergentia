@@ -407,8 +407,10 @@ class Trainer:
         output_layer_params = []
         other_params = []
 
-        if hasattr(self.model.ode_func, 'H_net'):
+        if hasattr(self.model.ode_func, 'H_net') and self.model.ode_func.H_net is not None:
             h_net_params = list(self.model.ode_func.H_net.parameters())
+        elif hasattr(self.model.ode_func, 'V_net') and self.model.ode_func.V_net is not None:
+            h_net_params = list(self.model.ode_func.V_net.parameters())
 
         if hasattr(self.model.encoder.pooling, 'assign_mlp'):
             assign_mlp_params = list(self.model.encoder.pooling.assign_mlp.parameters())
@@ -506,14 +508,14 @@ class Trainer:
                 z_in = z_curr.reshape(z_curr.size(0), -1).detach().requires_grad_(True)
                 if self.mps_ode_on_cpu:
                     z_in_cpu = z_in.cpu()
-                    H_vals = self.model.ode_func.H_net(z_in_cpu)
+                    H_vals = self.model.ode_func.hamiltonian(z_in_cpu)
                     H = H_vals.sum()
                     dH = torch.autograd.grad(H, z_in_cpu, create_graph=True, retain_graph=True)[0]
                     if dH is not None:
                         # Add small L2 regularization on H output to prevent scaling to infinity
                         loss_curv = torch.norm(dH.to(self.device), p=2) + 0.01 * torch.mean(H_vals**2).to(self.device)
                 else:
-                    H_vals = self.model.ode_func.H_net(z_in)
+                    H_vals = self.model.ode_func.hamiltonian(z_in)
                     H = H_vals.sum()
                     dH = torch.autograd.grad(H, z_in, create_graph=True, retain_graph=True)[0]
                     if dH is not None:

@@ -338,7 +338,7 @@ class HamiltonianODEFunc(nn.Module):
     The Hamiltonian structure preserves phase-space volume (Liouville's Theorem),
     which is critical for long-term stability in symbolic integration.
     """
-    def __init__(self, latent_dim, n_super_nodes, hidden_dim=64, dissipative=True):
+    def __init__(self, latent_dim, n_super_nodes, hidden_dim=64, dissipative=True, separable=True):
         """
         Initialize the Hamiltonian ODE function.
 
@@ -347,95 +347,104 @@ class HamiltonianODEFunc(nn.Module):
             n_super_nodes (int): Number of super-nodes
             hidden_dim (int): Hidden dimension for the Hamiltonian network
             dissipative (bool): Whether to include learnable dissipation terms
+            separable (bool): Whether to enforce H = V(q) + sum(p^2/2)
         """
         super(HamiltonianODEFunc, self).__init__()
         assert latent_dim % 2 == 0, "Latent dim must be even for Hamiltonian dynamics (q, p)"
         self.latent_dim = latent_dim
         self.n_super_nodes = n_super_nodes
         self.dissipative = dissipative
+        self.separable = separable
 
-        # ENHANCED: Increased capacity for Hamiltonian network - use full hidden_dim instead of fractions
-        self.H_net = nn.Sequential(
-            nn.Linear(latent_dim * n_super_nodes, hidden_dim),  # Full hidden size instead of hidden_dim//4
-            nn.Softplus(), # Smoother activation function for better second derivatives
-            nn.Linear(hidden_dim, hidden_dim),  # Full hidden size instead of hidden_dim//8
-            nn.Softplus(), # Additional activation
-            nn.Linear(hidden_dim, hidden_dim//2),  # Additional layer
-            nn.Softplus(),  # Replaced Tanh with Softplus to allow for quadratic kinetic energy
-            nn.Linear(hidden_dim//2, 1)
+        # Potential network V(q)
+        # If separable, input is (latent_dim // 2) * n_super_nodes
+        # Else, input is latent_dim * n_super_nodes
+        v_input_dim = (latent_dim // 2) * n_super_nodes if separable else latent_dim * n_super_nodes
+        
+        self.V_net = nn.Sequential(
+            nn.Linear(v_input_dim, hidden_dim),
+            nn.Softplus(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Softplus(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Softplus(),
+            nn.Linear(hidden_dim // 2, 1)
         )
 
-        # Initialize weights with smaller values to prevent initial instability
+        # For non-separable, we keep H_net for compatibility if needed, 
+        # but we'll use V_net as the primary engine.
+        self.H_net = self.V_net if not separable else None
+
+        # Initialize weights with smaller values
         self._initialize_weights_small()
 
         # Add LayerNorm at the input to stabilize gradients
-        self.input_norm = nn.LayerNorm(latent_dim * n_super_nodes)
+        self.input_norm = nn.LayerNorm(v_input_dim)
 
         if dissipative:
             # Small initial dissipation
             self.gamma = nn.Parameter(torch.full((n_super_nodes, 1), -5.0)) # log space
 
     def _initialize_weights_small(self):
-        """Initialize weights using orthogonal initialization for hidden layers to prevent vanishing gradients."""
-        for m in self.H_net.modules():
+        """Initialize weights using orthogonal initialization."""
+        for m in self.V_net.modules():
             if isinstance(m, nn.Linear):
-                # Use orthogonal initialization to maintain gradient flow
-                nn.init.orthogonal_(m.weight)
+                nn.init.orthogonal_(m.weight, gain=0.1)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+        
+        # Explicitly make the last layer even smaller to start with a flat potential
+        if isinstance(self.V_net[-1], nn.Linear):
+            nn.init.orthogonal_(self.V_net[-1].weight, gain=0.01)
+
+    def hamiltonian(self, y):
+        """Compute the total Hamiltonian H(q, p)."""
+        d_sub = self.latent_dim // 2
+        y_view = y.view(-1, self.n_super_nodes, 2, d_sub)
+        q = y_view[:, :, 0].reshape(y.size(0), -1)
+        p = y_view[:, :, 1].reshape(y.size(0), -1)
+
+        if self.separable:
+            # H = V(q) + sum(p^2/2)
+            q_norm = self.input_norm(q)
+            V = self.V_net(q_norm)
+            T = 0.5 * torch.sum(p**2, dim=1, keepdim=True)
+            return V + T
+        else:
+            # Full H(q, p)
+            y_norm = self.input_norm(y)
+            return self.V_net(y_norm)
 
     def forward(self, t, y):
         """
         Compute time derivatives using Hamiltonian mechanics.
-
-        Args:
-            t (Tensor): Time (unused in autonomous systems)
-            y (Tensor): State vector [batch_size, latent_dim * n_super_nodes]
-
-        Returns:
-            Tensor: Time derivatives [batch_size, latent_dim * n_super_nodes]
         """
         # y: [batch_size, latent_dim * n_super_nodes]
-        training = torch.is_grad_enabled()
-
-        # We need to compute dH/dy. We use autograd.grad.
-        # For MPS stability, use create_graph=False unless explicitly needed for higher-order derivatives
+        d_sub = self.latent_dim // 2
+        
         with torch.set_grad_enabled(True):
-            # Apply input normalization to stabilize gradients
-            y_norm = self.input_norm(y)
-            y_in = y_norm.detach().requires_grad_(True)
-            H_raw = self.H_net(y_in)
-            # Add small L2 regularization on the output to prevent scaling to infinity
-            H = H_raw.sum() + 0.01 * torch.sum(H_raw**2)
-            # For Hamiltonian dynamics, we need create_graph=True for higher-order derivatives
-            # But use retain_graph=True to avoid the error when accessed multiple times
+            y_in = y.detach().requires_grad_(True)
+            H_val = self.hamiltonian(y_in)
+            H = H_val.sum()
             dH = torch.autograd.grad(H, y_in, create_graph=True, retain_graph=True, allow_unused=True)[0]
-
+            
             if dH is None:
                 dH = torch.zeros_like(y_in)
             else:
-                # Handle NaNs and Infs in the gradient - MORE AGGRESSIVE CLIPPING
                 dH = torch.nan_to_num(dH, nan=0.0, posinf=1e2, neginf=-1e2)
 
-        # Gradient clipping for stability during ODE integration - MORE AGGRESSIVE
         dH = torch.clamp(dH, -1e2, 1e2)
-
-        # dH is [batch_size, n_super_nodes * latent_dim]
-        # Reshape to [batch_size, n_super_nodes, 2, latent_dim // 2]
-        d_sub = self.latent_dim // 2
         dH_view = dH.view(-1, self.n_super_nodes, 2, d_sub)
 
         dq = dH_view[:, :, 1]  # dH/dp
         dp = -dH_view[:, :, 0] # -dH/dq
 
         if self.dissipative:
-            # y: [B, K * D] -> [B, K, 2, D/2]
             y_view = y.view(-1, self.n_super_nodes, 2, d_sub)
-            p = y_view[:, :, 1] # momentum
-            gamma = torch.exp(torch.clamp(self.gamma, max=2.0)) # Clamp gamma to prevent extreme dissipation
+            p = y_view[:, :, 1]
+            gamma = torch.exp(torch.clamp(self.gamma, max=2.0))
             dp = dp - gamma * p
 
-        # Final clamping to prevent explosive growth
         result = torch.cat([dq, dp], dim=-1).view(y.shape[0], -1)
         return torch.clamp(result, -1e2, 1e2)
 

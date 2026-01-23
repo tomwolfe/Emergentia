@@ -135,17 +135,17 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
         # and we'll handle the p^2 term analytically
         self.transformer = FeatureTransformer(n_super_nodes, latent_dim, box_size=box_size, include_raw_latents=False, sim_type=sim_type)
 
-        # If we have a model and it has H_net, we should try to get the scalar H as target
+        # If we have a model and it has a hamiltonian method, we should try to get the scalar H as target
         # for better GP discovery of the energy function topology.
         h_targets = targets
-        if is_derivative_targets and model is not None and hasattr(model.ode_func, 'H_net'):
+        if is_derivative_targets and model is not None and hasattr(model.ode_func, 'hamiltonian'):
             try:
                 print(f"  -> Extracting Hamiltonian values from neural model...")
                 import torch
                 device = next(model.parameters()).device
                 z_torch = torch.from_numpy(aligned_latent_states).float().to(device)
                 with torch.no_grad():
-                    h_val = model.ode_func.H_net(z_torch).cpu().numpy()
+                    h_val = model.ode_func.hamiltonian(z_torch).cpu().numpy()
 
                 # Ensure h_val has the same shape as latent_states first dimension
                 if h_val.ndim > 1 and h_val.shape[1] == 1:
@@ -173,7 +173,7 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
         ke_term = 0.5 * np.sum(p_vals**2, axis=(1, 2))
         
         # Target for GP is now the potential V(q)
-        v_targets = h_targets - ke_term
+        v_targets = h_targets.flatten() - ke_term
 
         print(f"  -> Fitting FeatureTransformer to {aligned_latent_states.shape[0]} samples...")
         self.transformer.fit(aligned_latent_states, v_targets)
@@ -343,7 +343,15 @@ class HamiltonianEquation:
         self.enforce_separable = enforce_separable
 
     def execute(self, X):
-        return self.h_prog.execute(X)
+        # If X already has the correct number of features for h_prog, use it directly.
+        # Otherwise, slice it using feature_mask (assuming X is the full feature vector).
+        if hasattr(self.h_prog, 'feature_indices'):
+            # Some programs handle their own indexing
+            return self.h_prog.execute(X)
+        
+        if X.shape[1] == len(self.feature_mask):
+            return self.h_prog.execute(X)
+        return self.h_prog.execute(X[:, self.feature_mask])
 
     def compute_derivatives(self, z, transformer):
         """
@@ -380,10 +388,12 @@ class HamiltonianEquation:
                         pass
             
             # dV/dz = dV/dX @ dX_dz
-            # Account for normalization: dV/dz = (dV/dX_norm / X_std_selected) @ dX_dz
+            # Account for normalization: dV/dz = (dV/dX_norm / X_std_selected) * target_std @ dX_dz
             x_std_selected = transformer.x_poly_std[self.feature_mask]
             dV_dX_norm = dH_dX / x_std_selected
-            dV_dz = dV_dX_norm @ dX_dz
+            
+            # CRITICAL FIX: Multiply by target_std to get back to original scale
+            dV_dz = (dV_dX_norm * transformer.target_std) @ dX_dz
             
             for k in range(self.n_super_nodes):
                 q_start = k * self.latent_dim
@@ -409,8 +419,8 @@ class HamiltonianEquation:
         eps = 1e-4
         def get_V(state):
             X_p = transformer.transform(state.reshape(1, -1))
-            X_n = transformer.normalize_x(X_p)
-            return self.h_prog.execute(X_n[:, self.feature_mask])[0]
+            X_n = transformer.normalize_x(X_p) # Already sliced to mask
+            return self.h_prog.execute(X_n)[0]
 
         for k in range(self.n_super_nodes):
             q_start = k * self.latent_dim

@@ -88,7 +88,7 @@ class SymbolicDistiller:
                                  function_set=('add', 'sub', 'mul', safe_div, safe_sqrt, safe_log, 'abs', 'neg', safe_inv, square, inv_square),
                                  max_samples=0.9, n_jobs=-1, random_state=42, verbose=0)
 
-    def _select_features(self, X, y, sim_type=None):
+    def _select_features(self, X, y, sim_type=None, feature_names=None):
         # Sample data if it's too large
         if X.shape[0] > 1000:
             indices = np.random.choice(X.shape[0], 1000, replace=False)
@@ -123,11 +123,14 @@ class SymbolicDistiller:
         mask = np.zeros(X.shape[1], dtype=bool)
         
         # Physics-First filter: for LJ systems, protect d6 and d12 terms
-        protected_indices = []
-        if sim_type == 'lj' and hasattr(self, 'transformer') and hasattr(self.transformer, 'feature_names'):
-            for idx, name in enumerate(self.transformer.feature_names):
-                if 'sum_inv_d6' in name or 'sum_inv_d12' in name:
-                    protected_indices.append(idx)
+        # We use feature_names if provided, otherwise fallback to transformer names if X matches in size
+        if feature_names is None and hasattr(self, 'transformer') and hasattr(self.transformer, 'feature_names'):
+            if X.shape[1] == len(self.transformer.feature_names):
+                feature_names = self.transformer.feature_names
+        
+        if sim_type == 'lj' and feature_names is not None:
+            for idx, name in enumerate(feature_names):
+                if idx < len(combined_scores) and ('sum_inv_d6' in name or 'sum_inv_d12' in name):
                     combined_scores[idx] = 10.0 # Force protection
                     print(f"    -> [Physics-First] Protecting feature: {name}")
 
@@ -234,9 +237,9 @@ def extract_latent_data(model, dataset, dt, include_hamiltonian=False):
         ode_device = next(model.ode_func.parameters()).device
         z_torch = z_flat.to(ode_device)
         
-        if include_hamiltonian and hasattr(model.ode_func, 'H_net'):
+        if include_hamiltonian and hasattr(model.ode_func, 'hamiltonian'):
             # Extract scalar Hamiltonian for all steps at once
-            H_all = model.ode_func.H_net(z_torch)
+            H_all = model.ode_func.hamiltonian(z_torch)
             derivs = H_all.cpu().numpy()
         else:
             # Extract dynamics derivative for all steps at once
