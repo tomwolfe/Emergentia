@@ -3,6 +3,7 @@ Enhanced FeatureTransformer that balances domain knowledge with pure discovery c
 """
 
 import numpy as np
+import re
 from sklearn.preprocessing import PolynomialFeatures
 from sklearn.linear_model import LassoCV, ElasticNetCV
 from sklearn.feature_selection import SelectKBest, f_regression, mutual_info_regression
@@ -146,6 +147,25 @@ class BalancedFeatureTransformer:
         
         # For polynomial features
         self.poly_transformer = None
+        self.feature_dims = [] # NEW: store dimension of each feature (L, M, T)
+
+    def _get_dim(self, name):
+        """Helper to get dimension of a feature by name."""
+        if 'sum_inv_d' in name:
+            try:
+                n = int(re.search(r'd(\d+)', name).group(1))
+                return (-n, 0, 0) # L^-n
+            except: return (-1, 0, 0)
+        if 'sum_d' in name: return (1, 0, 0)
+        if 'p' in name and '2_sum' in name: return (0, 2, -2) # P^2 ~ M^2 L^2 T^-2 (simplified to P^2)
+        if name.startswith('z'):
+            try:
+                idx = int(re.search(r'z(\d+)', name).group(1))
+                dim_idx = idx % self.latent_dim
+                if dim_idx < self.latent_dim // 2: return (1, 0, 0) # Q ~ L
+                return (0, 1, -1) # P ~ M L T^-1 (simplified to P)
+            except: pass
+        return (0, 0, 0) # Dimensionless or unknown
 
     def fit(self, latent_states, targets):
         """
@@ -393,6 +413,10 @@ class BalancedFeatureTransformer:
             X_expanded = X_expanded[:, top_indices]
             if names is not None:
                 names = [names[idx] for idx in top_indices]
+        
+        # NEW: Update feature_dims if names are available
+        if names is not None:
+            self.feature_dims = [self._get_dim(n) for n in names]
             
         return X_expanded, names
 

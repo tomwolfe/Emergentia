@@ -17,6 +17,46 @@ from sklearn.metrics import mean_squared_error
 import warnings
 warnings.filterwarnings('ignore')
 
+def get_expression_dimension(expr, feature_dims):
+    """
+    Recursively determines the dimension of a SymPy expression.
+    Returns (L, M, T) or None if inconsistent.
+    """
+    if expr.is_Symbol:
+        try:
+            # Match x0, x1, etc.
+            idx = int(str(expr)[1:])
+            if idx < len(feature_dims): return feature_dims[idx]
+        except: pass
+        return (0, 0, 0)
+    if expr.is_Number:
+        return (0, 0, 0)
+    
+    if expr.is_Add:
+        dims = [get_expression_dimension(arg, feature_dims) for arg in expr.args]
+        if any(d is None for d in dims): return None
+        # All non-zero dimensions must match
+        non_zero_dims = [d for d in dims if any(v != 0 for v in d)]
+        if not non_zero_dims: return (0, 0, 0)
+        first = non_zero_dims[0]
+        if all(d == first for d in non_zero_dims): return first
+        return None # Inconsistent!
+    
+    if expr.is_Mul:
+        dims = [get_expression_dimension(arg, feature_dims) for arg in expr.args]
+        if any(d is None for d in dims): return None
+        return tuple(sum(x) for x in zip(*dims))
+    
+    if expr.is_Pow:
+        base_dim = get_expression_dimension(expr.args[0], feature_dims)
+        if base_dim is None: return None
+        try:
+            p = float(expr.args[1])
+            return tuple(v * p for v in base_dim)
+        except: return None
+        
+    return (0, 0, 0) # Fallback for unknown (log, sin, etc. usually dimensionless)
+
 class SymPyToTorch(torch.nn.Module):
     """
     A lightweight, robust converter from SymPy expressions to PyTorch modules.
@@ -392,6 +432,7 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
         self.use_sindy_pruning = use_sindy_pruning
         self.sindy_threshold = sindy_threshold
         self.all_candidates = [] # Store all candidates for Pareto front visualization
+        self.recovered_constants = {} # NEW: store recovered physical constants
 
     def _sindy_select(self, X, y, threshold=0.05, max_iter=10):
         """
@@ -540,7 +581,32 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
                     is_stable = self.validate_stability(prog, X_gp[0])
 
                 if is_stable:
-                    candidate = {'prog': prog, 'score': score, 'complexity': self.get_complexity(prog), 'p': p_coeff, 'target_idx': i}
+                    # NEW: Dimensional Penalty
+                    dim_penalty = 0.0
+                    if hasattr(self, 'transformer') and hasattr(self.transformer, 'feature_dims'):
+                        try:
+                            # Map X_i to x_i for consistency with Transformer
+                            # full_mask tells us which original features were used
+                            selected_indices = np.where(full_mask)[0]
+                            # Create a map for this specific candidate's features
+                            candidate_feature_dims = [self.transformer.feature_dims[idx] for idx in selected_indices]
+                            
+                            # Convert gplearn prog to sympy
+                            local_dict = {f'X{j}': sp.Symbol(f'x{j}') for j in range(len(selected_indices))}
+                            candidate_sympy = sp.sympify(str(prog), locals=local_dict)
+                            
+                            if get_expression_dimension(candidate_sympy, candidate_feature_dims) is None:
+                                dim_penalty = 0.5 # Substantial penalty for non-physicality
+                        except: pass
+
+                    candidate = {
+                        'prog': prog, 
+                        'score': score, 
+                        'complexity': self.get_complexity(prog), 
+                        'p': p_coeff, 
+                        'target_idx': i,
+                        'dim_penalty': dim_penalty
+                    }
                     candidates.append(candidate)
                     self.all_candidates.append(candidate)
             except Exception as e:
@@ -551,11 +617,11 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
 
         # Pareto Frontier Selection: REDUCED COMPLEXITY PENALTY IF R2 SCORE IS BELOW 0.9
         for c in candidates:
-            # Adjusted score: R2 penalized by complexity (length of the expression)
+            # Adjusted score: R2 penalized by complexity and dimension
             if c['score'] < 0.9:
-                c['pareto_score'] = c['score'] - 0.005 * c['complexity']  # Reduced penalty
+                c['pareto_score'] = c['score'] - 0.005 * c['complexity'] - c.get('dim_penalty', 0.0)
             else:
-                c['pareto_score'] = c['score'] - 0.015 * c['complexity']
+                c['pareto_score'] = c['score'] - 0.015 * c['complexity'] - c.get('dim_penalty', 0.0)
 
         candidates.sort(key=lambda x: x['pareto_score'], reverse=True)
         best_candidate = candidates[0]
@@ -618,6 +684,18 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
                     
                     if score_lj > best_candidate['score'] * 0.98: # Allow slightly lower score for physical correctness
                         print(f"  -> [Physics-Guided] LJ form found high fit: {score_lj:.4f}. Using physical model.")
+                        
+                        # PHYSICAL RECOVERY: Calculate epsilon and sigma
+                        # V = 4*eps * ((sigma/r)^12 - (sigma/r)^6) = C12/r^12 - C6/r^6
+                        # Here y_target is normalized, so we need to be careful.
+                        # But for the symbolic form, we can just report the recovered ratios.
+                        c6 = abs(model_lj.coef_[0])
+                        c12 = abs(model_lj.coef_[1])
+                        sigma_rec = (c12 / (c6 + 1e-9))**(1/6)
+                        epsilon_rec = (c6**2) / (4 * c12 + 1e-9)
+                        print(f"    -> [Physical Recovery] Recovered LJ ratios: epsilon_eff={epsilon_rec:.6f}, sigma_eff={sigma_rec:.6f}")
+                        self.recovered_constants[f'target_{i}_lj'] = {'epsilon': epsilon_rec, 'sigma': sigma_rec}
+
                         # Construct symbolic string
                         orig_d6 = np.where(full_mask)[0][d6_idx]
                         orig_d12 = np.where(full_mask)[0][d12_idx]

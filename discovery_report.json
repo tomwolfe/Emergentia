@@ -1,0 +1,23 @@
+{
+    "discovered_sympy": [
+        "SeparableHamiltonian(V=0.0805836514062944*x10, T=p^2/2)"
+    ],
+    "recovered_constants": {},
+    "stability_score": 0.9999999993712156,
+    "health_check": {
+        "Symbolic Parsimony": 299.97000299970006,
+        "Latent Correlation": 0.9590147776206976,
+        "Flicker Rate": 0.2407633662223816,
+        "Symbolic R2": -0.9071235867541764
+    },
+    "config": {
+        "particles": 4,
+        "super_nodes": 2,
+        "latent_dim": 8,
+        "hidden_dim": 128,
+        "hamiltonian": true,
+        "min_active": 4,
+        "sim": "lj",
+        "dt": 0.0005
+    }
+}

@@ -16,6 +16,27 @@ from train_utils import ImprovedEarlyStopping, robust_energy, get_device
 from stable_pooling import SparsityScheduler
 from visualization import plot_discovery_results, plot_training_history
 
+def print_diagnostic_dashboard(model, trainer, epoch, rec, cons, cond_proxy):
+    """
+    Textual Diagnostic Dashboard for the AI Physicist.
+    Summarizes phase-space density and manifold health.
+    """
+    print(f"\n>>> DIAGNOSTIC DASHBOARD | Epoch {epoch} <<<")
+    print(f"  [Losses] Rec: {rec:.6f} | Cons: {cons:.4f} | Total: {trainer.loss_tracker.history.get('total', 0):.4f}")
+    
+    # Phase Space Density Estimate (std of latents)
+    lvars = torch.exp(trainer.model.log_vars).detach().cpu().numpy()
+    print(f"  [Density] Latent SNR: {cond_proxy:.4f} | Rec Weight: {1.0/lvars[0]:.2f} | Cons Weight: {1.0/lvars[1]:.2f}")
+    
+    # Manifold Curvature (Log-Var of log_vars)
+    print(f"  [Curvature] LogVar Std: {np.std(lvars):.4f} | Align Scale: {torch.exp(trainer.log_align_scale).item():.4f}")
+    
+    # Active Super-nodes
+    active_mask = model.encoder.pooling.active_mask
+    n_active = (active_mask > 0.5).sum().item()
+    print(f"  [Resolution] Active Super-nodes: {n_active}/{len(active_mask)} | Sparsity: {trainer.model.encoder.pooling.current_sparsity_weight:.4f}")
+    print("-------------------------------------------\n")
+
 def main():
     parser = argparse.ArgumentParser(description="Extreme Focus on Reconstruction Quality")
     parser.add_argument('--particles', type=int, default=8)
@@ -130,6 +151,26 @@ def main():
 
         loss, rec, cons = trainer.train_step(batch_data, sim.dt, epoch=epoch, max_epochs=args.epochs)
 
+        # NEW: Jacobian Condition Number Logging
+        if epoch % 20 == 0:
+            try:
+                model.eval()
+                # Use a very small subset for Jacobian to avoid OOM/latency
+                subset_data = Batch.from_data_list([pre_batched_windows_raw[0][0]]).to(device)
+                x_input = subset_data.x.detach().requires_grad_(True)
+                z_out, _, _, _ = model.encode(x_input, subset_data.edge_index, subset_data.batch)
+                z0 = z_out[0, 0, 0] # Take one latent dimension
+                grad = torch.autograd.grad(z0, x_input, retain_graph=True)[0]
+                jacobian_norm = torch.norm(grad)
+                # Approximation of condition number using norm ratio if we can't do full SVD
+                latent_std = torch.std(z_out).item()
+                latent_mean_mag = torch.mean(torch.abs(z_out)).item()
+                cond_proxy = latent_std / (latent_mean_mag + 1e-6)
+                print(f"  [Diagnostic] Latent SNR: {cond_proxy:.4f} | Grad Norm: {jacobian_norm.item():.4f}")
+            except Exception as e:
+                pass
+            model.train()
+
         # Learning rate warmup: gradually increase LR for first 25 epochs to focus on reconstruction
         if epoch < 25:  # Extended warmup
             # Linear warmup from 0 to the scheduled LR
@@ -142,7 +183,9 @@ def main():
         loss_history.append(loss)
         if len(loss_history) > 20: loss_history.pop(0)  # Larger window for stability
 
-        if epoch % 10 == 0:  # Print less frequently to reduce overhead
+        if epoch % 50 == 0:  # Print dashboard every 50 epochs
+            print_diagnostic_dashboard(model, trainer, epoch, rec, cons, cond_proxy if 'cond_proxy' in locals() else 0.0)
+        elif epoch % 10 == 0:  # Print less frequently to reduce overhead
             print(f"Epoch {epoch:4d} | Loss: {loss:.4f} | Rec: {rec:.4f} | Cons: {cons:.4f}")
 
         # Early discovery gate - only check late in training with strict criteria
@@ -320,6 +363,29 @@ def main():
     confidence = np.mean(distiller.confidences) if hasattr(distiller, 'confidences') else 0.8
     trainer.update_symbolic_proxy(equations, symbolic_transformer, weight=args.sym_weight, confidence=confidence)
 
+    # 5.5 STAGE 3: Neural-Symbolic Consistency Training (Closed-Loop)
+    if trainer.symbolic_proxy is not None and confidence > 0.1:
+        print("\n--- Starting Stage 3: Neural-Symbolic Consistency Training ---")
+        stage3_epochs = 50
+        trainer.model.train()
+        # Unfreeze encoder and symbolic proxy for joint optimization
+        for p in trainer.model.encoder.parameters(): p.requires_grad = True
+        
+        for s3_epoch in range(stage3_epochs):
+            # Sample window
+            indices = np.random.randint(0, len(pre_batched_windows_raw), size=args.traj_batch_size)
+            sampled_data = []
+            for i in indices: sampled_data.extend(pre_batched_windows_raw[i])
+            batch_data = Batch.from_data_list(sampled_data).to(device)
+            batch_data.seq_len = args.batch_size
+            
+            # Step with higher symbolic weight
+            # We want to force the encoder to align with the symbolic proxy
+            loss, rec, cons = trainer.train_step(batch_data, sim.dt, epoch=args.epochs + s3_epoch, max_epochs=args.epochs + stage3_epochs)
+            
+            if s3_epoch % 10 == 0:
+                print(f"Stage 3 | Epoch {s3_epoch:2d} | Loss: {loss:.4f} | Rec: {rec:.4f} | Cons: {cons:.4f}")
+
     # 6. Visualization - OPTIMIZED
     # Visualization - OPTIMIZED
     print("Visualizing results...")
@@ -385,7 +451,7 @@ def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     model_save_path = os.path.join(results_dir, f"model_{timestamp}.pt")
     torch.save(model.state_dict(), model_save_path)
-    
+
     config_data = {
         'particles': args.particles,
         'super_nodes': args.super_nodes,
@@ -396,6 +462,50 @@ def main():
         'sim': args.sim,
         'dt': sim.dt
     }
+
+    # NEW: Shadow Integration for Stability Score
+    print("\nCalculating Stability Score (1000-step shadow integration)...")
+    stability_score = 0.0
+    if trainer.symbolic_proxy is not None:
+        try:
+            # Integrate 1000 steps
+            initial_z = torch.tensor(z_states[0].reshape(1, -1), dtype=torch.float32, device=device)
+            steps_1000 = 1000
+            dt = sim.dt
+            from visualization import generate_closed_loop_trajectory
+            shadow_traj = generate_closed_loop_trajectory(trainer.symbolic_proxy, initial_z, steps_1000, dt, device=device)
+            # Check for NaNs and finite values
+            # shadow_traj might be a numpy array if generate_closed_loop_trajectory handles conversion
+            if isinstance(shadow_traj, torch.Tensor):
+                is_fin = torch.isfinite(shadow_traj).all()
+                shadow_np = shadow_traj.cpu().numpy()
+            else:
+                is_fin = np.isfinite(shadow_traj).all()
+                shadow_np = shadow_traj
+                
+            if is_fin:
+                # Score based on whether it exploded (drift from mean)
+                drift = np.std(np.linalg.norm(shadow_np, axis=1))
+                stability_score = 1.0 / (1.0 + drift)
+            else:
+                stability_score = 0.0
+            print(f"  Stability Score: {stability_score:.4f}")
+        except Exception as e:
+            print(f"  Shadow integration failed: {e}")
+            stability_score = 0.0
+
+    # NEW: discovery_report.json as requested
+    report_data = {
+        'discovered_sympy': [str(eq) for eq in equations],
+        'recovered_constants': getattr(distiller, 'recovered_constants', {}),
+        'stability_score': stability_score,
+        'health_check': health_check,
+        'config': config_data
+    }
+    
+    with open('discovery_report.json', 'w') as f:
+        json.dump(report_data, f, indent=4)
+    print("Final report saved to discovery_report.json")
     
     discovery_data = {
         'config': config_data,

@@ -61,6 +61,7 @@ class SymbolicDistiller:
         self.stopping_criteria = stopping_criteria
         self.max_features = max_features
         self.transformer = None
+        self.recovered_constants = {} # NEW: store recovered constants
 
     def get_complexity(self, program):
         """Returns the length of the program as a measure of complexity."""
