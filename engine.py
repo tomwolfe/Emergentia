@@ -362,7 +362,7 @@ class Trainer:
     def __init__(self, model, lr=5e-4, device='cpu', stats=None, align_anneal_epochs=1000,
                  warmup_epochs=20, max_epochs=1000, sparsity_scheduler=None, hard_assignment_start=0.7,
                  skip_consistency_freq=2, enable_gradient_accumulation=False, grad_acc_steps=1,
-                 enhanced_balancer=None, consistency_weight=1.0, spatial_weight=1.0):
+                 enhanced_balancer=None, consistency_weight=1.0, spatial_weight=1.0, use_pcgrad=True):
         self.model = model.to(device)
         self.device = device
         self.loss_tracker = LossTracker()
@@ -378,6 +378,7 @@ class Trainer:
         self.enhanced_balancer = enhanced_balancer
         self.consistency_weight = consistency_weight
         self.spatial_weight = spatial_weight
+        self.use_pcgrad = use_pcgrad
 
         # Learnable log-scaling for alignment to ensure it stays positive and stable
         # Initialize to a value that brings the initial alignment loss below 1.0
@@ -446,6 +447,13 @@ class Trainer:
         self.optimizer = optim.Adam(param_groups, lr=lr)
         self.criterion = torch.nn.MSELoss().to(device)
         self.stats = stats
+
+        # Logical groupings for PCGrad/GradNorm
+        self.loss_groups = {
+            'Reconstruction': ['rec', 'cons', 'assign', 'ortho', 'conn'],
+            'Physicality': ['align', 'mi', 'sym', 'var', 'curv', 'anchor', 'hinge', 'smooth', 'activity'],
+            'Sparsity': ['pruning', 'sparsity', 'sep', 'l2', 'lvr']
+        }
 
     def update_symbolic_proxy(self, symbolic_proxy_or_equations, transformer=None, weight=0.1, confidence=0.0):
         """Update the symbolic proxy model with new discovered equations."""
@@ -613,6 +621,58 @@ class Trainer:
                 z_t, _, _, _ = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch, tau=tau, hard=hard)
                 z_preds.append(z_t)
         return torch.stack(z_preds)
+
+    def _apply_pcgrad(self, head_losses):
+        """
+        Applies Projected Conflicting Gradients (PCGrad) to multiple loss heads.
+        head_losses: dict of {head_name: loss_tensor}
+        """
+        # 1. Compute gradients for each head separately
+        head_grads = []
+        params = [p for p in self.model.parameters() if p.requires_grad]
+        
+        for name, loss in head_losses.items():
+            if loss.requires_grad:
+                # Get gradients for this head
+                grads = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
+                # Flatten gradients
+                flat_grads = []
+                for g, p in zip(grads, params):
+                    if g is not None:
+                        flat_grads.append(g.flatten())
+                    else:
+                        flat_grads.append(torch.zeros_like(p).flatten())
+                head_grads.append(torch.cat(flat_grads))
+        
+        if not head_grads:
+            return
+
+        # 2. PCGrad projection
+        # Shuffle heads to avoid bias
+        import random
+        random.shuffle(head_grads)
+        
+        pc_grads = [g.clone() for g in head_grads]
+        for i in range(len(pc_grads)):
+            for j in range(len(head_grads)):
+                if i == j: continue
+                # Project if conflicting: g_i = g_i - (g_i . g_j / |g_j|^2) * g_j
+                dot_prod = torch.dot(pc_grads[i], head_grads[j])
+                if dot_prod < 0:
+                    pc_grads[i] -= (dot_prod / (torch.norm(head_grads[j])**2 + 1e-8)) * head_grads[j]
+        
+        # 3. Sum projected gradients
+        final_grad = torch.stack(pc_grads).sum(dim=0)
+        
+        # 4. Apply to parameters
+        idx = 0
+        for p in params:
+            n = p.numel()
+            if p.grad is None:
+                p.grad = final_grad[idx:idx+n].view(p.shape).clone()
+            else:
+                p.grad.add_(final_grad[idx:idx+n].view(p.shape))
+            idx += n
 
     def train_step(self, data_list, dt, epoch=0, max_epochs=2000):
         if self.sparsity_scheduler is not None:
@@ -971,31 +1031,64 @@ class Trainer:
         discovery_loss += (weights['sym'] * (self.symbolic_weight - 1.0) * torch.clamp(loss_sym.to(torch.float32), 0, 100) * stage2_factor)
         discovery_loss += 1e-4 * torch.clamp(loss_curv.to(torch.float32), 0, 100)
 
-        # Main loss terms with their own log_vars
-        loss = discovery_loss 
-        
-        # Regularization Freeze: Ensure weights are 0.0 during freeze phase
-        # Reduced by 100x as requested
-        l2_weight = weights['l2'] * 1e-8 # From 1e-6
-        lvr_weight = weights['lvr'] * 0.001 # From 0.1
-        smooth_weight = weights['smooth'] * 1.0 # From 100.0
-        
-        loss += (l2_weight * torch.clamp(loss_l2, 0, 100) + (lvars[4] if use_log_vars else 0.0))
-        loss += (lvr_weight * torch.clamp(loss_lvr, 0, 100) + (lvars[5] if use_log_vars else 0.0))
-        
-        if compute_consistency: 
-            loss += (weights['cons'] * self.consistency_weight * torch.clamp(loss_cons.to(torch.float32), 0, 100) * stage2_factor + (lvars[1] if use_log_vars else 0.0))
+        # PCGRAD / GROUPED LOSSES
+        head_losses = {
+            'Reconstruction': torch.tensor(0.0, device=self.device),
+            'Physicality': torch.tensor(0.0, device=self.device),
+            'Sparsity': torch.tensor(0.0, device=self.device)
+        }
 
-        smooth_idx = 15
-        loss += (smooth_weight * torch.clamp(loss_smooth, 0, 100) + (lvars[smooth_idx] if use_log_vars else 0.0))
-        
-        # Ensure loss stays positive and doesn't explode
-        loss = torch.clamp(loss + 0.1 * torch.sum(lvars**2), 1e-4, 1e5)
-        loss = loss.to(torch.float32)
-        if not torch.isfinite(loss): loss = loss_rec if torch.isfinite(loss_rec) else torch.tensor(1.0, device=self.device, requires_grad=True)
+        use_log_vars = (epoch >= int(max_epochs * 0.75))
+        lvars = torch.clamp(self.model.log_vars, min=-6.0, max=5.0)
 
+        # Map each raw loss to its corresponding head
+        for i, k in enumerate(base_keys):
+            # Determine which head this loss belongs to
+            target_head = None
+            for head, members in self.loss_groups.items():
+                if k in members:
+                    target_head = head
+                    break
+            
+            if target_head is None: target_head = 'Physicality' # Default
+
+            # Compute weighted term
+            term = weights[k] * torch.clamp(raw_losses[k], 0, 100)
+            if use_log_vars and i < len(lvars):
+                term = term + lvars[i]
+            
+            head_losses[target_head] = head_losses[target_head] + term
+
+        # Add extra terms to Physicality
+        head_losses['Physicality'] = head_losses['Physicality'] + (weights['sym'] * (self.symbolic_weight - 1.0) * torch.clamp(loss_sym.to(torch.float32), 0, 100) * stage2_factor)
+        head_losses['Physicality'] = head_losses['Physicality'] + 1e-4 * torch.clamp(loss_curv.to(torch.float32), 0, 100)
+        if 'activity' in raw_losses:
+            head_losses['Physicality'] = head_losses['Physicality'] + raw_losses['activity']
+
+        # Determine if we should use PCGrad (only after warmup for stability)
+        do_pcgrad = self.use_pcgrad and (epoch > self.warmup_epochs) and not is_stage1
+
+        if do_pcgrad:
+            # Apply PCGrad: computes gradients for each head and projects them
+            self._apply_pcgrad(head_losses)
+            # Total loss for logging only
+            loss = torch.stack(list(head_losses.values())).sum()
+        else:
+            # Standard weighted summation and backward
+            loss = torch.stack(list(head_losses.values())).sum()
+            # Ensure loss stays positive and doesn't explode
+            loss = torch.clamp(loss + 0.1 * torch.sum(lvars**2), 1e-4, 1e5)
+            loss = loss.to(torch.float32)
+            if not torch.isfinite(loss): 
+                loss = loss_rec if torch.isfinite(loss_rec) else torch.tensor(1.0, device=self.device, requires_grad=True)
+            
+            if self.enable_gradient_accumulation:
+                (loss / self.grad_acc_steps).backward()
+            else:
+                loss.backward()
+
+        # Optimizer step
         if self.enable_gradient_accumulation:
-            (loss / self.grad_acc_steps).backward()
             if ((epoch + 1) % self.grad_acc_steps == 0) or (epoch == max_epochs - 1):
                 if is_stage1: torch.nn.utils.clip_grad_norm_(self.model.decoder.parameters(), 1.0)
                 if epoch > self.warmup_epochs and stage2_factor >= 0.95: torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
@@ -1003,7 +1096,6 @@ class Trainer:
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
         else:
-            loss.backward()
             if is_stage1: torch.nn.utils.clip_grad_norm_(self.model.decoder.parameters(), 1.0)
             if epoch > self.warmup_epochs and stage2_factor >= 0.95: torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
             else: torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)

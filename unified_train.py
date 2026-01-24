@@ -46,6 +46,7 @@ def main():
     parser.add_argument('--lr', type=float, default=5e-4)  # Slightly reduced for stability
     parser.add_argument('--sim', type=str, default='spring', choices=['spring', 'lj'])
     parser.add_argument('--hamiltonian', action='store_true')
+    parser.add_argument('--non_separable', action='store_true', help='Use non-separable Hamiltonian H(q, p)')
     parser.add_argument('--device', type=str, default='auto')
     parser.add_argument('--batch_size', type=int, default=5, help='Sequence length of each window')
     parser.add_argument('--traj_batch_size', type=int, default=4, help='Number of trajectories to process in parallel')
@@ -97,8 +98,14 @@ def main():
         latent_dim=args.latent_dim,
         hidden_dim=args.hidden_dim,
         hamiltonian=args.hamiltonian,
-        min_active_super_nodes=args.min_active
+        min_active_super_nodes=args.min_active,
+        dissipative=True # Enabled by default
     ).to(device)
+
+    # If Hamiltonian, set separable flag based on argument
+    if args.hamiltonian:
+        model.ode_func.separable = not args.non_separable
+        print(f"  -> Hamiltonian Dynamics: {'Separable' if not args.non_separable else 'Non-Separable'}")
 
     # Initialize SparsityScheduler to prevent resolution closure
     # If super_nodes == particles, we disable sparsity to maintain 1-to-1 mapping
@@ -271,14 +278,14 @@ def main():
             generations=args.gen,
             secondary_optimization=True
         )
+        equations = distiller.distill(z_states, h_targets, args.super_nodes, args.latent_dim, sim_type=args.sim, enforce_separable=not args.non_separable)
     else:
         distiller = EnhancedSymbolicDistiller(
             populations=args.pop, 
             generations=args.gen,
             secondary_optimization=True
         )
-        
-    equations = distiller.distill(z_states, h_targets, args.super_nodes, args.latent_dim, sim_type=args.sim)
+        equations = distiller.distill(z_states, h_targets, args.super_nodes, args.latent_dim, sim_type=args.sim)
     
     print("\nDiscovered Equations:")
     for i, eq in enumerate(equations):

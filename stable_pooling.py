@@ -154,9 +154,66 @@ class StableHierarchicalPooling(nn.Module):
             # Harder mask during inference
             logits = logits.masked_fill(mask == 0, -1e9)
 
-        s = F.gumbel_softmax(logits, tau=tau, hard=hard, dim=-1)
+    def sinkhorn_knopp(self, logits, tau=1.0, iterations=3):
+        """
+        Sinkhorn-Knopp algorithm to find a doubly stochastic assignment matrix.
+        Ensures each node is assigned to super-nodes (row sum=1) and each super-node
+        receives approximately N/K nodes (column sum=N/K).
+        """
+        N, K = logits.shape
+        # Use log-space for stability
+        P = logits / tau
+        
+        # Target column sum: N/K
+        log_target_col_sum = torch.log(torch.tensor(N / K, device=logits.device, dtype=logits.dtype) + 1e-9)
+        
+        for _ in range(iterations):
+            # Row normalization: log(P) = log(P) - logsumexp(log(P), dim=1)
+            P = P - torch.logsumexp(P, dim=1, keepdim=True)
+            # Column normalization: log(P) = log(P) - logsumexp(log(P), dim=0) + log(target)
+            P = P - torch.logsumexp(P, dim=0, keepdim=True) + log_target_col_sum
+            
+        return torch.exp(P)
+
+    def forward(self, x, batch, pos=None, tau=1.0, hard=False, prev_assignments=None, current_epoch=None, total_epochs=None):
+        """
+        Forward pass of hierarchical pooling with Sinkhorn-Knopp stability.
+        """
+        # x: [N, in_channels], batch: [N], pos: [N, 2]
+        if x.size(0) == 0:
+            return torch.zeros((0, self.n_super_nodes, x.size(1)), device=x.device), \
+                   torch.zeros((0, self.n_super_nodes), device=x.device), \
+                   {'entropy': torch.tensor(0.0, device=x.device),
+                    'diversity': torch.tensor(0.0, device=x.device),
+                    'spatial': torch.tensor(0.0, device=x.device),
+                    'pruning': torch.tensor(0.0, device=x.device),
+                    'temporal_consistency': torch.tensor(0.0, device=x.device),
+                    'collapse_prevention': torch.tensor(0.0, device=x.device),
+                    'balance': torch.tensor(0.0, device=x.device)}, \
+                   None
+
+        logits = self.assign_mlp(x) * self.scaling
+
+        # Logit Smoothing (EMA) to prevent "banding" and temporal chatter
+        if self.logits_ema is not None and self.logits_ema.size(0) == logits.size(0):
+            logits = self.logit_ema_alpha * self.logits_ema.detach() + (1.0 - self.logit_ema_alpha) * logits
+        self.logits_ema = logits.detach()
+
+        # Assignment Persistence
+        if prev_assignments is not None and prev_assignments.size(0) == x.size(0):
+            logits = logits + 5.0 * prev_assignments.detach()
+
+        # Apply Sinkhorn-Knopp instead of Gumbel-Softmax
+        # Sinkhorn naturally encourages utilization of all super-nodes
+        s = self.sinkhorn_knopp(logits, tau=tau, iterations=5)
+
+        if hard:
+            # Straight-through estimator for hard assignments
+            s_hard = torch.zeros_like(s).scatter_(-1, torch.argmax(s, dim=-1, keepdim=True), 1.0)
+            s = (s_hard - s).detach() + s
 
         avg_s = s.mean(dim=0)
+
 
         # COMPETITIVE DROPOUT: Randomly zero out most active super-node during training to force distribution
         if self.training and torch.rand(1).item() < 0.1:
@@ -313,49 +370,15 @@ class StableHierarchicalPooling(nn.Module):
 
     def apply_hard_revival(self):
         """
-        Forcefully revive inactive nodes by re-initializing their assignment MLP weights
-        if they have been inactive (active_mask near zero) OR if too few nodes are active.
-        Called every 50-100 epochs.
+        Simplified revival logic: reset active mask and let Sinkhorn redistribute nodes.
         """
         if not self.training:
             return
 
-        inactive_indices = torch.where(self.active_mask < 0.1)[0].tolist()
-        n_active = (self.active_mask > 0.5).sum().item()
-
-        # If too few nodes are active, we might need to revive more than just the near-zero ones
-        if n_active < self.min_active_super_nodes:
-            # Sort all indices by their active_mask value (ascending)
-            all_indices = torch.argsort(self.active_mask).tolist()
-            # Take enough to reach min_active_super_nodes
-            needed = self.min_active_super_nodes - n_active
-            for idx in all_indices:
-                if idx not in inactive_indices and needed > 0:
-                    inactive_indices.append(idx)
-                    needed -= 1
-                if needed <= 0: break
-
-        if len(inactive_indices) > 0:
-            print(f"  [Hard Revival] Reviving super-nodes: {inactive_indices}")
-            # Re-initialize the assign_mlp weights for inactive nodes to force new exploration
-            with torch.no_grad():
-                # Re-initialize the entire assign_mlp for inactive nodes
-                for idx in inactive_indices:
-                    # Re-initialize the weights for the corresponding output row in the final layer
-                    # We use a larger std to force exploration - INCREASED FROM 5.0 TO 10.0
-                    nn.init.normal_(self.assign_mlp[2].weight[idx], mean=0.0, std=10.0) # Increased std to 10.0 for more aggressive revival
-                    nn.init.constant_(self.assign_mlp[2].bias[idx], 0.0)
-
-                # Also re-initialize the first layer weights for the inactive nodes
-                # This provides a more comprehensive reset of the assignment function
-                in_features = self.assign_mlp[0].weight.shape[1]
-                for idx in inactive_indices:
-                    nn.init.xavier_uniform_(self.assign_mlp[0].weight)
-                    if self.assign_mlp[0].bias is not None:
-                        nn.init.zeros_(self.assign_mlp[0].bias)
-
-                # Reset active mask for these nodes to allow them to compete immediately
-                self.active_mask[inactive_indices] = 1.0
+        print(f"  [Sinkhorn Revival] Resetting active mask to encourage redistribution...")
+        self.active_mask.fill_(1.0)
+        # Clear logit EMA to remove persistence bias
+        self.logits_ema = None
 
 
 class DynamicLossBalancer:

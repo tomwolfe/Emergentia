@@ -422,10 +422,15 @@ class HamiltonianODEFunc(nn.Module):
         # y: [batch_size, latent_dim * n_super_nodes]
         d_sub = self.latent_dim // 2
         
+        # Ensure we are in a grad-enabled context
         with torch.set_grad_enabled(True):
-            y_in = y.detach().requires_grad_(True)
+            # Optimization: Only detach and set requires_grad if not already present
+            # This preserves the graph for higher-order derivatives
+            y_in = y if y.requires_grad else y.detach().requires_grad_(True)
             H_val = self.hamiltonian(y_in)
             H = H_val.sum()
+            
+            # Use create_graph=True to allow for higher-order derivatives (Jacobians)
             dH = torch.autograd.grad(H, y_in, create_graph=True, retain_graph=True, allow_unused=True)[0]
             
             if dH is None:
