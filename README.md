@@ -14,11 +14,13 @@ The pipeline consists of three main stages:
 
 ### 1. Hamiltonian Inductive Bias
 - **Enforced Separability**: Supports $H(q,p) = V(q) + \sum p^2/2$, ensuring $dq/dt = p$ is strictly maintained in the latent space.
+- **Non-Separable Support**: Extended to support Generalized Hamiltonians $H(q,p)$ via the `--non_separable` flag, allowing for more complex coupled dynamics.
 - **Canonical Equations**: Enforces $\dot{q} = \partial H/\partial p$ and $\dot{p} = -\partial H/\partial q$.
 - **Energy Conservation**: Maintains Liouville's Theorem and phase-space volume preservation.
 
 ### 2. Physics-Guided Symbolic Search
 - **LJ Potential Recovery**: Specialized routines to identify and optimize $A/r^{12} - B/r^6$ forms.
+- **Smooth Soft-Core Potentials**: Enhanced Lennard-Jones implementation with smooth soft-core potential to prevent gradient explosions.
 - **Physical Constant Recovery**: Explicitly recovers $\epsilon$ and $\sigma$ parameters for molecular potentials.
 - **Dimensional Analysis Filter**: Enforces physical units consistency (L, M, T) during symbolic search using a dimensionality penalty.
 - **Secondary Optimization**: L-BFGS refinement of physical constants for high-fidelity discovery.
@@ -83,6 +85,7 @@ Additional options for performance tuning:
 - `--eval_every N`: Evaluate every N epochs (default: 50)
 - `--sim`: Choose simulator ('spring' or 'lj' for Lennard-Jones)
 - `--hamiltonian`: Use Hamiltonian dynamics
+- `--non_separable`: Use non-separable Hamiltonian H(q, p) instead of separable form
 - `--lr`: Learning rate (default: 5e-4)
 
 ### Basic Example
@@ -140,6 +143,7 @@ model = DiscoveryEngineModel(
     node_features=4,
     latent_dim=4,      # Must be even for Hamiltonian systems
     hamiltonian=True,
+    separable=False,   # Set to False for non-separable Hamiltonian H(q, p)
     dissipative=True   # Include energy dissipation
 )
 
@@ -181,8 +185,10 @@ python unified_train.py --particles 16 --super_nodes 4 --epochs 500 --steps 500 
 ### 2. Stable Hierarchical Pooling & Stage 3 Alignment
 - **Neural-Symbolic Consistency**: Stage 3 closed-loop training where the encoder aligns with discovered symbolic laws
 - **Sparsity Scheduler**: Dynamically adjusts sparsity regularization to prevent resolution collapse
+- **Adaptive SNR-Based Scheduling**: Adjusts sparsity pressure based on Latent SNR to prevent resolution collapse in low-SNR conditions
 - **Temporal Consistency**: Maintains assignment stability across time steps
 - **Active Node Management**: Ensures sufficient super-nodes remain active during training
+- **Sinkhorn-Knopp Assignments**: Differentiable assignments replacing Hard Revival to ensure balanced super-node utilization
 
 ### 3. Memory Efficiency
 - **Gradient Accumulation**: Reduces memory usage during training
@@ -198,6 +204,7 @@ python unified_train.py --particles 16 --super_nodes 4 --epochs 500 --steps 500 
 - **Learnable Log-Variances**: Automatic loss balancing through learnable parameters
 - **Enhanced Assignment Loss**: Includes entropy, diversity, spatial, and temporal consistency terms
 - **Regularization Terms**: Latent variance, orthogonality, and connectivity losses
+- **PCGrad Integration**: Projected Conflicting Gradients (PCGrad) to handle conflicting objectives between Reconstruction, Physicality, and Sparsity heads
 
 ### 6. Hamiltonian Structure Preservation
 - **Canonical Equations**: Enforces proper Hamiltonian dynamics (dq/dt = ∂H/∂p, dp/dt = -∂H/∂q)
@@ -207,12 +214,18 @@ python unified_train.py --particles 16 --super_nodes 4 --epochs 500 --steps 500 
 ### 7. Apple Silicon (MPS) Support
 - **MPS Compatibility**: Fixes for PyTorch MPS backend stability
 - **CPU Offloading**: Moves ODE integration to CPU for stability on MPS devices
+- **Performance Optimizations**: Device caching and minimized MPS/CPU transfers for improved efficiency
 - **Precision Handling**: Proper float32/float64 management for MPS
 
 ### 8. Enhanced Visualization
 - **Comprehensive Plots**: Assignment heatmaps, latent trajectories, phase space plots
 - **Symbolic Comparison**: Overlay of learned vs symbolic predictions
 - **Training Monitoring**: Real-time loss tracking and balancing weights
+
+### 9. Physical Verification & Analysis
+- **Analytical Symplectic Drift**: Quantifies deviation from symplectic structure over time
+- **Energy Drift Calculation**: Measures relative energy conservation over trajectories
+- **Automated Physical Validation**: Continuous monitoring of Hamiltonian properties
 
 ## Mathematical Foundation
 
@@ -235,10 +248,22 @@ Where:
 
 ## Testing
 
-Testing files are not included in the current project structure. To test the functionality, run the main training script:
+The project now includes comprehensive physics validation tests:
+
+- `tests/test_physics_validation.py`: Validates GNN rotational invariance, symplectic ODE conditions, and PBC distance calculations
+- `test_physics.py`: Verifies FeatureTransformer Jacobians and SymPyToTorch accuracy
+
+To run the main functionality test:
 
 ```bash
 python unified_train.py --epochs 100 --steps 50 --particles 6 --super_nodes 2
+```
+
+To run physics validation tests:
+
+```bash
+python -m pytest tests/test_physics_validation.py
+python -m pytest test_physics.py
 ```
 
 ## Files Overview
@@ -257,10 +282,12 @@ python unified_train.py --epochs 100 --steps 50 --particles 6 --super_nodes 2
 - `train_utils.py`: Training utilities including early stopping and device management
 - `visualization.py`: Comprehensive visualization tools for training history, discovery results, and symbolic validation
 - `unified_train.py`: Unified training pipeline with closed-loop Stage 3 training (main entry point)
-- `discovery_report.json`: Automatically generated report with discovered laws, constants, and stability scores
+- `discovery_report.json`: Automatically generated report with discovered laws, constants, stability scores, and analytical Symplectic and Energy Drift calculations
 - `validate_discovery.py`: Closed-loop validation of discovered equations with forecast horizon analysis
 - `profile_train.py`: Performance profiling tools for training optimization
 - `test_mps_ode.py`: MPS (Apple Silicon) compatibility tests for ODE integration
+- `tests/test_physics_validation.py`: Physics validation tests for GNN rotational invariance, symplectic conditions, and PBC calculations
+- `test_physics.py`: Tests for FeatureTransformer Jacobians and SymPyToTorch accuracy
 - `config.yaml`: Configuration file for the pipeline
 - `requirements.txt`: Project dependencies
 - `training_history.png`: Visualization of training progress and loss components
