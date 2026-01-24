@@ -168,7 +168,7 @@ def calculate_lyapunov_exponent(proxy, z0, steps=1000, dt=0.01, epsilon=1e-6):
                 
     return float(lyapunov_sum / (steps * dt))
 
-def run_benchmark(model, equations, r2_scores, transformer, test_data_path=None):
+def run_benchmark(model, equations, r2_scores, transformer, stats=None, test_data_path=None):
     """Runs the full benchmark suite and saves validation_report.json."""
     print("Running Physics Benchmark...")
     
@@ -190,7 +190,8 @@ def run_benchmark(model, equations, r2_scores, transformer, test_data_path=None)
     vel_ood = vel * 1.414 # sqrt(2) for 2x kinetic energy
     pos_ood, vel_ood = sim.generate_trajectory(steps=1000, init_pos=pos[0], init_vel=vel_ood[0])
     
-    test_dataset, _ = prepare_data(pos_ood, vel_ood, stats=None) # We'll use model's internal normalization if needed
+    # USE THE ORIGINAL STATS IF PROVIDED
+    test_dataset, _ = prepare_data(pos_ood, vel_ood, stats=stats) 
     
     # 3. Perform evaluations
     # Get ground truth latent trajectory

@@ -19,6 +19,9 @@ class SymbolicProxy(nn.Module):
         # 1. Initialize differentiable feature transformer
         self.torch_transformer = TorchFeatureTransformer(transformer)
 
+        # NEW: Learnable output gain to fix units mismatch automatically
+        self.output_gain = nn.Parameter(torch.ones(1))
+
         # 2. Initialize differentiable symbolic modules
         self.sym_modules = nn.ModuleList()
 
@@ -82,6 +85,9 @@ class SymbolicProxy(nn.Module):
                 
                 if dH_dz is None:
                     dH_dz = torch.zeros_like(z_flat)
+                else:
+                    # CLAMP GRADIENTS for stability during stage 3
+                    dH_dz = torch.clamp(dH_dz, -10.0, 10.0)
             
             d_sub = self.latent_dim // 2
             dz_dt = torch.zeros_like(z_flat)
@@ -99,7 +105,7 @@ class SymbolicProxy(nn.Module):
                     gamma = self.dissipation[k]
                     dz_dt[:, p_start:p_end] -= gamma * z_flat[:, p_start:p_end]
             
-            return dz_dt
+            return self.output_gain * dz_dt
 
         X_norm = self.torch_transformer(z_flat)
 
@@ -123,4 +129,4 @@ class SymbolicProxy(nn.Module):
         Y_norm_pred = torch.stack(y_preds, dim=1).squeeze(-1)
         Y_pred = self.torch_transformer.denormalize_y(Y_norm_pred)
 
-        return Y_pred.to(torch.float32)
+        return self.output_gain * Y_pred.to(torch.float32)

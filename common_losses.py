@@ -48,6 +48,35 @@ def get_mi_loss(z, mu, mi_discriminator):
     return -mi_est
 
 
+def get_correlation_loss(z, mu):
+    """
+    Stronger linear alignment objective (Soft CCA).
+    Encourages linear correlation between z[:2] and mu.
+    """
+    z_spatial = z[:, :, :2] # [B, K, 2]
+    
+    # Flatten Batch and Super-node dims
+    z_f = z_spatial.reshape(-1, 2)
+    mu_f = mu.reshape(-1, 2)
+    
+    # Center the variables
+    z_c = z_f - z_f.mean(dim=0, keepdim=True)
+    mu_c = mu_f - mu_f.mean(dim=0, keepdim=True)
+    
+    # Compute correlation for x and y separately
+    def corr_dim(a, b):
+        num = (a * b).sum()
+        den = torch.sqrt((a**2).sum()) * torch.sqrt((b**2).sum()) + 1e-8
+        return num / den
+
+    corr_x = corr_dim(z_c[:, 0], mu_c[:, 0])
+    corr_y = corr_dim(z_c[:, 1], mu_c[:, 1])
+    
+    # We want to maximize absolute correlation (either 1 or -1 is fine for symbolic discovery)
+    # as the distiller can handle negative constants.
+    return 2.0 - (torch.abs(corr_x) + torch.abs(corr_y))
+
+
 def get_ortho_loss(s):
     """
     Orthogonality loss to encourage independence between super-nodes.

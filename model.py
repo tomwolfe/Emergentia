@@ -66,7 +66,7 @@ class EquivariantGNNLayer(MessagePassing):
         m_h, m_v = self.propagate(edge_index, x=x, dist_sq=dist_sq, dot_vr=dot_vr, rel_pos=rel_pos)
         
         # m_v is a vector [N, 2]. We take its norm as a scalar feature
-        m_v_norm = torch.norm(m_v, dim=-1, keepdim=True)
+        m_v_norm = torch.norm(m_v + 1e-8, dim=-1, keepdim=True)
         
         # Update node features
         h_update = self.phi_h(torch.cat([x, m_h, m_v_norm], dim=-1))
@@ -612,6 +612,10 @@ class DiscoveryEngineModel(nn.Module):
         # Mutual Information alignment components
         # Align first 2 dims of latent to mu (physical CoM)
         self.mi_discriminator = MIDiscriminator(min(latent_dim, 2), 2, hidden_dim)
+        
+        # NEW: Linear Alignment Layer for Soft CCA
+        # This layer is used ONLY for alignment loss and does not affect discovery
+        self.linear_aligner = nn.ModuleList([nn.Linear(latent_dim, 2) for _ in range(n_super_nodes)])
 
         # Learnable loss log-variances for automatic loss balancing
         # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning, 8: sep, 9: conn, 10: sparsity, 11: mi, 12: sym, 13: var, 14: hinge, 15: smooth, 16: anchor
@@ -630,8 +634,8 @@ class DiscoveryEngineModel(nn.Module):
         Encourage the latent variables to have non-zero standard deviation over the temporal sequence.
         z: [T, B, K, D] where T is time steps
         """
-        # Calculate std across time dimension
-        temporal_std = torch.std(z, dim=0)  # [B, K, D]
+        # Calculate std across time dimension with epsilon for stability
+        temporal_std = torch.sqrt(torch.var(z, dim=0) + 1e-8)  # [B, K, D]
         # Encourage non-zero standard deviation to prevent static latents
         # Increased threshold to 5.0 and using squared penalty for a much stronger "push"
         activity_penalty = torch.mean(torch.pow(torch.relu(5.0 - temporal_std), 2))
@@ -640,10 +644,22 @@ class DiscoveryEngineModel(nn.Module):
     def get_mi_loss(self, z, mu):
         """
         Unsupervised alignment loss via Mutual Information Maximization (MINE).
+        Combined with a stronger linear correlation objective and linear reconstruction.
         z: [B, K, D], mu: [B, K, 2]
         """
         from common_losses import get_mi_loss as common_mi_loss
-        return common_mi_loss(z, mu, self.mi_discriminator)
+        from common_losses import get_correlation_loss as common_corr_loss
+        
+        mi_loss = common_mi_loss(z, mu, self.mi_discriminator)
+        corr_loss = common_corr_loss(z, mu)
+        
+        # NEW: Linear Alignment Loss (Soft CCA)
+        linear_loss = 0.0
+        for k in range(len(self.linear_aligner)):
+            mu_pred = self.linear_aligner[k](z[:, k, :])
+            linear_loss += torch.nn.functional.mse_loss(mu_pred, mu[:, k, :])
+        
+        return mi_loss + 2.0 * corr_loss + 5.0 * linear_loss
 
     def encode(self, x, edge_index, batch, tau=1.0, hard=False, prev_assignments=None, current_epoch=None, total_epochs=None):
         return self.encoder(x, edge_index, batch, tau=tau, hard=hard, prev_assignments=prev_assignments, current_epoch=current_epoch, total_epochs=total_epochs)

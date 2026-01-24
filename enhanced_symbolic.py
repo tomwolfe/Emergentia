@@ -6,6 +6,7 @@ exact constants without secondary local optimization.
 
 import numpy as np
 import torch
+import torch.nn as nn
 from gplearn.genetic import SymbolicRegressor
 from gplearn.functions import make_function
 from symbolic import SymbolicDistiller, FeatureTransformer, OptimizedExpressionProgram
@@ -109,30 +110,16 @@ class SymPyToTorch(torch.nn.Module):
         self.symbols = [sp.Symbol(f'x{i}') for i in range(n_inputs)]
         self.expr = sympy_expr
         
+        # NEW: Extract and register numeric constants as parameters
+        self.constants = nn.ParameterList()
+        self.const_map = {} # Maps SymPy Number to parameter index
+        
+        # Traverse expression to find all unique numbers
+        # We use a temporary modified expression where numbers are replaced by place-holders
+        self.param_expr = self._replace_numbers_with_params(sympy_expr)
+        
         # Mapping SymPy ops to Torch ops
-        # We use epsilons for stability and to prevent NaN gradients near singularities
-        self.eps = 1e-8
-        self.op_map = {
-            sp.Add: torch.add,
-            sp.Mul: torch.mul,
-            sp.Pow: self._safe_pow,
-            sp.exp: self._safe_exp,
-            sp.log: self._safe_log,
-            sp.sin: torch.sin,
-            sp.cos: torch.cos,
-            sp.tan: self._safe_tan,
-            sp.Abs: torch.abs,
-            sp.sqrt: lambda x: torch.sqrt(torch.abs(x) + self.eps),
-            # Add explicit support for potential remaining gplearn-style functions
-            sp.Function('sub'): torch.sub,
-            sp.Function('add'): torch.add,
-            sp.Function('mul'): torch.mul,
-            sp.Function('div'): self._safe_div,
-            sp.Function('neg'): torch.neg,
-            sp.Function('inv'): lambda x: 1.0 / (x + self.eps),
-            sp.Function('square'): lambda x: torch.pow(x, 2),
-            sp.Function('inv_square'): lambda x: 1.0 / (torch.pow(x, 2) + self.eps),
-        }
+        # ... (rest of init)
 
     def _safe_div(self, x, y):
         return x / (y + torch.sign(y + 1e-12) * self.eps)
@@ -170,12 +157,33 @@ class SymPyToTorch(torch.nn.Module):
         res = torch.tan(x)
         return torch.clamp(res, -1e4, 1e4)
 
+    def _replace_numbers_with_params(self, expr):
+        """Recursively replaces numbers in SymPy expr with parameter symbols."""
+        if expr.is_Number:
+            # Skip very small integers or indices that are likely not physical constants
+            val = float(expr)
+            if expr.is_Integer and abs(val) <= 1:
+                return expr
+            
+            # Register as parameter if not already done
+            const_name = f"c{len(self.constants)}"
+            self.constants.append(nn.Parameter(torch.tensor(val)))
+            param_sym = sp.Symbol(const_name)
+            self.const_map[param_sym] = len(self.constants) - 1
+            return param_sym
+        
+        if not expr.args:
+            return expr
+        
+        new_args = [self._replace_numbers_with_params(arg) for arg in expr.args]
+        return expr.func(*new_args)
+
     def forward(self, x_inputs):
         """
         x_inputs: [Batch, n_inputs] tensor
         """
         try:
-            res = self._recursive_eval(self.expr, x_inputs)
+            res = self._recursive_eval(self.param_expr, x_inputs)
             # Catch any remaining NaNs or Infs and clamp
             res = torch.nan_to_num(res, nan=0.0, posinf=1e6, neginf=-1e6)
             res = torch.clamp(res, -1e6, 1e6)
@@ -197,6 +205,10 @@ class SymPyToTorch(torch.nn.Module):
 
     def _recursive_eval(self, node, x_inputs):
         if node.is_Symbol:
+            # Check if it's a parameter symbol
+            if node in self.const_map:
+                return self.constants[self.const_map[node]]
+            
             # Extract index from 'xi'
             try:
                 idx = int(node.name[1:])
@@ -249,7 +261,8 @@ class TorchFeatureTransformer(torch.nn.Module):
         self.sim_type = getattr(transformer, 'sim_type', 'lj')
 
         # Register FULL buffers for normalization parameters
-        # We now store full buffers and apply masking in forward() to avoid shape mismatches
+        self.register_buffer('z_mean', torch.from_numpy(transformer.z_mean).float())
+        self.register_buffer('z_std', torch.from_numpy(transformer.z_std).float())
         self.register_buffer('x_poly_mean', torch.from_numpy(transformer.x_poly_mean).float())
         self.register_buffer('x_poly_std', torch.from_numpy(transformer.x_poly_std).float())
         self.register_buffer('target_mean', torch.tensor(transformer.target_mean).float())
@@ -280,11 +293,15 @@ class TorchFeatureTransformer(torch.nn.Module):
         # Safety clamp
         z_flat = torch.clamp(z_flat.to(torch.float32), -1e6, 1e6)
         batch_size = z_flat.size(0)
+        
+        # Center and normalize raw latents matching BalancedFeatureTransformer
+        z_flat_norm = (z_flat - self.z_mean) / self.z_std
+        
         z_nodes = z_flat.view(batch_size, self.n_super_nodes, self.latent_dim)
 
         features = []
         if self.include_raw_latents:
-            features.append(z_flat)
+            features.append(z_flat_norm)
 
         if self.include_dists and self.basis_functions != 'polynomial_only':
             # Compute distance features using the same logic as BalancedFeatureTransformer
@@ -300,11 +317,11 @@ class TorchFeatureTransformer(torch.nn.Module):
         if self.basis_functions == 'polynomial':
             X_expanded = self._polynomial_expansion(X)
         elif self.basis_functions == 'physics_informed':
-            X_expanded = self._physics_informed_expansion(X, z_flat)
+            X_expanded = self._physics_informed_expansion(X, z_flat_norm)
         elif self.basis_functions == 'adaptive':
-            X_expanded = self._adaptive_expansion(X, z_flat)
+            X_expanded = self._adaptive_expansion(X, z_flat_norm)
         else:
-            X_expanded = self._physics_informed_expansion(X, z_flat)
+            X_expanded = self._physics_informed_expansion(X, z_flat_norm)
 
         # Final safety clip and NaN handling
         X_expanded = torch.nan_to_num(X_expanded, nan=0.0, posinf=1e9, neginf=-1e9)
@@ -393,7 +410,7 @@ class TorchFeatureTransformer(torch.nn.Module):
 
         return torch.cat(features, dim=1)
 
-    def _physics_informed_expansion(self, X, z_flat):
+    def _physics_informed_expansion(self, X, z_flat_norm):
         """
         Perform physics-informed polynomial expansion with cross-terms.
         Matches BalancedFeatureTransformer logic.
@@ -405,7 +422,7 @@ class TorchFeatureTransformer(torch.nn.Module):
         features = [X]
 
         # 2. Squares and Transcendental of raw latents
-        X_raw = z_flat
+        X_raw = z_flat_norm
         features.append(X_raw**2)
         
         # Transcendental: Sin, Cos, Log, Exp
@@ -455,11 +472,11 @@ class TorchFeatureTransformer(torch.nn.Module):
 
         return X_expanded
 
-    def _adaptive_expansion(self, X, z_flat):
+    def _adaptive_expansion(self, X, z_flat_norm):
         """
         Adaptive expansion that learns the most relevant feature combinations.
         """
-        X_physics = self._physics_informed_expansion(X, z_flat)
+        X_physics = self._physics_informed_expansion(X, z_flat_norm)
         return X_physics
 
     def denormalize_y(self, Y_norm):
@@ -584,26 +601,28 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
 
         if linear_score > 0.9999:
             print(f"  -> Target_{i}: High linear fit (R2={linear_score:.3f}). Using linear model.")
+            
+            # Find the indices of selected features from the full_mask
+            selected_indices = np.where(full_mask)[0]
+
             class LinearProgram:
                 def __init__(self, model, feature_indices): 
                     self.model = model
                     self.length_ = 1
                     self.feature_indices = feature_indices
-                    # Create a string representation
+                    # Create a string representation using GLOBAL indices
                     terms = []
-                    # Lower threshold for terms to 1e-6
                     if abs(model.intercept_) > 1e-6:
                         terms.append(f"{model.intercept_:.6f}")
                     
                     coeffs = model.coef_
                     for idx, coef in enumerate(coeffs):
                         if abs(coef) > 1e-6:
-                            # Use local index (idx) instead of mapping back to original
-                            # This ensures consistency with GP and the sliced input matrix
-                            terms.append(f"mul({coef:.6f}, X{idx})")
+                            # Use global index from feature_indices
+                            global_idx = feature_indices[idx]
+                            terms.append(f"mul({coef:.6f}, X{global_idx})")
                     
                     if not terms:
-                        # If everything is extremely small, check if intercept is actually non-zero
                         self.expr_str = f"{model.intercept_:.6e}"
                     elif len(terms) == 1:
                         self.expr_str = terms[0]
@@ -614,13 +633,14 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
 
                 def execute(self, X):
                     if X.ndim == 1: X = X.reshape(1, -1)
+                    # If X is the full X_norm, we need to slice it using feature_indices
+                    if X.shape[1] > len(self.feature_indices):
+                        return self.model.predict(X[:, self.feature_indices])
                     return self.model.predict(X)
                 
                 def __str__(self):
                     return self.expr_str
             
-            # Find the indices of selected features from the full_mask
-            selected_indices = np.where(full_mask)[0]
             return LinearProgram(ridge, selected_indices), full_mask, linear_score
 
         parsimony_levels = [0.01, 0.05] # Reduced from [0.001, 0.01, 0.05, 0.1]
@@ -715,7 +735,9 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
 
         # Apply secondary optimization if enabled
         if self.secondary_optimization:
-            optimized_prog = self._optimize_constants(best_candidate['prog'], X_selected, y_target)
+            # We need to make sure _optimize_constants knows the global indices for remapping
+            selected_indices = np.where(full_mask)[0]
+            optimized_prog = self._optimize_constants(best_candidate['prog'], X_selected, y_target, global_indices=selected_indices)
             if optimized_prog:
                 # Evaluate the optimized program
                 try:
@@ -736,7 +758,7 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
 
         return best_candidate['prog'], full_mask, confidence
 
-    def _optimize_constants(self, program, X, y_true):
+    def _optimize_constants(self, program, X, y_true, global_indices=None):
         """
         Apply secondary optimization to refine constants in the symbolic expression.
         Uses SymPy tree traversal for robust constant identification.
@@ -772,54 +794,81 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
             # Filter constants that are likely parameters and not indices/small integers
             constants = sorted([float(a) for a in all_atoms if not a.is_Integer or abs(a) > 5])
             
-            if not constants:
+            if not constants and global_indices is None:
                 return program
             
-            # 3. Parametrize constants
-            const_vars = [sp.Symbol(f'c{i}') for i in range(len(constants))]
-            subs_map = {sp.Float(c): cv for c, cv in zip(constants, const_vars)}
-            param_expr = full_expr.subs(subs_map)
-            
-            # 4. Lambdify for optimization
-            f_lamb = sp.lambdify(const_vars + feat_vars, param_expr, modules=['numpy'])
-            
-            def eval_expr(const_vals):
-                try:
-                    y_pred = f_lamb(*const_vals, *[X[:, i] for i in range(n_features)])
-                    if np.any(np.isnan(y_pred)) or np.any(np.isinf(y_pred)):
+            if constants:
+                # 3. Parametrize constants
+                const_vars = [sp.Symbol(f'c{i}') for i in range(len(constants))]
+                subs_map = {sp.Float(c): cv for c, cv in zip(constants, const_vars)}
+                param_expr = full_expr.subs(subs_map)
+                
+                # 4. Lambdify for optimization
+                f_lamb = sp.lambdify(const_vars + feat_vars, param_expr, modules=['numpy'])
+                
+                def eval_expr(const_vals):
+                    try:
+                        y_pred = f_lamb(*const_vals, *[X[:, i] for i in range(n_features)])
+                        if np.any(np.isnan(y_pred)) or np.any(np.isinf(y_pred)):
+                            return float('inf')
+                        return mean_squared_error(y_true, y_pred)
+                    except:
                         return float('inf')
-                    return mean_squared_error(y_true, y_pred)
+                
+                # Perform optimization: Two-stage approach for robustness
+                # 1. Global search (Differential Evolution) - reduced iterations for speed
+                bounds = [(c - 2.0 * abs(c) - 0.5, c + 2.0 * abs(c) + 0.5) for c in constants]
+                try:
+                    res_de = differential_evolution(eval_expr, bounds, maxiter=10, popsize=5)
+                    initial_guess = res_de.x if res_de.success else constants
                 except:
-                    return float('inf')
-            
-            # Perform optimization
-            result = minimize(eval_expr, constants, method=self.opt_method, 
-                             options={'maxiter': self.opt_iterations})
-            
-            if result.success:
-                opt_consts = result.x
+                    initial_guess = constants
+
+                # 2. Local refinement (L-BFGS-B)
+                result = minimize(eval_expr, initial_guess, method=self.opt_method, 
+                                 options={'maxiter': self.opt_iterations})
                 
-                # Physics-Inspired Simplification
-                simplified_consts = opt_consts.copy()
-                for j in range(len(simplified_consts)):
-                    val = simplified_consts[j]
-                    for base in [1.0, 0.5, 0.25]:
-                        rounded = round(val / base) * base
-                        if abs(val - rounded) < 0.12:
-                            simplified_consts[j] = rounded
-                            break
-                
-                mse_opt = eval_expr(opt_consts)
-                mse_simple = eval_expr(simplified_consts)
-                final_consts = simplified_consts if mse_simple < 1.05 * mse_opt else opt_consts
-                
-                # Create final optimized expression
-                final_subs = {cv: sp.Float(val) for cv, val in zip(const_vars, final_consts)}
-                optimized_expr = param_expr.subs(final_subs)
-                
-                return OptimizedExpressionWrapper(str(optimized_expr), program)
+                if result.success:
+                    opt_consts = result.x
+                    
+                    # Physics-Inspired Simplification
+                    simplified_consts = opt_consts.copy()
+                    for j in range(len(simplified_consts)):
+                        val = simplified_consts[j]
+                        for base in [1.0, 0.5, 0.25]:
+                            rounded = round(val / base) * base
+                            if abs(val - rounded) < 0.12:
+                                simplified_consts[j] = rounded
+                                break
+                    
+                    mse_opt = eval_expr(opt_consts)
+                    mse_simple = eval_expr(simplified_consts)
+                    final_consts = simplified_consts if mse_simple < 1.05 * mse_opt else opt_consts
+                    
+                    # Create final optimized expression
+                    final_subs = {cv: sp.Float(val) for cv, val in zip(const_vars, final_consts)}
+                    optimized_expr = param_expr.subs(final_subs)
+                else:
+                    optimized_expr = full_expr
             else:
-                return program
+                optimized_expr = full_expr
+                
+            # REMAP local indices (X0, X1...) to global indices
+            if global_indices is not None:
+                # Replace x0 with x{global_indices[0]}, etc.
+                # Use a temporary mapping to avoid collisions
+                remap_subs = {}
+                for idx in range(len(global_indices)):
+                    remap_subs[sp.Symbol(f'x{idx}')] = sp.Symbol(f'x{global_indices[idx]}')
+                
+                final_remapped_expr = optimized_expr.subs(remap_subs)
+                return OptimizedExpressionWrapper(str(final_remapped_expr), program)
+            
+            return OptimizedExpressionWrapper(str(optimized_expr), program)
+                
+        except Exception as e:
+            print(f"  -> Secondary optimization failed: {e}")
+            return program
                 
         except Exception as e:
             print(f"  -> Secondary optimization failed: {e}")
@@ -934,7 +983,7 @@ class EnsembleSymbolicDistiller(EnhancedSymbolicDistiller):
         self.ensemble_size = ensemble_size
         self.consensus_threshold = consensus_threshold
 
-    def distill(self, latent_states, targets, n_super_nodes, latent_dim, box_size=None, sim_type=None, enforce_separable=True):
+    def distill(self, latent_states, targets, n_super_nodes, latent_dim, box_size=None, sim_type=None, enforce_separable=True, hamiltonian=False):
         """
         Run ensemble distillation across multiple targets in parallel.
         """
@@ -942,7 +991,8 @@ class EnsembleSymbolicDistiller(EnhancedSymbolicDistiller):
         self.transformer = BalancedFeatureTransformer(n_super_nodes, latent_dim, box_size=box_size, 
                                                      basis_functions='physics_informed', 
                                                      include_raw_latents=True, sim_type=sim_type,
-                                                     feature_selection_method='bic') # Use new BIC method
+                                                     feature_selection_method='bic',
+                                                     hamiltonian=hamiltonian) # Use new BIC method
         self.transformer.fit(latent_states, targets)
 
         X_poly = self.transformer.transform(latent_states)

@@ -11,6 +11,7 @@ from simulator import SpringMassSimulator, LennardJonesSimulator
 from model import DiscoveryEngineModel
 from engine import Trainer, prepare_data, analyze_latent_space
 from symbolic import extract_latent_data, SymbolicDistiller
+from symbolic_proxy import SymbolicProxy
 from hamiltonian_symbolic import HamiltonianSymbolicDistiller
 from train_utils import ImprovedEarlyStopping, robust_energy, get_device
 from stable_pooling import SparsityScheduler
@@ -246,9 +247,12 @@ def main():
     corrs = analyze_latent_space(model, sample_dataset, sample_pos, device=device)
     
     print("\nLatent-Physical Correlation Matrix (max correlation per super-node):")
+    max_corrs = []
     for k in range(args.super_nodes):
         max_corr = np.max(corrs[k])
+        max_corrs.append(max_corr)
         print(f"  Super-node {k}: {max_corr:.4f}")
+    mean_max_corr = np.mean(max_corrs)
 
     # 2. Calculate Flicker Rate (mean change in assignments S)
     print("\nCalculating Flicker Rate...")
@@ -272,11 +276,11 @@ def main():
     from symmetry_checks import NoetherChecker
     
     # --- SELF-CORRECTION LOOP ---
-    # OPTIMIZATION: Reduce retries and ensemble size for quick/short runs
+    # ADAPTIVE RESOURCES: Use more resources for the final attempt
     is_quick = args.quick_symbolic or args.epochs < 50
-    MAX_RETRIES = 0 if is_quick else 1
-    pop_size = 500 if is_quick else min(args.pop, 2000)
-    gen_size = 5 if is_quick else min(args.gen, 20)
+    MAX_RETRIES = 1 if is_quick else 2
+    pop_size = 2000 if is_quick else max(args.pop, 5000)
+    gen_size = 15 if is_quick else max(args.gen, 30)
     ensemble_size = 2 if is_quick else 3
     
     bench_report = {}
@@ -286,6 +290,31 @@ def main():
         # Adjust parsimony based on attempt
         parsimony = 0.01 if attempt == 0 else (0.05 if attempt == 1 else 0.1)
         
+        # If we are struggling, increase search resources
+        if attempt == MAX_RETRIES and not is_quick:
+            pop_size = 10000
+            gen_size = 50
+            print(f"  [Self-Correction] Final attempt: Escalating to Pop={pop_size}, Gen={gen_size}")
+
+        # NEW: If first attempt failed badly, try to retrain the GNN for a few epochs
+        if attempt > 0 and bench_report.get('symbolic_r2_ood', 0) < 0.5:
+            print(f"  [Self-Correction] Discovery failed (R2={bench_report.get('symbolic_r2_ood', 0):.4f}). Retraining GNN...")
+            trainer.model.train()
+            # Temporary aggressive training
+            for extra_epoch in range(20):
+                indices = np.random.randint(0, len(pre_batched_windows_raw), size=args.traj_batch_size)
+                sampled_data = []
+                for i in indices: sampled_data.extend(pre_batched_windows_raw[i])
+                batch_data = Batch.from_data_list(sampled_data).to(device)
+                batch_data.seq_len = args.batch_size
+                trainer.train_step(batch_data, sim.dt, epoch=args.epochs + extra_epoch, max_epochs=args.epochs + 20)
+            
+            # Re-extract data
+            z_states, derivs_all, t_states = extract_latent_data(model, dataset, sim.dt, include_hamiltonian=args.hamiltonian)
+            h_targets = derivs_all
+            if not args.hamiltonian: dz_states = derivs_all
+            else: _, dz_states, _ = extract_latent_data(model, dataset, sim.dt, include_hamiltonian=False)
+
         distiller = EnsembleSymbolicDistiller(
             populations=pop_size, 
             generations=gen_size,
@@ -295,7 +324,7 @@ def main():
             parsimony=parsimony
         )
         
-        equations = distiller.distill(z_states, h_targets, args.super_nodes, args.latent_dim, sim_type=args.sim)
+        equations = distiller.distill(z_states, h_targets, args.super_nodes, args.latent_dim, sim_type=args.sim, hamiltonian=args.hamiltonian)
         
         print("\nDiscovered Equations:")
         for i, eq in enumerate(equations):
@@ -307,17 +336,27 @@ def main():
         symbolic_r2s = []
         X_poly = distiller.transformer.transform(z_states)
         X_norm = distiller.transformer.normalize_x(X_poly)
-        Y_norm_true = distiller.transformer.normalize_y(dz_states)
         
-        for i, eq in enumerate(equations):
-            if eq is not None:
-                y_pred = eq.execute(X_norm)
-                y_true = Y_norm_true[:, i]
-                r2 = 1 - np.sum((y_true - y_pred)**2) / (np.sum((y_true - np.mean(y_true))**2) + 1e-9)
-                symbolic_r2s.append(r2)
-                print(f"  Equation {i} R2: {r2:.4f}")
-            else:
-                symbolic_r2s.append(0.0)
+        # Create a temporary proxy for R2 calculation
+        temp_proxy = SymbolicProxy(
+            args.super_nodes, args.latent_dim, equations, distiller.transformer, 
+            hamiltonian=args.hamiltonian
+        ).to(device)
+        
+        with torch.no_grad():
+            z_torch = torch.tensor(z_states, dtype=torch.float32, device=device)
+            # Proxy returns dz/dt
+            dz_pred_torch = temp_proxy(0, z_torch)
+            dz_pred = dz_pred_torch.cpu().numpy()
+            
+        # We compare dz_pred with dz_states
+        for i in range(dz_states.shape[1]):
+            y_true = dz_states[:, i]
+            y_pred = dz_pred[:, i]
+            r2 = 1 - np.sum((y_true - y_pred)**2) / (np.sum((y_true - np.mean(y_true))**2) + 1e-9)
+            symbolic_r2s.append(r2)
+            if i < 5 or i == dz_states.shape[1] - 1: # Print some
+                print(f"  Component {i} R2: {r2:.4f}")
 
         # 5. Symbolic Parsimony Score
         def get_complexity(expr):
@@ -338,7 +377,7 @@ def main():
         # 6. Run Autonomous Physics Benchmark & Symmetry Checks
         try:
             from physics_benchmark import run_benchmark
-            bench_report = run_benchmark(model, equations, symbolic_r2s, distiller.transformer)
+            bench_report = run_benchmark(model, equations, symbolic_r2s, distiller.transformer, stats=stats)
             
             # Add Symmetry Checks
             n_checker = NoetherChecker(trainer.symbolic_proxy, args.latent_dim)
@@ -367,11 +406,18 @@ def main():
     # 5.5 STAGE 3: Neural-Symbolic Consistency Training (Closed-Loop)
     if trainer.symbolic_proxy is not None:
         print("\n--- Starting Stage 3: Neural-Symbolic Consistency Training ---")
-        # OPTIMIZATION: Scale stage 3 epochs
-        stage3_epochs = 15 if is_quick else 30 
+        # ADAPTIVE AGGRESSION: Increase epochs and weight if correlation is low
+        stage3_base = 15 if is_quick else 30
+        stage3_epochs = stage3_base
+        if mean_max_corr < 0.9:
+            stage3_epochs = int(stage3_base * 2)
+            print(f"  [Adaptive] Low correlation ({mean_max_corr:.4f}). Doubling Stage 3 epochs to {stage3_epochs}.")
+        
         trainer.model.train()
         # Increase symbolic weight to force alignment
-        trainer.symbolic_weight = 50.0 # Aggressive alignment
+        trainer.symbolic_weight = 50.0 if mean_max_corr >= 0.9 else 150.0 # Much more aggressive if low corr
+        if mean_max_corr < 0.9:
+            print(f"  [Adaptive] Setting symbolic_weight to {trainer.symbolic_weight} for stronger alignment.")
         
         # Unfreeze encoder and symbolic proxy for joint optimization
         for p in trainer.model.encoder.parameters(): p.requires_grad = True

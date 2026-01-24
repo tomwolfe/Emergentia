@@ -248,6 +248,10 @@ class Trainer:
                        if id(p) not in h_ids and id(p) not in assign_ids 
                        and id(p) not in output_ids and id(p) != id(self.model.log_vars)]
 
+        # Include symbolic proxy parameters if available
+        if self.symbolic_proxy is not None:
+            other_params.extend(list(self.symbolic_proxy.parameters()))
+
         param_groups = [
             {'params': other_params, 'weight_decay': 1e-5},
             {'params': [self.log_align_scale], 'lr': 1e-3},
@@ -272,12 +276,18 @@ class Trainer:
                 self.model.encoder.n_super_nodes,
                 self.model.encoder.latent_dim,
                 symbolic_proxy_or_equations,
-                transformer
+                transformer,
+                hamiltonian=self.model.hamiltonian
             ).to(proxy_device)
 
         self.symbolic_weight = weight
         self.symbolic_confidence = confidence
         print(f"Symbolic proxy updated. Weight: {weight}, Confidence: {confidence:.3f} on {proxy_device}")
+        
+        # NEW: Re-initialize optimizer to include symbolic proxy parameters
+        param_groups = self._prepare_param_groups(self.optimizer.param_groups[0]['lr'])
+        # Preserve original learning rates if possible, but recreating is safer
+        self.optimizer = optim.Adam(param_groups, lr=self.optimizer.param_groups[0]['lr'])
         
     def _get_schedules(self, epoch, max_epochs):
         progress = epoch / max_epochs

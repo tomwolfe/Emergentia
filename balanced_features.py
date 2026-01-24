@@ -175,7 +175,7 @@ class BalancedFeatureTransformer:
     
     def __init__(self, n_super_nodes, latent_dim, include_dists=True, box_size=None, 
                  basis_functions='physics_informed', max_degree=2, feature_selection_method='recursive',
-                 include_raw_latents=False, sim_type=None):
+                 include_raw_latents=False, sim_type=None, hamiltonian=False):
         """
         Initialize the balanced feature transformer.
 
@@ -189,6 +189,7 @@ class BalancedFeatureTransformer:
             feature_selection_method (str): Method for feature selection ('recursive', 'mutual_info', 'f_test', 'lasso')
             include_raw_latents (bool): Whether to include raw linear latents (often leads to trivial H=z0)
             sim_type (str): Type of simulation ('spring', 'lj', etc.)
+            hamiltonian (bool): Whether this is for a Hamiltonian system
         """
         self.n_super_nodes = n_super_nodes
         self.latent_dim = latent_dim
@@ -199,6 +200,7 @@ class BalancedFeatureTransformer:
         self.feature_selection_method = feature_selection_method
         self.include_raw_latents = include_raw_latents
         self.sim_type = sim_type
+        self.hamiltonian = hamiltonian
         
         # Normalization parameters
         self.z_mean = None
@@ -532,29 +534,39 @@ class BalancedFeatureTransformer:
             y_selection = y[:, 0] if y.ndim > 1 else y
             lasso.fit(X, y_selection)
             self.selected_feature_indices = np.where(np.abs(lasso.coef_) > 1e-5)[0]
+        # Fallback to mutual info
         else:
-            # Fallback to mutual info
             max_f = min(200, n_features)
             selector = SelectKBest(score_func=f_regression, k=max_f)
             y_selection = y[:, 0] if y.ndim > 1 else y
             selector.fit(X, y_selection)
             self.selected_feature_indices = selector.get_support(indices=True)
 
-        # For LJ system, explicitly ensure 1/r^6 and 1/r^12 features are included if they exist
-        # Find indices of LJ features if they exist in the feature matrix
-        # This is a heuristic approach - we look for features that match the pattern of LJ terms
-        if hasattr(self, 'x_poly_mean') and hasattr(self, 'x_poly_std'):
-            # Look for features that represent 1/r^6 and 1/r^12 terms
-            # This is approximate - we'll check for features that have high values when d is small
-            # and low values when d is large
-
-            # For now, we'll just ensure that if we have distance-based features,
-            # we prioritize keeping the LJ terms if they were computed
-            # This requires knowing which columns correspond to which features
-            # Since this is complex, we'll add a manual override for LJ systems
-            if hasattr(self, 'basis_functions') and self.basis_functions == 'physics_informed':
-                # If we know this is for an LJ system, we can try to identify and prioritize LJ features
-                pass  # The duplication approach above should be sufficient
+        # HAMILTONIAN PRIORITIZATION: Ensure p^2 and key potential terms are included
+        if self.hamiltonian:
+            # Find indices of p^2 terms (p0^2_sum, p1^2_sum...)
+            p_sq_indices = [i for i, name in enumerate(self.feature_names) if 'p' in name and '2_sum' in name]
+            
+            # Find indices of important distance terms (sum_inv_d6, sum_inv_d12 for LJ)
+            dist_indices = []
+            if self.sim_type == 'lj':
+                dist_indices = [i for i, name in enumerate(self.feature_names) if 'sum_inv_d6' in name or 'sum_inv_d12' in name]
+            elif self.sim_type == 'spring':
+                dist_indices = [i for i, name in enumerate(self.feature_names) if 'sum_inv_d2' in name or 'sum_d' in name]
+            
+            important_indices = set(p_sq_indices + dist_indices)
+            if important_indices:
+                # Add them to selected indices if not already there
+                current_selected = set(self.selected_feature_indices)
+                updated_selected = sorted(list(current_selected.union(important_indices)))
+                # If too many, remove some from the original selection (not the important ones)
+                if len(updated_selected) > 40:
+                    # Keep all important ones, and take the rest from original
+                    non_important_original = [i for i in self.selected_feature_indices if i not in important_indices]
+                    to_keep = 40 - len(important_indices)
+                    updated_selected = sorted(list(important_indices) + non_important_original[:to_keep])
+                
+                self.selected_feature_indices = np.array(updated_selected)
 
         self.n_selected_features = len(self.selected_feature_indices)
 
