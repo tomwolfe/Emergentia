@@ -424,6 +424,30 @@ class SymbolicProxy(torch.nn.Module):
 
         return Y_pred.to(torch.float32)  # Ensure output is float32 for MPS stability
 
+class ReconstructionLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, loss_rec, loss_cons):
+        return loss_rec + loss_cons
+
+class StructuralLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, loss_assign, loss_ortho, loss_conn, loss_pruning, loss_sparsity, loss_sep):
+        return loss_assign + loss_ortho + loss_conn + loss_pruning + loss_sparsity + loss_sep
+
+class PhysicalityLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, loss_align, loss_mi, loss_anchor, loss_curv, loss_activity, loss_l2, loss_lvr, loss_hinge, loss_smooth):
+        return loss_align + loss_mi + loss_anchor + loss_curv + loss_activity + loss_l2 + loss_lvr + loss_hinge + loss_smooth
+
+class SymbolicConsistencyLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, loss_sym, stage2_factor, symbolic_weight):
+        return loss_sym * stage2_factor * max(1.0, symbolic_weight)
+
 class Trainer:
     def __init__(self, model, lr=5e-4, device='cpu', stats=None, align_anneal_epochs=1000,
                  warmup_epochs=20, max_epochs=1000, sparsity_scheduler=None, hard_assignment_start=0.7,
@@ -445,6 +469,12 @@ class Trainer:
         self.consistency_weight = consistency_weight
         self.spatial_weight = spatial_weight
         self.use_pcgrad = use_pcgrad
+
+        # Initialize consolidated loss modules
+        self.recon_loss_fn = ReconstructionLoss()
+        self.struct_loss_fn = StructuralLoss()
+        self.phys_loss_fn = PhysicalityLoss()
+        self.sym_cons_loss_fn = SymbolicConsistencyLoss()
 
         # Learnable log-scaling for alignment to ensure it stays positive and stable
         # Initialize to a value that brings the initial alignment loss below 1.0
@@ -514,14 +544,15 @@ class Trainer:
         self.criterion = torch.nn.MSELoss().to(device)
         self.stats = stats
 
-        # Logical groupings for PCGrad/GradNorm
+        # Logical groupings for PCGrad/GradNorm (Consolidated to 4 Meta-Groups)
         self.loss_groups = {
-            'Reconstruction': ['rec', 'cons', 'assign', 'ortho', 'conn'],
-            'Physicality': ['align', 'mi', 'sym', 'var', 'curv', 'anchor', 'hinge', 'smooth', 'activity'],
-            'Sparsity': ['pruning', 'sparsity', 'sep', 'l2', 'lvr']
+            'ReconstructionLoss': ['rec', 'cons'],
+            'StructuralLoss': ['assign', 'ortho', 'conn', 'pruning', 'sparsity', 'sep'],
+            'PhysicalityLoss': ['align', 'mi', 'anchor', 'curv', 'activity', 'l2', 'lvr', 'hinge', 'smooth'],
+            'SymbolicConsistencyLoss': ['sym']
         }
         
-        # Initialize GradNorm Balancer
+        # Initialize GradNorm Balancer for the 4 meta-groups
         self.grad_norm_balancer = GradNormBalancer(n_tasks=len(self.loss_groups), device=device)
         self.gn_optimizer = optim.Adam(self.grad_norm_balancer.parameters(), lr=1e-2)
 
@@ -1104,34 +1135,30 @@ class Trainer:
         discovery_loss += (weights['sym'] * (self.symbolic_weight - 1.0) * torch.clamp(loss_sym.to(torch.float32), 0, 100) * stage2_factor)
         discovery_loss += 1e-4 * torch.clamp(loss_curv.to(torch.float32), 0, 100)
 
-        # GRAD_NORM / PCGRAD / GROUPED LOSSES
+        # GRAD_NORM / PCGRAD / GROUPED LOSSES (Consolidated Meta-Losses)
         head_losses_dict = {
-            'Reconstruction': torch.tensor(0.0, device=self.device),
-            'Physicality': torch.tensor(0.0, device=self.device),
-            'Sparsity': torch.tensor(0.0, device=self.device)
+            'ReconstructionLoss': self.recon_loss_fn(loss_rec * weights['rec'], loss_cons * weights['cons']),
+            'StructuralLoss': self.struct_loss_fn(
+                loss_assign * weights['assign'], loss_ortho * weights['ortho'], 
+                loss_conn * weights['conn'], loss_pruning * weights['pruning'], 
+                loss_sparsity * weights['sparsity'], loss_sep * weights['sep']
+            ),
+            'PhysicalityLoss': self.phys_loss_fn(
+                loss_align * weights['align'], loss_mi * weights['mi'], 
+                loss_anchor * weights['anchor'], loss_curv * weights['curv'], 
+                raw_losses.get('activity', torch.tensor(0.0, device=self.device)) * weights.get('activity', 1.0),
+                loss_l2 * weights['l2'], loss_lvr * weights['lvr'], 
+                loss_hinge * weights['hinge'], loss_smooth * weights['smooth']
+            ),
+            'SymbolicConsistencyLoss': self.sym_cons_loss_fn(loss_sym * weights['sym'], stage2_factor, self.symbolic_weight)
         }
 
-        # Map each raw loss to its corresponding head
-        for i, k in enumerate(base_keys):
-            target_head = None
-            for head, members in self.loss_groups.items():
-                if k in members:
-                    target_head = head
-                    break
-            
-            if target_head is None: target_head = 'Physicality'
-
-            term = weights[k] * torch.clamp(raw_losses[k], 0, 100)
-            if use_log_vars and i < len(lvars):
-                term = term * torch.exp(-lvars[i]) + lvars[i]
-            
-            head_losses_dict[target_head] = head_losses_dict[target_head] + term
-
-        # Add extra terms to Physicality
-        head_losses_dict['Physicality'] = head_losses_dict['Physicality'] + (weights['sym'] * (self.symbolic_weight - 1.0) * torch.clamp(loss_sym.to(torch.float32), 0, 100) * stage2_factor)
-        head_losses_dict['Physicality'] = head_losses_dict['Physicality'] + 1e-4 * torch.clamp(loss_curv.to(torch.float32), 0, 100)
-        if 'activity' in raw_losses:
-            head_losses_dict['Physicality'] = head_losses_dict['Physicality'] + raw_losses['activity']
+        # Apply Uncertainty Weighting to Meta-Losses if enabled
+        if use_log_vars:
+            for i, (name, h_loss) in enumerate(head_losses_dict.items()):
+                # We use the first 4 log_vars for the meta-groups
+                if i < 4:
+                    head_losses_dict[name] = h_loss * torch.exp(-lvars[i]) + lvars[i]
 
         # Determine if we should use GradNorm or PCGrad
         do_grad_norm = (epoch > self.warmup_epochs) and not is_stage1
@@ -1140,7 +1167,8 @@ class Trainer:
         if do_grad_norm:
             # 1. Get task weights from GradNorm balancer
             gn_weights = self.grad_norm_balancer.get_weights()
-            head_losses_list = [head_losses_dict[h] for h in ['Reconstruction', 'Physicality', 'Sparsity']]
+            head_names = ['ReconstructionLoss', 'StructuralLoss', 'PhysicalityLoss', 'SymbolicConsistencyLoss']
+            head_losses_list = [head_losses_dict[h] for h in head_names]
             
             # 2. Compute total loss with GradNorm weights
             loss = torch.tensor(0.0, device=self.device)
@@ -1154,7 +1182,6 @@ class Trainer:
                 loss.backward(retain_graph=True)
                 
             # 4. Update GradNorm weights
-            # Use shared parameters for GradNorm (GNN Encoder is a good choice)
             shared_params = list(self.model.encoder.parameters())
             self.grad_norm_balancer.update(head_losses_list, shared_params, self.gn_optimizer)
             self.gn_optimizer.step()

@@ -225,17 +225,14 @@ class BalancedFeatureTransformer:
             if dist_features:
                 features.extend(dist_features)
                 if fit_transformer:
-                    if self.sim_type == 'lj':
-                        for n in [1, 2, 4]:
-                            base_names.append(f"sum_inv_d{n}")
-                    else:
-                        base_names.append("sum_d")
-                        base_names.append("sum_inv_d")
-                        for n in [2, 3, 4, 6, 8, 10, 12]:
-                            base_names.append(f"sum_inv_d{n}")
-                        base_names.append("sum_exp_d")
-                        base_names.append("sum_yukawa_d")
-                        base_names.append("sum_log_d")
+                    base_names.append("sum_d")
+                    base_names.append("sum_inv_d")
+                    # Expanded spectrum of power laws for unbiased discovery
+                    for n in [2, 3, 4, 5, 6, 8, 10, 12, 14]:
+                        base_names.append(f"sum_inv_d{n}")
+                    base_names.append("sum_exp_d")
+                    base_names.append("sum_yukawa_d")
+                    base_names.append("sum_log_d")
 
         X = np.hstack(features)
         # Final safety clip before expansion
@@ -293,25 +290,20 @@ class BalancedFeatureTransformer:
         # We compute the features for EACH pair and then SUM them across the pair dimension (axis 1)
         # This creates "Global Symmetric Features"
         
-        if self.sim_type == 'lj':
-            # For LJ, only include basic power laws to force discovery of higher powers
-            for n in [1, 2, 4]:
-                aggregated_features.append((1.0 / (d**n + 0.001)).sum(axis=1, keepdims=True))
-        else:
-            # 1. Basic distance and inverse distance
-            aggregated_features.append(d.sum(axis=1, keepdims=True))
-            aggregated_features.append((1.0 / (d + 0.1)).sum(axis=1, keepdims=True))
-            
-            # 2. Spectrum of power laws: 1/r^n
-            for n in [2, 3, 4, 6, 8, 10, 12]:
-                aggregated_features.append((1.0 / (d**n + 0.1)).sum(axis=1, keepdims=True))
-            
-            # 3. Short-range interaction terms (Exponential/Yukawa-like)
-            aggregated_features.append(np.exp(-d).sum(axis=1, keepdims=True))
-            aggregated_features.append((np.exp(-d) / (d + 0.1)).sum(axis=1, keepdims=True))
-            
-            # 4. Logarithmic interactions (2D gravity/electrostatics)
-            aggregated_features.append(np.log(d + 0.1).sum(axis=1, keepdims=True))
+        # 1. Basic distance and inverse distance
+        aggregated_features.append(d.sum(axis=1, keepdims=True))
+        aggregated_features.append((1.0 / (d + 0.001)).sum(axis=1, keepdims=True))
+        
+        # 2. Spectrum of power laws: 1/r^n (unbiased)
+        for n in [2, 3, 4, 5, 6, 8, 10, 12, 14]:
+            aggregated_features.append((1.0 / (d**n + 0.001)).sum(axis=1, keepdims=True))
+        
+        # 3. Short-range interaction terms (Exponential/Yukawa-like)
+        aggregated_features.append(np.exp(-d).sum(axis=1, keepdims=True))
+        aggregated_features.append((np.exp(-d) / (d + 0.001)).sum(axis=1, keepdims=True))
+        
+        # 4. Logarithmic interactions (2D gravity/electrostatics)
+        aggregated_features.append(np.log(d + 0.001).sum(axis=1, keepdims=True))
 
         return aggregated_features
 
@@ -514,12 +506,12 @@ class BalancedFeatureTransformer:
             # Initialize sum jacobians
             jd_sum = np.zeros(n_latents)
             j_inv_d_sum = np.zeros(n_latents)
-            j_pow_sums = {n: np.zeros(n_latents) for n in [2, 3, 4, 6, 8, 10, 12]}
+            j_pow_sums = {n: np.zeros(n_latents) for n in [2, 3, 4, 5, 6, 8, 10, 12, 14]}
             j_exp_sum = np.zeros(n_latents)
             j_yukawa_sum = np.zeros(n_latents)
             j_log_sum = np.zeros(n_latents)
 
-            softening = 0.001 if self.sim_type == 'lj' else 0.1
+            softening = 0.001
 
             for i, j in zip(i_idx, j_idx):
                 diff = z_nodes[i, :2] - z_nodes[j, :2]
@@ -538,28 +530,21 @@ class BalancedFeatureTransformer:
                 jd_sum += jd_pair
                 j_inv_d_sum += -1.0 / (d + softening)**2 * jd_pair
                 
-                for n in [2, 3, 4, 6, 8, 10, 12]:
+                for n in [2, 3, 4, 5, 6, 8, 10, 12, 14]:
                     j_pow_sums[n] += -n * d**(n-1) / (d**n + softening)**2 * jd_pair
                     
                 j_exp_sum += -np.exp(-d) * jd_pair
                 j_yukawa_sum += ((-np.exp(-d)*(d + softening) - np.exp(-d)) / (d + softening)**2 * jd_pair)
                 j_log_sum += 1.0 / (d + softening) * jd_pair
 
-            # Add aggregated jacobians to list based on sim_type
-            if self.sim_type == 'lj':
-                for n in [1, 2, 4]:
-                    if n == 1:
-                        jac_list.append(j_inv_d_sum.reshape(1, -1))
-                    else:
-                        jac_list.append(j_pow_sums[n].reshape(1, -1))
-            else:
-                jac_list.append(jd_sum.reshape(1, -1))
-                jac_list.append(j_inv_d_sum.reshape(1, -1))
-                for n in [2, 3, 4, 6, 8, 10, 12]:
-                    jac_list.append(j_pow_sums[n].reshape(1, -1))
-                jac_list.append(j_exp_sum.reshape(1, -1))
-                jac_list.append(j_yukawa_sum.reshape(1, -1))
-                jac_list.append(j_log_sum.reshape(1, -1))
+            # Add aggregated jacobians to list
+            jac_list.append(jd_sum.reshape(1, -1))
+            jac_list.append(j_inv_d_sum.reshape(1, -1))
+            for n in [2, 3, 4, 5, 6, 8, 10, 12, 14]:
+                jac_list.append(j_pow_sums[n].reshape(1, -1))
+            jac_list.append(j_exp_sum.reshape(1, -1))
+            jac_list.append(j_yukawa_sum.reshape(1, -1))
+            jac_list.append(j_log_sum.reshape(1, -1))
 
         X_base_jac = np.vstack(jac_list)
         

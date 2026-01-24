@@ -566,6 +566,23 @@ def main():
             symp_drift = 1.0
             eng_drift = 1.0
 
+    # NEW: Run Autonomous Physics Benchmark
+    try:
+        from physics_benchmark import run_benchmark
+        # equations, distiller, model, trainer, dataset are available in locals()
+        r2_scores = symbolic_r2s # calculated above
+        bench_report = run_benchmark(model, equations, r2_scores, distiller.transformer)
+        
+        # Merge benchmark into health_check for discovery_report.json
+        health_check.update({
+            "OOD R2": bench_report['symbolic_r2_ood'],
+            "Energy Drift": bench_report['energy_conservation_error'],
+            "Forecast Horizon": bench_report['forecast_horizon'],
+            "Mass Consistency": bench_report['mass_consistency']
+        })
+    except Exception as e:
+        print(f"Benchmark failed: {e}")
+
     # NEW: discovery_report.json as requested
     def make_serializable(obj):
         if isinstance(obj, dict):

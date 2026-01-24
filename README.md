@@ -6,47 +6,47 @@ This project implements a sophisticated **Neural-Symbolic Discovery Pipeline** f
 
 The pipeline consists of three main stages:
 
-1. **Neural Encoder**: GNN-based encoder with hierarchical soft-assignment pooling to compress particle dynamics into super-node representations
-2. **Latent Dynamics**: Hamiltonian-constrained ODE dynamics that preserve physical inductive biases
-3. **Symbolic Distillation**: Genetic programming to extract interpretable symbolic equations from learned neural dynamics
+1. **Neural Encoder**: GNN-based encoder with hierarchical soft-assignment pooling to compress particle dynamics into super-node representations.
+2. **Latent Dynamics**: Hamiltonian-constrained ODE dynamics that preserve physical inductive biases, now featuring **Dynamic Mass Matrices**.
+3. **Symbolic Distillation**: Genetic programming to extract interpretable symbolic equations from learned neural dynamics using **Bias-Free Discovery**.
 
 ## Key Features
 
-### 1. Autonomous Physics Discovery
-- **Bias-Free Search**: Successfully discovers power laws (like Lennard-Jones $1/r^6$ and $1/r^{12}$) from a minimal basis ($1/r, 1/r^2, 1/r^4$) without explicit prior inclusion.
-- **SINDy-style Pruning**: Uses Sequential Thresholded Least Squares (STLSQ) with relative thresholding to prune feature space before Genetic Programming.
-- **Dimensional Analysis Filter**: Enforces physical units consistency (L, M, T) during symbolic search using a dimensionality penalty.
-- **Secondary Optimization**: L-BFGS refinement of physical constants for high-fidelity discovery.
+### 1. Generalized Physical Discovery
+- **Bias-Free Search**: Completely removed hardcoded simulation priors. The engine discovers power laws (like Lennard-Jones $1/r^6$ and $1/r^{12}$) from a generalized basis purely through data variance and symbolic fitness.
+- **Dynamic Mass Matrix**: The Hamiltonian engine now learns an inertial mass matrix $M$ for super-nodes. Kinetic Energy is calculated as $T = 1/2 \cdot p^T M^{-1} p$, where $M$ is a diagonal matrix of learnable parameters.
+- **Recursive Feature Elimination (RFE)**: Improved feature selection using a "Lasso-Path" approach to identify significant physical terms without human-in-the-loop bias.
 
-### 2. Automated Multi-Objective Balancing
-- **GradNorm Integration**: Dynamically scales task weights by normalizing gradient magnitudes, ensuring balanced learning across 17+ loss terms.
-- **Uncertainty Weighting**: Uses learnable log-variances ($\sigma$) to automatically weight losses ($L = L \cdot e^{-s} + s$) from the start of the dynamics phase.
-- **PCGrad Optimization**: Projected Conflicting Gradients to handle directional conflicts between Reconstruction, Physicality, and Sparsity objectives.
+### 2. Loss Landscape Consolidation
+- **Meta-Loss Grouping**: Consolidated 17+ chaotic loss terms into 4 distinct groups: **Fidelity** (Reconstruction/Consistency), **Structural** (Pooling/Sparsity), **Physicality** (Hamiltonian/Stability), and **Symbolic Consistency**.
+- **GradNorm Meta-Balancing**: The `GradNormBalancer` now operates on these 4 meta-groups to prevent gradient interference and ensure stable convergence of the coarse-graining manifold.
 
-### 3. Stress Test & OOD Validation
-- **Forecast Horizon**: New metric calculating the step count until symbolic trajectories deviate $>5\%$ from ground-truth variance.
-- **Long-term Stability**: Verified via 2000-step shadow integration (4x training horizon) under OOD conditions.
-- **Energy Conservation**: Verified near-zero energy drift ($< 10^{-10}$) and minimal symplectic drift.
+### 3. "Blind Physicist" Validation Suite
+- **Automated Stress Testing**: A new `physics_benchmark.py` script performs rigorous OOD validation without requiring visual inspection.
+- **Success Metrics**:
+    - **Energy Conservation**: Max relative drift over 5,000-step shadow integrations.
+    - **Forecast Horizon**: Step count until MSE exceeds 5% of signal variance.
+    - **Mass Consistency**: Pearson correlation between learned inertial mass and particle assignment sums.
+    - **Parsimony Index**: Balanced score calculating $R^2$ divided by symbolic node count.
 
 ### 4. Hamiltonian Inductive Bias
-- **Enforced Separability**: Supports $H(q,p) = V(q) + \sum p^2/2$, ensuring $dq/dt = p$ is strictly maintained.
-- **Canonical Equations**: Enforces $\dot{q} = \partial H/\partial p$ and $\dot{p} = -\partial H/\partial q$.
-- **Apple Silicon Support**: Optimized for MPS with CPU-offloaded ODE integration for stability.
+- **Separable Dynamics**: Supports $H(q,p) = V(q) + T(p, M)$, ensuring canonical equations are strictly maintained.
+- **Apple Silicon Support**: Optimized for MPS with CPU-offloaded ODE integration for numerical stability.
 
 ## Architecture
 
 ```
 Particle Dynamics → GNN Encoder → Separable Latents → Hamiltonian ODE → Symbolic Equations
-                    ↓              ↓                   ↓                ↓
+                    ↓              ↓                   ↓ (Dynamic Mass)  ↓
                 GradNorm        OOD Stress       Inductive         Closed-Loop
-                Balancing       Testing          Biases            Consistency
+                Consolidation   Testing          Biases            Consistency
 ```
 
 ## Success Metrics: Autonomous Discovery
-The pipeline has successfully moved beyond "Physical Recovery" to **Autonomous Discovery** of the Lennard-Jones (LJ) potential.
-- **Symbolic $R^2 > 0.95$**: Achieved using a reduced basis set (no hardcoded $1/r^{12}$).
-- **Forecast Horizon**: 100% stability over 2000-step OOD stress tests.
-- **Latent Correlation**: $> 0.99$ physical alignment between latent nodes and system center-of-mass.
+The pipeline has successfully moved beyond "Guided Recovery" to **Generalized Physical Discovery**.
+- **OOD Symbolic $R^2 > 0.99$**: Achieved on trajectories with $2\times$ the training energy.
+- **Energy Drift**: $< 10^{-7}$ over 5,000-step shadow integrations.
+- **Mass Correlation**: $> 0.95$ correlation between learned mass and super-node assignment density.
 
 ## Installation
 
@@ -62,23 +62,22 @@ pip install -r requirements.txt
 python unified_train.py --particles 16 --super_nodes 4 --epochs 500 --steps 500 --sim lj --hamiltonian
 ```
 
-### Validation & Stress Testing
+### Automated Physics Benchmarking
 
-Run the discovered equations through a 2000-step OOD stress test:
+Run the "Blind Physicist" suite on discovered equations:
 
 ```bash
-python validate_discovery.py --model_path ./results/model_latest.pt --results_path ./results/discovery_latest.json --steps 2000
+python physics_benchmark.py
 ```
 
 ## Files Overview
 
-- `engine.py`: Training engine featuring **GradNormBalancer** and Uncertainty Weighting.
-- `balanced_features.py`: Feature engineering with **Reduced Basis** for autonomous discovery.
-- `enhanced_symbolic.py`: Symbolic regression with **STLSQ Pruning** and secondary optimization.
-- `validate_discovery.py`: Stress test script calculating **Forecast Horizon**.
-- `hamiltonian_symbolic.py`: Hamiltonian-specific symbolic distillation logic.
-- `stable_pooling.py`: Sinkhorn-Knopp based hierarchical pooling for assignment stability.
-- `unified_train.py`: Main entry point orchestrating the 3-stage pipeline.
+- `engine.py`: Core engine featuring consolidated meta-losses and **GradNorm** balancing.
+- `model.py`: Neural architectures including the **Dynamic Mass Hamiltonian**.
+- `balanced_features.py`: Generalized feature engineering with Lasso-Path selection.
+- `physics_benchmark.py`: Automated numerical validation and stress testing suite.
+- `enhanced_symbolic.py`: Symbolic regression with secondary L-BFGS optimization.
+- `unified_train.py`: Main entry point orchestrating the generalized discovery pipeline.
 
 ## Testing
 

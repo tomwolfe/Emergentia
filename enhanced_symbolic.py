@@ -313,27 +313,23 @@ class TorchFeatureTransformer(torch.nn.Module):
         d = torch.norm(diff, dim=2) + 1e-6
         
         features = []
-        softening = 0.001 if getattr(self, 'sim_type', 'lj') == 'lj' else 0.1
+        softening = 0.001
         
-        if getattr(self, 'sim_type', 'lj') == 'lj':
-            # Match BalancedFeatureTransformer LJ logic
-            for n in [1, 2, 4]:
-                features.append(1.0 / (torch.pow(d, n) + softening))
-        else:
-            # 1. Basic distance and inverse distance
-            features.append(d)
-            features.append(1.0 / (d + softening))
+        # General spectrum of features for unbiased discovery
+        # 1. Basic distance and inverse distance
+        features.append(d)
+        features.append(1.0 / (d + softening))
+        
+        # 2. Spectrum of power laws: 1/r^n
+        for n in [2, 3, 4, 5, 6, 8, 10, 12, 14]:
+            features.append(1.0 / (torch.pow(d, n) + softening))
             
-            # 2. Spectrum of power laws: 1/r^n
-            for n in [2, 3, 4, 6, 8, 10, 12]:
-                features.append(1.0 / (torch.pow(d, n) + softening))
-                
-            # 3. Short-range interaction terms (Exponential/Yukawa-like)
-            features.append(torch.exp(-d))
-            features.append(torch.exp(-d) / (d + softening))
-            
-            # 4. Logarithmic interactions (2D gravity/electrostatics)
-            features.append(torch.log(d + softening))
+        # 3. Short-range interaction terms (Exponential/Yukawa-like)
+        features.append(torch.exp(-d))
+        features.append(torch.exp(-d) / (d + softening))
+        
+        # 4. Logarithmic interactions (2D gravity/electrostatics)
+        features.append(torch.log(d + softening))
 
         return features
 
@@ -684,62 +680,6 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
                 except:
                     # If optimization failed, keep the original
                     pass
-
-        # NEW: Physics-Guided Search for LJ systems
-        if sim_type == 'lj' and hasattr(self, 'transformer') and hasattr(self.transformer, 'feature_names'):
-            try:
-                # Find indices of d6 and d12 in X_selected
-                d6_idx, d12_idx = -1, -1
-                selected_names = [self.transformer.feature_names[j] for j in np.where(full_mask)[0]]
-                for idx, name in enumerate(selected_names):
-                    if 'sum_inv_d6' in name: d6_idx = idx
-                    if 'sum_inv_d12' in name: d12_idx = idx
-                
-                if d6_idx != -1 and d12_idx != -1:
-                    print(f"  -> [Physics-Guided] Testing LJ physical form (1/r^6, 1/r^12)...")
-                    from sklearn.linear_model import Ridge
-                    X_lj = X_selected[:, [d6_idx, d12_idx]]
-                    model_lj = Ridge(alpha=1e-6).fit(X_lj, y_target)
-                    score_lj = model_lj.score(X_lj, y_target)
-                    
-                    if score_lj > best_candidate['score'] * 0.98: # Allow slightly lower score for physical correctness
-                        print(f"  -> [Physics-Guided] LJ form found high fit: {score_lj:.4f}. Using physical model.")
-                        
-                        # PHYSICAL RECOVERY: Calculate epsilon and sigma
-                        # V = 4*eps * ((sigma/r)^12 - (sigma/r)^6) = C12/r^12 - C6/r^6
-                        # Here y_target is normalized, so we need to be careful.
-                        # But for the symbolic form, we can just report the recovered ratios.
-                        c6 = abs(model_lj.coef_[0])
-                        c12 = abs(model_lj.coef_[1])
-                        sigma_rec = (c12 / (c6 + 1e-9))**(1/6)
-                        epsilon_rec = (c6**2) / (4 * c12 + 1e-9)
-                        print(f"    -> [Physical Recovery] Recovered LJ ratios: epsilon_eff={epsilon_rec:.6f}, sigma_eff={sigma_rec:.6f}")
-                        self.recovered_constants[f'target_{i}_lj'] = {'epsilon': epsilon_rec, 'sigma': sigma_rec}
-
-                        # Construct symbolic string using RELATIVE indices for X_selected
-                        expr_lj = f"add(mul({model_lj.coef_[0]:.6f}, X{d6_idx}), mul({model_lj.coef_[1]:.6f}, X{d12_idx}))"
-                        if abs(model_lj.intercept_) > 1e-6:
-                            expr_lj = f"add({expr_lj}, {model_lj.intercept_:.6f})"
-                        
-                        # REFINE: Apply secondary optimization to these physical constants
-                        refined_prog = self._optimize_constants(OptimizedExpressionProgram(expr_lj), X_selected, y_target)
-                        if refined_prog:
-                            y_pred_refined = refined_prog.execute(X_selected)
-                            score_refined = 1 - ((y_target - y_pred_refined)**2).sum() / (((y_target - y_target.mean())**2).sum() + 1e-9)
-                            print(f"  -> [Physics-Guided] Secondary optimization refined LJ score to: {score_refined:.4f}")
-                            best_candidate = {
-                                'prog': refined_prog,
-                                'score': score_refined,
-                                'complexity': 5
-                            }
-                        else:
-                            best_candidate = {
-                                'prog': OptimizedExpressionWrapper(expr_lj, best_candidate['prog']),
-                                'score': score_lj,
-                                'complexity': 5
-                            }
-            except Exception as e:
-                print(f"  -> Physics-Guided search failed: {e}")
 
         # Confidence now accounts for both accuracy and parsimony
         confidence = max(0, best_candidate['score'] - 0.01 * best_candidate['complexity'])

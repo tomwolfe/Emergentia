@@ -108,17 +108,10 @@ class SymbolicDistiller:
         
         mask = np.zeros(X.shape[1], dtype=bool)
         
-        # Physics-First filter: for LJ systems, protect d6 and d12 terms
         # We use feature_names if provided, otherwise fallback to transformer names if X matches in size
         if feature_names is None and hasattr(self, 'transformer') and hasattr(self.transformer, 'feature_names'):
             if X.shape[1] == len(self.transformer.feature_names):
                 feature_names = self.transformer.feature_names
-        
-        if sim_type == 'lj' and feature_names is not None:
-            for idx, name in enumerate(feature_names):
-                if idx < len(combined_scores) and ('sum_inv_d6' in name or 'sum_inv_d12' in name):
-                    combined_scores[idx] = 10.0 # Force protection
-                    print(f"    -> [Physics-First] Protecting feature: {name}")
 
         mask[np.argsort(combined_scores)[-self.max_features:]] = True
         return mask

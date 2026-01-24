@@ -385,6 +385,10 @@ class HamiltonianODEFunc(nn.Module):
             # Small initial dissipation
             self.gamma = nn.Parameter(torch.full((n_super_nodes, 1), -5.0)) # log space
 
+        # NEW: Dynamic Mass Matrix
+        # Initialize masses to 1.0 (log-space for positivity)
+        self.log_masses = nn.Parameter(torch.zeros(n_super_nodes, 1))
+
     def _initialize_weights_small(self):
         """Initialize weights using orthogonal initialization."""
         for m in self.V_net.modules():
@@ -397,18 +401,26 @@ class HamiltonianODEFunc(nn.Module):
         if isinstance(self.V_net[-1], nn.Linear):
             nn.init.orthogonal_(self.V_net[-1].weight, gain=0.01)
 
+    def get_masses(self):
+        """Returns the diagonal elements of the mass matrix M."""
+        return torch.exp(self.log_masses)
+
     def hamiltonian(self, y):
         """Compute the total Hamiltonian H(q, p)."""
         d_sub = self.latent_dim // 2
         y_view = y.view(-1, self.n_super_nodes, 2, d_sub)
         q = y_view[:, :, 0].reshape(y.size(0), -1)
-        p = y_view[:, :, 1].reshape(y.size(0), -1)
+        p = y_view[:, :, 1] # [B, K, D_sub]
 
         if self.separable:
-            # H = V(q) + sum(p^2/2)
+            # H = V(q) + T(p)
+            # T = 1/2 * p^T * M^-1 * p
             q_norm = self.input_norm(q)
             V = self.V_net(q_norm)
-            T = 0.5 * torch.sum(p**2, dim=1, keepdim=True)
+            
+            # Dynamic Mass Matrix (diagonal)
+            M_diag = self.get_masses().view(1, self.n_super_nodes, 1)
+            T = 0.5 * torch.sum((p**2) / M_diag, dim=(1, 2)).unsqueeze(-1)
             return V + T
         else:
             # Full H(q, p)
