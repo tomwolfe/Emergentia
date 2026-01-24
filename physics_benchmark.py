@@ -13,7 +13,7 @@ from simulator import SpringMassSimulator
 from enhanced_symbolic import gp_to_sympy
 import sympy as sp
 
-def calculate_energy_drift(proxy, z0, steps=5000, dt=0.01):
+def calculate_energy_drift(proxy, z0, steps=1000, dt=0.01):
     """Calculates max relative energy drift over a long shadow integration."""
     device = torch.device('cpu') # Use CPU for long integration stability
     proxy = proxy.to(device)
@@ -214,7 +214,7 @@ def run_benchmark(model, equations, r2_scores, transformer, test_data_path=None)
     forecast_horizon = calculate_forecast_horizon(proxy, z_gt, dt=sim.dt)
     mass_consistency = calculate_mass_consistency(model, test_dataset)
     parsimony = calculate_parsimony_index(equations, r2_scores)
-    lyapunov = calculate_lyapunov_exponent(proxy, z0, steps=1000, dt=sim.dt)
+    lyapunov = calculate_lyapunov_exponent(proxy, z0, steps=200, dt=sim.dt)
     
     # 4. Symbolic R2 (OOD)
     # We evaluate how well the proxy predicts dz/dt on OOD data

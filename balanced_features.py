@@ -16,7 +16,7 @@ class BICFeatureSelector:
     Selects features using Lasso with Bayesian Information Criterion (BIC).
     BIC penalizes complexity more harshly than AIC or CV, leading to more parsimonious models.
     """
-    def __init__(self, max_features=100, min_variance=1e-6):
+    def __init__(self, max_features=40, min_variance=1e-6):
         self.max_features = max_features
         self.min_variance = min_variance
         self.selected_indices = []
@@ -85,7 +85,7 @@ class RecursiveFeatureSelector:
     Selects features recursively by iteratively adding the most informative ones.
     This prevents the combinatorial explosion of polynomial terms.
     """
-    def __init__(self, max_features=100, tolerance=1e-4, min_variance=1e-6):
+    def __init__(self, max_features=40, tolerance=1e-4, min_variance=1e-6):
         self.max_features = max_features
         self.tolerance = tolerance
         self.min_variance = min_variance
@@ -520,11 +520,11 @@ class BalancedFeatureTransformer:
         n_features = X.shape[1]
 
         if self.feature_selection_method == 'bic':
-            self.bic_selector = BICFeatureSelector(max_features=min(150, n_features))
+            self.bic_selector = BICFeatureSelector(max_features=min(30, n_features))
             self.bic_selector.fit(X, y)
             self.selected_feature_indices = self.bic_selector.selected_indices
         elif self.feature_selection_method == 'recursive':
-            self.recursive_selector = RecursiveFeatureSelector(max_features=min(200, n_features))
+            self.recursive_selector = RecursiveFeatureSelector(max_features=min(40, n_features))
             self.recursive_selector.fit(X, y)
             self.selected_feature_indices = self.recursive_selector.selected_indices
         elif self.feature_selection_method == 'lasso':

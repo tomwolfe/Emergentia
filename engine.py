@@ -223,10 +223,6 @@ class Trainer:
         self.optimizer = optim.Adam(param_groups, lr=lr)
         self.criterion = torch.nn.MSELoss().to(device)
         self.stats = stats
-        
-        # Initialize GradNorm Balancer
-        self.grad_norm_balancer = GradNormBalancer(n_tasks=len(self.loss_groups), device=device)
-        self.gn_optimizer = optim.Adam(self.grad_norm_balancer.parameters(), lr=1e-2)
 
     def _prepare_param_groups(self, lr):
         h_net_params = []
@@ -297,18 +293,26 @@ class Trainer:
         
         return tau, hard, tf_ratio, entropy_weight
 
-    def _compute_hamiltonian_curv_loss(self, z_curr):
-        loss_curv = torch.tensor(0.0, device=self.device)
-        if self.model.hamiltonian:
-            with torch.set_grad_enabled(True):
-                z_in = z_curr.reshape(z_curr.size(0), -1).detach().requires_grad_(True)
-                z_in_ode = self.hardware.to_ode_device(z_in)
-                H_vals = self.model.ode_func.hamiltonian(z_in_ode)
-                H = H_vals.sum()
-                dH = torch.autograd.grad(H, z_in_ode, create_graph=True, retain_graph=True, allow_unused=True)[0]
-                if dH is not None:
-                    loss_curv = torch.norm(self.hardware.to_main_device(dH), p=2) + 0.01 * torch.mean(self.hardware.to_main_device(H_vals)**2)
-        return loss_curv
+    def _compute_hamiltonian_conservation_loss(self, z_preds):
+        """
+        Penalizes the variance of the Hamiltonian along the integrated trajectory.
+        This ensures the learned H is a true constant of motion.
+        """
+        if not self.model.hamiltonian or z_preds.size(0) < 2:
+            return torch.tensor(0.0, device=self.device)
+            
+        with torch.set_grad_enabled(True):
+            # z_preds: [T, B, K, D] -> flatten to [T*B, K*D]
+            T, B, K, D = z_preds.shape
+            z_flat = z_preds.reshape(-1, K * D)
+            z_in_ode = self.hardware.to_ode_device(z_flat)
+            
+            H_vals = self.model.ode_func.hamiltonian(z_in_ode)
+            H_vals = H_vals.view(T, B) # [T, B]
+            
+            # Variance over time for each batch element
+            H_var = torch.var(H_vals, dim=0).mean()
+            return self.hardware.to_main_device(H_var)
 
     def _compute_latent_smoothing_loss(self, z_preds):
         if z_preds.size(0) < 3:
@@ -441,15 +445,6 @@ class Trainer:
             1.0 * losses_all.get('temporal_consistency', 0.0)
         )
 
-        # OPTIMIZATION: Skip expensive losses if weight is zero
-        loss_curv = torch.tensor(0.0, device=self.device)
-        if is_stage2 and not is_stage1:
-             loss_curv = self._compute_hamiltonian_curv_loss(z_curr)
-
-        loss_sym = torch.tensor(0.0, device=self.device)
-        if self.symbolic_proxy is not None and not is_warmup:
-            loss_sym = self._compute_symbolic_loss(z_curr, is_warmup)
-
         if not is_warmup:
             progress_after_warmup = min(1.0, (epoch - int(max_epochs * 0.1)) / 100.0)
             target_integration_steps = max(4, int(progress_after_warmup * seq_len))
@@ -476,6 +471,15 @@ class Trainer:
                 z_preds = z_preds[:seq_len]
         else:
             z_preds = z_all_target
+
+        # OPTIMIZATION: Skip expensive losses if weight is zero
+        loss_curv = torch.tensor(0.0, device=self.device)
+        if is_stage2 and not is_stage1:
+             loss_curv = self._compute_hamiltonian_conservation_loss(z_preds)
+
+        loss_sym = torch.tensor(0.0, device=self.device)
+        if self.symbolic_proxy is not None and not is_warmup:
+            loss_sym = self._compute_symbolic_loss(z_curr, is_warmup)
 
         loss_l2 = torch.mean(z_preds**2) * 0.1
         z_vel = (z_preds[1:] - z_preds[:-1]) / dt
@@ -521,11 +525,15 @@ class Trainer:
         lvars = torch.clamp(self.model.log_vars, min=-6.0, max=5.0)
         raw_losses = {'rec': loss_rec, 'cons': loss_cons, 'assign': loss_assign, 'ortho': loss_ortho, 'l2': loss_l2, 'lvr': loss_lvr, 'align': loss_align, 'pruning': loss_pruning, 'sep': loss_sep, 'conn': loss_conn, 'sparsity': loss_sparsity, 'mi': loss_mi, 'sym': loss_sym, 'var': loss_var, 'hinge': loss_hinge, 'smooth': loss_smooth, 'anchor': loss_anchor, 'curv': loss_curv, 'activity': (torch.relu(1.0 - torch.norm(z_vel, dim=-1)).mean() if len(z_vel) > 0 else self.model.get_activity_penalty(z_preds)) * 1000.0}
         
-        weights = {k: (100.0 if is_stage1 and k == 'rec' else (10.0 if k in ['rec', 'assign', 'anchor'] else 1.0)) for k in raw_losses}
-        if epoch >= int(max_epochs * 0.75):
-            for i, k in enumerate(list(raw_losses.keys())[:17]): weights[k] = torch.exp(-lvars[i]) * loss_multipliers[i]
-        
-        if epoch < (max_epochs * 0.3): weights['l2'] = weights['lvr'] = weights['smooth'] = 0.0
+        # Base weights for stability during warmup/stage1
+        weights = {k: 1.0 for k in raw_losses}
+        if is_stage1:
+            weights['rec'] = 100.0
+            weights['assign'] = 10.0
+            weights['anchor'] = 10.0
+            weights['align'] = 5.0
+            # Suppress complex physics losses in stage 1
+            for k in ['curv', 'sym', 'lvr', 'smooth']: weights[k] = 0.0
         
         stage2_factor = (1.0 / (1 + np.exp(-12.0 * (min(1.0, (epoch - stage1_end) / max(1, int(max_epochs * 0.1))) - 0.5)))) if is_stage2 else 0.0
 
@@ -536,24 +544,17 @@ class Trainer:
             'SymbolicConsistencyLoss': self.loss_modules['SymbolicConsistencyLoss'](loss_sym * weights['sym'], stage2_factor, self.symbolic_weight)
         }
 
-        if epoch >= stage1_end:
+        # Apply learned uncertainty weighting (log_vars) after stage 1
+        loss = 0.0
+        if not is_stage1:
             for i, (name, h_loss) in enumerate(head_losses_dict.items()):
-                if i < 4: head_losses_dict[name] = h_loss * torch.exp(-lvars[i]) + lvars[i]
-
-        do_grad_norm = (epoch > int(max_epochs * 0.1)) and not is_stage1
-        if do_grad_norm:
-            gn_weights = self.grad_norm_balancer.get_weights()
-            head_names = ['ReconstructionLoss', 'StructuralLoss', 'PhysicalityLoss', 'SymbolicConsistencyLoss']
-            head_losses_list = [head_losses_dict[h] for h in head_names]
-            loss = sum(gn_weights[i] * head_losses_list[i] for i in range(len(head_names)))
-            loss.backward(retain_graph=True)
-            self.grad_norm_balancer.update(head_losses_list, list(self.model.encoder.parameters()), self.gn_optimizer)
-            self.gn_optimizer.step(); self.gn_optimizer.zero_grad()
-        elif self.use_pcgrad and (epoch > int(max_epochs * 0.1)) and not is_stage1:
-            self._apply_pcgrad(head_losses_dict)
-            loss = torch.stack(list(head_losses_dict.values())).sum()
+                loss += h_loss * torch.exp(-lvars[i]) + lvars[i]
         else:
-            loss = torch.stack(list(head_losses_dict.values())).sum()
+            loss = sum(head_losses_dict.values())
+
+        if self.use_pcgrad and (epoch > int(max_epochs * 0.1)) and not is_stage1:
+            self._apply_pcgrad(head_losses_dict)
+        else:
             loss = torch.clamp(loss + 0.1 * torch.sum(lvars**2), 1e-4, 1e5)
             if self.enable_gradient_accumulation: (loss / self.grad_acc_steps).backward()
             else: loss.backward()

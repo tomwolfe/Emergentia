@@ -274,10 +274,10 @@ def main():
     # --- SELF-CORRECTION LOOP ---
     # OPTIMIZATION: Reduce retries and ensemble size for quick/short runs
     is_quick = args.quick_symbolic or args.epochs < 50
-    MAX_RETRIES = 0 if is_quick else 2
-    pop_size = 500 if is_quick else args.pop
-    gen_size = 5 if is_quick else args.gen
-    ensemble_size = 2 if is_quick else 5
+    MAX_RETRIES = 0 if is_quick else 1
+    pop_size = 500 if is_quick else min(args.pop, 2000)
+    gen_size = 5 if is_quick else min(args.gen, 20)
+    ensemble_size = 2 if is_quick else 3
     
     bench_report = {}
     for attempt in range(MAX_RETRIES + 1):
@@ -368,7 +368,7 @@ def main():
     if trainer.symbolic_proxy is not None:
         print("\n--- Starting Stage 3: Neural-Symbolic Consistency Training ---")
         # OPTIMIZATION: Scale stage 3 epochs
-        stage3_epochs = 20 if is_quick else 100 
+        stage3_epochs = 15 if is_quick else 30 
         trainer.model.train()
         # Increase symbolic weight to force alignment
         trainer.symbolic_weight = 50.0 # Aggressive alignment

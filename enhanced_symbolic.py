@@ -478,9 +478,9 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
     4. Better handling of physics-specific parameters
     """
 
-    def __init__(self, populations=5000, generations=60, stopping_criteria=0.0001, max_features=15,
+    def __init__(self, populations=5000, generations=60, stopping_criteria=0.0001, max_features=10,
                  secondary_optimization=True, opt_method='L-BFGS-B', opt_iterations=200,
-                 use_sindy_pruning=True, sindy_threshold=0.01, **kwargs):
+                 use_sindy_pruning=True, sindy_threshold=0.05, **kwargs):
         super().__init__(populations, generations, stopping_criteria, max_features)
         self.secondary_optimization = secondary_optimization
         self.opt_method = opt_method
@@ -598,9 +598,9 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
                     coeffs = model.coef_
                     for idx, coef in enumerate(coeffs):
                         if abs(coef) > 1e-6:
-                            # Map back to original feature index
-                            orig_idx = feature_indices[idx]
-                            terms.append(f"mul({coef:.6f}, X{orig_idx})")
+                            # Use local index (idx) instead of mapping back to original
+                            # This ensures consistency with GP and the sliced input matrix
+                            terms.append(f"mul({coef:.6f}, X{idx})")
                     
                     if not terms:
                         # If everything is extremely small, check if intercept is actually non-zero
@@ -623,14 +623,14 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
             selected_indices = np.where(full_mask)[0]
             return LinearProgram(ridge, selected_indices), full_mask, linear_score
 
-        parsimony_levels = [0.001, 0.01, 0.05, 0.1]
-        complexity_factor = max(1.0, 3.0 * (1.0 - linear_score))
+        parsimony_levels = [0.01, 0.05] # Reduced from [0.001, 0.01, 0.05, 0.1]
+        complexity_factor = max(1.0, 2.0 * (1.0 - linear_score)) # Reduced from 3.0
         scaled_pop = int(self.populations * complexity_factor)
-        scaled_pop = min(scaled_pop, 10000)
+        scaled_pop = min(scaled_pop, 5000) # Reduced from 10000
 
         candidates = []
         for p_coeff in parsimony_levels:
-            est = self._get_regressor(scaled_pop, self.generations // 2, parsimony=p_coeff)
+            est = self._get_regressor(scaled_pop, min(self.generations // 2, 20), parsimony=p_coeff) # Cap gens
             try:
                 # Force float64 for stability
                 X_gp = X_selected.astype(np.float64)
@@ -681,22 +681,22 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
         if not candidates:
             return None, full_mask, 0.0
 
-        # Pareto Frontier Selection: REDUCED COMPLEXITY PENALTY IF R2 SCORE IS BELOW 0.9
+        # Pareto Frontier Selection: HARSHER COMPLEXITY PENALTY
         for c in candidates:
             # Adjusted score: R2 penalized by complexity and dimension
             if c['score'] < 0.9:
-                c['pareto_score'] = c['score'] - 0.005 * c['complexity'] - c.get('dim_penalty', 0.0)
+                c['pareto_score'] = c['score'] - 0.02 * c['complexity'] - c.get('dim_penalty', 0.0)
             else:
-                c['pareto_score'] = c['score'] - 0.015 * c['complexity'] - c.get('dim_penalty', 0.0)
+                c['pareto_score'] = c['score'] - 0.04 * c['complexity'] - c.get('dim_penalty', 0.0)
 
         candidates.sort(key=lambda x: x['pareto_score'], reverse=True)
         best_candidate = candidates[0]
 
-        # If the best candidate still has a very high complexity (> 20 nodes),
+        # If the best candidate still has a very high complexity (> 15 nodes),
         # look for a significantly simpler one that is still reasonably accurate.
-        if best_candidate['complexity'] > 20:
+        if best_candidate['complexity'] > 15:
             for c in candidates[1:]:
-                if c['complexity'] < 10 and (best_candidate['score'] - c['score']) < 0.08:
+                if c['complexity'] < 8 and (best_candidate['score'] - c['score']) < 0.1:
                     best_candidate = c
                     break
 
