@@ -293,7 +293,10 @@ class SymbolicProxy(torch.nn.Module):
                 
                 # For Hamiltonian symbolic proxy, we do need higher-order derivatives
                 # Use create_graph=True but with retain_graph=True to avoid the error
-                dH_dz = torch.autograd.grad(H.sum(), z_flat, create_graph=True, retain_graph=True)[0]
+                # Use allow_unused=True for constant expressions
+                dH_dz = torch.autograd.grad(H.sum(), z_flat, create_graph=True, retain_graph=True, allow_unused=True)[0]
+                if dH_dz is None:
+                    dH_dz = torch.zeros_like(z_flat)
             
             # Continue with derivative computation (gradients no longer needed)
             # Split z and dH_dz into q and p
@@ -639,9 +642,10 @@ class Trainer:
                 flat_grads = []
                 for g, p in zip(grads, params):
                     if g is not None:
-                        flat_grads.append(g.flatten())
+                        # Move to trainer device for concatenation
+                        flat_grads.append(g.flatten().to(self.device))
                     else:
-                        flat_grads.append(torch.zeros_like(p).flatten())
+                        flat_grads.append(torch.zeros_like(p).flatten().to(self.device))
                 head_grads.append(torch.cat(flat_grads))
         
         if not head_grads:
@@ -669,9 +673,9 @@ class Trainer:
         for p in params:
             n = p.numel()
             if p.grad is None:
-                p.grad = final_grad[idx:idx+n].view(p.shape).clone()
+                p.grad = final_grad[idx:idx+n].view(p.shape).clone().to(p.device)
             else:
-                p.grad.add_(final_grad[idx:idx+n].view(p.shape))
+                p.grad.add_(final_grad[idx:idx+n].view(p.shape).to(p.device))
             idx += n
 
     def train_step(self, data_list, dt, epoch=0, max_epochs=2000):

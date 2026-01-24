@@ -59,8 +59,8 @@ def main():
     parser.add_argument('--spatial_weight', type=float, default=0.1, help='Very low weight for spatial loss')
     parser.add_argument('--sym_weight', type=float, default=1.0, help='Weight for symbolic loss')
     parser.add_argument('--min_active', type=int, default=4, help='Minimum active super-nodes')
-    parser.add_argument('--pop', type=int, default=1000, help='Symbolic population')
-    parser.add_argument('--gen', type=int, default=20, help='Symbolic generations')
+    parser.add_argument('--pop', type=int, default=5000, help='Symbolic population')
+    parser.add_argument('--gen', type=int, default=40, help='Symbolic generations')
     args = parser.parse_args()
 
     device = get_device() if args.device == 'auto' else args.device
@@ -375,10 +375,13 @@ def main():
     trainer.update_symbolic_proxy(equations, symbolic_transformer, weight=args.sym_weight, confidence=confidence)
 
     # 5.5 STAGE 3: Neural-Symbolic Consistency Training (Closed-Loop)
-    if trainer.symbolic_proxy is not None and confidence > 0.1:
+    if trainer.symbolic_proxy is not None:
         print("\n--- Starting Stage 3: Neural-Symbolic Consistency Training ---")
-        stage3_epochs = 50
+        stage3_epochs = 100 # Increased
         trainer.model.train()
+        # Increase symbolic weight to force alignment
+        trainer.symbolic_weight = 50.0 # Aggressive alignment
+        
         # Unfreeze encoder and symbolic proxy for joint optimization
         for p in trainer.model.encoder.parameters(): p.requires_grad = True
         
@@ -564,26 +567,39 @@ def main():
             eng_drift = 1.0
 
     # NEW: discovery_report.json as requested
-    report_data = {
+    def make_serializable(obj):
+        if isinstance(obj, dict):
+            return {k: make_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [make_serializable(v) for v in obj]
+        elif hasattr(obj, 'item'):
+            return obj.item()
+        elif isinstance(obj, np.float32) or isinstance(obj, np.float64):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return obj
+
+    report_data = make_serializable({
         'discovered_sympy': [str(eq) for eq in equations],
         'recovered_constants': getattr(distiller, 'recovered_constants', {}),
-        'stability_score': float(stability_score),
-        'symplectic_drift': float(symp_drift),
-        'energy_drift': float(eng_drift),
-        'health_check': {k: float(v) if hasattr(v, 'item') else v for k, v in health_check.items()},
+        'stability_score': stability_score,
+        'symplectic_drift': symp_drift,
+        'energy_drift': eng_drift,
+        'health_check': health_check,
         'config': config_data
-    }
+    })
     
     with open('discovery_report.json', 'w') as f:
         json.dump(report_data, f, indent=4)
     print("Final report saved to discovery_report.json")
     
-    discovery_data = {
+    discovery_data = make_serializable({
         'config': config_data,
         'equations': [str(eq) for eq in equations],
         'health_check': health_check,
         'model_path': model_save_path
-    }
+    })
     
     results_json_path = os.path.join(results_dir, f"discovery_{timestamp}.json")
     with open(results_json_path, 'w') as f:

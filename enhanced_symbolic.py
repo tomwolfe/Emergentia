@@ -8,7 +8,8 @@ import numpy as np
 import torch
 from gplearn.genetic import SymbolicRegressor
 from gplearn.functions import make_function
-from symbolic import SymbolicDistiller, FeatureTransformer, gp_to_sympy, OptimizedExpressionProgram
+from symbolic import SymbolicDistiller, FeatureTransformer, OptimizedExpressionProgram
+from symbolic_utils import gp_to_sympy
 from balanced_features import BalancedFeatureTransformer
 from hamiltonian_symbolic import HamiltonianSymbolicDistiller
 import sympy as sp
@@ -206,6 +207,7 @@ class TorchFeatureTransformer(torch.nn.Module):
         self.box_size = transformer.box_size
         self.basis_functions = getattr(transformer, 'basis_functions', 'physics_informed')
         self.include_raw_latents = getattr(transformer, 'include_raw_latents', False)
+        self.sim_type = getattr(transformer, 'sim_type', 'lj')
 
         # Register FULL buffers for normalization parameters
         # We now store full buffers and apply masking in forward() to avoid shape mismatches
@@ -311,21 +313,22 @@ class TorchFeatureTransformer(torch.nn.Module):
         d = torch.norm(diff, dim=2) + 1e-6
         
         features = []
+        softening = 0.001 if getattr(self, 'sim_type', 'lj') == 'lj' else 0.1
         
         # 1. Basic distance and inverse distance
         features.append(d)
-        features.append(1.0 / (d + 0.1))
+        features.append(1.0 / (d + softening))
         
         # 2. Spectrum of power laws: 1/r^n
         for n in [2, 3, 4, 6, 8, 10, 12]:
-            features.append(1.0 / (torch.pow(d, n) + 0.1))
+            features.append(1.0 / (torch.pow(d, n) + softening))
             
         # 3. Short-range interaction terms (Exponential/Yukawa-like)
         features.append(torch.exp(-d))
-        features.append(torch.exp(-d) / (d + 0.1))
+        features.append(torch.exp(-d) / (d + softening))
         
         # 4. Logarithmic interactions (2D gravity/electrostatics)
-        features.append(torch.log(d + 0.1))
+        features.append(torch.log(d + softening))
 
         return features
 
@@ -704,10 +707,8 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
                         print(f"    -> [Physical Recovery] Recovered LJ ratios: epsilon_eff={epsilon_rec:.6f}, sigma_eff={sigma_rec:.6f}")
                         self.recovered_constants[f'target_{i}_lj'] = {'epsilon': epsilon_rec, 'sigma': sigma_rec}
 
-                        # Construct symbolic string
-                        orig_d6 = np.where(full_mask)[0][d6_idx]
-                        orig_d12 = np.where(full_mask)[0][d12_idx]
-                        expr_lj = f"add(mul({model_lj.coef_[0]:.6f}, X{orig_d6}), mul({model_lj.coef_[1]:.6f}, X{orig_d12}))"
+                        # Construct symbolic string using RELATIVE indices for X_selected
+                        expr_lj = f"add(mul({model_lj.coef_[0]:.6f}, X{d6_idx}), mul({model_lj.coef_[1]:.6f}, X{d12_idx}))"
                         if abs(model_lj.intercept_) > 1e-6:
                             expr_lj = f"add({expr_lj}, {model_lj.intercept_:.6f})"
                         

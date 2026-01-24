@@ -1,38 +1,28 @@
 {
     "discovered_sympy": [
-        "sub(log(inv(sub(square(div(inv_square(sub(abs(div(X0, X0)), inv_square(sqrt(square(sqrt(X0)))))), inv(add(X0, -0.459)))), neg(sub(0.486, X0))))), square(log(neg(log(sqrt(X0))))))",
-        "log(Abs(2*x0 - 0.378340134644187) + 0.25)",
-        "log(Abs(x0*(x0 - 0.5) + 2*x0 + square(0.0) - 0.5) + 0.25)",
-        "log(Abs(2*x0 - 3.5) - 2.75)",
-        "log(add(sub(X0, 0.634), X0))",
-        "-log(Abs(2*x0 - 0.37834014177023) + 0.25)",
-        "neg(X0)",
-        "-0.5*x0",
-        "log(log(add(X0, -0.178)))",
-        "-log(Abs(2*x0 - 0.378340127112419) + 0.25)",
-        "log(Abs(x0 - 0.25) + 0.5)",
-        "log(Abs(2*x0 - 2.25) - 1.5)",
-        "log(Abs(x0 - 0.25) + 0.5) + Abs(square(0.25*x0))",
-        "log(Abs(x0 - 0.25) + 0.5)",
-        "log(Abs(2*x0 - 4.25) - 3.5)",
-        "-log(Abs(2*x0 - 0.378340602534611) + 0.25)"
+        "SeparableHamiltonian(V=0.081857*x1 - 0.078034*x3 + 0.093416, T=p^2/2)"
     ],
-    "recovered_constants": {},
-    "stability_score": 0.0,
-    "symplectic_drift": 1.0,
-    "energy_drift": 1.0,
+    "recovered_constants": {
+        "target_0_lj": {
+            "epsilon": 0.021466536447405815,
+            "sigma": 0.9920614957809448
+        }
+    },
+    "stability_score": 0.9999999998274338,
+    "symplectic_drift": 1.7930192441895088e-08,
+    "energy_drift": 0.0,
     "health_check": {
-        "Symbolic Parsimony": 688.6998340300411,
-        "Latent Correlation": 0.9999005585218834,
-        "Flicker Rate": 0.0004813724081031978,
-        "Symbolic R2": -0.6624009810728814
+        "Symbolic Parsimony": 5.627810688244442,
+        "Latent Correlation": 0.9311310006091529,
+        "Flicker Rate": 9.924946789396927e-05,
+        "Symbolic R2": 0.533065971543037
     },
     "config": {
         "particles": 4,
-        "super_nodes": 2,
+        "super_nodes": 4,
         "latent_dim": 8,
         "hidden_dim": 128,
-        "hamiltonian": false,
+        "hamiltonian": true,
         "min_active": 4,
         "sim": "lj",
         "dt": 0.0005

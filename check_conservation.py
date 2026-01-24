@@ -5,25 +5,7 @@ from typing import List, Optional
 import json
 import os
 import re
-
-def gp_to_sympy(expr_str, n_features):
-    local_dict = {
-        'add': lambda x,y: x+y,
-        'sub': lambda x,y: x-y,
-        'mul': lambda x,y: x*y,
-        'div': lambda x,y: x/(y+1e-9),
-        'sqrt': lambda x: sp.sqrt(sp.Abs(x)),
-        'log': lambda x: sp.log(sp.Abs(x)+1e-9),
-        'abs': sp.Abs,
-        'neg': lambda x: -x,
-        'inv': lambda x: 1.0/(x+1e-9),
-        'square': lambda x: x**2,
-        'inv_square': lambda x: 1.0/(x**2+1e-9)
-    }
-    # Map X0, X1 to x0, x1
-    for i in range(n_features):
-        local_dict[f'X{i}'] = sp.Symbol(f'x{i}')
-    return sp.sympify(expr_str, locals=local_dict)
+from symbolic_utils import gp_to_sympy
 
 def calculate_symplectic_drift(model_func, z0, dt, steps=100):
     """

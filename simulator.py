@@ -253,12 +253,12 @@ class LennardJonesSimulator(SpringMassSimulator):
         # IMPROVED: Smooth Soft-Core LJ implementation for better stability
         # Instead of hard clipping dist_sq, we add a softening parameter alpha.
         # V(r) = 4*epsilon * [ (sigma^2 / (r^2 + alpha*sigma^2))^6 - (sigma^2 / (r^2 + alpha*sigma^2))^3 ]
-        alpha = 0.01  # Small softening to prevent singularities while preserving physics
+        alpha = 0.001  # Reduced softening for higher physical fidelity
         dist_sq_soft = dist_sq + alpha * (self.sigma**2)
 
         sr6 = (self.sigma**2 / dist_sq_soft)**3
         # Prevent overflow by clamping sr6 before squaring
-        sr6 = np.clip(sr6, -1e8, 1e8)
+        sr6 = np.clip(sr6, -1e10, 1e10) # Increased range
         sr12 = sr6**2
 
         # Force magnitude with soft-core correction
@@ -267,8 +267,8 @@ class LennardJonesSimulator(SpringMassSimulator):
 
         force_vec = f_mag * diff
 
-        # Stability clamping - reduced max force for better stability
-        max_f = 100.0  # Reduced max force for better stability
+        # Stability clamping - increased for better fidelity but still safe
+        max_f = 200.0  # Increased from 100.0
         force_vec = np.clip(force_vec, -max_f, max_f)
 
         np.add.at(forces, idx1, -force_vec)
@@ -294,12 +294,12 @@ class LennardJonesSimulator(SpringMassSimulator):
             dist_sq = np.sum(diff**2, axis=1)
             
             # Use same soft-core softening as in compute_forces
-            alpha = 0.01
+            alpha = 0.001
             dist_sq_soft = dist_sq + alpha * (self.sigma**2)
             
             sr6 = (self.sigma**2 / dist_sq_soft)**3
             # Prevent overflow by clamping sr6 before squaring
-            sr6 = np.clip(sr6, -1e8, 1e8)
+            sr6 = np.clip(sr6, -1e10, 1e10)
             sr12 = sr6**2
             pe = 4 * self.epsilon * np.sum(sr12 - sr6)
             

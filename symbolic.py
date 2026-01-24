@@ -18,8 +18,8 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # Sanitized Symbolic Primitives
-from pure_symbolic_functions import create_safe_functions
-safe_sqrt, safe_log, safe_div, safe_inv = create_safe_functions()
+from symbolic_utils import create_safe_functions, gp_to_sympy
+safe_sqrt, safe_log, safe_div, safe_inv, square_func, inv_square_func = create_safe_functions()
 from balanced_features import BalancedFeatureTransformer as FeatureTransformer
 
 class OptimizedExpressionProgram:
@@ -68,25 +68,10 @@ class SymbolicDistiller:
         return getattr(program, 'length_', 1)
 
     def _get_regressor(self, pop, gen, parsimony=0.05):
-        # Safe square function that prevents overflow
-        def safe_square(x):
-            x_clipped = np.clip(x, -1e6, 1e6)  # Prevent large values before squaring
-            return np.clip(x_clipped**2, -1e12, 1e12)  # Also clip result
-
-        square = make_function(function=safe_square, name='square', arity=1)
-
-        # Safe inverse square function that prevents overflow
-        def safe_inv_square(x):
-            x_squared = np.clip(x**2, 1e-12, 1e12)  # Prevent underflow/overflow in x^2
-            result = 1.0 / (x_squared + 1e-9)
-            return np.clip(result, -1e12, 1e12)  # Clip final result
-
-        inv_square = make_function(function=safe_inv_square, name='inv_square', arity=1)
-
         # Use n_jobs=-1 to utilize all available CPU cores for GP
         # Added max_samples=0.9 to speed up fitness evaluation and reduce memory
         return SymbolicRegressor(population_size=pop, generations=gen, parsimony_coefficient=parsimony,
-                                 function_set=('add', 'sub', 'mul', safe_div, safe_sqrt, safe_log, 'abs', 'neg', safe_inv, square, inv_square),
+                                 function_set=('add', 'sub', 'mul', safe_div, safe_sqrt, safe_log, 'abs', 'neg', safe_inv, square_func, inv_square_func),
                                  max_samples=0.9, n_jobs=-1, random_state=42, verbose=0)
 
     def _select_features(self, X, y, sim_type=None, feature_names=None):
@@ -256,20 +241,4 @@ def extract_latent_data(model, dataset, dt, include_hamiltonian=False):
         states = z_flat.cpu().numpy()
 
     return states, derivs, np.linspace(0, seq_len * dt, seq_len)
-
-def gp_to_sympy(expr_str, *args, **kwargs):
-    local_dict = {
-        'add': lambda x,y: x+y,
-        'sub': lambda x,y: x-y,
-        'mul': lambda x,y: x*y,
-        'div': lambda x,y: x/(y+1e-9),
-        'sqrt': lambda x: sp.sqrt(sp.Abs(x)),
-        'log': lambda x: sp.log(sp.Abs(x)+1e-9),
-        'abs': sp.Abs,
-        'neg': lambda x: -x,
-        'inv': lambda x: 1.0/(x+1e-9),
-        'square': lambda x: sp.Pow(x, 2),  # Using SymPy power function for better handling
-        'inv_square': lambda x: 1.0/(sp.Pow(x, 2)+1e-9)  # Using SymPy power function for better handling
-    }
-    return sp.sympify(expr_str, locals=local_dict)
 

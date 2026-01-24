@@ -296,22 +296,22 @@ class BalancedFeatureTransformer:
         if self.sim_type == 'lj':
             # For LJ, include common power laws but exclude exponential/log to focus search
             for n in [1, 2, 4, 6, 8, 10, 12]:
-                aggregated_features.append((1.0 / (d**n + 1e-4)).sum(axis=1, keepdims=True))
+                aggregated_features.append((1.0 / (d**n + 0.001)).sum(axis=1, keepdims=True))
         else:
             # 1. Basic distance and inverse distance
             aggregated_features.append(d.sum(axis=1, keepdims=True))
-            aggregated_features.append((1.0 / (d + 1e-4)).sum(axis=1, keepdims=True))
+            aggregated_features.append((1.0 / (d + 0.1)).sum(axis=1, keepdims=True))
             
             # 2. Spectrum of power laws: 1/r^n
             for n in [2, 3, 4, 6, 8, 10, 12]:
-                aggregated_features.append((1.0 / (d**n + 1e-4)).sum(axis=1, keepdims=True))
-                
+                aggregated_features.append((1.0 / (d**n + 0.1)).sum(axis=1, keepdims=True))
+            
             # 3. Short-range interaction terms (Exponential/Yukawa-like)
             aggregated_features.append(np.exp(-d).sum(axis=1, keepdims=True))
-            aggregated_features.append((np.exp(-d) / (d + 1e-4)).sum(axis=1, keepdims=True))
+            aggregated_features.append((np.exp(-d) / (d + 0.1)).sum(axis=1, keepdims=True))
             
             # 4. Logarithmic interactions (2D gravity/electrostatics)
-            aggregated_features.append(np.log(d + 1e-4).sum(axis=1, keepdims=True))
+            aggregated_features.append(np.log(d + 0.1).sum(axis=1, keepdims=True))
 
         return aggregated_features
 
@@ -518,6 +518,8 @@ class BalancedFeatureTransformer:
             j_yukawa_sum = np.zeros(n_latents)
             j_log_sum = np.zeros(n_latents)
 
+            softening = 0.001 if self.sim_type == 'lj' else 0.1
+
             for i, j in zip(i_idx, j_idx):
                 diff = z_nodes[i, :2] - z_nodes[j, :2]
                 if self.box_size is not None:
@@ -533,14 +535,14 @@ class BalancedFeatureTransformer:
                 
                 # Sum the jacobians of individual terms
                 jd_sum += jd_pair
-                j_inv_d_sum += -1.0 / (d + 1e-4)**2 * jd_pair
+                j_inv_d_sum += -1.0 / (d + softening)**2 * jd_pair
                 
                 for n in [2, 3, 4, 6, 8, 10, 12]:
-                    j_pow_sums[n] += -n * d**(n-1) / (d**n + 1e-4)**2 * jd_pair
+                    j_pow_sums[n] += -n * d**(n-1) / (d**n + softening)**2 * jd_pair
                     
                 j_exp_sum += -np.exp(-d) * jd_pair
-                j_yukawa_sum += ((-np.exp(-d)*(d + 1e-4) - np.exp(-d)) / (d + 1e-4)**2 * jd_pair)
-                j_log_sum += 1.0 / (d + 1e-4) * jd_pair
+                j_yukawa_sum += ((-np.exp(-d)*(d + softening) - np.exp(-d)) / (d + softening)**2 * jd_pair)
+                j_log_sum += 1.0 / (d + softening) * jd_pair
 
             # Add aggregated jacobians to list based on sim_type
             if self.sim_type == 'lj':

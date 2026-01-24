@@ -249,7 +249,7 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
 
         # Wrap it in a class that can compute derivatives
         try:
-            from symbolic import gp_to_sympy
+            from symbolic_utils import gp_to_sympy
             import sympy as sp
             
             expr_str = str(h_prog)
