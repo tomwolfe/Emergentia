@@ -1,21 +1,38 @@
 {
     "discovered_sympy": [
-        "SeparableHamiltonian(V=0.0805836514062944*x10, T=p^2/2)"
+        "sub(log(inv(sub(square(div(inv_square(sub(abs(div(X0, X0)), inv_square(sqrt(square(sqrt(X0)))))), inv(add(X0, -0.459)))), neg(sub(0.486, X0))))), square(log(neg(log(sqrt(X0))))))",
+        "log(Abs(2*x0 - 0.378340134644187) + 0.25)",
+        "log(Abs(x0*(x0 - 0.5) + 2*x0 + square(0.0) - 0.5) + 0.25)",
+        "log(Abs(2*x0 - 3.5) - 2.75)",
+        "log(add(sub(X0, 0.634), X0))",
+        "-log(Abs(2*x0 - 0.37834014177023) + 0.25)",
+        "neg(X0)",
+        "-0.5*x0",
+        "log(log(add(X0, -0.178)))",
+        "-log(Abs(2*x0 - 0.378340127112419) + 0.25)",
+        "log(Abs(x0 - 0.25) + 0.5)",
+        "log(Abs(2*x0 - 2.25) - 1.5)",
+        "log(Abs(x0 - 0.25) + 0.5) + Abs(square(0.25*x0))",
+        "log(Abs(x0 - 0.25) + 0.5)",
+        "log(Abs(2*x0 - 4.25) - 3.5)",
+        "-log(Abs(2*x0 - 0.378340602534611) + 0.25)"
     ],
     "recovered_constants": {},
-    "stability_score": 0.9999999993712156,
+    "stability_score": 0.0,
+    "symplectic_drift": 1.0,
+    "energy_drift": 1.0,
     "health_check": {
-        "Symbolic Parsimony": 299.97000299970006,
-        "Latent Correlation": 0.9590147776206976,
-        "Flicker Rate": 0.2407633662223816,
-        "Symbolic R2": -0.9071235867541764
+        "Symbolic Parsimony": 688.6998340300411,
+        "Latent Correlation": 0.9999005585218834,
+        "Flicker Rate": 0.0004813724081031978,
+        "Symbolic R2": -0.6624009810728814
     },
     "config": {
         "particles": 4,
         "super_nodes": 2,
         "latent_dim": 8,
         "hidden_dim": 128,
-        "hamiltonian": true,
+        "hamiltonian": false,
         "min_active": 4,
         "sim": "lj",
         "dt": 0.0005

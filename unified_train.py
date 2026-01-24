@@ -167,6 +167,10 @@ def main():
                 latent_mean_mag = torch.mean(torch.abs(z_out)).item()
                 cond_proxy = latent_std / (latent_mean_mag + 1e-6)
                 print(f"  [Diagnostic] Latent SNR: {cond_proxy:.4f} | Grad Norm: {jacobian_norm.item():.4f}")
+                
+                # Adaptive sparsity adjustment
+                if sparsity_scheduler is not None:
+                    sparsity_scheduler.adjust_to_snr(cond_proxy)
             except Exception as e:
                 pass
             model.train()
@@ -342,10 +346,10 @@ def main():
 
     # Output Health Check JSON (simulated with print for now)
     health_check = {
-        "Symbolic Parsimony": np.mean(parsimony_scores) if parsimony_scores else 0,
-        "Latent Correlation": np.mean([np.max(corrs[k]) for k in range(args.super_nodes)]),
-        "Flicker Rate": flicker_rate,
-        "Symbolic R2": np.mean(symbolic_r2s) if symbolic_r2s else 0
+        "Symbolic Parsimony": float(np.mean(parsimony_scores)) if parsimony_scores else 0.0,
+        "Latent Correlation": float(np.mean([np.max(corrs[k]) for k in range(args.super_nodes)])),
+        "Flicker Rate": float(flicker_rate),
+        "Symbolic R2": float(np.mean(symbolic_r2s)) if symbolic_r2s else 0.0
     }
     print("\n--- Final Health Check ---")
     for k, v in health_check.items():
@@ -490,16 +494,76 @@ def main():
             else:
                 stability_score = 0.0
             print(f"  Stability Score: {stability_score:.4f}")
+            
+            # NEW: Calculate physical drifts
+            from check_conservation import calculate_symplectic_drift, calculate_energy_drift
+            print("  Calculating Symplectic and Energy Drifts...")
+            
+            # Move symbolic proxy to CPU for drift calculation to ensure stability and consistency
+            trainer.symbolic_proxy.to('cpu')
+            initial_z_cpu = initial_z.to('cpu')
+            
+            symp_drift = calculate_symplectic_drift(trainer.symbolic_proxy, initial_z_cpu, dt, steps=100)
+            
+            # Ground truth energy function (requires decoding)
+            def gt_energy_func(z_in):
+                with torch.no_grad():
+                    # Move to CPU for consistent numpy integration
+                    z_in_cpu = z_in.to('cpu')
+                    z_reshaped = z_in_cpu.view(-1, config_data['super_nodes'], config_data['latent_dim'])
+                    
+                    # Decoder requires s, batch, and stats
+                    model_device = next(trainer.model.parameters()).device
+                    
+                    # For a clean drift calculation, we assume 1-to-1 mapping if possible
+                    # or just use the first particle
+                    n_particles_eval = config_data['particles']
+                    n_super_eval = config_data['super_nodes']
+                    
+                    # Create a dummy batch and hard assignment
+                    # For 4 particles and 2 super-nodes, we assign 2 particles per super-node
+                    eval_batch = torch.zeros(n_particles_eval, dtype=torch.long, device=model_device)
+                    eval_s = torch.zeros(n_particles_eval, n_super_eval, device=model_device)
+                    for i in range(n_particles_eval):
+                        eval_s[i, i % n_super_eval] = 1.0
+                    
+                    # Move inputs to model device
+                    z_in_dev = z_reshaped.to(model_device)
+                    
+                    # Use the model's stats for denormalization
+                    model_stats = trainer.stats
+                    
+                    recon = trainer.model.decoder(z_in_dev, eval_s, eval_batch, stats=model_stats)
+                    pos_pred = recon[:, :2]
+                    vel_pred = recon[:, 2:]
+                    
+                    p_np = pos_pred.cpu().numpy()
+                    v_np = vel_pred.cpu().numpy()
+                    return torch.tensor(sim.energy(p_np, v_np))
+            
+            eng_drift = calculate_energy_drift(trainer.symbolic_proxy, gt_energy_func, initial_z_cpu, dt, steps=100)
+            
+            # Ensure they are scalar floats
+            if hasattr(symp_drift, 'item'): symp_drift = symp_drift.item()
+            if hasattr(eng_drift, 'item'): eng_drift = eng_drift.item()
+            
+            print(f"  Symplectic Drift: {symp_drift:.6f}")
+            print(f"  Energy Drift: {eng_drift:.6f}")
+            
         except Exception as e:
-            print(f"  Shadow integration failed: {e}")
+            print(f"  Drift calculation failed: {e}")
             stability_score = 0.0
+            symp_drift = 1.0
+            eng_drift = 1.0
 
     # NEW: discovery_report.json as requested
     report_data = {
         'discovered_sympy': [str(eq) for eq in equations],
         'recovered_constants': getattr(distiller, 'recovered_constants', {}),
-        'stability_score': stability_score,
-        'health_check': health_check,
+        'stability_score': float(stability_score),
+        'symplectic_drift': float(symp_drift),
+        'energy_drift': float(eng_drift),
+        'health_check': {k: float(v) if hasattr(v, 'item') else v for k, v in health_check.items()},
         'config': config_data
     }
     

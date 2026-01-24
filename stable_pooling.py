@@ -440,20 +440,40 @@ class SparsityScheduler:
     Sparsity scheduler that gradually increases sparsity pressure.
     This prevents resolution collapse by allowing the model to find a good
     representation before aggressively pruning super-nodes.
+    
+    NEW: Adaptive adjustment based on Latent SNR to prevent resolution collapse.
     """
 
     def __init__(self, initial_weight=0.0, target_weight=0.1, warmup_steps=1000, 
                  max_steps=5000, schedule_type='sigmoid'):
         self.initial_weight = initial_weight
         self.target_weight = target_weight
+        self.base_target_weight = target_weight
         self.warmup_steps = warmup_steps
         self.max_steps = max_steps
         self.schedule_type = schedule_type
         self.current_step = 0
+        self.last_snr = 1.0
 
     def step(self):
         self.current_step += 1
         return self.get_weight()
+
+    def adjust_to_snr(self, snr):
+        """
+        Adaptive adjustment: If SNR is low, reduce sparsity pressure to prevent collapse.
+        If SNR is high, we can afford more sparsity.
+        """
+        self.last_snr = snr
+        # Threshold for "healthy" SNR is around 1.0 - 2.0 based on logs
+        if snr < 1.0:
+            # Scale target weight down if SNR is poor
+            # Reduces sparsity pressure linearly as SNR drops below 1.0
+            reduction_factor = max(0.1, snr)
+            self.target_weight = self.base_target_weight * reduction_factor
+        else:
+            # Restore to base target weight if SNR is healthy
+            self.target_weight = self.base_target_weight
 
     def get_weight(self):
         if self.current_step < self.warmup_steps:

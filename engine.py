@@ -264,7 +264,12 @@ class SymbolicProxy(torch.nn.Module):
             else:
                 self.sym_modules.append(None)
 
-    def forward(self, z_flat):
+    def forward(self, t, z_flat=None):
+        # Handle cases where t is not provided (legacy call) or t, z are provided (ODE solver call)
+        if z_flat is None:
+            # If only one argument provided, it's z_flat (legacy)
+            z_flat = t
+            
         # z_flat: [Batch, K * D]
         # Ensure input is float32 for MPS stability
         z_flat = z_flat.to(torch.float32)
@@ -342,11 +347,11 @@ class SymbolicProxy(torch.nn.Module):
                 else:
                     X_input = X_norm
 
-                y_preds.append(sym_mod(X_input))
+                y_preds.append(sym_mod(X_input).view(-1, 1))
             else:
-                y_preds.append(torch.zeros(z_flat.size(0), device=z_flat.device, dtype=torch.float32))
+                y_preds.append(torch.zeros((z_flat.size(0), 1), device=z_flat.device, dtype=torch.float32))
 
-        Y_norm_pred = torch.stack(y_preds, dim=1)
+        Y_norm_pred = torch.stack(y_preds, dim=1).squeeze(-1)
 
         # 3. Denormalize
         Y_pred = self.torch_transformer.denormalize_y(Y_norm_pred)
@@ -444,21 +449,22 @@ class Trainer:
 
     def update_symbolic_proxy(self, symbolic_proxy_or_equations, transformer=None, weight=0.1, confidence=0.0):
         """Update the symbolic proxy model with new discovered equations."""
+        # Determine correct device for symbolic proxy (must match ode_func if on MPS)
+        proxy_device = torch.device('cpu') if getattr(self, 'mps_ode_on_cpu', False) else self.device
+
         if hasattr(symbolic_proxy_or_equations, 'forward'):  # It's already a proxy module
-            self.symbolic_proxy = symbolic_proxy_or_equations
+            self.symbolic_proxy = symbolic_proxy_or_equations.to(proxy_device)
         else:  # It's a list of equations
             self.symbolic_proxy = SymbolicProxy(
                 self.model.encoder.n_super_nodes,
                 self.model.encoder.latent_dim,
                 symbolic_proxy_or_equations,
                 transformer
-            )
-            # Ensure all parameters and buffers of the symbolic proxy are on the same device as the model
-            self.symbolic_proxy = self.symbolic_proxy.to(self.device)
+            ).to(proxy_device)
 
         self.symbolic_weight = weight
         self.symbolic_confidence = confidence
-        print(f"Symbolic proxy updated. Weight: {weight}, Confidence: {confidence:.3f}")
+        print(f"Symbolic proxy updated. Weight: {weight}, Confidence: {confidence:.3f} on {proxy_device}")
         
     def _get_schedules(self, epoch, max_epochs):
         progress = epoch / max_epochs

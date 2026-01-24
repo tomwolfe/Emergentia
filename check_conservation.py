@@ -25,6 +25,73 @@ def gp_to_sympy(expr_str, n_features):
         local_dict[f'X{i}'] = sp.Symbol(f'x{i}')
     return sp.sympify(expr_str, locals=local_dict)
 
+def calculate_symplectic_drift(model_func, z0, dt, steps=100):
+    """
+    Calculates the symplectic drift over time.
+    Symplectic drift measures how much the Jacobian of the flow deviates from being symplectic.
+    For a symplectic map J, J^T * Omega * J = Omega.
+    """
+    batch_size, latent_dim = z0.shape
+    device = z0.device
+    
+    # Define the symplectic matrix Omega
+    # Omega = [[0, I], [-I, 0]]
+    d = latent_dim // 2
+    Omega = torch.zeros((latent_dim, latent_dim), device=device)
+    Omega[:d, d:] = torch.eye(d, device=device)
+    Omega[d:, :d] = -torch.eye(d, device=device)
+    
+    z = z0.clone().detach().requires_grad_(True)
+    
+    drifts = []
+    
+    for _ in range(steps):
+        # Compute one step using rk4
+        # k1 = model_func(z)
+        # ... simplified for now: just compute Jacobian of the one-step map
+        
+        # To get the flow Jacobian, we need to integrate
+        # But we can also check the divergence of the vector field: div(f) = 0 for Hamiltonian
+        # Or check the condition on the vector field Jacobian M: M^T * Omega + Omega * M = 0
+        
+        def get_dz(z_in):
+            return model_func(0, z_in)
+        
+        # Vectorized Jacobian computation
+        # Use a small batch if possible, or just the first element
+        z_sample = z[0:1]
+        # Jacobian expects a function that takes only one argument (z)
+        M = torch.autograd.functional.jacobian(get_dz, z_sample).squeeze()
+        
+        # Hamiltonian condition: M^T * Omega + Omega * M = 0
+        drift_matrix = M.t() @ Omega + Omega @ M
+        drift = torch.norm(drift_matrix).item()
+        drifts.append(drift)
+        
+        # Update z (Euler step for simplicity in drift tracking)
+        dz = get_dz(z)
+        z = (z + dz * dt).detach().requires_grad_(True)
+        
+    return np.mean(drifts)
+
+def calculate_energy_drift(model_func, energy_func, z0, dt, steps=100):
+    """
+    Calculates the relative energy drift over a trajectory.
+    """
+    z = z0.clone().detach()
+    
+    initial_energy = energy_func(z)
+    energies = [initial_energy.item()]
+    
+    for _ in range(steps):
+        dz = model_func(0, z)
+        z = z + dz * dt
+        energies.append(energy_func(z).item())
+        
+    energies = np.array(energies)
+    drift = np.abs(energies - initial_energy.item()) / (np.abs(initial_energy.item()) + 1e-9)
+    return np.max(drift)
+
 def verify_hamiltonian_properties(expr_str, n_super_nodes, latent_dim):
     """
     Verifies if a discovered expression satisfies Hamiltonian properties.

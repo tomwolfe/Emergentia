@@ -249,16 +249,21 @@ class LennardJonesSimulator(SpringMassSimulator):
                 diff[:, i] -= self.box_size[i] * np.round(diff[:, i] / self.box_size[i])
 
         dist_sq = np.sum(diff**2, axis=1, keepdims=True)
-        # Soft-Core LJ implementation for stability - increased threshold
-        dist_sq = np.maximum(dist_sq, 0.9 * self.sigma**2)
+        
+        # IMPROVED: Smooth Soft-Core LJ implementation for better stability
+        # Instead of hard clipping dist_sq, we add a softening parameter alpha.
+        # V(r) = 4*epsilon * [ (sigma^2 / (r^2 + alpha*sigma^2))^6 - (sigma^2 / (r^2 + alpha*sigma^2))^3 ]
+        alpha = 0.01  # Small softening to prevent singularities while preserving physics
+        dist_sq_soft = dist_sq + alpha * (self.sigma**2)
 
-        sr6 = (self.sigma**2 / dist_sq)**3
+        sr6 = (self.sigma**2 / dist_sq_soft)**3
         # Prevent overflow by clamping sr6 before squaring
-        sr6 = np.clip(sr6, -1e10, 1e10)
+        sr6 = np.clip(sr6, -1e8, 1e8)
         sr12 = sr6**2
 
-        # F = 24 * epsilon / r^2 * [2*(sigma/r)^12 - (sigma/r)^6] * vec_r
-        f_mag = (24 * self.epsilon / dist_sq) * (2 * sr12 - sr6)
+        # Force magnitude with soft-core correction
+        # F = -dV/dr * (vec_r / r) = 24 * epsilon * [2*sr12 - sr6] * (vec_r / (r^2 + alpha*sigma^2))
+        f_mag = (24 * self.epsilon / dist_sq_soft) * (2 * sr12 - sr6)
 
         force_vec = f_mag * diff
 
@@ -287,9 +292,14 @@ class LennardJonesSimulator(SpringMassSimulator):
                 for i in range(2):
                     diff[:, i] -= self.box_size[i] * np.round(diff[:, i] / self.box_size[i])
             dist_sq = np.sum(diff**2, axis=1)
-            sr6 = (self.sigma**2 / dist_sq)**3
+            
+            # Use same soft-core softening as in compute_forces
+            alpha = 0.01
+            dist_sq_soft = dist_sq + alpha * (self.sigma**2)
+            
+            sr6 = (self.sigma**2 / dist_sq_soft)**3
             # Prevent overflow by clamping sr6 before squaring
-            sr6 = np.clip(sr6, -1e10, 1e10)
+            sr6 = np.clip(sr6, -1e8, 1e8)
             sr12 = sr6**2
             pe = 4 * self.epsilon * np.sum(sr12 - sr6)
             

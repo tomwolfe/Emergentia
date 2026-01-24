@@ -655,21 +655,21 @@ class DiscoveryEngineModel(nn.Module):
         z0_flat = z0.reshape(z0.size(0), -1).to(torch.float32)
         t = t.to(torch.float32)
 
-        # Use the device of the ode_func parameters
-        # Optimization: Cache the device to avoid repeated calls
-        if not hasattr(self, '_ode_device'):
-            self._ode_device = next(self.ode_func.parameters()).device
-        ode_device = self._ode_device
+        # Optimization: Cache the target device and is_mps flag to avoid repeated logic
+        if not hasattr(self, '_cached_target_device'):
+            ode_device = next(self.ode_func.parameters()).device
+            is_mps = (str(z0.device) == 'mps' or str(ode_device) == 'mps')
+            self._cached_target_device = torch.device('cpu') if is_mps else ode_device
+            self._is_mps_fix = is_mps
+        
+        target_device = self._cached_target_device
         original_device = z0.device
-
-        # MPS fix: torchdiffeq is unstable on MPS. If original or ode device is MPS, use CPU.
-        is_mps = (str(original_device) == 'mps' or str(ode_device) == 'mps')
-        target_device = torch.device('cpu') if is_mps else ode_device
 
         y0 = z0_flat if z0_flat.device == target_device else z0_flat.to(target_device)
         t_ode = t if t.device == target_device else t.to(target_device)
 
         # Ensure ode_func is on the correct device - only if necessary
+        # Parameters check is slow, but we only do it if we are not on the right device
         if next(self.ode_func.parameters()).device != target_device:
             self.ode_func.to(target_device)
 

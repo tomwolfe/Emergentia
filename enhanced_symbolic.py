@@ -138,14 +138,22 @@ class SymPyToTorch(torch.nn.Module):
             res = self._recursive_eval(self.expr, x_inputs)
             # Catch any remaining NaNs or Infs and clamp
             res = torch.nan_to_num(res, nan=0.0, posinf=1e6, neginf=-1e6)
-            return torch.clamp(res, -1e6, 1e6)
+            res = torch.clamp(res, -1e6, 1e6)
         except Exception:
             # Fallback for unexpected SymPy structures
             l_func = sp.lambdify(self.symbols, self.expr, modules='torch')
             args = [x_inputs[:, i] for i in range(self.n_inputs)]
             res = l_func(*args)
             res = torch.nan_to_num(res, nan=0.0, posinf=1e6, neginf=-1e6)
-            return torch.clamp(res, -1e6, 1e6)
+            res = torch.clamp(res, -1e6, 1e6)
+        
+        # Ensure output is [Batch, 1]
+        if res.dim() == 1:
+            res = res.unsqueeze(1)
+        elif res.dim() == 0:
+            res = res.expand(x_inputs.size(0), 1)
+        
+        return res
 
     def _recursive_eval(self, node, x_inputs):
         if node.is_Symbol:
@@ -268,9 +276,9 @@ class TorchFeatureTransformer(torch.nn.Module):
             valid_mask = mask[mask < X_expanded.size(1)]
             X_selected = X_expanded[:, valid_mask]
             
-            # 2. Mask normalization buffers accordingly
-            mu = self.x_poly_mean[valid_mask]
-            std = self.x_poly_std[valid_mask]
+            # 2. Mask normalization buffers accordingly (ensure they are on correct device)
+            mu = self.x_poly_mean.to(X_expanded.device)[valid_mask]
+            std = self.x_poly_std.to(X_expanded.device)[valid_mask]
             
             # 3. Normalize selected features
             X_norm_selected = (X_selected - mu) / std
