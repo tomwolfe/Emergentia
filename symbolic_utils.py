@@ -47,7 +47,16 @@ def create_safe_functions():
 def gp_to_sympy(expr_str, n_features=None):
     """
     Unified GP expression to SymPy conversion.
+    Handles standard gplearn strings and custom Hamiltonian strings.
     """
+    # Pre-process Hamiltonian strings: "SeparableHamiltonian(V=..., T=...)" -> extract V
+    if "Hamiltonian" in expr_str:
+        if "V=" in expr_str:
+            start = expr_str.find("V=") + 2
+            end = expr_str.find(", T=")
+            if end == -1: end = expr_str.rfind(")")
+            expr_str = expr_str[start:end]
+            
     local_dict = {
         'add': lambda x,y: x+y,
         'sub': lambda x,y: x-y,

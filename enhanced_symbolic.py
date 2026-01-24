@@ -315,20 +315,25 @@ class TorchFeatureTransformer(torch.nn.Module):
         features = []
         softening = 0.001 if getattr(self, 'sim_type', 'lj') == 'lj' else 0.1
         
-        # 1. Basic distance and inverse distance
-        features.append(d)
-        features.append(1.0 / (d + softening))
-        
-        # 2. Spectrum of power laws: 1/r^n
-        for n in [2, 3, 4, 6, 8, 10, 12]:
-            features.append(1.0 / (torch.pow(d, n) + softening))
+        if getattr(self, 'sim_type', 'lj') == 'lj':
+            # Match BalancedFeatureTransformer LJ logic
+            for n in [1, 2, 4]:
+                features.append(1.0 / (torch.pow(d, n) + softening))
+        else:
+            # 1. Basic distance and inverse distance
+            features.append(d)
+            features.append(1.0 / (d + softening))
             
-        # 3. Short-range interaction terms (Exponential/Yukawa-like)
-        features.append(torch.exp(-d))
-        features.append(torch.exp(-d) / (d + softening))
-        
-        # 4. Logarithmic interactions (2D gravity/electrostatics)
-        features.append(torch.log(d + softening))
+            # 2. Spectrum of power laws: 1/r^n
+            for n in [2, 3, 4, 6, 8, 10, 12]:
+                features.append(1.0 / (torch.pow(d, n) + softening))
+                
+            # 3. Short-range interaction terms (Exponential/Yukawa-like)
+            features.append(torch.exp(-d))
+            features.append(torch.exp(-d) / (d + softening))
+            
+            # 4. Logarithmic interactions (2D gravity/electrostatics)
+            features.append(torch.log(d + softening))
 
         return features
 
@@ -433,9 +438,9 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
     4. Better handling of physics-specific parameters
     """
 
-    def __init__(self, populations=2000, generations=40, stopping_criteria=0.001, max_features=12,
-                 secondary_optimization=True, opt_method='L-BFGS-B', opt_iterations=100,
-                 use_sindy_pruning=True, sindy_threshold=0.05):
+    def __init__(self, populations=5000, generations=60, stopping_criteria=0.0001, max_features=15,
+                 secondary_optimization=True, opt_method='L-BFGS-B', opt_iterations=200,
+                 use_sindy_pruning=True, sindy_threshold=0.01):
         super().__init__(populations, generations, stopping_criteria, max_features)
         self.secondary_optimization = secondary_optimization
         self.opt_method = opt_method
@@ -448,6 +453,7 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
     def _sindy_select(self, X, y, threshold=0.05, max_iter=10):
         """
         Sequential Thresholded Least Squares (STLSQ) for SINDy-style pruning.
+        Uses relative thresholding for improved robustness.
         """
         from sklearn.linear_model import Ridge
         n_features = X.shape[1]
@@ -462,9 +468,12 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
             # Update mask: threshold coefficients
             new_mask = np.zeros(n_features, dtype=bool)
             active_coeffs = np.abs(model.coef_)
-            # Normalize coeffs by their max to make threshold relative or use absolute
-            # Absolute threshold is more standard in SINDy
-            new_mask[mask] = active_coeffs > threshold
+            
+            # Use relative threshold: max(absolute_threshold, relative_threshold * max_coeff)
+            max_coeff = np.max(active_coeffs) if len(active_coeffs) > 0 else 0
+            effective_threshold = max(threshold, 0.05 * max_coeff)
+            
+            new_mask[mask] = active_coeffs > effective_threshold
             
             if np.array_equal(mask, new_mask): break
             mask = new_mask

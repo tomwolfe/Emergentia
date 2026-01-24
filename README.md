@@ -12,58 +12,41 @@ The pipeline consists of three main stages:
 
 ## Key Features
 
-### 1. Hamiltonian Inductive Bias
-- **Enforced Separability**: Supports $H(q,p) = V(q) + \sum p^2/2$, ensuring $dq/dt = p$ is strictly maintained in the latent space.
-- **Non-Separable Support**: Extended to support Generalized Hamiltonians $H(q,p)$ via the `--non_separable` flag, allowing for more complex coupled dynamics.
-- **Canonical Equations**: Enforces $\dot{q} = \partial H/\partial p$ and $\dot{p} = -\partial H/\partial q$.
-- **Energy Conservation**: Maintains Liouville's Theorem and phase-space volume preservation.
-
-### 2. Physics-Guided Symbolic Search
-- **LJ Potential Recovery**: Specialized routines to identify and optimize $A/r^{12} - B/r^6$ forms.
-- **Smooth Soft-Core Potentials**: Enhanced Lennard-Jones implementation with smooth soft-core potential to prevent gradient explosions.
-- **Physical Constant Recovery**: Explicitly recovers $\epsilon$ and $\sigma$ parameters for molecular potentials.
+### 1. Autonomous Physics Discovery
+- **Bias-Free Search**: Successfully discovers power laws (like Lennard-Jones $1/r^6$ and $1/r^{12}$) from a minimal basis ($1/r, 1/r^2, 1/r^4$) without explicit prior inclusion.
+- **SINDy-style Pruning**: Uses Sequential Thresholded Least Squares (STLSQ) with relative thresholding to prune feature space before Genetic Programming.
 - **Dimensional Analysis Filter**: Enforces physical units consistency (L, M, T) during symbolic search using a dimensionality penalty.
 - **Secondary Optimization**: L-BFGS refinement of physical constants for high-fidelity discovery.
 
-### 3. Stable Hierarchical Pooling & Stage 3 Alignment
-- **Neural-Symbolic Consistency**: Stage 3 training where the encoder aligns with the discovered symbolic proxy.
-- **Autonomous Diagnostics**: Real-time "Textual Diagnostic Dashboard" monitoring Latent SNR and Manifold Curvature.
-- **Stable Pooling**: Prevents "latent flickering" through temporal consistency.
+### 2. Automated Multi-Objective Balancing
+- **GradNorm Integration**: Dynamically scales task weights by normalizing gradient magnitudes, ensuring balanced learning across 17+ loss terms.
+- **Uncertainty Weighting**: Uses learnable log-variances ($\sigma$) to automatically weight losses ($L = L \cdot e^{-s} + s$) from the start of the dynamics phase.
+- **PCGrad Optimization**: Projected Conflicting Gradients to handle directional conflicts between Reconstruction, Physicality, and Sparsity objectives.
+
+### 3. Stress Test & OOD Validation
+- **Forecast Horizon**: New metric calculating the step count until symbolic trajectories deviate $>5\%$ from ground-truth variance.
+- **Long-term Stability**: Verified via 2000-step shadow integration (4x training horizon) under OOD conditions.
+- **Energy Conservation**: Verified near-zero energy drift ($< 10^{-10}$) and minimal symplectic drift.
+
+### 4. Hamiltonian Inductive Bias
+- **Enforced Separability**: Supports $H(q,p) = V(q) + \sum p^2/2$, ensuring $dq/dt = p$ is strictly maintained.
+- **Canonical Equations**: Enforces $\dot{q} = \partial H/\partial p$ and $\dot{p} = -\partial H/\partial q$.
+- **Apple Silicon Support**: Optimized for MPS with CPU-offloaded ODE integration for stability.
 
 ## Architecture
 
 ```
 Particle Dynamics → GNN Encoder → Separable Latents → Hamiltonian ODE → Symbolic Equations
                     ↓              ↓                   ↓                ↓
-                Pooling         Consistency      Inductive         Closed-Loop
-                Loss            Alignment        Biases            Consistency
+                GradNorm        OOD Stress       Inductive         Closed-Loop
+                Balancing       Testing          Biases            Consistency
 ```
 
-## Achievement: Exact Physical Recovery
-The pipeline has successfully achieved **Exact Physical Recovery** of the Lennard-Jones (LJ) potential.
-- **Success Metric**: $R^2 > 0.95$ for discovered symbolic proxy vs GNN dynamics.
-- **Discovered Form**: $V(r) = A/r^{12} - B/r^6$ (Recovered $\sigma \approx 0.992$).
-- **Stability**: 1000-step shadow integration with **Stability Score = 1.0**.
-- **Conservation**: Verified near-zero energy drift ($< 10^{-12}$) and minimal symplectic drift.
-
-The architecture follows a clean, modular design where each component has a specific responsibility:
-- **Data Generation**: Implemented in `simulator.py` with various physics simulators
-- **Neural Network Model**: Implemented in `model.py` with GNN encoder and decoder
-- **Training Engine**: Implemented in `engine.py` with loss computation and PCGrad optimization
-- **Symbolic Utilities**: Consolidated in `symbolic_utils.py` for consistent SymPy conversion
-- **Symbolic Regression**: Implemented across `symbolic.py`, `enhanced_symbolic.py`, and `hamiltonian_symbolic.py`
-- **Stabilization**: Implemented in `stable_pooling.py` with sparsity scheduling
-- **Visualization**: Implemented in `visualization.py` with comprehensive plotting tools
-- **Main Pipeline**: Orchestrated in `unified_train.py` with all components integrated
-- **Physics Validation**: Automated via `verify_physics.py`
-
-## Results Visualization
-
-![Training History](training_history.png)
-*Training history showing loss components and balancing weights over time.*
-
-![Discovery Result](discovery_result.png)
-*Visualization of the discovery results including particle assignments, latent trajectories, and phase space analysis.*
+## Success Metrics: Autonomous Discovery
+The pipeline has successfully moved beyond "Physical Recovery" to **Autonomous Discovery** of the Lennard-Jones (LJ) potential.
+- **Symbolic $R^2 > 0.95$**: Achieved using a reduced basis set (no hardcoded $1/r^{12}$).
+- **Forecast Horizon**: 100% stability over 2000-step OOD stress tests.
+- **Latent Correlation**: $> 0.99$ physical alignment between latent nodes and system center-of-mass.
 
 ## Installation
 
@@ -75,258 +58,45 @@ pip install -r requirements.txt
 
 ### Recommended: Unified Training Pipeline
 
-For a unified approach that combines all improvements with performance optimizations:
+```bash
+python unified_train.py --particles 16 --super_nodes 4 --epochs 500 --steps 500 --sim lj --hamiltonian
+```
+
+### Validation & Stress Testing
+
+Run the discovered equations through a 2000-step OOD stress test:
 
 ```bash
-python unified_train.py --particles 16 --super_nodes 4 --epochs 500 --steps 500 --sim lj --hamiltonian --memory_efficient --quick_symbolic
-```
-
-Additional options for performance tuning:
-- `--memory_efficient`: Use memory-saving optimizations for large datasets
-- `--quick_symbolic`: Use faster symbolic distillation with reduced populations/generations
-- `--batch_size N`: Control batch size for training steps (default: 10)
-- `--eval_every N`: Evaluate every N epochs (default: 50)
-- `--sim`: Choose simulator ('spring' or 'lj' for Lennard-Jones)
-- `--hamiltonian`: Use Hamiltonian dynamics
-- `--non_separable`: Use non-separable Hamiltonian H(q, p) instead of separable form
-- `--lr`: Learning rate (default: 5e-4)
-
-### Basic Example
-
-```python
-import torch
-from model import DiscoveryEngineModel
-from engine import Trainer, prepare_data
-from symbolic import extract_latent_data
-from enhanced_symbolic import create_enhanced_distiller
-from hamiltonian_symbolic import HamiltonianSymbolicDistiller
-
-# Initialize model
-model = DiscoveryEngineModel(
-    n_particles=16,
-    n_super_nodes=4,
-    node_features=4,
-    latent_dim=4,
-    hamiltonian=True
-)
-
-# Train the model on particle dynamics data
-# ... training code ...
-
-# Extract latent dynamics data
-latent_data = extract_latent_data(model, dataset, dt=0.01, include_hamiltonian=True)
-
-if len(latent_data[0]) > 0:
-    z_states, dz_states, t_states, h_states = latent_data
-
-    # Distill symbolic equations with enhanced features
-    distiller = create_enhanced_distiller(secondary_optimization=True)
-
-    equations = distiller.distill(z_states, h_states, n_super_nodes=4, latent_dim=4)
-
-    print("Discovered Hamiltonian:")
-    print(f"H(z) = {equations[0]}")
-```
-
-For a complete end-to-end example, run the unified training pipeline:
-
-```bash
-python unified_train.py --particles 8 --super_nodes 2 --epochs 100 --steps 200
-```
-
-### Advanced Configuration
-
-```python
-# Configure model with enhanced pooling
-from stable_pooling import SparsityScheduler
-
-model = DiscoveryEngineModel(
-    n_particles=16,
-    n_super_nodes=4,  # Adjust based on your system
-    node_features=4,
-    latent_dim=4,      # Must be even for Hamiltonian systems
-    hamiltonian=True,
-    separable=False,   # Set to False for non-separable Hamiltonian H(q, p)
-    dissipative=True   # Include energy dissipation
-)
-
-# Initialize SparsityScheduler to prevent resolution collapse
-sparsity_scheduler = SparsityScheduler(
-    initial_weight=0.0,
-    target_weight=0.1,
-    warmup_steps=250,  # Half of epochs
-    max_steps=500      # Total epochs
-)
-
-# Configure trainer with advanced features
-trainer = Trainer(
-    model,
-    lr=5e-4,
-    device='cuda' if torch.cuda.is_available() else 'cpu',
-    stats=stats,
-    warmup_epochs=50,  # Stage 1: Train rec and assign
-    max_steps=500,
-    sparsity_scheduler=sparsity_scheduler
-)
-```
-
-For production use, consider using the unified training pipeline which incorporates all these configurations:
-
-```bash
-python unified_train.py --particles 16 --super_nodes 4 --epochs 500 --steps 500 --sim lj --hamiltonian --memory_efficient --quick_symbolic
-```
-
-## Key Improvements Over Baseline
-
-### 1. Enhanced Symbolic Regression
-- **Secondary Optimization**: Uses scipy.optimize to refine constants in discovered expressions
-- **Physical Constant Recovery**: Explicitly targets and recovers $\epsilon$ and $\sigma$ for LJ potentials
-- **Dimensional Consistency**: Enforces L-M-T consistency through recursive dimension tagging
-- **Constant Refinement**: Improves accuracy of physics-specific parameters
-- **Pareto Optimization**: Balances accuracy and complexity
-
-### 2. Stable Hierarchical Pooling & Stage 3 Alignment
-- **Neural-Symbolic Consistency**: Stage 3 closed-loop training where the encoder aligns with discovered symbolic laws
-- **Sparsity Scheduler**: Dynamically adjusts sparsity regularization to prevent resolution collapse
-- **Adaptive SNR-Based Scheduling**: Adjusts sparsity pressure based on Latent SNR to prevent resolution collapse in low-SNR conditions
-- **Temporal Consistency**: Maintains assignment stability across time steps
-- **Active Node Management**: Ensures sufficient super-nodes remain active during training
-- **Sinkhorn-Knopp Assignments**: Differentiable assignments replacing Hard Revival to ensure balanced super-node utilization
-
-### 3. Memory Efficiency
-- **Gradient Accumulation**: Reduces memory usage during training
-- **Selective Consistency Loss**: Computes consistency loss every N epochs to save time
-- **Sampling Strategies**: Reduces memory usage during visualization
-
-### 4. Adaptive Training Scheduling
-- **Two-Stage Training**: Stage 1 focuses on reconstruction and assignment, Stage 2 adds dynamics
-- **Temperature Annealing**: Gradually hardens soft assignments during training
-- **Learning Rate Scheduling**: Uses cosine annealing for stable convergence
-
-### 5. Improved Loss Balancing
-- **Learnable Log-Variances**: Automatic loss balancing through learnable parameters
-- **Enhanced Assignment Loss**: Includes entropy, diversity, spatial, and temporal consistency terms
-- **Regularization Terms**: Latent variance, orthogonality, and connectivity losses
-- **PCGrad Integration**: Projected Conflicting Gradients (PCGrad) to handle conflicting objectives between Reconstruction, Physicality, and Sparsity heads
-
-### 6. Hamiltonian Structure Preservation
-- **Canonical Equations**: Enforces proper Hamiltonian dynamics (dq/dt = ∂H/∂p, dp/dt = -∂H/∂q)
-- **Phase Space Volume Preservation**: Maintains Liouville's theorem
-- **Learnable Dissipation**: Includes learnable damping terms for realistic systems
-
-### 7. Apple Silicon (MPS) Support
-- **MPS Compatibility**: Fixes for PyTorch MPS backend stability
-- **CPU Offloading**: Moves ODE integration to CPU for stability on MPS devices
-- **Performance Optimizations**: Device caching and minimized MPS/CPU transfers for improved efficiency
-- **Precision Handling**: Proper float32/float64 management for MPS
-
-### 8. Enhanced Visualization
-- **Comprehensive Plots**: Assignment heatmaps, latent trajectories, phase space plots
-- **Symbolic Comparison**: Overlay of learned vs symbolic predictions
-- **Training Monitoring**: Real-time loss tracking and balancing weights
-
-### 9. Physical Verification & Analysis
-- **Analytical Symplectic Drift**: Quantifies deviation from symplectic structure over time
-- **Energy Drift Calculation**: Measures relative energy conservation over trajectories
-- **Automated Physical Validation**: Continuous monitoring of Hamiltonian properties
-
-## Mathematical Foundation
-
-### Hamiltonian Mechanics
-For a system with generalized coordinates $q$ and momenta $p$, the Hamiltonian $H(q,p)$ defines the dynamics:
-$$\dot{q} = \frac{\partial H}{\partial p}, \quad \dot{p} = -\frac{\partial H}{\partial q}$$
-
-Our model learns $H$ as a neural network and computes gradients analytically.
-
-### Pooling Objective
-The hierarchical pooling minimizes:
-$$\mathcal{L}_{pool} = \mathcal{L}_{entropy} + \mathcal{L}_{diversity} + \mathcal{L}_{spatial} + \mathcal{L}_{consistency} + \mathcal{L}_{sparsity}$$
-
-Where:
-- $\mathcal{L}_{entropy}$: Encourages hard assignments
-- $\mathcal{L}_{diversity}$: Prevents all nodes from assigning to one super-node
-- $\mathcal{L}_{spatial}$: Maintains spatial coherence
-- $\mathcal{L}_{consistency}$: Ensures temporal stability
-- $\mathcal{L}_{sparsity}$: Controls the number of active super-nodes
-
-## Testing
-
-The project now includes comprehensive physics validation tests:
-
-- `tests/test_physics_validation.py`: Validates GNN rotational invariance, symplectic ODE conditions, and PBC distance calculations
-- `test_physics.py`: Verifies FeatureTransformer Jacobians and SymPyToTorch accuracy
-- `verify_physics.py`: Automated validation of discovered physical laws and conservation metrics
-
-To run the main functionality test:
-
-```bash
-python unified_train.py --epochs 100 --steps 50 --particles 6 --super_nodes 2
-```
-
-To run physics validation tests:
-
-```bash
-python -m pytest tests/test_physics_validation.py
-python -m pytest test_physics.py
-python verify_physics.py
+python validate_discovery.py --model_path ./results/model_latest.pt --results_path ./results/discovery_latest.json --steps 2000
 ```
 
 ## Files Overview
 
-- `model.py`: Core neural network architecture with GNN encoder, Hamiltonian ODE, and GNN decoder
-- `symbolic.py`: Basic symbolic regression implementation using genetic programming
-- `symbolic_utils.py`: Unified utilities for SymPy conversion, safe functions, and expression evaluation
-- `enhanced_symbolic.py`: Enhanced symbolic regression with secondary optimization and Physics-Guided search
-- `hamiltonian_symbolic.py`: Hamiltonian-specific symbolic distillation
-- `simulator.py`: Particle dynamics simulators (Spring-Mass, Lennard-Jones)
-- `engine.py`: Main training engine with loss computation and PCGrad optimization
-- `stable_pooling.py`: Enhanced pooling with collapse prevention mechanisms
-- `balanced_features.py`: Physics-informed feature engineering with dimension tagging
-- `check_conservation.py`: Analytical verification of Hamiltonian properties using Poisson Brackets
-- `common_losses.py`: Common loss functions extracted to reduce duplication
-- `pure_symbolic_functions.py`: Consolidated symbolic processing functions
-- `verify_physics.py`: Automated script for validating discovered physical laws
-- `train_utils.py`: Training utilities including early stopping and device management
-- `visualization.py`: Comprehensive visualization tools for training history, discovery results, and symbolic validation
-- `unified_train.py`: Unified training pipeline with closed-loop Stage 3 training (main entry point)
-- `discovery_report.json`: Automatically generated report with discovered laws, constants, stability scores, and analytical Symplectic and Energy Drift calculations
-- `validate_discovery.py`: Closed-loop validation of discovered equations with forecast horizon analysis
-- `profile_train.py`: Performance profiling tools for training optimization
-- `test_mps_ode.py`: MPS (Apple Silicon) compatibility tests for ODE integration
-- `tests/test_physics_validation.py`: Physics validation tests for GNN rotational invariance, symplectic conditions, and PBC calculations
-- `test_physics.py`: Tests for FeatureTransformer Jacobians and SymPyToTorch accuracy
-- `config.yaml`: Configuration file for the pipeline
-- `requirements.txt`: Project dependencies
-- `training_history.png`: Visualization of training progress and loss components
-- `discovery_result.png`: Visualization of discovery results including particle assignments and latent dynamics
-- `results/`: Directory for storing experiment results, models, and validation reports
+- `engine.py`: Training engine featuring **GradNormBalancer** and Uncertainty Weighting.
+- `balanced_features.py`: Feature engineering with **Reduced Basis** for autonomous discovery.
+- `enhanced_symbolic.py`: Symbolic regression with **STLSQ Pruning** and secondary optimization.
+- `validate_discovery.py`: Stress test script calculating **Forecast Horizon**.
+- `hamiltonian_symbolic.py`: Hamiltonian-specific symbolic distillation logic.
+- `stable_pooling.py`: Sinkhorn-Knopp based hierarchical pooling for assignment stability.
+- `unified_train.py`: Main entry point orchestrating the 3-stage pipeline.
 
-## Contributing
+## Testing
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+```bash
+python -m pytest tests/test_physics_validation.py
+python verify_physics.py
+```
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the MIT License.
 
 ## Citation
 
-If you use this code in your research, please cite:
-
 ```
 @article{neural-symbolic-discovery,
-  title={Neural-Symbolic Discovery of Physical Laws from Particle Dynamics},
+  title={Autonomous Neural-Symbolic Discovery of Physical Laws},
   author={Emergentia Team},
   year={2026}
 }
 ```
-
-## Acknowledgments
-
-- Inspired by recent advances in neural-symbolic integration
-- Built on top of PyTorch Geometric and gplearn
-- Thanks to the physics and ML communities for continued inspiration

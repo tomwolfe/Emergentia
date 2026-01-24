@@ -1,0 +1,8 @@
+{
+    "Forecast Horizon": 1999,
+    "Relative Horizon": 0.9995,
+    "Stability Score": 0.9995,
+    "Total Steps": 2000,
+    "MSE at End": 0.0116681307554245,
+    "Passed": true
+}

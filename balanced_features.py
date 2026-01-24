@@ -226,7 +226,7 @@ class BalancedFeatureTransformer:
                 features.extend(dist_features)
                 if fit_transformer:
                     if self.sim_type == 'lj':
-                        for n in [1, 2, 4, 6, 8, 10, 12]:
+                        for n in [1, 2, 4]:
                             base_names.append(f"sum_inv_d{n}")
                     else:
                         base_names.append("sum_d")
@@ -294,8 +294,8 @@ class BalancedFeatureTransformer:
         # This creates "Global Symmetric Features"
         
         if self.sim_type == 'lj':
-            # For LJ, include common power laws but exclude exponential/log to focus search
-            for n in [1, 2, 4, 6, 8, 10, 12]:
+            # For LJ, only include basic power laws to force discovery of higher powers
+            for n in [1, 2, 4]:
                 aggregated_features.append((1.0 / (d**n + 0.001)).sum(axis=1, keepdims=True))
         else:
             # 1. Basic distance and inverse distance
@@ -344,12 +344,13 @@ class BalancedFeatureTransformer:
         names = list(base_names) if base_names is not None else None
         
         # 2. Squares of raw latents: [Batch, n_raw_latents]
-        # ALWAYS include squares as they are fundamental for kinetic energy (p^2)
+        # Include squares as they are fundamental, but only if requested or for momentum
         X_raw = z_flat_norm
-        features.append(X_raw**2)
-        if names is not None and raw_latent_names is not None:
-            for i in range(n_raw_latents):
-                names.append(f"{raw_latent_names[i]}^2")
+        if self.include_raw_latents:
+            features.append(X_raw**2)
+            if names is not None and raw_latent_names is not None:
+                for i in range(n_raw_latents):
+                    names.append(f"{raw_latent_names[i]}^2")
 
         # NEW: Explicit sum of squares of momentum dims (p^2) per super-node
         # Assuming last half of latent_dim are momentum dims
@@ -546,7 +547,7 @@ class BalancedFeatureTransformer:
 
             # Add aggregated jacobians to list based on sim_type
             if self.sim_type == 'lj':
-                for n in [1, 2, 4, 6, 8, 10, 12]:
+                for n in [1, 2, 4]:
                     if n == 1:
                         jac_list.append(j_inv_d_sum.reshape(1, -1))
                     else:

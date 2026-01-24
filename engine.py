@@ -201,16 +201,70 @@ class LossTracker:
     def get_running_averages(self):
         return {**self.history, **{f"w_{k}": v for k, v in self.weights.items()}}
 
+class GradNormBalancer(torch.nn.Module):
+    """
+    Implementation of GradNorm: Gradient Normalization for Multi-Task Learning.
+    Balances task weights by normalizing gradient magnitudes.
+    """
+    def __init__(self, n_tasks, alpha=1.5, device='cpu'):
+        super().__init__()
+        self.n_tasks = n_tasks
+        self.alpha = alpha
+        # Initialize weights to 1.0
+        self.weights = torch.nn.Parameter(torch.ones(n_tasks, device=device))
+        self.initial_losses = None
+        
+    def get_weights(self):
+        # Ensure weights stay positive and sum to n_tasks
+        w = torch.softmax(self.weights, dim=0) * self.n_tasks
+        return w
+
+    def update(self, losses, shared_weights, optimizer):
+        """
+        losses: List of loss tensors
+        shared_weights: Parameters common to all tasks (e.g., GNN encoder)
+        """
+        if self.initial_losses is None:
+            self.initial_losses = torch.tensor([l.item() for l in losses], device=self.weights.device)
+            return
+
+        # 1. Compute L2 norm of gradients for each task
+        norms = []
+        for i, loss in enumerate(losses):
+            # Compute gradient of task loss with respect to shared weights
+            grad = torch.autograd.grad(loss, shared_weights, retain_graph=True, allow_unused=True)[0]
+            if grad is not None:
+                norms.append(torch.norm(self.weights[i] * grad, p=2))
+            else:
+                norms.append(torch.tensor(0.0, device=self.weights.device))
+        
+        norms = torch.stack(norms)
+        avg_norm = norms.mean() + 1e-6
+
+        # 2. Compute relative inverse training rate
+        loss_ratios = torch.tensor([l.item() for l in losses], device=self.weights.device) / (self.initial_losses + 1e-6)
+        # Prioritize tasks that are far from convergence
+        inverse_train_rates = loss_ratios / (loss_ratios.mean() + 1e-6)
+
+        # 3. Target norm
+        target_norms = (avg_norm * (inverse_train_rates ** self.alpha)).detach()
+
+        # 4. GradNorm loss
+        grad_norm_loss = torch.nn.functional.l1_loss(norms, target_norms)
+        
+        # 5. Backward for weights (optimizer for GradNorm weights should be separate or handled)
+        self.weights.grad = torch.autograd.grad(grad_norm_loss, self.weights)[0]
+
 class SymbolicProxy(torch.nn.Module):
     """
     A differentiable proxy for the discovered symbolic laws.
     Allows end-to-end gradient flow from symbolic equations back to the GNN.
     """
-    def __init__(self, n_super_nodes, latent_dim, equations, transformer):
+    def __init__(self, n_super_nodes, latent_dim, equations, transformer, hamiltonian=False):
         super().__init__()
         self.n_super_nodes = n_super_nodes
         self.latent_dim = latent_dim
-        self.is_hamiltonian = False
+        self.is_hamiltonian = hamiltonian
         self.dissipation_coeffs = None
 
         # 1. Initialize differentiable feature transformer
@@ -253,7 +307,7 @@ class SymbolicProxy(torch.nn.Module):
                     sympy_expr = gp_to_sympy(str(eq))
 
                 # For Hamiltonian equations, we may need to handle them differently
-                if hasattr(eq, 'compute_derivatives'):
+                if hasattr(eq, 'compute_derivatives') or "Hamiltonian" in str(eq):
                     # This is a Hamiltonian equation that computes derivatives differently
                     self.is_hamiltonian = True
                     if hasattr(eq, 'dissipation_coeffs'):
@@ -291,10 +345,19 @@ class SymbolicProxy(torch.nn.Module):
                 # Denormalize H to physical units
                 H = self.torch_transformer.denormalize_y(H_norm)
                 
+                # Ensure H has grad_fn even if it's a constant to avoid integration errors
+                if not H.requires_grad:
+                    H = H + 0.0 * z_flat.sum()
+                
                 # For Hamiltonian symbolic proxy, we do need higher-order derivatives
                 # Use create_graph=True but with retain_graph=True to avoid the error
                 # Use allow_unused=True for constant expressions
-                dH_dz = torch.autograd.grad(H.sum(), z_flat, create_graph=True, retain_graph=True, allow_unused=True)[0]
+                try:
+                    dH_dz = torch.autograd.grad(H.sum(), z_flat, create_graph=True, retain_graph=True, allow_unused=True)[0]
+                except Exception as e:
+                    print(f"Warning: SymbolicProxy grad computation failed: {e}")
+                    dH_dz = None
+                
                 if dH_dz is None:
                     dH_dz = torch.zeros_like(z_flat)
             
@@ -457,6 +520,10 @@ class Trainer:
             'Physicality': ['align', 'mi', 'sym', 'var', 'curv', 'anchor', 'hinge', 'smooth', 'activity'],
             'Sparsity': ['pruning', 'sparsity', 'sep', 'l2', 'lvr']
         }
+        
+        # Initialize GradNorm Balancer
+        self.grad_norm_balancer = GradNormBalancer(n_tasks=len(self.loss_groups), device=device)
+        self.gn_optimizer = optim.Adam(self.grad_norm_balancer.parameters(), lr=1e-2)
 
     def update_symbolic_proxy(self, symbolic_proxy_or_equations, transformer=None, weight=0.1, confidence=0.0):
         """Update the symbolic proxy model with new discovered equations."""
@@ -1023,68 +1090,85 @@ class Trainer:
             stage2_factor = 1.0 / (1 + math.exp(-12.0 * (progress_in_stage2 - 0.5)))
 
         discovery_loss = torch.tensor(0.0, device=self.device)
-        use_log_vars = (epoch >= int(max_epochs * 0.75))
+        # Enable uncertainty weighting much earlier (after stage 1)
+        use_log_vars = (epoch >= stage2_start)
         
         for i, k in enumerate(raw_losses.keys()):
             if k not in ['cons', 'l2', 'lvr']: # Activity is now included in discovery_loss
                 term = weights[k] * torch.clamp(raw_losses[k], 0, 100)
                 if use_log_vars and i < len(lvars):
-                    term = term + lvars[i]
+                    # Uncertainty weighting: L = L*exp(-s) + s
+                    term = term * torch.exp(-lvars[i]) + lvars[i]
                 discovery_loss += term
 
         discovery_loss += (weights['sym'] * (self.symbolic_weight - 1.0) * torch.clamp(loss_sym.to(torch.float32), 0, 100) * stage2_factor)
         discovery_loss += 1e-4 * torch.clamp(loss_curv.to(torch.float32), 0, 100)
 
-        # PCGRAD / GROUPED LOSSES
-        head_losses = {
+        # GRAD_NORM / PCGRAD / GROUPED LOSSES
+        head_losses_dict = {
             'Reconstruction': torch.tensor(0.0, device=self.device),
             'Physicality': torch.tensor(0.0, device=self.device),
             'Sparsity': torch.tensor(0.0, device=self.device)
         }
 
-        use_log_vars = (epoch >= int(max_epochs * 0.75))
-        lvars = torch.clamp(self.model.log_vars, min=-6.0, max=5.0)
-
         # Map each raw loss to its corresponding head
         for i, k in enumerate(base_keys):
-            # Determine which head this loss belongs to
             target_head = None
             for head, members in self.loss_groups.items():
                 if k in members:
                     target_head = head
                     break
             
-            if target_head is None: target_head = 'Physicality' # Default
+            if target_head is None: target_head = 'Physicality'
 
-            # Compute weighted term
             term = weights[k] * torch.clamp(raw_losses[k], 0, 100)
             if use_log_vars and i < len(lvars):
-                term = term + lvars[i]
+                term = term * torch.exp(-lvars[i]) + lvars[i]
             
-            head_losses[target_head] = head_losses[target_head] + term
+            head_losses_dict[target_head] = head_losses_dict[target_head] + term
 
         # Add extra terms to Physicality
-        head_losses['Physicality'] = head_losses['Physicality'] + (weights['sym'] * (self.symbolic_weight - 1.0) * torch.clamp(loss_sym.to(torch.float32), 0, 100) * stage2_factor)
-        head_losses['Physicality'] = head_losses['Physicality'] + 1e-4 * torch.clamp(loss_curv.to(torch.float32), 0, 100)
+        head_losses_dict['Physicality'] = head_losses_dict['Physicality'] + (weights['sym'] * (self.symbolic_weight - 1.0) * torch.clamp(loss_sym.to(torch.float32), 0, 100) * stage2_factor)
+        head_losses_dict['Physicality'] = head_losses_dict['Physicality'] + 1e-4 * torch.clamp(loss_curv.to(torch.float32), 0, 100)
         if 'activity' in raw_losses:
-            head_losses['Physicality'] = head_losses['Physicality'] + raw_losses['activity']
+            head_losses_dict['Physicality'] = head_losses_dict['Physicality'] + raw_losses['activity']
 
-        # Determine if we should use PCGrad (only after warmup for stability)
-        do_pcgrad = self.use_pcgrad and (epoch > self.warmup_epochs) and not is_stage1
+        # Determine if we should use GradNorm or PCGrad
+        do_grad_norm = (epoch > self.warmup_epochs) and not is_stage1
+        do_pcgrad = self.use_pcgrad and (epoch > self.warmup_epochs) and not is_stage1 and not do_grad_norm
 
-        if do_pcgrad:
+        if do_grad_norm:
+            # 1. Get task weights from GradNorm balancer
+            gn_weights = self.grad_norm_balancer.get_weights()
+            head_losses_list = [head_losses_dict[h] for h in ['Reconstruction', 'Physicality', 'Sparsity']]
+            
+            # 2. Compute total loss with GradNorm weights
+            loss = torch.tensor(0.0, device=self.device)
+            for i, h_loss in enumerate(head_losses_list):
+                loss = loss + gn_weights[i] * h_loss
+            
+            # 3. Backward
+            if self.enable_gradient_accumulation:
+                (loss / self.grad_acc_steps).backward(retain_graph=True)
+            else:
+                loss.backward(retain_graph=True)
+                
+            # 4. Update GradNorm weights
+            # Use shared parameters for GradNorm (GNN Encoder is a good choice)
+            shared_params = list(self.model.encoder.parameters())
+            self.grad_norm_balancer.update(head_losses_list, shared_params, self.gn_optimizer)
+            self.gn_optimizer.step()
+            self.gn_optimizer.zero_grad()
+            
+        elif do_pcgrad:
             # Apply PCGrad: computes gradients for each head and projects them
-            self._apply_pcgrad(head_losses)
-            # Total loss for logging only
-            loss = torch.stack(list(head_losses.values())).sum()
+            self._apply_pcgrad(head_losses_dict)
+            loss = torch.stack(list(head_losses_dict.values())).sum()
         else:
             # Standard weighted summation and backward
-            loss = torch.stack(list(head_losses.values())).sum()
-            # Ensure loss stays positive and doesn't explode
+            loss = torch.stack(list(head_losses_dict.values())).sum()
             loss = torch.clamp(loss + 0.1 * torch.sum(lvars**2), 1e-4, 1e5)
             loss = loss.to(torch.float32)
-            if not torch.isfinite(loss): 
-                loss = loss_rec if torch.isfinite(loss_rec) else torch.tensor(1.0, device=self.device, requires_grad=True)
             
             if self.enable_gradient_accumulation:
                 (loss / self.grad_acc_steps).backward()

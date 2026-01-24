@@ -4,7 +4,8 @@ Enhanced Symbolic Distiller that enforces Hamiltonian structure during symbolic 
 
 import numpy as np
 import sympy as sp
-from symbolic import SymbolicDistiller, FeatureTransformer
+from symbolic import SymbolicDistiller
+from balanced_features import BalancedFeatureTransformer as FeatureTransformer
 
 class HamiltonianSymbolicDistiller(SymbolicDistiller):
     """
