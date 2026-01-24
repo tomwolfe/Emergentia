@@ -19,28 +19,29 @@ The pipeline consists of three main stages:
 
 ### 2. Physics-Guided Symbolic Search
 - **LJ Potential Recovery**: Specialized routines to identify and optimize $A/r^{12} - B/r^6$ forms.
+- **Physical Constant Recovery**: Explicitly recovers $\epsilon$ and $\sigma$ parameters for molecular potentials.
+- **Dimensional Analysis Filter**: Enforces physical units consistency (L, M, T) during symbolic search using a dimensionality penalty.
 - **Secondary Optimization**: L-BFGS refinement of physical constants for high-fidelity discovery.
-- **Physics-First Filtering**: Protects $1/r^n$ features from pruning in molecular systems.
 
-### 3. Stable Hierarchical Pooling
-- Prevents "latent flickering" through temporal consistency.
-- Ensures spatial contiguity of super-nodes.
-- Dynamic resolution selection to find optimal meso-scale.
+### 3. Stable Hierarchical Pooling & Stage 3 Alignment
+- **Neural-Symbolic Consistency**: Stage 3 training where the encoder aligns with the discovered symbolic proxy.
+- **Autonomous Diagnostics**: Real-time "Textual Diagnostic Dashboard" monitoring Latent SNR and Manifold Curvature.
+- **Stable Pooling**: Prevents "latent flickering" through temporal consistency.
 
 ## Architecture
 
 ```
 Particle Dynamics → GNN Encoder → Separable Latents → Hamiltonian ODE → Symbolic Equations
                     ↓              ↓                   ↓                ↓
-                Pooling         Assignment       Inductive         Guided
-                Loss            Consistency      Biases            Distillation
+                Pooling         Consistency      Inductive         Closed-Loop
+                Loss            Alignment        Biases            Consistency
 ```
 
 ## Achievement: Exact Physical Recovery
 The pipeline has successfully achieved **Exact Physical Recovery** of the Lennard-Jones (LJ) potential.
 - **Success Metric**: $R^2 > 0.98$ for discovered Hamiltonian vs Neural Dynamics.
-- **Discovered Form**: $V(r) = \frac{A}{r^{12}} - \frac{B}{r^6} + C$.
-- **Stability**: Latent Correlation $> 0.99$, Flicker Rate $< 0.001$.
+- **Discovered Form**: $V(r) = 4\epsilon [(\frac{\sigma}{r})^{12} - (\frac{\sigma}{r})^6]$.
+- **Stability**: 1000-step shadow integration with high stability scores and verified Poisson brackets.
 
 The architecture follows a clean, modular design where each component has a specific responsibility:
 - **Data Generation**: Implemented in `simulator.py` with various physics simulators
@@ -172,10 +173,13 @@ python unified_train.py --particles 16 --super_nodes 4 --epochs 500 --steps 500 
 
 ### 1. Enhanced Symbolic Regression
 - **Secondary Optimization**: Uses scipy.optimize to refine constants in discovered expressions
+- **Physical Constant Recovery**: Explicitly targets and recovers $\epsilon$ and $\sigma$ for LJ potentials
+- **Dimensional Consistency**: Enforces L-M-T consistency through recursive dimension tagging
 - **Constant Refinement**: Improves accuracy of physics-specific parameters
 - **Pareto Optimization**: Balances accuracy and complexity
 
-### 2. Stable Hierarchical Pooling
+### 2. Stable Hierarchical Pooling & Stage 3 Alignment
+- **Neural-Symbolic Consistency**: Stage 3 closed-loop training where the encoder aligns with discovered symbolic laws
 - **Sparsity Scheduler**: Dynamically adjusts sparsity regularization to prevent resolution collapse
 - **Temporal Consistency**: Maintains assignment stability across time steps
 - **Active Node Management**: Ensures sufficient super-nodes remain active during training
@@ -246,12 +250,14 @@ python unified_train.py --epochs 100 --steps 50 --particles 6 --super_nodes 2
 - `simulator.py`: Particle dynamics simulators (Spring-Mass, Lennard-Jones)
 - `engine.py`: Main training engine with loss computation and optimization
 - `stable_pooling.py`: Enhanced pooling with collapse prevention mechanisms
-- `balanced_features.py`: Physics-informed feature engineering
+- `balanced_features.py`: Physics-informed feature engineering with dimension tagging
+- `check_conservation.py`: Analytical verification of Hamiltonian properties using Poisson Brackets
 - `common_losses.py`: Common loss functions extracted to reduce duplication
 - `pure_symbolic_functions.py`: Pure functions extracted from symbolic processing modules
 - `train_utils.py`: Training utilities including early stopping and device management
 - `visualization.py`: Comprehensive visualization tools for training history, discovery results, and symbolic validation
-- `unified_train.py`: Unified training pipeline with all improvements (main entry point)
+- `unified_train.py`: Unified training pipeline with closed-loop Stage 3 training (main entry point)
+- `discovery_report.json`: Automatically generated report with discovered laws, constants, and stability scores
 - `validate_discovery.py`: Closed-loop validation of discovered equations with forecast horizon analysis
 - `profile_train.py`: Performance profiling tools for training optimization
 - `test_mps_ode.py`: MPS (Apple Silicon) compatibility tests for ODE integration
