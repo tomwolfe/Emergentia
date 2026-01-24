@@ -1,8 +1,9 @@
 {
-    "Forecast Horizon": 1999,
-    "Relative Horizon": 0.9995,
-    "Stability Score": 0.9995,
-    "Total Steps": 2000,
-    "MSE at End": 0.0116681307554245,
-    "Passed": true
+    "energy_conservation_error": 3.0305259245947553,
+    "forecast_horizon": 9,
+    "mass_consistency": 0.0,
+    "parsimony_index": 0.016489170491695404,
+    "symbolic_r2_ood": -0.010418206453323364,
+    "lyapunov_exponent": 8.979584905571308,
+    "success": false
 }

@@ -66,13 +66,13 @@ def calculate_forecast_horizon(proxy, z_gt, dt=0.01, threshold=0.05):
     variance = torch.var(z_gt).item()
     mse_threshold = threshold * variance
     
-    z = z_gt[0]
+    z = z_gt[0].unsqueeze(0)
     horizon = T
     
     for t in range(1, T):
         dz = proxy(z)
         z = z + dz * dt
-        mse = torch.mean((z - z_gt[t])**2).item()
+        mse = torch.mean((z - z_gt[t].unsqueeze(0))**2).item()
         if mse > mse_threshold:
             horizon = t
             break
@@ -182,8 +182,9 @@ def run_benchmark(model, equations, r2_scores, transformer, test_data_path=None)
     )
     
     # 2. Generate OOD test trajectory
-    # Double the energy: we can do this by scaling initial velocities
-    sim = SpringMassSimulator(n_particles=16)
+    # Use same number of particles as model was trained on
+    n_particles = getattr(model.encoder, 'n_particles', 16)
+    sim = SpringMassSimulator(n_particles=n_particles)
     pos, vel = sim.generate_trajectory(steps=1000)
     # Scale velocities to increase energy
     vel_ood = vel * 1.414 # sqrt(2) for 2x kinetic energy
@@ -200,17 +201,25 @@ def run_benchmark(model, equations, r2_scores, transformer, test_data_path=None)
         for data in test_dataset:
             data = data.to(device)
             z, _, _, _ = model.encode(data.x, data.edge_index, torch.zeros(data.x.size(0), dtype=torch.long, device=device))
-            z_gt_list.append(z[0])
-    z_gt = torch.stack(z_gt_list)
+            # z: [1, K, D] -> append [K*D]
+            z_gt_list.append(z.view(-1).detach())
     
-    energy_drift = calculate_energy_drift(proxy, z_gt[0], steps=5000, dt=sim.dt)
+    z_gt = torch.stack(z_gt_list).cpu() # [T, K*D] on CPU for stability
+    
+    # Ensure z0 has batch dimension [1, K*D]
+    z0 = z_gt[0].unsqueeze(0)
+    
+    # proxy is moved to CPU inside these functions
+    energy_drift = calculate_energy_drift(proxy, z0, steps=5000, dt=sim.dt)
     forecast_horizon = calculate_forecast_horizon(proxy, z_gt, dt=sim.dt)
     mass_consistency = calculate_mass_consistency(model, test_dataset)
     parsimony = calculate_parsimony_index(equations, r2_scores)
-    lyapunov = calculate_lyapunov_exponent(proxy, z_gt[0], steps=1000, dt=sim.dt)
+    lyapunov = calculate_lyapunov_exponent(proxy, z0, steps=1000, dt=sim.dt)
     
-    # Symbolic R2 (OOD)
+    # 4. Symbolic R2 (OOD)
     # We evaluate how well the proxy predicts dz/dt on OOD data
+    # Ensure proxy is on CPU
+    proxy = proxy.to(torch.device('cpu'))
     z_flat = z_gt.view(z_gt.size(0), -1)
     dz_gt = (z_flat[1:] - z_flat[:-1]) / sim.dt
     dz_pred = proxy(z_flat[:-1])

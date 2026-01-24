@@ -105,15 +105,16 @@ def generate_closed_loop_trajectory(symbolic_proxy, z0, steps, dt, device='cpu')
     # z0: [1, K*D]
     z0_np = z0.detach().cpu().numpy().flatten()
     
-    # Get the device of the symbolic_proxy
-    proxy_device = next(symbolic_proxy.parameters()).device if list(symbolic_proxy.parameters()) else torch.device('cpu')
+    # Get the device of the symbolic_proxy robustly
+    proxy_device = next(symbolic_proxy.parameters()).device if list(symbolic_proxy.parameters()) else \
+                   next(symbolic_proxy.buffers()).device if list(symbolic_proxy.buffers()) else torch.device('cpu')
 
     def ode_func(t, y):
         # y: [K*D]
         y_torch = torch.from_numpy(y).float().to(proxy_device).unsqueeze(0)
         with torch.no_grad():
             dz_dt = symbolic_proxy(y_torch)
-        return dz_dt.cpu().numpy().flatten()
+        return dz_dt.detach().cpu().numpy().flatten()
     
     t_span = (0, (steps - 1) * dt)
     t_eval = np.linspace(0, (steps - 1) * dt, steps)

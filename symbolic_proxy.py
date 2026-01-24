@@ -57,7 +57,11 @@ class SymbolicProxy(nn.Module):
         if z_flat is None:
             z_flat = t
             
-        z_flat = z_flat.to(torch.float32)
+        # Robustly get current device
+        device = next(self.parameters()).device if list(self.parameters()) else \
+                 next(self.buffers()).device if list(self.buffers()) else z_flat.device
+        
+        z_flat = z_flat.to(device).to(torch.float32)
 
         if self.is_hamiltonian:
             with torch.enable_grad():

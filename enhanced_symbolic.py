@@ -488,6 +488,7 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
         self.use_sindy_pruning = use_sindy_pruning
         self.sindy_threshold = sindy_threshold
         self.extra_kwargs = kwargs
+        self.all_candidates = [] # Store all candidates for analysis
 
     def _get_regressor(self, pop, gen, parsimony=None):
         """Override to use parsimony from extra_kwargs if provided."""

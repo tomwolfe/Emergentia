@@ -467,8 +467,8 @@ def main():
         'discovered_sympy': [str(eq) for eq in equations],
         'health_check': {
             "Symbolic R2": float(np.mean(symbolic_r2s)) if symbolic_r2s else 0.0,
-            "Energy Drift": bench_report['energy_conservation_error'] if 'bench_report' in locals() else 1.0,
-            "OOD R2": bench_report['symbolic_r2_ood'] if 'bench_report' in locals() else 0.0,
+            "Energy Drift": bench_report.get('energy_conservation_error', 1.0) if 'bench_report' in locals() else 1.0,
+            "OOD R2": bench_report.get('symbolic_r2_ood', 0.0) if 'bench_report' in locals() else 0.0,
             "Lyapunov": bench_report.get('lyapunov_exponent', 0.0) if 'bench_report' in locals() else 0.0,
             "Stability Score": stability_score if 'stability_score' in locals() else 0.0,
             "Symplectic Drift": symp_drift if 'symp_drift' in locals() else 1.0

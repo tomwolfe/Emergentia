@@ -205,14 +205,22 @@ class SpringMassSimulator:
 
         return self.pos.copy(), self.vel.copy()
 
-    def generate_trajectory(self, steps=1000):
-        trajectory_pos = []
-        trajectory_vel = []
+    def generate_trajectory(self, steps=1000, init_pos=None, init_vel=None):
+        """
+        Generates a trajectory for the spring-mass system.
+        """
+        if init_pos is not None:
+            self.pos = init_pos.copy()
+        if init_vel is not None:
+            self.vel = init_vel.copy()
+            
+        pos_history = [self.pos.copy()]
+        vel_history = [self.vel.copy()]
         for _ in range(steps):
             p, v = self.step()
-            trajectory_pos.append(p)
-            trajectory_vel.append(v)
-        return np.array(trajectory_pos), np.array(trajectory_vel)
+            pos_history.append(p)
+            vel_history.append(v)
+        return np.array(pos_history), np.array(vel_history)
 
 class LennardJonesSimulator(SpringMassSimulator):
     """

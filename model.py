@@ -225,7 +225,7 @@ class HierarchicalPooling(nn.Module):
         return out, s, assign_losses, mu
 
 class GNNEncoder(nn.Module):
-    def __init__(self, node_features, hidden_dim, latent_dim, n_super_nodes, min_active_super_nodes=4):
+    def __init__(self, node_features, hidden_dim, latent_dim, n_super_nodes, n_particles=None, min_active_super_nodes=4):
         super(GNNEncoder, self).__init__()
         self.gnn1 = EquivariantGNNLayer(node_features, hidden_dim)
         self.ln1 = nn.LayerNorm(hidden_dim)
@@ -233,6 +233,7 @@ class GNNEncoder(nn.Module):
         self.ln2 = nn.LayerNorm(hidden_dim)
         self.n_super_nodes = n_super_nodes
         self.latent_dim = latent_dim
+        self.n_particles = n_particles
 
         # Spatially-aware pooling instead of global_mean_pool
         # Use the Enhanced StableHierarchicalPooling
@@ -598,7 +599,7 @@ class MIDiscriminator(nn.Module):
 class DiscoveryEngineModel(nn.Module):
     def __init__(self, n_particles, n_super_nodes, node_features=4, latent_dim=4, hidden_dim=128, hamiltonian=False, dissipative=True, min_active_super_nodes=4, box_size=10.0):
         super(DiscoveryEngineModel, self).__init__()
-        self.encoder = GNNEncoder(node_features, hidden_dim, latent_dim, n_super_nodes, min_active_super_nodes=min_active_super_nodes)
+        self.encoder = GNNEncoder(node_features, hidden_dim, latent_dim, n_super_nodes, n_particles=n_particles, min_active_super_nodes=min_active_super_nodes)
         
         if hamiltonian:
             self.ode_func = HamiltonianODEFunc(latent_dim, n_super_nodes, hidden_dim, dissipative=dissipative)
