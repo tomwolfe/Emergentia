@@ -40,8 +40,11 @@ def get_expression_dimension(expr, feature_dims):
         non_zero_dims = [d for d in dims if any(v != 0 for v in d)]
         if not non_zero_dims: return (0, 0, 0)
         first = non_zero_dims[0]
-        if all(d == first for d in non_zero_dims): return first
-        return None # Inconsistent!
+        # Check for consistency with small tolerance for float dims
+        for d in non_zero_dims:
+            if not all(abs(v1 - v2) < 1e-5 for v1, v2 in zip(d, first)):
+                return None
+        return first
     
     if expr.is_Mul:
         dims = [get_expression_dimension(arg, feature_dims) for arg in expr.args]
@@ -54,9 +57,45 @@ def get_expression_dimension(expr, feature_dims):
         try:
             p = float(expr.args[1])
             return tuple(v * p for v in base_dim)
-        except: return None
+        except: 
+            # If power is not a number, the expression must be dimensionless
+            if all(v == 0 for v in base_dim): return (0, 0, 0)
+            return None
         
-    return (0, 0, 0) # Fallback for unknown (log, sin, etc. usually dimensionless)
+    # Standard functions (sin, cos, exp, log) require dimensionless arguments
+    if expr.func in [sp.sin, sp.cos, sp.tan, sp.exp, sp.log]:
+        arg_dim = get_expression_dimension(expr.args[0], feature_dims)
+        if arg_dim is None or any(v != 0 for v in arg_dim):
+            return None
+        return (0, 0, 0)
+
+    return (0, 0, 0) # Fallback for unknown (usually dimensionless)
+
+class DimensionalGuard:
+    """Enforces physical unit consistency in symbolic discovery."""
+    def __init__(self, feature_dims):
+        self.feature_dims = feature_dims
+
+    def check_consistency(self, sympy_expr, selected_indices=None):
+        """
+        Returns True if the expression is dimensionally homogeneous.
+        selected_indices: if the expression uses a subset of features (X0, X1...) 
+                          mapped to original indices.
+        """
+        try:
+            if selected_indices is not None:
+                candidate_feature_dims = [self.feature_dims[idx] for idx in selected_indices]
+            else:
+                candidate_feature_dims = self.feature_dims
+                
+            dim = get_expression_dimension(sympy_expr, candidate_feature_dims)
+            return dim is not None
+        except Exception:
+            return False
+
+    def get_penalty(self, sympy_expr, selected_indices=None, penalty_value=0.5):
+        """Returns a penalty score if inconsistent."""
+        return 0.0 if self.check_consistency(sympy_expr, selected_indices) else penalty_value
 
 class SymPyToTorch(torch.nn.Module):
     """
@@ -488,7 +527,13 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
 
     def _distill_single_target(self, i, X_norm, Y_norm, targets_shape_1=None, latent_states_shape_1=None, is_hamiltonian=False, skip_deep_search=False, sim_type=None):
         print(f"Selecting features for target_{i} (Input dim: {X_norm.shape[1]})...")
-        y_target = Y_norm[:, i] if Y_norm.ndim > 1 else Y_norm
+        # Handle cases where Y_norm might be a single target already or the full target matrix
+        if Y_norm.ndim > 1 and Y_norm.shape[1] > i:
+            y_target = Y_norm[:, i]
+        elif Y_norm.ndim > 1 and Y_norm.shape[1] == 1:
+            y_target = Y_norm[:, 0]
+        else:
+            y_target = Y_norm
 
         variances = np.var(X_norm, axis=0)
         valid_indices = np.where(variances > 1e-6)[0]
@@ -607,23 +652,17 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
                     is_stable = self.validate_stability(prog, X_gp[0])
 
                 if is_stable:
-                    # NEW: Dimensional Penalty
+                    # Use DimensionalGuard for physical consistency penalty
                     dim_penalty = 0.0
                     if hasattr(self, 'transformer') and hasattr(self.transformer, 'feature_dims'):
+                        guard = DimensionalGuard(self.transformer.feature_dims)
+                        selected_indices = np.where(full_mask)[0]
+                        local_dict = {f'X{j}': sp.Symbol(f'x{j}') for j in range(len(selected_indices))}
                         try:
-                            # Map X_i to x_i for consistency with Transformer
-                            # full_mask tells us which original features were used
-                            selected_indices = np.where(full_mask)[0]
-                            # Create a map for this specific candidate's features
-                            candidate_feature_dims = [self.transformer.feature_dims[idx] for idx in selected_indices]
-                            
-                            # Convert gplearn prog to sympy
-                            local_dict = {f'X{j}': sp.Symbol(f'x{j}') for j in range(len(selected_indices))}
                             candidate_sympy = sp.sympify(str(prog), locals=local_dict)
-                            
-                            if get_expression_dimension(candidate_sympy, candidate_feature_dims) is None:
-                                dim_penalty = 0.5 # Substantial penalty for non-physicality
-                        except: pass
+                            dim_penalty = guard.get_penalty(candidate_sympy, selected_indices)
+                        except:
+                            dim_penalty = 0.2 # Small penalty for unparseable but stable
 
                     candidate = {
                         'prog': prog, 
@@ -896,7 +935,7 @@ class EnsembleSymbolicDistiller(EnhancedSymbolicDistiller):
 
     def distill(self, latent_states, targets, n_super_nodes, latent_dim, box_size=None, sim_type=None, enforce_separable=True):
         """
-        Run ensemble distillation across multiple targets.
+        Run ensemble distillation across multiple targets in parallel.
         """
         # Fit transformer once
         self.transformer = BalancedFeatureTransformer(n_super_nodes, latent_dim, box_size=box_size, 
@@ -912,27 +951,37 @@ class EnsembleSymbolicDistiller(EnhancedSymbolicDistiller):
         n_targets = targets.shape[1] if targets.ndim > 1 else 1
         final_equations = []
         
+        from joblib import Parallel, delayed
+        
+        # Inner helper to run a single ensemble member
+        def run_ensemble_member(target_idx, X_norm, yi_norm):
+            idx = np.random.permutation(len(X_norm))
+            X_run = X_norm[idx]
+            y_run = yi_norm[idx]
+            
+            prog, _, _ = self._distill_single_target(target_idx, X_run, y_run.reshape(-1, 1), 
+                                                    targets_shape_1=n_targets, 
+                                                    latent_states_shape_1=latent_dim * n_super_nodes,
+                                                    sim_type=sim_type)
+            return prog
+
+        self.confidences = []
         for i in range(n_targets):
-            print(f"\n[Ensemble] Distilling target {i}/{n_targets-1}...")
+            print(f"\n[Ensemble] Distilling target {i}/{n_targets-1} (Size: {len(X_norm)}, Ensemble: {self.ensemble_size})...")
             yi_norm = Y_norm[:, i] if Y_norm.ndim > 1 else Y_norm
             
-            # 1. Run multiple independent distillations
-            run_expressions = []
-            for run in range(self.ensemble_size):
-                # Shuffle data for each run to ensure independence
-                idx = np.random.permutation(len(X_norm))
-                X_run = X_norm[idx]
-                y_run = yi_norm[idx]
-                
-                prog, _, _ = self._distill_single_target(i, X_run, y_run.reshape(-1, 1), 
-                                                        targets_shape_1=n_targets, 
-                                                        latent_states_shape_1=latent_dim * n_super_nodes,
-                                                        sim_type=sim_type)
-                if prog:
-                    run_expressions.append(prog)
+            # 1. Run multiple independent distillations in parallel
+            # We use a smaller number of jobs to avoid memory explosion, but enough to speed up
+            n_jobs = min(self.ensemble_size, 8) 
+            run_expressions = Parallel(n_jobs=n_jobs)(
+                delayed(run_ensemble_member)(i, X_norm, yi_norm) for _ in range(self.ensemble_size)
+            )
+            
+            run_expressions = [p for p in run_expressions if p is not None]
             
             if not run_expressions:
                 final_equations.append(None)
+                self.confidences.append(0.0)
                 continue
 
             # 2. Extract and canonicalize terms from all runs
@@ -954,19 +1003,19 @@ class EnsembleSymbolicDistiller(EnhancedSymbolicDistiller):
                         term_counts[key] = term_counts.get(key, 0) + 1
                         term_to_sympy[key] = func_part
                 except Exception as e:
-                    print(f"  [Ensemble] Failed to parse run expression: {e}")
+                    pass
 
             # 3. Filter terms by consensus threshold
             consensus_terms = [term_to_sympy[key] for key, count in term_counts.items() 
                               if count >= self.consensus_threshold]
             
-            print(f"  [Ensemble] Terms found across {self.ensemble_size} runs: {len(term_counts)}")
-            print(f"  [Ensemble] Terms reaching consensus (>= {self.consensus_threshold}): {len(consensus_terms)}")
+            print(f"  [Ensemble] Terms found: {len(term_counts)} | Consensus (>= {self.consensus_threshold}): {len(consensus_terms)}")
 
             if not consensus_terms:
                 # Fallback to the best single run if no consensus
-                print("  [Ensemble] No consensus terms found. Falling back to best single run.")
+                print("  [Ensemble] No consensus terms found. Falling back to best run.")
                 final_equations.append(run_expressions[0])
+                self.confidences.append(0.5)
                 continue
 
             # 4. Re-fit constants for the consensus expression
@@ -975,6 +1024,7 @@ class EnsembleSymbolicDistiller(EnhancedSymbolicDistiller):
             # Use secondary optimization to find best constants c_j
             refined_prog = self._refine_consensus_expression(consensus_expr, consensus_terms, X_norm, yi_norm)
             final_equations.append(refined_prog)
+            self.confidences.append(0.9) # High confidence for consensus
 
         return final_equations
 

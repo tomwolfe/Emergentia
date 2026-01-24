@@ -667,12 +667,16 @@ class DiscoveryEngineModel(nn.Module):
         s_j = s[col]
         return torch.mean((s_i - s_j)**2)
     
-    def forward_dynamics(self, z0, t, step_size=None):
+    def forward_dynamics(self, z0, t, step_size=None, chunk_size=None):
+        """
+        Compute time derivatives with optimized device management and chunking.
+        """
         # z0: [batch_size, n_super_nodes, latent_dim]
+        z0_shape = z0.shape
         z0_flat = z0.reshape(z0.size(0), -1).to(torch.float32)
         t = t.to(torch.float32)
 
-        # Optimization: Cache the target device and is_mps flag to avoid repeated logic
+        # Optimization: Cache the target device and is_mps flag
         if not hasattr(self, '_cached_target_device'):
             ode_device = next(self.ode_func.parameters()).device
             is_mps = (str(z0.device) == 'mps' or str(ode_device) == 'mps')
@@ -682,49 +686,56 @@ class DiscoveryEngineModel(nn.Module):
         target_device = self._cached_target_device
         original_device = z0.device
 
+        # Determine chunk size if not provided
+        if chunk_size is None:
+            chunk_size = 20 if self._is_mps_fix else 100
+            
         y0 = z0_flat if z0_flat.device == target_device else z0_flat.to(target_device)
         t_ode = t if t.device == target_device else t.to(target_device)
 
-        # Ensure ode_func is on the correct device - only if necessary
-        # Parameters check is slow, but we only do it if we are not on the right device
+        # Ensure ode_func is on target_device
         if next(self.ode_func.parameters()).device != target_device:
             self.ode_func.to(target_device)
 
-        # Tighter step size for better accuracy with LJ potential, but respect t intervals
         if step_size is None:
-            if self.training:
-                # Midpoint is 2nd order, rk4 is 4th order. Midpoint is 2x faster.
-                # For discovery, midpoint is usually sufficient.
-                if len(t) > 1:
-                    dt_span = (t[1] - t[0]).item()
-                    step_size = min(0.001, dt_span) # Reduced from 0.005 for stability
-                else:
-                    step_size = 0.001
+            if len(t) > 1:
+                dt_span = (t[1] - t[0]).item()
+                step_size = min(0.001, dt_span)
             else:
                 step_size = 0.001
 
         method = 'midpoint' if self.training else 'rk4'
         options = {'step_size': step_size}
+        solver_fn = odeint_adjoint if (self.hamiltonian and self.training) else odeint
 
-        # Use the selected solver
-        if self.hamiltonian and self.training:
-            # Use adjoint method to save memory when training Hamiltonian
-            zt_flat = odeint_adjoint(self.ode_func, y0, t_ode, method=method, options=options)
+        # Chunked Integration Loop
+        if len(t) > chunk_size:
+            zt_flat_list = []
+            curr_y0 = y0
+            for i in range(0, len(t) - 1, chunk_size - 1):
+                end_idx = min(i + chunk_size, len(t))
+                t_chunk = t_ode[i:end_idx]
+                
+                # Adjust t_chunk to be relative to 0 if necessary for the solver, 
+                # but odeint usually handles absolute t.
+                out_chunk = solver_fn(self.ode_func, curr_y0, t_chunk, method=method, options=options)
+                
+                # Avoid duplicating the overlapping point
+                if i == 0:
+                    zt_flat_list.append(out_chunk)
+                else:
+                    zt_flat_list.append(out_chunk[1:])
+                
+                curr_y0 = out_chunk[-1]
+            zt_flat = torch.cat(zt_flat_list, dim=0)
         else:
-            zt_flat = odeint(self.ode_func, y0, t_ode, method=method, options=options)
+            zt_flat = solver_fn(self.ode_func, y0, t_ode, method=method, options=options)
 
-        # Move back to original device only if necessary
+        # Final cleanup and return
         if zt_flat.device != original_device:
             zt_flat = zt_flat.to(original_device)
 
-        # Check for NaN values and handle them
         if torch.isnan(zt_flat).any():
-            print(f"WARNING: NaN detected in forward_dynamics output!")
-            print(f"  Input z0 shape: {z0.shape}")
-            print(f"  Input z0 has NaN: {torch.isnan(z0).any()}")
-            print(f"  Output zt_flat has NaN: {torch.isnan(zt_flat).any()}")
-            # Replace NaN values with 0
             zt_flat = torch.nan_to_num(zt_flat, nan=0.0, posinf=1e2, neginf=-1e2)
 
-        # zt_flat: [len(t), batch_size, latent_dim * n_super_nodes]
-        return zt_flat.reshape(zt_flat.size(0), zt_flat.size(1), -1, z0.size(-1))
+        return zt_flat.reshape(zt_flat.size(0), zt_flat.size(1), z0_shape[1], z0_shape[2])

@@ -1,10 +1,15 @@
 import torch
 import torch.optim as optim
+import torch.nn as nn
 from torch_geometric.data import Data, Batch
 from simulator import SpringMassSimulator
 from model import DiscoveryEngineModel
 import numpy as np
 from scipy.spatial import KDTree
+
+from loss_functions import LossTracker, GradNormBalancer, LossFactory
+from hardware_manager import HardwareManager
+from symbolic_proxy import SymbolicProxy
 
 def compute_stats(pos, vel, box_size=None):
     # pos, vel: [T, N, 2]
@@ -39,6 +44,10 @@ def prepare_data(pos, vel, radius=1.1, stats=None, device='cpu', cache_edges=Tru
     # Pre-convert to float32 for speed
     pos_norm = pos_norm.astype(np.float32)
     vel_norm = vel_norm.astype(np.float32)
+    
+    # OPTIMIZATION: Pre-convert to tensors
+    pos_tensors = torch.from_numpy(pos_norm).to(device)
+    vel_tensors = torch.from_numpy(vel_norm).to(device)
 
     # Cache edge indices if they are consistent across time steps (for efficiency)
     cached_edges = None
@@ -70,8 +79,7 @@ def prepare_data(pos, vel, radius=1.1, stats=None, device='cpu', cache_edges=Tru
                 edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
 
         # Fast tensor creation
-        x = torch.cat([torch.from_numpy(pos_norm[t]).to(device),
-                       torch.from_numpy(vel_norm[t]).to(device)], dim=1)
+        x = torch.cat([pos_tensors[t], vel_tensors[t]], dim=1)
         data = Data(x=x, edge_index=edge_index)
         dataset.append(data)
     return dataset, stats
@@ -165,296 +173,14 @@ def enhance_physical_mapping(model, dataset, pos_raw, vel_raw, tau=0.1, device='
 
     return np.array(all_corrs)
 
-class LossTracker:
-    """Tracks running averages and full history of loss components to help with balancing and visualization."""
-    def __init__(self, alpha=0.9):
-        self.alpha = alpha
-        self.history = {}
-        self.weights = {}
-        self.history_list = {}  # Store full history for plotting
-        self.weights_list = {}
-
-    def update(self, components, weights=None):
-        for k, v in components.items():
-            val = v.item() if hasattr(v, 'item') else v
-            if k not in self.history:
-                self.history[k] = val
-                self.history_list[k] = [val]
-            else:
-                self.history[k] = self.alpha * self.history[k] + (1 - self.alpha) * val
-                self.history_list[k].append(val)
-        
-        if weights is not None:
-            for k, v in weights.items():
-                val = v.item() if hasattr(v, 'item') else v
-                if k not in self.weights:
-                    self.weights[k] = val
-                    self.weights_list[k] = [val]
-                else:
-                    self.weights[k] = self.alpha * self.weights[k] + (1 - self.alpha) * val
-                    self.weights_list[k].append(val)
-
-    def get_stats(self):
-        # For plotting, we return the history lists
-        return {**self.history_list, **{f"w_{k}": v for k, v in self.weights_list.items()}}
-
-    def get_running_averages(self):
-        return {**self.history, **{f"w_{k}": v for k, v in self.weights.items()}}
-
-class GradNormBalancer(torch.nn.Module):
-    """
-    Implementation of GradNorm: Gradient Normalization for Multi-Task Learning.
-    Balances task weights by normalizing gradient magnitudes.
-    """
-    def __init__(self, n_tasks, alpha=1.5, device='cpu'):
-        super().__init__()
-        self.n_tasks = n_tasks
-        self.alpha = alpha
-        # Initialize weights to 1.0
-        self.weights = torch.nn.Parameter(torch.ones(n_tasks, device=device))
-        self.initial_losses = None
-        
-    def get_weights(self):
-        # Ensure weights stay positive and sum to n_tasks
-        w = torch.softmax(self.weights, dim=0) * self.n_tasks
-        return w
-
-    def update(self, losses, shared_weights, optimizer):
-        """
-        losses: List of loss tensors
-        shared_weights: Parameters common to all tasks (e.g., GNN encoder)
-        """
-        if self.initial_losses is None:
-            self.initial_losses = torch.tensor([l.item() for l in losses], device=self.weights.device)
-            return
-
-        # 1. Compute L2 norm of gradients for each task
-        norms = []
-        for i, loss in enumerate(losses):
-            # Compute gradient of task loss with respect to shared weights
-            grad = torch.autograd.grad(loss, shared_weights, retain_graph=True, allow_unused=True)[0]
-            if grad is not None:
-                norms.append(torch.norm(self.weights[i] * grad, p=2))
-            else:
-                norms.append(torch.tensor(0.0, device=self.weights.device))
-        
-        norms = torch.stack(norms)
-        avg_norm = norms.mean() + 1e-6
-
-        # 2. Compute relative inverse training rate
-        loss_ratios = torch.tensor([l.item() for l in losses], device=self.weights.device) / (self.initial_losses + 1e-6)
-        # Prioritize tasks that are far from convergence
-        inverse_train_rates = loss_ratios / (loss_ratios.mean() + 1e-6)
-
-        # 3. Target norm
-        target_norms = (avg_norm * (inverse_train_rates ** self.alpha)).detach()
-
-        # 4. GradNorm loss
-        grad_norm_loss = torch.nn.functional.l1_loss(norms, target_norms)
-        
-        # 5. Backward for weights (optimizer for GradNorm weights should be separate or handled)
-        self.weights.grad = torch.autograd.grad(grad_norm_loss, self.weights)[0]
-
-class SymbolicProxy(torch.nn.Module):
-    """
-    A differentiable proxy for the discovered symbolic laws.
-    Allows end-to-end gradient flow from symbolic equations back to the GNN.
-    """
-    def __init__(self, n_super_nodes, latent_dim, equations, transformer, hamiltonian=False):
-        super().__init__()
-        self.n_super_nodes = n_super_nodes
-        self.latent_dim = latent_dim
-        self.is_hamiltonian = hamiltonian
-        self.dissipation_coeffs = None
-
-        # 1. Initialize differentiable feature transformer
-        from enhanced_symbolic import TorchFeatureTransformer, SymPyToTorch
-        self.torch_transformer = TorchFeatureTransformer(transformer)
-
-        # 2. Initialize differentiable symbolic modules
-        self.sym_modules = torch.nn.ModuleList()
-        from symbolic import gp_to_sympy
-
-        # Calculate n_inputs as the number of features AFTER feature selection
-        # The number of inputs to SymPyToTorch should match what TorchFeatureTransformer.forward() outputs
-        # Since there might be inconsistencies in how the feature selection is handled,
-        # we'll determine the actual number of features by running a dummy forward pass
-        try:
-            # Use same device and dtype as the transformer buffers
-            dummy_input = torch.zeros(1, n_super_nodes * latent_dim, 
-                                     dtype=self.torch_transformer.x_poly_mean.dtype, 
-                                     device=self.torch_transformer.x_poly_mean.device)
-            with torch.no_grad():
-                dummy_output = self.torch_transformer(dummy_input)
-                n_inputs = dummy_output.size(1)
-                print(f"DEBUG: Determined actual output size from TorchFeatureTransformer: {n_inputs}")
-        except Exception as e:
-            # Fallback to using the size of feature mask if dummy pass fails
-            if hasattr(self.torch_transformer, 'feature_mask') and self.torch_transformer.feature_mask.numel() > 0:
-                n_inputs = self.torch_transformer.feature_mask.size(0)
-                print(f"DEBUG: Using feature_mask size fallback: {n_inputs}")
-            else:
-                # Use the size of normalization parameters as last resort
-                n_inputs = self.torch_transformer.x_poly_mean.size(0)
-                print(f"DEBUG: Using normalization parameter size fallback: {n_inputs}")
-
-        for eq in equations:
-            if eq is not None:
-                # Check if it's already a wrapped program with a sympy expression
-                if hasattr(eq, 'sympy_expr'):
-                    sympy_expr = eq.sympy_expr
-                else:
-                    sympy_expr = gp_to_sympy(str(eq))
-
-                # For Hamiltonian equations, we may need to handle them differently
-                if hasattr(eq, 'compute_derivatives') or "Hamiltonian" in str(eq):
-                    # This is a Hamiltonian equation that computes derivatives differently
-                    self.is_hamiltonian = True
-                    if hasattr(eq, 'dissipation_coeffs'):
-                        self.register_buffer('dissipation', torch.from_numpy(eq.dissipation_coeffs).float())
-                    self.sym_modules.append(SymPyToTorch(sympy_expr, n_inputs))
-                else:
-                    self.sym_modules.append(SymPyToTorch(sympy_expr, n_inputs))
-            else:
-                self.sym_modules.append(None)
-
-    def forward(self, t, z_flat=None):
-        # Handle cases where t is not provided (legacy call) or t, z are provided (ODE solver call)
-        if z_flat is None:
-            # If only one argument provided, it's z_flat (legacy)
-            z_flat = t
-            
-        # z_flat: [Batch, K * D]
-        # Ensure input is float32 for MPS stability
-        z_flat = z_flat.to(torch.float32)
-
-        if self.is_hamiltonian:
-            # Enable gradients for Hamiltonian derivative computation
-            # We need to compute dH/dz. If we want to backprop through this (second-order),
-            # we must ensure the input z_flat has requires_grad=True.
-            with torch.enable_grad():
-                # If input already requires grad, don't detach it to preserve the graph
-                if not z_flat.requires_grad:
-                    z_flat = z_flat.detach().requires_grad_(True)
-                
-                X_norm = self.torch_transformer(z_flat)
-                
-                # Hamiltonian H is the output of the first (and only) sym_module
-                H_norm = self.sym_modules[0](X_norm)
-                
-                # Denormalize H to physical units
-                H = self.torch_transformer.denormalize_y(H_norm)
-                
-                # Ensure H has grad_fn even if it's a constant to avoid integration errors
-                if not H.requires_grad:
-                    H = H + 0.0 * z_flat.sum()
-                
-                # For Hamiltonian symbolic proxy, we do need higher-order derivatives
-                # Use create_graph=True but with retain_graph=True to avoid the error
-                # Use allow_unused=True for constant expressions
-                try:
-                    dH_dz = torch.autograd.grad(H.sum(), z_flat, create_graph=True, retain_graph=True, allow_unused=True)[0]
-                except Exception as e:
-                    print(f"Warning: SymbolicProxy grad computation failed: {e}")
-                    dH_dz = None
-                
-                if dH_dz is None:
-                    dH_dz = torch.zeros_like(z_flat)
-            
-            # Continue with derivative computation (gradients no longer needed)
-            # Split z and dH_dz into q and p
-            batch_size = z_flat.size(0)
-            d_sub = self.latent_dim // 2
-            
-            dz_dt = torch.zeros_like(z_flat)
-            
-            for k in range(self.n_super_nodes):
-                q_start = k * self.latent_dim
-                q_end = q_start + d_sub
-                p_start = q_end
-                p_end = p_start + d_sub
-                
-                # dq/dt = dH/dp
-                dz_dt[:, q_start:q_end] = dH_dz[:, p_start:p_end]
-                
-                # dp/dt = -dH/dq - gamma*p
-                # Conservative part
-                dz_dt[:, p_start:p_end] = -dH_dz[:, q_start:q_end]
-                
-                # Dissipative part
-                if hasattr(self, 'dissipation'):
-                    gamma = self.dissipation[k]
-                    dz_dt[:, p_start:p_end] -= gamma * z_flat[:, p_start:p_end]
-            
-            return dz_dt
-
-        # 1. Differentiable feature transformation
-        X_norm = self.torch_transformer(z_flat)
-
-        # 2. Execute each symbolic equation
-        y_preds = []
-        for sym_mod in self.sym_modules:
-            if sym_mod is not None:
-                # At this point, X_norm has been transformed and masked by torch_transformer
-                # The torch_transformer applies the feature mask AFTER normalization
-                # So X_norm.size(1) should match the number of selected features
-                # But double-check and handle mismatches gracefully
-                if X_norm.size(1) != sym_mod.n_inputs:
-                    # Adjust X_norm to match expected input size
-                    if X_norm.size(1) > sym_mod.n_inputs:
-                        X_input = X_norm[:, :sym_mod.n_inputs]
-                    elif X_norm.size(1) < sym_mod.n_inputs:
-                        # Pad with zeros to match expected size
-                        padding = torch.zeros((X_norm.size(0), sym_mod.n_inputs - X_norm.size(1)),
-                                              device=X_norm.device, dtype=X_norm.dtype)
-                        X_input = torch.cat([X_norm, padding], dim=1)
-                    else:
-                        X_input = X_norm
-                else:
-                    X_input = X_norm
-
-                y_preds.append(sym_mod(X_input).view(-1, 1))
-            else:
-                y_preds.append(torch.zeros((z_flat.size(0), 1), device=z_flat.device, dtype=torch.float32))
-
-        Y_norm_pred = torch.stack(y_preds, dim=1).squeeze(-1)
-
-        # 3. Denormalize
-        Y_pred = self.torch_transformer.denormalize_y(Y_norm_pred)
-
-        return Y_pred.to(torch.float32)  # Ensure output is float32 for MPS stability
-
-class ReconstructionLoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-    def forward(self, loss_rec, loss_cons):
-        return loss_rec + loss_cons
-
-class StructuralLoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-    def forward(self, loss_assign, loss_ortho, loss_conn, loss_pruning, loss_sparsity, loss_sep):
-        return loss_assign + loss_ortho + loss_conn + loss_pruning + loss_sparsity + loss_sep
-
-class PhysicalityLoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-    def forward(self, loss_align, loss_mi, loss_anchor, loss_curv, loss_activity, loss_l2, loss_lvr, loss_hinge, loss_smooth):
-        return loss_align + loss_mi + loss_anchor + loss_curv + loss_activity + loss_l2 + loss_lvr + loss_hinge + loss_smooth
-
-class SymbolicConsistencyLoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-    def forward(self, loss_sym, stage2_factor, symbolic_weight):
-        return loss_sym * stage2_factor * max(1.0, symbolic_weight)
-
 class Trainer:
     def __init__(self, model, lr=5e-4, device='cpu', stats=None, align_anneal_epochs=1000,
                  warmup_epochs=20, max_epochs=1000, sparsity_scheduler=None, hard_assignment_start=0.7,
                  skip_consistency_freq=2, enable_gradient_accumulation=False, grad_acc_steps=1,
-                 enhanced_balancer=None, consistency_weight=1.0, spatial_weight=1.0, use_pcgrad=True):
+                 enhanced_balancer=None, consistency_weight=1.0, spatial_weight=1.0, use_pcgrad=False):
         self.model = model.to(device)
-        self.device = device
+        self.device = torch.device(device)
+        self.hardware = HardwareManager(device)
         self.loss_tracker = LossTracker()
         self.s_history = []
         self.max_s_history = 10
@@ -462,7 +188,7 @@ class Trainer:
         self.warmup_epochs = warmup_epochs
         self.sparsity_scheduler = sparsity_scheduler
         self.hard_assignment_start = hard_assignment_start
-        self.skip_consistency_freq = skip_consistency_freq  # Skip consistency loss every N epochs
+        self.skip_consistency_freq = skip_consistency_freq
         self.enable_gradient_accumulation = enable_gradient_accumulation
         self.grad_acc_steps = grad_acc_steps
         self.enhanced_balancer = enhanced_balancer
@@ -470,23 +196,18 @@ class Trainer:
         self.spatial_weight = spatial_weight
         self.use_pcgrad = use_pcgrad
 
-        # Initialize consolidated loss modules
-        self.recon_loss_fn = ReconstructionLoss()
-        self.struct_loss_fn = StructuralLoss()
-        self.phys_loss_fn = PhysicalityLoss()
-        self.sym_cons_loss_fn = SymbolicConsistencyLoss()
+        # Initialize consolidated loss modules from factory
+        self.loss_modules = LossFactory.create_loss_modules()
+        self.loss_groups = LossFactory.get_loss_groups()
 
-        # Learnable log-scaling for alignment to ensure it stays positive and stable
-        # Initialize to a value that brings the initial alignment loss below 1.0
-        self.log_align_scale = torch.nn.Parameter(torch.tensor(0.0, device=device))  # exp(0) = 1.0
+        # Learnable log-scaling for alignment
+        self.log_align_scale = torch.nn.Parameter(torch.tensor(0.0, device=device))
 
-        # Manually re-balance initial log_vars for stability - PRIORITIZE RECONSTRUCTION
         with torch.no_grad():
             self.model.log_vars.fill_(0.0)
 
-        # Significantly increase spatial and connectivity loss multipliers by 10x
         if hasattr(self.model.encoder.pooling, 'temporal_consistency_weight'):
-            self.model.encoder.pooling.temporal_consistency_weight = 1.0 # Reduced from 5.0 to allow discovery
+            self.model.encoder.pooling.temporal_consistency_weight = 1.0
 
         # Symbolic-in-the-loop
         self.symbolic_proxy = None
@@ -494,21 +215,24 @@ class Trainer:
         self.symbolic_confidence = 0.0
         self.min_symbolic_confidence = 0.7
 
-        # MPS fix: torchdiffeq has issues with MPS (float64 defaults and stability)
-        self.use_mps_fix = (str(device) == 'mps')
-        if self.use_mps_fix:
-            # Move the ODE function to CPU for stability
-            self.model.ode_func.to('cpu')
-            self.mps_ode_on_cpu = True
-        else:
-            self.mps_ode_on_cpu = False
+        # Hardware setup
+        self.hardware.prepare_model_for_ode(self.model)
 
-        # Separate H_net, GNNEncoder.assign_mlp, and GNNEncoder.output_layer parameters to apply specific weight decay
+        # Separate parameters for specific weight decay
+        param_groups = self._prepare_param_groups(lr)
+        self.optimizer = optim.Adam(param_groups, lr=lr)
+        self.criterion = torch.nn.MSELoss().to(device)
+        self.stats = stats
+        
+        # Initialize GradNorm Balancer
+        self.grad_norm_balancer = GradNormBalancer(n_tasks=len(self.loss_groups), device=device)
+        self.gn_optimizer = optim.Adam(self.grad_norm_balancer.parameters(), lr=1e-2)
+
+    def _prepare_param_groups(self, lr):
         h_net_params = []
         assign_mlp_params = []
         output_layer_params = []
-        other_params = []
-
+        
         if hasattr(self.model.ode_func, 'H_net') and self.model.ode_func.H_net is not None:
             h_net_params = list(self.model.ode_func.H_net.parameters())
         elif hasattr(self.model.ode_func, 'V_net') and self.model.ode_func.V_net is not None:
@@ -531,39 +255,23 @@ class Trainer:
         param_groups = [
             {'params': other_params, 'weight_decay': 1e-5},
             {'params': [self.log_align_scale], 'lr': 1e-3},
-            {'params': [self.model.log_vars], 'lr': 1e-1}, # Increased from 1e-2
+            {'params': [self.model.log_vars], 'lr': 1e-1},
         ]
         if h_net_params:
-            param_groups.append({'params': h_net_params, 'weight_decay': 1e-5}) # Reduced from 1e-2 to allow complexity
+            param_groups.append({'params': h_net_params, 'weight_decay': 1e-5})
         if assign_mlp_params:
-            param_groups.append({'params': assign_mlp_params, 'weight_decay': 1e-3}) # Reduced from 1e-2
+            param_groups.append({'params': assign_mlp_params, 'weight_decay': 1e-3})
         if output_layer_params:
-            param_groups.append({'params': output_layer_params, 'weight_decay': 1e-3}) # Reduced from 1e-2
-
-        self.optimizer = optim.Adam(param_groups, lr=lr)
-        self.criterion = torch.nn.MSELoss().to(device)
-        self.stats = stats
-
-        # Logical groupings for PCGrad/GradNorm (Consolidated to 4 Meta-Groups)
-        self.loss_groups = {
-            'ReconstructionLoss': ['rec', 'cons'],
-            'StructuralLoss': ['assign', 'ortho', 'conn', 'pruning', 'sparsity', 'sep'],
-            'PhysicalityLoss': ['align', 'mi', 'anchor', 'curv', 'activity', 'l2', 'lvr', 'hinge', 'smooth'],
-            'SymbolicConsistencyLoss': ['sym']
-        }
-        
-        # Initialize GradNorm Balancer for the 4 meta-groups
-        self.grad_norm_balancer = GradNormBalancer(n_tasks=len(self.loss_groups), device=device)
-        self.gn_optimizer = optim.Adam(self.grad_norm_balancer.parameters(), lr=1e-2)
+            param_groups.append({'params': output_layer_params, 'weight_decay': 1e-3})
+        return param_groups
 
     def update_symbolic_proxy(self, symbolic_proxy_or_equations, transformer=None, weight=0.1, confidence=0.0):
         """Update the symbolic proxy model with new discovered equations."""
-        # Determine correct device for symbolic proxy (must match ode_func if on MPS)
-        proxy_device = torch.device('cpu') if getattr(self, 'mps_ode_on_cpu', False) else self.device
+        proxy_device = self.hardware.get_ode_device()
 
-        if hasattr(symbolic_proxy_or_equations, 'forward'):  # It's already a proxy module
+        if hasattr(symbolic_proxy_or_equations, 'forward'):
             self.symbolic_proxy = symbolic_proxy_or_equations.to(proxy_device)
-        else:  # It's a list of equations
+        else:
             self.symbolic_proxy = SymbolicProxy(
                 self.model.encoder.n_super_nodes,
                 self.model.encoder.latent_dim,
@@ -589,70 +297,24 @@ class Trainer:
         
         return tau, hard, tf_ratio, entropy_weight
 
-    def _compute_initial_recon_loss(self, batch_0, tau, hard, entropy_weight, epoch, max_epochs):
-        z_curr, s_0, losses_0, mu_0 = self.model.encode(batch_0.x, batch_0.edge_index, batch_0.batch, tau=tau, hard=hard, current_epoch=epoch, total_epochs=max_epochs)
-
-        if torch.isnan(z_curr).any() or torch.isinf(z_curr).any():
-            z_curr = torch.nan_to_num(z_curr, nan=0.0, posinf=1.0, neginf=-1.0)
-
-        # Use normalized reconstruction loss for better scale consistency
-        recon_0 = self.model.decode(z_curr, s_0, batch_0.batch, stats=None)
-        loss_rec = self.criterion(recon_0, batch_0.x)
-        
-        # Enhanced assignment loss including stability terms
-        loss_assign = (
-            (2.0 * entropy_weight) * losses_0['entropy'] +
-            10.0 * losses_0['diversity'] +
-            5.0 * self.spatial_weight * losses_0['spatial'] +
-            1.0 * losses_0.get('collapse_prevention', 0.0) + # Increased from 0.1
-            1.0 * losses_0.get('balance', 0.0) + # Increased from 0.1
-            1.0 * losses_0.get('temporal_consistency', 0.0) # Increased from 0.1
-        )
-        
-        initial_results = {
-            'z_curr': z_curr, 's_0': s_0, 'mu_0': mu_0,
-            'loss_rec': loss_rec, 'loss_assign': loss_assign,
-            'losses_0': losses_0, 'x_0_target': batch_0.x
-        }
-        return initial_results
-
     def _compute_hamiltonian_curv_loss(self, z_curr):
         loss_curv = torch.tensor(0.0, device=self.device)
         if self.model.hamiltonian:
             with torch.set_grad_enabled(True):
                 z_in = z_curr.reshape(z_curr.size(0), -1).detach().requires_grad_(True)
-                if self.mps_ode_on_cpu:
-                    z_in_cpu = z_in.cpu()
-                    H_vals = self.model.ode_func.hamiltonian(z_in_cpu)
-                    H = H_vals.sum()
-                    dH = torch.autograd.grad(H, z_in_cpu, create_graph=True, retain_graph=True)[0]
-                    if dH is not None:
-                        # Add small L2 regularization on H output to prevent scaling to infinity
-                        loss_curv = torch.norm(dH.to(self.device), p=2) + 0.01 * torch.mean(H_vals**2).to(self.device)
-                else:
-                    H_vals = self.model.ode_func.hamiltonian(z_in)
-                    H = H_vals.sum()
-                    dH = torch.autograd.grad(H, z_in, create_graph=True, retain_graph=True)[0]
-                    if dH is not None:
-                        # Add small L2 regularization on H output to prevent scaling to infinity
-                        loss_curv = torch.norm(dH, p=2) + 0.01 * torch.mean(H_vals**2)
+                z_in_ode = self.hardware.to_ode_device(z_in)
+                H_vals = self.model.ode_func.hamiltonian(z_in_ode)
+                H = H_vals.sum()
+                dH = torch.autograd.grad(H, z_in_ode, create_graph=True, retain_graph=True, allow_unused=True)[0]
+                if dH is not None:
+                    loss_curv = torch.norm(self.hardware.to_main_device(dH), p=2) + 0.01 * torch.mean(self.hardware.to_main_device(H_vals)**2)
         return loss_curv
 
     def _compute_latent_smoothing_loss(self, z_preds):
-        """
-        Compute a loss that penalizes the second derivative of latent trajectories
-        to eliminate high-frequency jitter.
-        """
-        if z_preds.size(0) < 3:  # Need at least 3 points to compute second derivative
+        if z_preds.size(0) < 3:
             return torch.tensor(0.0, device=self.device)
-
-        # Compute first differences
-        first_diff = z_preds[1:] - z_preds[:-1]  # [T-1, B, K, D]
-
-        # Compute second differences (second derivative approximation)
-        second_diff = first_diff[1:] - first_diff[:-1]  # [T-2, B, K, D]
-
-        # Return the mean squared second difference
+        first_diff = z_preds[1:] - z_preds[:-1]
+        second_diff = first_diff[1:] - first_diff[:-1]
         return torch.mean(second_diff**2)
 
     def _compute_symbolic_loss(self, z_curr, is_warmup):
@@ -660,149 +322,56 @@ class Trainer:
         if (self.symbolic_proxy is not None and not is_warmup and
             self.symbolic_confidence >= self.min_symbolic_confidence):
             z0_flat = z_curr.view(z_curr.size(0), -1)
-            
-            # Use enable_grad to ensure we can compute Jacobians even during eval
             with torch.enable_grad():
                 z_in = z0_flat.detach().requires_grad_(True)
+                z_in_ode = self.hardware.to_ode_device(z_in)
+                gnn_dz = self.model.ode_func(0, z_in_ode)
+                sym_dz = self.symbolic_proxy(0, z_in_ode)
                 
-                if self.mps_ode_on_cpu:
-                    z_in_cpu = z_in.cpu()
-                    gnn_dz = self.model.ode_func(0, z_in_cpu)
-                    sym_dz = self.symbolic_proxy(z_in_cpu)
-                else:
-                    gnn_dz = self.model.ode_func(0, z_in)
-                    sym_dz = self.symbolic_proxy(z_in)
-                
-                # 1. Derivative consistency
                 loss_sym_val = torch.nn.functional.huber_loss(gnn_dz, sym_dz, delta=0.1)
-                
-                # 2. Jacobian consistency (Jacobian of the flow)
-                # This ensures the local linearized dynamics match, leading to better stability
                 try:
-                    # Compute Jacobians for GNN and Symbolic Proxy
-                    # Since we want the Jacobian with respect to inputs, we use a loop or vectorized jacobian
-                    # For performance, we'll take a random direction or just the diagonal of the Jacobian
-                    # if the full Jacobian is too expensive.
-                    # Here we'll implement a robust Jacobian norm difference.
-                    
-                    # Random projection for Jacobian consistency (Hutchinson-style)
                     v = torch.randn_like(gnn_dz)
-                    
-                    # Compute v^T * J = grad(gnn_dz * v)
-                    grad_gnn = torch.autograd.grad(gnn_dz, z_in, grad_outputs=v, create_graph=True)[0]
-                    grad_sym = torch.autograd.grad(sym_dz, z_in, grad_outputs=v, create_graph=True)[0]
-                    
+                    grad_gnn = torch.autograd.grad(gnn_dz, z_in_ode, grad_outputs=v, create_graph=True)[0]
+                    grad_sym = torch.autograd.grad(sym_dz, z_in_ode, grad_outputs=v, create_graph=True)[0]
                     loss_jac = torch.nn.functional.mse_loss(grad_gnn, grad_sym)
-                    loss_sym = (loss_sym_val + 0.1 * loss_jac).to(self.device)
-                except Exception as e:
-                    # Fallback to just derivative consistency if Jacobian fails
-                    loss_sym = loss_sym_val.to(self.device)
-                    
+                    loss_sym = self.hardware.to_main_device(loss_sym_val + 0.1 * loss_jac)
+                except Exception:
+                    loss_sym = self.hardware.to_main_device(loss_sym_val)
         return loss_sym
 
-    def _integrate_trajectories(self, z_curr, data_list, dt, tf_ratio, tau, hard, is_warmup, epoch):
-        z_preds = [z_curr]
-        seq_len = len(data_list)
-
-        # NEW: Gradual Integration Schedule - start with 2 steps and increase to full length
-        # Only apply during dynamics phase (after warmup)
-        if not is_warmup:
-            # Calculate how many time steps to integrate based on training progress
-            # Start with 2 steps and gradually increase to full sequence length
-            progress_after_warmup = max(0.0, (epoch - self.warmup_epochs) / max(1, 100))  # Over 100 epochs
-            target_integration_steps = max(2, int(progress_after_warmup * seq_len))
-
-            # MPS fix: torchdiffeq has issues with MPS. If we are on MPS,
-            # we ensure the ODE integration happens on CPU.
-            use_mps_fix = (str(self.device) == 'mps')
-
-            for t in range(1, seq_len):
-                if np.random.random() < tf_ratio:
-                    batch_t_prev = Batch.from_data_list([data_list[t-1]]).to(self.device)
-                    z_curr_forced, _, _, _ = self.model.encode(batch_t_prev.x, batch_t_prev.edge_index, batch_t_prev.batch, tau=tau, hard=hard)
-                    z_curr = torch.nan_to_num(z_curr_forced)
-
-                # NEW: Use variable integration steps based on schedule
-                # If we're still in the gradual integration phase, only integrate a few steps
-                if t <= target_integration_steps:
-                    t_span = torch.tensor([0, dt], device=self.device, dtype=torch.float32)
-                else:
-                    # For steps beyond our current integration capacity, use shorter spans
-                    t_span = torch.tensor([0, min(dt, dt * (target_integration_steps / seq_len))], device=self.device, dtype=torch.float32)
-
-                try:
-                    if use_mps_fix:
-                        # Move to CPU for integration
-                        z_curr_cpu = z_curr.cpu()
-                        t_span_cpu = t_span.cpu()
-                        # forward_dynamics already handles moving to ode_func's device (which is CPU)
-                        z_next_seq = self.model.forward_dynamics(z_curr_cpu, t_span_cpu)
-                        # Move back to MPS
-                        z_curr = torch.nan_to_num(z_next_seq[1].to(self.device), nan=0.0, posinf=1.0, neginf=-1.0)
-                    else:
-                        z_next_seq = self.model.forward_dynamics(z_curr, t_span)
-                        z_curr = torch.nan_to_num(z_next_seq[1], nan=0.0, posinf=1.0, neginf=-1.0)
-                except Exception:
-                    z_curr = z_curr.detach()
-                z_preds.append(z_curr)
-        else:
-            for t in range(1, seq_len):
-                batch_t = Batch.from_data_list([data_list[t]]).to(self.device)
-                z_t, _, _, _ = self.model.encode(batch_t.x, batch_t.edge_index, batch_t.batch, tau=tau, hard=hard)
-                z_preds.append(z_t)
-        return torch.stack(z_preds)
-
     def _apply_pcgrad(self, head_losses):
-        """
-        Applies Projected Conflicting Gradients (PCGrad) to multiple loss heads.
-        head_losses: dict of {head_name: loss_tensor}
-        """
-        # 1. Compute gradients for each head separately
         head_grads = []
         params = [p for p in self.model.parameters() if p.requires_grad]
         
         for name, loss in head_losses.items():
             if loss.requires_grad:
-                # Get gradients for this head
                 grads = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
-                # Flatten gradients
                 flat_grads = []
                 for g, p in zip(grads, params):
                     if g is not None:
-                        # Move to trainer device for concatenation
                         flat_grads.append(g.flatten().to(self.device))
                     else:
                         flat_grads.append(torch.zeros_like(p).flatten().to(self.device))
                 head_grads.append(torch.cat(flat_grads))
         
-        if not head_grads:
-            return
+        if not head_grads: return
 
-        # 2. PCGrad projection
-        # Shuffle heads to avoid bias
         import random
         random.shuffle(head_grads)
-        
         pc_grads = [g.clone() for g in head_grads]
         for i in range(len(pc_grads)):
             for j in range(len(head_grads)):
                 if i == j: continue
-                # Project if conflicting: g_i = g_i - (g_i . g_j / |g_j|^2) * g_j
                 dot_prod = torch.dot(pc_grads[i], head_grads[j])
                 if dot_prod < 0:
                     pc_grads[i] -= (dot_prod / (torch.norm(head_grads[j])**2 + 1e-8)) * head_grads[j]
         
-        # 3. Sum projected gradients
         final_grad = torch.stack(pc_grads).sum(dim=0)
-        
-        # 4. Apply to parameters
         idx = 0
         for p in params:
             n = p.numel()
-            if p.grad is None:
-                p.grad = final_grad[idx:idx+n].view(p.shape).clone().to(p.device)
-            else:
-                p.grad.add_(final_grad[idx:idx+n].view(p.shape).to(p.device))
+            if p.grad is None: p.grad = final_grad[idx:idx+n].view(p.shape).clone().to(p.device)
+            else: p.grad.add_(final_grad[idx:idx+n].view(p.shape).to(p.device))
             idx += n
 
     def train_step(self, data_list, dt, epoch=0, max_epochs=2000):
@@ -811,36 +380,16 @@ class Trainer:
             if hasattr(self.model.encoder.pooling, 'set_sparsity_weight'):
                 self.model.encoder.pooling.set_sparsity_weight(new_weight)
 
-        # Make stages relative to max_epochs
-        stage1_end = int(max_epochs * 0.15) # Reduced from 0.25 to start dynamics earlier
-        stage2_start = stage1_end
-        
-        is_stage1 = epoch < stage1_end # Stage 1: Focus on reconstruction and structure
-        is_stage2 = epoch >= stage2_start # Stage 2: Unfreeze ode_func with sigmoid ramp
-        
-        # Override warmup to 10% of total epochs if it was set to something else
-        if self.warmup_epochs > int(max_epochs * 0.1):
-            self.warmup_epochs = int(max_epochs * 0.1)
-            
-        is_warmup = epoch < self.warmup_epochs
+        stage1_end = int(max_epochs * 0.15)
+        is_stage1 = epoch < stage1_end
+        is_stage2 = epoch >= stage1_end
+        is_warmup = epoch < int(max_epochs * 0.1)
 
-        # Multiplier tensor for Stage 1 masking
         loss_multipliers = torch.ones(17, device=self.device)
         if is_stage1:
-            # Mask out dynamics-related losses during Stage 1
-            loss_multipliers[1] = 0.0  # cons
-            loss_multipliers[4] = 0.0001 # l2 - Reduced by 100x from 0.01
-            loss_multipliers[5] = 0.0001 # lvr - Reduced by 100x from 0.01
-            loss_multipliers[12] = 0.0 # sym
-            loss_multipliers[15] = 0.01 # smooth - Reduced by 100x from 1.0 (implicit)
-            # Prioritize reconstruction and structural stability
-            loss_multipliers[0] = 100.0 # rec (Increased from 50)
-            loss_multipliers[2] = 5.0   # assign (Decreased from 10)
-            loss_multipliers[6] = 20.0 # align
-            loss_multipliers[9] = 20.0 # conn
-            loss_multipliers[16] = 50.0 # anchor
+            loss_multipliers[1], loss_multipliers[4], loss_multipliers[5], loss_multipliers[12], loss_multipliers[15] = 0.0, 0.0001, 0.0001, 0.0, 0.01
+            loss_multipliers[0], loss_multipliers[2], loss_multipliers[6], loss_multipliers[9], loss_multipliers[16] = 100.0, 5.0, 20.0, 20.0, 50.0
 
-        # Two-stage training: Stage 1 freezes ODE, Stage 2 unfreezes it
         for p in self.model.ode_func.parameters(): p.requires_grad = is_stage2
         if self.symbolic_proxy is not None:
             for p in self.symbolic_proxy.parameters(): p.requires_grad = is_stage2
@@ -849,60 +398,40 @@ class Trainer:
             if hasattr(self.model.encoder.pooling, 'apply_hard_revival'):
                 self.model.encoder.pooling.apply_hard_revival()
 
-        # Start consistency much earlier (halfway through warmup)
-        compute_consistency = (epoch >= (self.warmup_epochs // 2)) and (epoch % self.skip_consistency_freq == 0)
+        compute_consistency = (epoch >= (int(max_epochs * 0.1) // 2)) and (epoch % self.skip_consistency_freq == 0)
         self.optimizer.zero_grad(set_to_none=True)
 
         tau, hard, tf_ratio, entropy_weight = self._get_schedules(epoch, max_epochs)
         
-        # OPTIMIZATION: Use pre-batched data if provided
         if isinstance(data_list, Batch):
             full_batch = data_list
-            # For multi-trajectory batching, we need both seq_len and trajectory batch_size
-            if hasattr(full_batch, 'seq_len'):
-                seq_len = full_batch.seq_len
-                batch_size = full_batch.num_graphs // seq_len
-            else:
-                seq_len = getattr(full_batch, 'num_graphs', 1)
-                batch_size = 1
+            seq_len = getattr(full_batch, 'seq_len', full_batch.num_graphs)
+            batch_size = full_batch.num_graphs // seq_len
         else:
             full_batch = Batch.from_data_list(data_list).to(self.device)
             seq_len = len(data_list)
             batch_size = 1
 
-        # Encode everything in one go
         z_all_target, s_all, losses_all, mu_all = self.model.encode(
             full_batch.x, full_batch.edge_index, full_batch.batch, 
             tau=tau, hard=hard, current_epoch=epoch, total_epochs=max_epochs
         )
         
-        # Reshape to [T, B, K, D]
         z_all_target = z_all_target.reshape(seq_len, batch_size, self.model.encoder.n_super_nodes, -1)
-        
-        # Correctly reshape s_all and mu_all to handle multiple trajectories
-        num_nodes_total = full_batch.num_nodes
-        nodes_per_traj_step = num_nodes_total // (seq_len * batch_size)
-        
-        # s_all is [num_nodes_total, K]
-        # mu_all is [seq_len * batch_size, K, 2]
+        nodes_per_traj_step = full_batch.num_nodes // (seq_len * batch_size)
         mu_all = mu_all.reshape(seq_len, batch_size, self.model.encoder.n_super_nodes, 2)
-
-        z_curr = z_all_target[0] # [B, K, D]
+        z_curr = z_all_target[0]
         
-        # Initial reconstruction loss for the first step of all trajectories in the batch
-        s_0 = s_all.view(seq_len, batch_size, nodes_per_traj_step, -1)[0].reshape(-1, self.model.encoder.n_super_nodes)
+        s_reshaped = s_all.view(seq_len, batch_size, nodes_per_traj_step, -1)
+        s_0 = s_reshaped[0].reshape(-1, self.model.encoder.n_super_nodes)
+        
+        x_reshaped = full_batch.x.view(seq_len, batch_size, nodes_per_traj_step, -1)
+        x_target_0 = x_reshaped[0].reshape(-1, 4)
+        
         batch_idx_0 = torch.arange(batch_size, device=self.device).repeat_interleave(nodes_per_traj_step)
-        
         recon_0 = self.model.decode(z_curr, s_0, batch_idx_0, stats=None)
-        x_target_0 = full_batch.x.view(seq_len, batch_size, nodes_per_traj_step, -1)[0].reshape(-1, 4)
         loss_rec = self.criterion(recon_0, x_target_0)
-        s_0 = s_all[:full_batch.num_nodes // seq_len]
         
-        # Initial reconstruction loss
-        recon_0 = self.model.decode(z_curr, s_0, torch.zeros_like(full_batch.batch[:full_batch.num_nodes // seq_len]), stats=None)
-        loss_rec = self.criterion(recon_0, full_batch.x[:full_batch.num_nodes // seq_len])
-        
-        # Assignment loss for step 0
         loss_assign = (
             (2.0 * entropy_weight) * losses_all['entropy'] +
             10.0 * losses_all['diversity'] +
@@ -912,350 +441,135 @@ class Trainer:
             1.0 * losses_all.get('temporal_consistency', 0.0)
         )
 
-        loss_curv = self._compute_hamiltonian_curv_loss(z_curr)
-        loss_sym = self._compute_symbolic_loss(z_curr, is_warmup)
+        # OPTIMIZATION: Skip expensive losses if weight is zero
+        loss_curv = torch.tensor(0.0, device=self.device)
+        if is_stage2 and not is_stage1:
+             loss_curv = self._compute_hamiltonian_curv_loss(z_curr)
 
-        # INTEGRATION OPTIMIZATION: 
-        # Use a chunked integration approach to balance between teacher forcing and performance
-        # NEW: Gradual Integration Schedule - start with a few steps and increase
-        target_integration_steps = seq_len
+        loss_sym = torch.tensor(0.0, device=self.device)
+        if self.symbolic_proxy is not None and not is_warmup:
+            loss_sym = self._compute_symbolic_loss(z_curr, is_warmup)
+
         if not is_warmup:
-            # Gradually increase integration length from 4 steps to full seq_len over 100 epochs
-            progress_after_warmup = min(1.0, (epoch - self.warmup_epochs) / 100.0)
+            progress_after_warmup = min(1.0, (epoch - int(max_epochs * 0.1)) / 100.0)
             target_integration_steps = max(4, int(progress_after_warmup * seq_len))
-
+            z_curr_ode = self.hardware.to_ode_device(z_curr)
+            
             if tf_ratio == 0:
-                # Full integration up to target steps
-                t_span = torch.linspace(0, (target_integration_steps - 1) * dt, target_integration_steps, device=self.device)
-                z_preds_integrated = self.model.forward_dynamics(z_curr, t_span) # [T_target, B, K, D]
-                
-                # If target < seq_len, we pad with ground truth for the remaining steps to maintain loss shapes
-                if target_integration_steps < seq_len:
-                    z_preds = torch.cat([z_preds_integrated, z_all_target[target_integration_steps:]], dim=0)
-                else:
-                    z_preds = z_preds_integrated
+                t_span = torch.linspace(0, (target_integration_steps - 1) * dt, target_integration_steps, device=self.hardware.get_ode_device())
+                z_preds_integrated = self.model.forward_dynamics(z_curr_ode, t_span)
+                z_preds_integrated = self.hardware.to_main_device(z_preds_integrated)
+                z_preds = torch.cat([z_preds_integrated, z_all_target[target_integration_steps:]], dim=0) if target_integration_steps < seq_len else z_preds_integrated
             else:
-                # Chunked integration: group steps to reduce odeint calls
-                chunk_size = 10 if self.device == 'mps' else 5
-                z_preds_list = [z_curr]
-                z_step = z_curr
-                
-                # Only integrate up to target_integration_steps
+                chunk_size = 10 if self.hardware.is_mps else 5
+                z_preds_list, z_step = [z_curr], z_curr
                 for i in range(1, target_integration_steps, chunk_size):
                     end_idx = min(i + chunk_size, target_integration_steps)
                     actual_chunk = end_idx - i
-                    
-                    if np.random.random() < tf_ratio:
-                        z_step = z_all_target[i-1]
-                    
-                    t_span_chunk = torch.linspace(0, actual_chunk * dt, actual_chunk + 1, device=self.device)
-                    z_chunk_preds = self.model.forward_dynamics(z_step, t_span_chunk)
-                    
-                    for j in range(1, actual_chunk + 1):
-                        z_preds_list.append(z_chunk_preds[j])
-                    
+                    if np.random.random() < tf_ratio: z_step = z_all_target[i-1]
+                    t_span_chunk = torch.linspace(0, actual_chunk * dt, actual_chunk + 1, device=self.hardware.get_ode_device())
+                    z_chunk_preds = self.hardware.to_main_device(self.model.forward_dynamics(self.hardware.to_ode_device(z_step), t_span_chunk))
+                    for j in range(1, actual_chunk + 1): z_preds_list.append(z_chunk_preds[j])
                     z_step = z_chunk_preds[-1]
-                
-                z_preds_integrated = torch.stack(z_preds_list)
-                
-                # Pad if necessary
-                if len(z_preds_integrated) < seq_len:
-                    z_preds = torch.cat([z_preds_integrated, z_all_target[len(z_preds_integrated):]], dim=0)
-                else:
-                    z_preds = z_preds_integrated[:seq_len]
+                z_preds = torch.stack(z_preds_list)
+                if len(z_preds) < seq_len: z_preds = torch.cat([z_preds, z_all_target[len(z_preds):]], dim=0)
+                z_preds = z_preds[:seq_len]
         else:
-            # Warmup: just use targets
             z_preds = z_all_target
 
         loss_l2 = torch.mean(z_preds**2) * 0.1
-        
-        dt_reg = max(dt, 0.01) 
         z_vel = (z_preds[1:] - z_preds[:-1]) / dt
         z_acc = (z_vel[1:] - z_vel[:-1]) / dt if len(z_vel) > 1 else torch.tensor(0.0, device=self.device)
-        
-        loss_lvr = torch.mean(torch.clamp(z_acc**2, 0, 100)) if len(z_vel) > 1 else torch.tensor(0.0, device=self.device)
-        loss_lvr += 0.1 * torch.mean(torch.clamp(z_vel**2, 0, 100)) if len(z_vel) > 0 else torch.tensor(0.0, device=self.device)
-
+        loss_lvr = 0.1 * (torch.mean(torch.clamp(z_acc**2, 0, 100)) + torch.mean(torch.clamp(z_vel**2, 0, 100))) if len(z_vel) > 1 else torch.tensor(0.0, device=self.device)
         loss_smooth = self._compute_latent_smoothing_loss(z_preds) * (dt / 0.001)**2
-
-        loss_pruning = losses_all['pruning']
-        loss_sparsity = losses_all['sparsity']
-        loss_sep = losses_all.get('separation', torch.tensor(0.0, device=self.device))
-        
-        # Connectivity and ortho losses for step 0
-        nodes_per_traj = full_batch.num_nodes // batch_size
-        s_0 = s_all.view(seq_len, batch_size, nodes_per_traj_step, -1)[0].reshape(-1, self.model.encoder.n_super_nodes)
-        
-        # Correctly get edges for step 0 across all trajectories in the batch
-        # This is tricky because edge_index is global for the whole Batch
-        # But we only want edges within the first step of each trajectory
+        loss_pruning, loss_sparsity, loss_sep = losses_all['pruning'], losses_all['sparsity'], losses_all.get('separation', torch.tensor(0.0, device=self.device))
         loss_conn = 10.0 * self.model.get_connectivity_loss(s_0, full_batch.edge_index[:, full_batch.edge_index[0] < (batch_size * nodes_per_traj_step)])
-        
         loss_ortho = self.model.get_ortho_loss(s_0)
-        loss_var = self.model.get_latent_variance_loss(z_curr) * 0.1
-        loss_hinge = torch.mean(torch.relu(0.1 - torch.norm(z_preds, dim=-1))) * 0.1
+        loss_var, loss_hinge = self.model.get_latent_variance_loss(z_curr) * 0.1, torch.mean(torch.relu(0.1 - torch.norm(z_preds, dim=-1))) * 0.1
 
-        loss_align = torch.tensor(0.0, device=self.device)
-        loss_mi = torch.tensor(0.0, device=self.device)
-        loss_cons = torch.tensor(0.0, device=self.device)
-        loss_anchor = torch.tensor(0.0, device=self.device)
-
-        # Batch compute all subsequent reconstruction and alignment losses
         processed_indices = [t for t in range(seq_len) if (t % 2 == 0 or t == seq_len - 1)]
         processed_steps = len(processed_indices)
-        
-        # OPTIMIZATION: Batch decode all processed steps across all trajectories
-        # z_preds is [T, B, K, D]
-        z_batch = z_preds[processed_indices].view(-1, self.model.encoder.n_super_nodes, self.model.encoder.latent_dim) # [processed_steps * B, K, D]
-        
-        # Prepare s_batch and x_target_batch
-        # We need to pick nodes for each processed step and each trajectory
-        # s_all is [T*B*N_p, K]
-        s_reshaped = s_all.view(seq_len, batch_size, nodes_per_traj_step, -1)
+        z_batch = z_preds[processed_indices].view(-1, self.model.encoder.n_super_nodes, self.model.encoder.latent_dim)
         s_batch = s_reshaped[processed_indices].reshape(-1, self.model.encoder.n_super_nodes)
-        
-        x_reshaped = full_batch.x.view(seq_len, batch_size, nodes_per_traj_step, -1)
         x_target_batch = x_reshaped[processed_indices].reshape(-1, 4)
-        
-        # Create a batch index for the combined decode
-        # Each z in z_batch [processed_steps * B, K, D] corresponds to nodes_per_traj_step nodes
         decode_batch_idx = torch.arange(processed_steps * batch_size, device=self.device).repeat_interleave(nodes_per_traj_step)
-        
         recon_all = self.model.decode(z_batch, s_batch, decode_batch_idx, stats=None)
         loss_rec = self.criterion(recon_all, x_target_batch)
 
-        # Alignment weight
-        rec_val = loss_rec.item()
-        alignment_base_weight = 0.0
-        if epoch > self.warmup_epochs:
-            progress_after_warmup = min(1.0, (epoch - self.warmup_epochs) / max(1, self.align_anneal_epochs))
-            alignment_base_weight = 0.05 + 0.95 * progress_after_warmup
+        alignment_weight = 0.01
+        if epoch > int(max_epochs * 0.1):
+            progress_after_warmup = min(1.0, (epoch - int(max_epochs * 0.1)) / max(1, self.align_anneal_epochs))
+            alignment_weight = max(0.01, (0.05 + 0.95 * progress_after_warmup) * (0.2 + 0.8 * (1.0 - min(1.0, loss_rec.item() / 0.5))))
         
-        rec_quality_factor = 1.0 - min(1.0, rec_val / 0.5)
-        alignment_weight = max(0.01, alignment_base_weight * (0.2 + 0.8 * rec_quality_factor))
-        
-        d_align = min(self.model.encoder.latent_dim // 2 if self.model.hamiltonian else 2, 2)
-        huber_loss = torch.nn.SmoothL1Loss(beta=0.1)
-
-        # Batch compute anchor and alignment
-        # mu_all: [T, B, K, 2], z_preds: [T, B, K, D]
         mu_processed = mu_all[processed_indices].view(-1, self.model.encoder.n_super_nodes, 2)
         z_processed = z_preds[processed_indices].view(-1, self.model.encoder.n_super_nodes, self.model.encoder.latent_dim)
-        
         loss_anchor = self.criterion(z_processed[:, :, :2], mu_processed)
-        
-        z_clamped = torch.clamp(z_processed[:, :, :d_align], -1.0, 1.0)
-        mu_clamped = torch.clamp(mu_processed[:, :, :d_align], -1.0, 1.0)
-        loss_align = 2.0 * alignment_weight * huber_loss(z_clamped * torch.exp(self.log_align_scale), mu_clamped)
-        
-        # MI loss
-        if epoch % 5 == 0 or epoch > int(max_epochs * 0.75):
-            loss_mi = alignment_weight * 5.0 * self.model.get_mi_loss(z_processed, mu_processed)
-        else:
-            loss_mi = torch.tensor(0.0, device=self.device)
+        loss_align = 2.0 * alignment_weight * torch.nn.functional.smooth_l1_loss(torch.clamp(z_processed[:, :, :2], -1.0, 1.0) * torch.exp(self.log_align_scale), torch.clamp(mu_processed, -1.0, 1.0), beta=0.1)
+        loss_mi = alignment_weight * 5.0 * self.model.get_mi_loss(z_processed, mu_processed) if epoch % 5 == 0 or epoch > int(max_epochs * 0.75) else torch.tensor(0.0, device=self.device)
 
-        # Vectorized consistency and assignment stability
+        loss_cons = torch.tensor(0.0, device=self.device)
         if len(processed_indices) > 1:
-            curr_idx = processed_indices[1:]
-            prev_idx = processed_indices[:-1]
-            
-            s_curr = s_reshaped[curr_idx]
-            s_prev = s_reshaped[prev_idx]
-            
-            mu_curr = mu_all[curr_idx]
-            mu_prev = mu_all[prev_idx]
-            z_t_curr = z_all_target[curr_idx]
-            z_t_prev = z_all_target[prev_idx]
-            
-            loss_assign += (
-                self.criterion(s_curr, s_prev) + 
-                10.0 * self.criterion(mu_curr, mu_prev) + 
-                0.5 * self.criterion(z_t_curr, z_t_prev)
-            )
-            
-            if compute_consistency and not is_warmup:
-                z_p_curr = z_preds[curr_idx]
-                loss_cons = self.criterion(z_p_curr, z_t_curr)
+            curr_idx, prev_idx = processed_indices[1:], processed_indices[:-1]
+            loss_assign += (self.criterion(s_reshaped[curr_idx], s_reshaped[prev_idx]) + 10.0 * self.criterion(mu_all[curr_idx], mu_all[prev_idx]) + 0.5 * self.criterion(z_all_target[curr_idx], z_all_target[prev_idx]))
+            if compute_consistency and not is_warmup: loss_cons = self.criterion(z_preds[curr_idx], z_all_target[curr_idx])
 
-        # Normalize losses by number of steps AND trajectory batch size
         norm_factor = processed_steps * batch_size
-        loss_assign = loss_assign / norm_factor
-        loss_pruning = loss_pruning / norm_factor
-        loss_sparsity = loss_sparsity / norm_factor
-        loss_ortho = loss_ortho / norm_factor
-        loss_sep = loss_sep / norm_factor
-        loss_conn = loss_conn / norm_factor
-        loss_anchor = loss_anchor / norm_factor
-            
-        loss_align /= (norm_factor * self.model.encoder.n_super_nodes)
-        loss_mi /= (norm_factor * self.model.encoder.n_super_nodes)
+        loss_assign, loss_pruning, loss_sparsity, loss_ortho, loss_sep, loss_conn, loss_anchor = loss_assign / norm_factor, loss_pruning / norm_factor, loss_sparsity / norm_factor, loss_ortho / norm_factor, loss_sep / norm_factor, loss_conn / norm_factor, loss_anchor / norm_factor
+        loss_align, loss_mi = loss_align / (norm_factor * self.model.encoder.n_super_nodes), loss_mi / (norm_factor * self.model.encoder.n_super_nodes)
 
-        # Clamp log_vars for l2 and lvr to a minimum of 0.0 (weight <= 1.0) to prevent crushing dynamics
-        with torch.no_grad():
-            self.model.log_vars[4:6].clamp_(min=0.0)
-            
+        with torch.no_grad(): self.model.log_vars[4:6].clamp_(min=0.0)
         lvars = torch.clamp(self.model.log_vars, min=-6.0, max=5.0)
+        raw_losses = {'rec': loss_rec, 'cons': loss_cons, 'assign': loss_assign, 'ortho': loss_ortho, 'l2': loss_l2, 'lvr': loss_lvr, 'align': loss_align, 'pruning': loss_pruning, 'sep': loss_sep, 'conn': loss_conn, 'sparsity': loss_sparsity, 'mi': loss_mi, 'sym': loss_sym, 'var': loss_var, 'hinge': loss_hinge, 'smooth': loss_smooth, 'anchor': loss_anchor, 'curv': loss_curv, 'activity': (torch.relu(1.0 - torch.norm(z_vel, dim=-1)).mean() if len(z_vel) > 0 else self.model.get_activity_penalty(z_preds)) * 1000.0}
         
-        raw_losses = {
-            'rec': loss_rec, 'cons': loss_cons, 'assign': loss_assign, 'ortho': loss_ortho, 
-            'l2': loss_l2, 'lvr': loss_lvr, 'align': loss_align, 'pruning': loss_pruning, 
-            'sep': loss_sep, 'conn': loss_conn, 'sparsity': loss_sparsity, 'mi': loss_mi, 
-            'sym': loss_sym, 'var': loss_var, 'hinge': loss_hinge, 'smooth': loss_smooth, 
-            'anchor': loss_anchor
-        }
-
-        # Activity penalty: Force the model to utilize latent space
-        if len(z_vel) > 0:
-            loss_activity = torch.relu(1.0 - torch.norm(z_vel, dim=-1)).mean()
-            raw_losses['activity'] = loss_activity * 1000.0
-        else:
-            loss_activity = self.model.get_activity_penalty(z_preds)
-            raw_losses['activity'] = loss_activity * 1000.0
-
-        for k in raw_losses:
-            raw_losses[k] = raw_losses[k].to(torch.float32)
-
-        base_keys = list(raw_losses.keys())[:17]
+        weights = {k: (100.0 if is_stage1 and k == 'rec' else (10.0 if k in ['rec', 'assign', 'anchor'] else 1.0)) for k in raw_losses}
+        if epoch >= int(max_epochs * 0.75):
+            for i, k in enumerate(list(raw_losses.keys())[:17]): weights[k] = torch.exp(-lvars[i]) * loss_multipliers[i]
         
-        # Regularization Freeze: 30% of total epochs
-        is_reg_freeze = epoch < (max_epochs * 0.3)
+        if epoch < (max_epochs * 0.3): weights['l2'] = weights['lvr'] = weights['smooth'] = 0.0
         
-        # Use fixed weights for the first 75% of training to ensure stability
-        if epoch < int(max_epochs * 0.75):
-            weights = {k: 1.0 for k in base_keys}
-            weights['rec'] = 100.0 if is_stage1 else 10.0
-            weights['assign'] = 10.0
-            weights['anchor'] = 10.0
-            if 'activity' in raw_losses: weights['activity'] = 1.0 # Multiplied by 1000.0 in raw_losses
-        else:
-            weights = {k: torch.exp(-lvars[i]) * loss_multipliers[i] for i, k in enumerate(base_keys)}
-            if 'activity' in raw_losses: weights['activity'] = 1.0
+        stage2_factor = (1.0 / (1 + np.exp(-12.0 * (min(1.0, (epoch - stage1_end) / max(1, int(max_epochs * 0.1))) - 0.5)))) if is_stage2 else 0.0
 
-        # Apply Regularization Freeze
-        if is_reg_freeze:
-            weights['l2'] = 0.0
-            weights['lvr'] = 0.0
-            weights['smooth'] = 0.0
-
-        if self.enhanced_balancer and not is_stage1 and epoch >= int(max_epochs * 0.75):
-            balanced = self.enhanced_balancer.get_balanced_losses(raw_losses, self.model.parameters())
-            for k in weights:
-                if k in balanced and raw_losses[k].item() != 0: weights[k] = balanced[k] / raw_losses[k]
-
-        stage2_factor = 0.0
-        if is_stage2:
-            ramp_duration = max(1, int(max_epochs * 0.1))
-            progress_in_stage2 = min(1.0, (epoch - stage2_start) / ramp_duration)
-            import math
-            stage2_factor = 1.0 / (1 + math.exp(-12.0 * (progress_in_stage2 - 0.5)))
-
-        discovery_loss = torch.tensor(0.0, device=self.device)
-        # Enable uncertainty weighting much earlier (after stage 1)
-        use_log_vars = (epoch >= stage2_start)
-        
-        for i, k in enumerate(raw_losses.keys()):
-            if k not in ['cons', 'l2', 'lvr']: # Activity is now included in discovery_loss
-                term = weights[k] * torch.clamp(raw_losses[k], 0, 100)
-                if use_log_vars and i < len(lvars):
-                    # Uncertainty weighting: L = L*exp(-s) + s
-                    term = term * torch.exp(-lvars[i]) + lvars[i]
-                discovery_loss += term
-
-        discovery_loss += (weights['sym'] * (self.symbolic_weight - 1.0) * torch.clamp(loss_sym.to(torch.float32), 0, 100) * stage2_factor)
-        discovery_loss += 1e-4 * torch.clamp(loss_curv.to(torch.float32), 0, 100)
-
-        # GRAD_NORM / PCGRAD / GROUPED LOSSES (Consolidated Meta-Losses)
         head_losses_dict = {
-            'ReconstructionLoss': self.recon_loss_fn(loss_rec * weights['rec'], loss_cons * weights['cons']),
-            'StructuralLoss': self.struct_loss_fn(
-                loss_assign * weights['assign'], loss_ortho * weights['ortho'], 
-                loss_conn * weights['conn'], loss_pruning * weights['pruning'], 
-                loss_sparsity * weights['sparsity'], loss_sep * weights['sep']
-            ),
-            'PhysicalityLoss': self.phys_loss_fn(
-                loss_align * weights['align'], loss_mi * weights['mi'], 
-                loss_anchor * weights['anchor'], loss_curv * weights['curv'], 
-                raw_losses.get('activity', torch.tensor(0.0, device=self.device)) * weights.get('activity', 1.0),
-                loss_l2 * weights['l2'], loss_lvr * weights['lvr'], 
-                loss_hinge * weights['hinge'], loss_smooth * weights['smooth']
-            ),
-            'SymbolicConsistencyLoss': self.sym_cons_loss_fn(loss_sym * weights['sym'], stage2_factor, self.symbolic_weight)
+            'ReconstructionLoss': self.loss_modules['ReconstructionLoss'](loss_rec * weights['rec'], loss_cons * weights['cons']),
+            'StructuralLoss': self.loss_modules['StructuralLoss'](loss_assign * weights['assign'], loss_ortho * weights['ortho'], loss_conn * weights['conn'], loss_pruning * weights['pruning'], loss_sparsity * weights['sparsity'], loss_sep * weights['sep']),
+            'PhysicalityLoss': self.loss_modules['PhysicalityLoss'](loss_align * weights['align'], loss_mi * weights['mi'], loss_anchor * weights['anchor'], loss_curv * weights['curv'], raw_losses['activity'] * weights.get('activity', 1.0), loss_l2 * weights['l2'], loss_lvr * weights['lvr'], loss_hinge * weights['hinge'], loss_smooth * weights['smooth']),
+            'SymbolicConsistencyLoss': self.loss_modules['SymbolicConsistencyLoss'](loss_sym * weights['sym'], stage2_factor, self.symbolic_weight)
         }
 
-        # Apply Uncertainty Weighting to Meta-Losses if enabled
-        if use_log_vars:
+        if epoch >= stage1_end:
             for i, (name, h_loss) in enumerate(head_losses_dict.items()):
-                # We use the first 4 log_vars for the meta-groups
-                if i < 4:
-                    head_losses_dict[name] = h_loss * torch.exp(-lvars[i]) + lvars[i]
+                if i < 4: head_losses_dict[name] = h_loss * torch.exp(-lvars[i]) + lvars[i]
 
-        # Determine if we should use GradNorm or PCGrad
-        do_grad_norm = (epoch > self.warmup_epochs) and not is_stage1
-        do_pcgrad = self.use_pcgrad and (epoch > self.warmup_epochs) and not is_stage1 and not do_grad_norm
-
+        do_grad_norm = (epoch > int(max_epochs * 0.1)) and not is_stage1
         if do_grad_norm:
-            # 1. Get task weights from GradNorm balancer
             gn_weights = self.grad_norm_balancer.get_weights()
             head_names = ['ReconstructionLoss', 'StructuralLoss', 'PhysicalityLoss', 'SymbolicConsistencyLoss']
             head_losses_list = [head_losses_dict[h] for h in head_names]
-            
-            # 2. Compute total loss with GradNorm weights
-            loss = torch.tensor(0.0, device=self.device)
-            for i, h_loss in enumerate(head_losses_list):
-                loss = loss + gn_weights[i] * h_loss
-            
-            # 3. Backward
-            if self.enable_gradient_accumulation:
-                (loss / self.grad_acc_steps).backward(retain_graph=True)
-            else:
-                loss.backward(retain_graph=True)
-                
-            # 4. Update GradNorm weights
-            shared_params = list(self.model.encoder.parameters())
-            self.grad_norm_balancer.update(head_losses_list, shared_params, self.gn_optimizer)
-            self.gn_optimizer.step()
-            self.gn_optimizer.zero_grad()
-            
-        elif do_pcgrad:
-            # Apply PCGrad: computes gradients for each head and projects them
+            loss = sum(gn_weights[i] * head_losses_list[i] for i in range(len(head_names)))
+            loss.backward(retain_graph=True)
+            self.grad_norm_balancer.update(head_losses_list, list(self.model.encoder.parameters()), self.gn_optimizer)
+            self.gn_optimizer.step(); self.gn_optimizer.zero_grad()
+        elif self.use_pcgrad and (epoch > int(max_epochs * 0.1)) and not is_stage1:
             self._apply_pcgrad(head_losses_dict)
             loss = torch.stack(list(head_losses_dict.values())).sum()
         else:
-            # Standard weighted summation and backward
             loss = torch.stack(list(head_losses_dict.values())).sum()
             loss = torch.clamp(loss + 0.1 * torch.sum(lvars**2), 1e-4, 1e5)
-            loss = loss.to(torch.float32)
-            
-            if self.enable_gradient_accumulation:
-                (loss / self.grad_acc_steps).backward()
-            else:
-                loss.backward()
+            if self.enable_gradient_accumulation: (loss / self.grad_acc_steps).backward()
+            else: loss.backward()
 
-        # Optimizer step
         if self.enable_gradient_accumulation:
             if ((epoch + 1) % self.grad_acc_steps == 0) or (epoch == max_epochs - 1):
-                if is_stage1: torch.nn.utils.clip_grad_norm_(self.model.decoder.parameters(), 1.0)
-                if epoch > self.warmup_epochs and stage2_factor >= 0.95: torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
-                else: torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                self.optimizer.step()
-                self.optimizer.zero_grad(set_to_none=True)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5 if epoch > int(max_epochs * 0.1) and stage2_factor >= 0.95 else 1.0)
+                self.optimizer.step(); self.optimizer.zero_grad(set_to_none=True)
         else:
-            if is_stage1: torch.nn.utils.clip_grad_norm_(self.model.decoder.parameters(), 1.0)
-            if epoch > self.warmup_epochs and stage2_factor >= 0.95: torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
-            else: torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5 if epoch > int(max_epochs * 0.1) and stage2_factor >= 0.95 else 1.0)
             self.optimizer.step()
 
         self.loss_tracker.update({'total': loss.to(torch.float32), 'rec_raw': loss_rec, 'cons_raw': loss_cons, 'assign': loss_assign, 'align': loss_align, 'mi': loss_mi, 'sym': loss_sym, 'lvar_raw': loss_var, 'curv_raw': loss_curv, 'hinge_raw': loss_hinge, 'smooth_raw': loss_smooth, 'anchor_raw': loss_anchor, 'lvars_mean': lvars.mean()}, weights=weights)
         
         if epoch % 100 == 0:
-            fidelity_loss = loss_rec + loss_cons
-            structural_loss = loss_assign + loss_ortho + loss_pruning + loss_sep + loss_conn + loss_sparsity
-            physical_loss = loss_align + loss_mi + loss_curv + loss_sym + loss_anchor
-            reg_loss = loss_l2 + loss_lvr + loss_var + loss_hinge + loss_smooth + loss_activity
-            
-            print(f"  [Loss Meta] Fidelity: {fidelity_loss:.4f} | Structure: {structural_loss:.4f} | Physics: {physical_loss:.4f} | Reg: {reg_loss:.4f}")
             print(f"  [Loss Detail] Rec: {loss_rec:.4f} | Cons: {loss_cons:.4f} | Assign: {loss_assign:.4f} | Align: {loss_align:.4f} | Anchor: {loss_anchor:.4f} | Sym: {loss_sym:.4f}")
-
         return loss.item(), loss_rec.item(), loss_cons.item() if compute_consistency else 0.0
 
 if __name__ == "__main__":

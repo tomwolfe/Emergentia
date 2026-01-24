@@ -157,9 +157,10 @@ def main():
             batch_data.seq_len = args.batch_size
 
         loss, rec, cons = trainer.train_step(batch_data, sim.dt, epoch=epoch, max_epochs=args.epochs)
+        last_rec = rec
 
-        # NEW: Jacobian Condition Number Logging
-        if epoch % 20 == 0:
+        # NEW: Jacobian Condition Number Logging - Only if we are going to print
+        if epoch % 50 == 0:
             try:
                 model.eval()
                 # Use a very small subset for Jacobian to avoid OOM/latency
@@ -173,31 +174,19 @@ def main():
                 latent_std = torch.std(z_out).item()
                 latent_mean_mag = torch.mean(torch.abs(z_out)).item()
                 cond_proxy = latent_std / (latent_mean_mag + 1e-6)
-                print(f"  [Diagnostic] Latent SNR: {cond_proxy:.4f} | Grad Norm: {jacobian_norm.item():.4f}")
                 
                 # Adaptive sparsity adjustment
                 if sparsity_scheduler is not None:
                     sparsity_scheduler.adjust_to_snr(cond_proxy)
+                
+                print_diagnostic_dashboard(model, trainer, epoch, rec, cons, cond_proxy)
             except Exception as e:
                 pass
             model.train()
-
-        # Learning rate warmup: gradually increase LR for first 25 epochs to focus on reconstruction
-        if epoch < 25:  # Extended warmup
-            # Linear warmup from 0 to the scheduled LR
-            warmup_factor = (epoch + 1) / 25.0
-            for param_group in trainer.optimizer.param_groups:
-                param_group['lr'] = args.lr * warmup_factor
-
-        scheduler.step()
-        last_rec = rec
-        loss_history.append(loss)
-        if len(loss_history) > 20: loss_history.pop(0)  # Larger window for stability
-
-        if epoch % 50 == 0:  # Print dashboard every 50 epochs
-            print_diagnostic_dashboard(model, trainer, epoch, rec, cons, cond_proxy if 'cond_proxy' in locals() else 0.0)
         elif epoch % 10 == 0:  # Print less frequently to reduce overhead
             print(f"Epoch {epoch:4d} | Loss: {loss:.4f} | Rec: {rec:.4f} | Cons: {cons:.4f}")
+
+        # Learning rate warmup: gradually increase LR for first 25 epochs to focus on reconstruction
 
         # Early discovery gate - only check late in training with strict criteria
         if epoch >= 100 and epoch % 40 == 0:  # Check every 40 epochs starting at 100
@@ -238,12 +227,19 @@ def main():
     print("\n--- Discovery Health Report ---")
     
     # Extract data for analysis: h_targets for distillation, dz_states for validation
-    z_states, h_targets, t_states = extract_latent_data(model, dataset, sim.dt, include_hamiltonian=args.hamiltonian)
-    _, dz_states, _ = extract_latent_data(model, dataset, sim.dt, include_hamiltonian=False)
+    # OPTIMIZATION: Call extract_latent_data only once and decide based on hamiltonian
+    z_states, derivs_all, t_states = extract_latent_data(model, dataset, sim.dt, include_hamiltonian=args.hamiltonian)
+    if args.hamiltonian:
+        h_targets = derivs_all
+        # Need dz_states for R2 calculation
+        _, dz_states, _ = extract_latent_data(model, dataset, sim.dt, include_hamiltonian=False)
+    else:
+        h_targets = derivs_all
+        dz_states = derivs_all
     
     # 1. Calculate Correlation Matrix between latents and physical CoM
     print("Calculating Correlation Matrix...")
-    sample_size = min(200, len(dataset))
+    sample_size = min(100 if args.quick_symbolic else 200, len(dataset))
     sample_indices = np.linspace(0, len(dataset)-1, sample_size, dtype=int)
     sample_dataset = [dataset[i] for i in sample_indices]
     sample_pos = pos[sample_indices]
@@ -258,22 +254,32 @@ def main():
     print("\nCalculating Flicker Rate...")
     model.eval()
     s_list = []
+    # OPTIMIZATION: Use a subset for flicker rate if quick
+    flicker_sample_size = min(50 if args.quick_symbolic else len(dataset_list), len(dataset_list))
+    flicker_indices = np.linspace(0, len(dataset_list)-1, flicker_sample_size, dtype=int)
     with torch.no_grad():
-        for data in dataset_list:
+        for idx in flicker_indices:
+            data = dataset_list[idx]
             batch = Batch.from_data_list([data]).to(device)
             _, s, _, _ = model.encode(batch.x, batch.edge_index, batch.batch)
             s_list.append(s.cpu())
     
-    s_all = torch.stack(s_list) # [T, N, K]
+    s_all = torch.stack(s_list) # [T_sub, N, K]
     flicker_rate = torch.mean(torch.abs(s_all[1:] - s_all[:-1])).item()
     print(f"  Mean Flicker Rate: {flicker_rate:.6f}")
 
-    # 3. Perform Symbolic Distillation using EnsembleSymbolicDistiller
-    print("\nPerforming ensemble symbolic distillation...")
     from enhanced_symbolic import EnsembleSymbolicDistiller
+    from symmetry_checks import NoetherChecker
     
     # --- SELF-CORRECTION LOOP ---
-    MAX_RETRIES = 2
+    # OPTIMIZATION: Reduce retries and ensemble size for quick/short runs
+    is_quick = args.quick_symbolic or args.epochs < 50
+    MAX_RETRIES = 0 if is_quick else 2
+    pop_size = 500 if is_quick else args.pop
+    gen_size = 5 if is_quick else args.gen
+    ensemble_size = 2 if is_quick else 5
+    
+    bench_report = {}
     for attempt in range(MAX_RETRIES + 1):
         print(f"\n[Verification Loop] Attempt {attempt+1}/{MAX_RETRIES+1}...")
         
@@ -281,10 +287,10 @@ def main():
         parsimony = 0.01 if attempt == 0 else (0.05 if attempt == 1 else 0.1)
         
         distiller = EnsembleSymbolicDistiller(
-            populations=args.pop, 
-            generations=args.gen,
-            ensemble_size=5,
-            consensus_threshold=4,
+            populations=pop_size, 
+            generations=gen_size,
+            ensemble_size=ensemble_size,
+            consensus_threshold=max(1, ensemble_size - 1),
             secondary_optimization=True,
             parsimony=parsimony
         )
@@ -329,22 +335,30 @@ def main():
         confidence = np.mean(distiller.confidences) if hasattr(distiller, 'confidences') else 0.8
         trainer.update_symbolic_proxy(equations, symbolic_transformer, weight=args.sym_weight, confidence=confidence)
 
-        # 6. Run Autonomous Physics Benchmark for Self-Correction
+        # 6. Run Autonomous Physics Benchmark & Symmetry Checks
         try:
             from physics_benchmark import run_benchmark
             bench_report = run_benchmark(model, equations, symbolic_r2s, distiller.transformer)
             
+            # Add Symmetry Checks
+            n_checker = NoetherChecker(trainer.symbolic_proxy, args.latent_dim)
+            rot_error = n_checker.check_rotational_invariance(torch.tensor(z_states[0:1], dtype=torch.float32, device=device))
+            bench_report['rotational_invariance_error'] = rot_error
+            print(f"  Rotational Invariance Error: {rot_error:.2e}")
+            
             energy_drift = bench_report['energy_conservation_error']
             ood_r2 = bench_report['symbolic_r2_ood']
             
-            if energy_drift < 1e-5 and ood_r2 > 0.99:
-                print(f"[Verification Loop] Success! Energy Drift: {energy_drift:.2e}, OOD R2: {ood_r2:.4f}")
+            if energy_drift < 1e-6 and ood_r2 > 0.99 and rot_error < 1e-3:
+                print(f"[Verification Loop] EXACT PHYSICAL RECOVERY! Energy Drift: {energy_drift:.2e}, OOD R2: {ood_r2:.4f}")
                 break
             elif attempt < MAX_RETRIES:
-                print(f"[Verification Loop] Criteria not met. Retrying with higher parsimony...")
-                # Also try to unfreeze GNN bottleneck if possible or adjust its scaling
+                print(f"[Verification Loop] Criteria not met. Retrying with hyperparam adjustment...")
+                if energy_drift > 1e-5:
+                    args.sym_weight *= 2.0
+                    print(f"  -> Increasing sym_weight to {args.sym_weight}")
                 with torch.no_grad():
-                    trainer.model.log_vars.data += 0.1 # Slightly increase uncertainty to allow more flexibility
+                    trainer.model.log_vars.data += 0.1 
             else:
                 print(f"[Verification Loop] Max retries reached. Keeping best effort.")
         except Exception as e:
@@ -353,7 +367,8 @@ def main():
     # 5.5 STAGE 3: Neural-Symbolic Consistency Training (Closed-Loop)
     if trainer.symbolic_proxy is not None:
         print("\n--- Starting Stage 3: Neural-Symbolic Consistency Training ---")
-        stage3_epochs = 100 # Increased
+        # OPTIMIZATION: Scale stage 3 epochs
+        stage3_epochs = 20 if is_quick else 100 
         trainer.model.train()
         # Increase symbolic weight to force alignment
         trainer.symbolic_weight = 50.0 # Aggressive alignment
