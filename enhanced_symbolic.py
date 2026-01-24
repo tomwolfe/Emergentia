@@ -365,10 +365,15 @@ class TorchFeatureTransformer(torch.nn.Module):
         # 1. Base features: (Optional raw latents) + distance features
         features = [X]
 
-        # 2. Squares of raw latents: [Batch, n_raw_latents]
-        # ALWAYS include squares as they are fundamental for kinetic energy (p^2)
+        # 2. Squares and Transcendental of raw latents
         X_raw = z_flat
         features.append(X_raw**2)
+        
+        # Transcendental: Sin, Cos, Log, Exp
+        features.append(torch.sin(X_raw))
+        features.append(torch.cos(X_raw))
+        features.append(torch.log(torch.abs(X_raw) + 1e-3))
+        features.append(torch.exp(torch.clamp(X_raw, -10, 2)))
 
         # NEW: Explicit sum of squares of momentum dims (p^2) per super-node
         d_sub = self.latent_dim // 2
@@ -436,15 +441,20 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
 
     def __init__(self, populations=5000, generations=60, stopping_criteria=0.0001, max_features=15,
                  secondary_optimization=True, opt_method='L-BFGS-B', opt_iterations=200,
-                 use_sindy_pruning=True, sindy_threshold=0.01):
+                 use_sindy_pruning=True, sindy_threshold=0.01, **kwargs):
         super().__init__(populations, generations, stopping_criteria, max_features)
         self.secondary_optimization = secondary_optimization
         self.opt_method = opt_method
         self.opt_iterations = opt_iterations
         self.use_sindy_pruning = use_sindy_pruning
         self.sindy_threshold = sindy_threshold
-        self.all_candidates = [] # Store all candidates for Pareto front visualization
-        self.recovered_constants = {} # NEW: store recovered physical constants
+        self.extra_kwargs = kwargs
+
+    def _get_regressor(self, pop, gen, parsimony=None):
+        """Override to use parsimony from extra_kwargs if provided."""
+        if parsimony is None:
+            parsimony = self.extra_kwargs.get('parsimony', 0.05)
+        return super()._get_regressor(pop, gen, parsimony=parsimony)
 
     def _sindy_select(self, X, y, threshold=0.05, max_iter=10):
         """
@@ -813,10 +823,10 @@ class OptimizedExpressionWrapper:
     Wrapper for expressions with optimized constants.
     Ensures that refined constants are used during execution.
     """
-    def __init__(self, expr_str, original_program):
+    def __init__(self, expr_str, original_program=None):
         self.expr_str = expr_str
         self.original_program = original_program
-        self.length_ = original_program.length_
+        self.length_ = getattr(original_program, 'length_', len(str(expr_str)))
         self._lambda_func = None
         self._feat_indices = None
         
@@ -824,17 +834,17 @@ class OptimizedExpressionWrapper:
         try:
             # Use robust converter
             # gp_to_sympy handles the mapping of X0, X1 to x0, x1
-            sympy_expr = gp_to_sympy(expr_str)
+            self.sympy_expr = gp_to_sympy(str(expr_str))
             
             # Identify all used features
-            all_symbols = sorted(list(sympy_expr.free_symbols), key=lambda s: s.name)
+            all_symbols = sorted(list(self.sympy_expr.free_symbols), key=lambda s: s.name)
             self._feat_indices = [int(s.name[1:]) for s in all_symbols if s.name.startswith('x')]
             
             # Lambdify for performance
             # We must provide all features up to max_idx to ensure correct indexing
             max_idx = max(self._feat_indices) if self._feat_indices else 0
             feat_vars = [sp.Symbol(f'x{i}') for i in range(max_idx + 1)]
-            self._lambda_func = sp.lambdify(feat_vars, sympy_expr, modules=['numpy'])
+            self._lambda_func = sp.lambdify(feat_vars, self.sympy_expr, modules=['numpy'])
             
         except Exception as e:
             print(f"Warning: Could not compile optimized expression '{expr_str}': {e}")
@@ -861,12 +871,146 @@ class OptimizedExpressionWrapper:
                 return np.asarray(result).flatten()
             except Exception as e:
                 # Fallback to original program if execution fails
-                return self.original_program.execute(X)
+                if self.original_program:
+                    return self.original_program.execute(X)
+                return np.zeros(X.shape[0])
         
-        return self.original_program.execute(X)
+        if self.original_program:
+            return self.original_program.execute(X)
+        return np.zeros(X.shape[0])
 
     def __str__(self):
         return self.expr_str
+
+
+class EnsembleSymbolicDistiller(EnhancedSymbolicDistiller):
+    """
+    Implements Ensemble Distillation to eliminate spurious terms.
+    Runs distillation 5 times on different data shuffles and only keeps terms
+    that appear in at least 4 of the 5 runs.
+    """
+    def __init__(self, populations=2000, generations=40, ensemble_size=5, consensus_threshold=4, **kwargs):
+        super().__init__(populations=populations, generations=generations, **kwargs)
+        self.ensemble_size = ensemble_size
+        self.consensus_threshold = consensus_threshold
+
+    def distill(self, latent_states, targets, n_super_nodes, latent_dim, box_size=None, sim_type=None, enforce_separable=True):
+        """
+        Run ensemble distillation across multiple targets.
+        """
+        # Fit transformer once
+        self.transformer = BalancedFeatureTransformer(n_super_nodes, latent_dim, box_size=box_size, 
+                                                     basis_functions='physics_informed', 
+                                                     include_raw_latents=True, sim_type=sim_type,
+                                                     feature_selection_method='bic') # Use new BIC method
+        self.transformer.fit(latent_states, targets)
+
+        X_poly = self.transformer.transform(latent_states)
+        X_norm = self.transformer.normalize_x(X_poly)
+        Y_norm = self.transformer.normalize_y(targets)
+
+        n_targets = targets.shape[1] if targets.ndim > 1 else 1
+        final_equations = []
+        
+        for i in range(n_targets):
+            print(f"\n[Ensemble] Distilling target {i}/{n_targets-1}...")
+            yi_norm = Y_norm[:, i] if Y_norm.ndim > 1 else Y_norm
+            
+            # 1. Run multiple independent distillations
+            run_expressions = []
+            for run in range(self.ensemble_size):
+                # Shuffle data for each run to ensure independence
+                idx = np.random.permutation(len(X_norm))
+                X_run = X_norm[idx]
+                y_run = yi_norm[idx]
+                
+                prog, _, _ = self._distill_single_target(i, X_run, y_run.reshape(-1, 1), 
+                                                        targets_shape_1=n_targets, 
+                                                        latent_states_shape_1=latent_dim * n_super_nodes,
+                                                        sim_type=sim_type)
+                if prog:
+                    run_expressions.append(prog)
+            
+            if not run_expressions:
+                final_equations.append(None)
+                continue
+
+            # 2. Extract and canonicalize terms from all runs
+            term_counts = {}
+            term_to_sympy = {}
+            
+            for prog in run_expressions:
+                try:
+                    expr = gp_to_sympy(str(prog))
+                    # Expand and split into additive terms
+                    expr = sp.expand(expr)
+                    terms = sp.Add.make_args(expr)
+                    
+                    for term in terms:
+                        # Canonicalize: separate constant from functional part
+                        coeff, func_part = term.as_coeff_Mul()
+                        # Use string representation of functional part as key
+                        key = str(func_part)
+                        term_counts[key] = term_counts.get(key, 0) + 1
+                        term_to_sympy[key] = func_part
+                except Exception as e:
+                    print(f"  [Ensemble] Failed to parse run expression: {e}")
+
+            # 3. Filter terms by consensus threshold
+            consensus_terms = [term_to_sympy[key] for key, count in term_counts.items() 
+                              if count >= self.consensus_threshold]
+            
+            print(f"  [Ensemble] Terms found across {self.ensemble_size} runs: {len(term_counts)}")
+            print(f"  [Ensemble] Terms reaching consensus (>= {self.consensus_threshold}): {len(consensus_terms)}")
+
+            if not consensus_terms:
+                # Fallback to the best single run if no consensus
+                print("  [Ensemble] No consensus terms found. Falling back to best single run.")
+                final_equations.append(run_expressions[0])
+                continue
+
+            # 4. Re-fit constants for the consensus expression
+            consensus_expr = sp.Add(*[sp.Symbol(f'c{j}') * consensus_terms[j] for j in range(len(consensus_terms))])
+            
+            # Use secondary optimization to find best constants c_j
+            refined_prog = self._refine_consensus_expression(consensus_expr, consensus_terms, X_norm, yi_norm)
+            final_equations.append(refined_prog)
+
+        return final_equations
+
+    def _refine_consensus_expression(self, consensus_expr, consensus_terms, X, y_true):
+        """
+        Fit constants for a consensus expression using least squares.
+        """
+        n_features = X.shape[1]
+        feat_vars = [sp.Symbol(f'x{i}') for i in range(n_features)]
+        
+        # Build feature matrix for regression: Phi_ij = term_j(X_i)
+        phi = np.zeros((X.shape[0], len(consensus_terms)))
+        for j, term in enumerate(consensus_terms):
+            f_lamb = sp.lambdify(feat_vars, term, modules=['numpy'])
+            try:
+                # Handle terms that might only use a subset of features
+                val = f_lamb(*[X[:, k] for k in range(n_features)])
+                if np.isscalar(val):
+                    phi[:, j] = np.full(X.shape[0], val)
+                else:
+                    phi[:, j] = val
+            except:
+                phi[:, j] = 0.0
+
+        # Linear regression to find constants
+        from sklearn.linear_model import Ridge
+        reg = Ridge(alpha=1e-6, fit_intercept=True)
+        reg.fit(phi, y_true)
+        
+        # Reconstruct final SymPy expression
+        final_expr = reg.intercept_
+        for j, coeff in enumerate(reg.coef_):
+            if abs(coeff) > 1e-6:
+                final_expr += coeff * consensus_terms[j]
+        
+        return OptimizedExpressionWrapper(str(final_expr))
 
 
 class PhysicsAwareSymbolicDistiller(EnhancedSymbolicDistiller, HamiltonianSymbolicDistiller):

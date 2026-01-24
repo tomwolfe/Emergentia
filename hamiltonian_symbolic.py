@@ -241,16 +241,16 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
             print(f"Warning: Failed to validate {target_name} stability: {e}")
             h_conf = 0.0
             
-                # Estimate dissipation coefficients γ and masses m
-                dissipation_coeffs = np.zeros(n_super_nodes)
-                masses = np.ones(n_super_nodes)
-                if model is not None:
-                    if self.estimate_dissipation and hasattr(model.ode_func, 'gamma'):
-                        import torch
-                        dissipation_coeffs = torch.exp(model.ode_func.gamma).detach().cpu().numpy().flatten()
-                    if hasattr(model.ode_func, 'get_masses'):
-                        import torch
-                        masses = model.ode_func.get_masses().detach().cpu().numpy().flatten()
+            # Estimate dissipation coefficients γ and masses m
+            dissipation_coeffs = np.zeros(n_super_nodes)
+            masses = np.ones(n_super_nodes)
+            if model is not None:
+                if self.estimate_dissipation and hasattr(model.ode_func, 'gamma'):
+                    import torch
+                    dissipation_coeffs = torch.exp(model.ode_func.gamma).detach().cpu().numpy().flatten()
+                if hasattr(model.ode_func, 'get_masses'):
+                    import torch
+                    masses = model.ode_func.get_masses().detach().cpu().numpy().flatten()
         
                 # Wrap it in a class that can compute derivatives
                 try:

@@ -5,10 +5,79 @@ Enhanced FeatureTransformer that balances domain knowledge with pure discovery c
 import numpy as np
 import re
 from sklearn.preprocessing import PolynomialFeatures
-from sklearn.linear_model import LassoCV, ElasticNetCV
+from sklearn.linear_model import LassoCV, ElasticNetCV, LassoLarsIC
 from sklearn.feature_selection import SelectKBest, f_regression, mutual_info_regression
 import warnings
 warnings.filterwarnings('ignore')
+
+
+class BICFeatureSelector:
+    """
+    Selects features using Lasso with Bayesian Information Criterion (BIC).
+    BIC penalizes complexity more harshly than AIC or CV, leading to more parsimonious models.
+    """
+    def __init__(self, max_features=100, min_variance=1e-6):
+        self.max_features = max_features
+        self.min_variance = min_variance
+        self.selected_indices = []
+
+    def fit(self, X, y):
+        # 0. Clean input data
+        X = np.nan_to_num(X, nan=0.0, posinf=1e6, neginf=-1e6)
+        y = np.nan_to_num(y, nan=0.0, posinf=1e6, neginf=-1e6)
+
+        # 1. Variance filtering
+        variances = np.var(X, axis=0)
+        high_variance_indices = np.where(variances > self.min_variance)[0]
+        
+        if len(high_variance_indices) == 0:
+            self.selected_indices = np.array([], dtype=int)
+            return self
+            
+        X_filtered = X[:, high_variance_indices]
+        
+        # 2. Use LassoLarsIC with BIC
+        try:
+            # We select features for each output dimension and union them
+            union_indices = set()
+            n_outputs = y.shape[1] if y.ndim > 1 else 1
+            
+            for i in range(n_outputs):
+                yi = y[:, i] if y.ndim > 1 else y
+                # LassoLarsIC is very fast and provides a clear BIC path
+                model = LassoLarsIC(criterion='bic', max_iter=500)
+                model.fit(X_filtered, yi)
+                
+                # Get indices of non-zero coefficients
+                nonzero = np.where(np.abs(model.coef_) > 1e-10)[0]
+                union_indices.update(nonzero)
+            
+            selected_filtered_indices = np.array(list(union_indices))
+            
+            if len(selected_filtered_indices) > self.max_features:
+                # If too many, take those with largest combined importance
+                # (This is a heuristic, but necessary to cap complexity)
+                importance = np.zeros(X_filtered.shape[1])
+                for i in range(n_outputs):
+                    yi = y[:, i] if y.ndim > 1 else y
+                    model = LassoLarsIC(criterion='bic')
+                    model.fit(X_filtered, yi)
+                    importance += np.abs(model.coef_)
+                
+                top_indices = np.argsort(importance)[-self.max_features:]
+                selected_filtered_indices = top_indices
+        except Exception as e:
+            print(f"Warning: BIC selection failed ({e}), falling back to mutual info.")
+            from sklearn.feature_selection import mutual_info_regression
+            y_sel = y[:, 0] if y.ndim > 1 else y
+            mi = mutual_info_regression(X_filtered, y_sel)
+            selected_filtered_indices = np.argsort(mi)[-min(self.max_features, len(mi)):]
+            
+        self.selected_indices = high_variance_indices[selected_filtered_indices]
+        return self
+
+    def transform(self, X):
+        return X[:, self.selected_indices]
 
 
 class RecursiveFeatureSelector:
@@ -335,14 +404,29 @@ class BalancedFeatureTransformer:
         features = [X]
         names = list(base_names) if base_names is not None else None
         
-        # 2. Squares of raw latents: [Batch, n_raw_latents]
-        # Include squares as they are fundamental, but only if requested or for momentum
+        # 2. Squares and Transcendental of raw latents
         X_raw = z_flat_norm
         if self.include_raw_latents:
+            # Squares
             features.append(X_raw**2)
             if names is not None and raw_latent_names is not None:
                 for i in range(n_raw_latents):
                     names.append(f"{raw_latent_names[i]}^2")
+            
+            # Transcendental: Sin, Cos, Log, Exp
+            # We clip inputs to these functions to maintain numerical stability
+            features.append(np.sin(X_raw))
+            features.append(np.cos(X_raw))
+            # Log(abs(x) + eps) to capture logarithmic dependencies
+            features.append(np.log(np.abs(X_raw) + 1e-3))
+            # Exp(x) clipped to prevent overflow
+            features.append(np.exp(np.clip(X_raw, -10, 2)))
+            
+            if names is not None and raw_latent_names is not None:
+                for i in range(n_raw_latents): names.append(f"sin({raw_latent_names[i]})")
+                for i in range(n_raw_latents): names.append(f"cos({raw_latent_names[i]})")
+                for i in range(n_raw_latents): names.append(f"log(|{raw_latent_names[i]}|)")
+                for i in range(n_raw_latents): names.append(f"exp({raw_latent_names[i]})")
 
         # NEW: Explicit sum of squares of momentum dims (p^2) per super-node
         # Assuming last half of latent_dim are momentum dims
@@ -435,7 +519,11 @@ class BalancedFeatureTransformer:
         """
         n_features = X.shape[1]
 
-        if self.feature_selection_method == 'recursive':
+        if self.feature_selection_method == 'bic':
+            self.bic_selector = BICFeatureSelector(max_features=min(150, n_features))
+            self.bic_selector.fit(X, y)
+            self.selected_feature_indices = self.bic_selector.selected_indices
+        elif self.feature_selection_method == 'recursive':
             self.recursive_selector = RecursiveFeatureSelector(max_features=min(200, n_features))
             self.recursive_selector.fit(X, y)
             self.selected_feature_indices = self.recursive_selector.selected_indices

@@ -660,15 +660,44 @@ class Trainer:
         if (self.symbolic_proxy is not None and not is_warmup and
             self.symbolic_confidence >= self.min_symbolic_confidence):
             z0_flat = z_curr.view(z_curr.size(0), -1)
-            if self.mps_ode_on_cpu:
-                z0_flat_cpu = z0_flat.cpu()
-                gnn_dz_cpu = self.model.ode_func(0, z0_flat_cpu)
-                sym_dz_cpu = self.symbolic_proxy(z0_flat_cpu)
-                loss_sym = torch.nn.functional.huber_loss(gnn_dz_cpu, sym_dz_cpu, delta=0.1).to(self.device)
-            else:
-                gnn_dz = self.model.ode_func(0, z0_flat)
-                sym_dz = self.symbolic_proxy(z0_flat)
-                loss_sym = torch.nn.functional.huber_loss(gnn_dz, sym_dz, delta=0.1)
+            
+            # Use enable_grad to ensure we can compute Jacobians even during eval
+            with torch.enable_grad():
+                z_in = z0_flat.detach().requires_grad_(True)
+                
+                if self.mps_ode_on_cpu:
+                    z_in_cpu = z_in.cpu()
+                    gnn_dz = self.model.ode_func(0, z_in_cpu)
+                    sym_dz = self.symbolic_proxy(z_in_cpu)
+                else:
+                    gnn_dz = self.model.ode_func(0, z_in)
+                    sym_dz = self.symbolic_proxy(z_in)
+                
+                # 1. Derivative consistency
+                loss_sym_val = torch.nn.functional.huber_loss(gnn_dz, sym_dz, delta=0.1)
+                
+                # 2. Jacobian consistency (Jacobian of the flow)
+                # This ensures the local linearized dynamics match, leading to better stability
+                try:
+                    # Compute Jacobians for GNN and Symbolic Proxy
+                    # Since we want the Jacobian with respect to inputs, we use a loop or vectorized jacobian
+                    # For performance, we'll take a random direction or just the diagonal of the Jacobian
+                    # if the full Jacobian is too expensive.
+                    # Here we'll implement a robust Jacobian norm difference.
+                    
+                    # Random projection for Jacobian consistency (Hutchinson-style)
+                    v = torch.randn_like(gnn_dz)
+                    
+                    # Compute v^T * J = grad(gnn_dz * v)
+                    grad_gnn = torch.autograd.grad(gnn_dz, z_in, grad_outputs=v, create_graph=True)[0]
+                    grad_sym = torch.autograd.grad(sym_dz, z_in, grad_outputs=v, create_graph=True)[0]
+                    
+                    loss_jac = torch.nn.functional.mse_loss(grad_gnn, grad_sym)
+                    loss_sym = (loss_sym_val + 0.1 * loss_jac).to(self.device)
+                except Exception as e:
+                    # Fallback to just derivative consistency if Jacobian fails
+                    loss_sym = loss_sym_val.to(self.device)
+                    
         return loss_sym
 
     def _integrate_trajectories(self, z_curr, data_list, dt, tf_ratio, tau, hard, is_warmup, epoch):

@@ -268,112 +268,88 @@ def main():
     flicker_rate = torch.mean(torch.abs(s_all[1:] - s_all[:-1])).item()
     print(f"  Mean Flicker Rate: {flicker_rate:.6f}")
 
-    # 3. Perform Symbolic Distillation using EnhancedSymbolicDistiller
-    print("\nPerforming enhanced symbolic distillation...")
-    from enhanced_symbolic import EnhancedSymbolicDistiller, PhysicsAwareSymbolicDistiller
+    # 3. Perform Symbolic Distillation using EnsembleSymbolicDistiller
+    print("\nPerforming ensemble symbolic distillation...")
+    from enhanced_symbolic import EnsembleSymbolicDistiller
     
-    if args.hamiltonian:
-        distiller = PhysicsAwareSymbolicDistiller(
+    # --- SELF-CORRECTION LOOP ---
+    MAX_RETRIES = 2
+    for attempt in range(MAX_RETRIES + 1):
+        print(f"\n[Verification Loop] Attempt {attempt+1}/{MAX_RETRIES+1}...")
+        
+        # Adjust parsimony based on attempt
+        parsimony = 0.01 if attempt == 0 else (0.05 if attempt == 1 else 0.1)
+        
+        distiller = EnsembleSymbolicDistiller(
             populations=args.pop, 
             generations=args.gen,
-            secondary_optimization=True
+            ensemble_size=5,
+            consensus_threshold=4,
+            secondary_optimization=True,
+            parsimony=parsimony
         )
-        equations = distiller.distill(z_states, h_targets, args.super_nodes, args.latent_dim, sim_type=args.sim, enforce_separable=not args.non_separable)
-    else:
-        distiller = EnhancedSymbolicDistiller(
-            populations=args.pop, 
-            generations=args.gen,
-            secondary_optimization=True
-        )
+        
         equations = distiller.distill(z_states, h_targets, args.super_nodes, args.latent_dim, sim_type=args.sim)
-    
-    print("\nDiscovered Equations:")
-    for i, eq in enumerate(equations):
-        target = "H" if args.hamiltonian else f"dz_{i}/dt"
-        print(f"{target} = {eq}")
+        
+        print("\nDiscovered Equations:")
+        for i, eq in enumerate(equations):
+            target = "H" if args.hamiltonian else f"dz_{i}/dt"
+            print(f"{target} = {eq}")
 
-    # 4. Calculate Symbolic R2
-    print("\nCalculating Symbolic R2...")
-    symbolic_r2s = []
-    # We need to transform z_states to the same feature space used by the distiller
-    X_poly = distiller.transformer.transform(z_states)
-    X_norm = distiller.transformer.normalize_x(X_poly)
-    Y_norm_true = distiller.transformer.normalize_y(dz_states)
-    
-    for i, eq in enumerate(equations):
-        if eq is not None:
-            if hasattr(eq, 'compute_derivatives'):
-                # Hamiltonian case: compute_derivatives returns full dz/dt
-                dz_pred = []
-                for j in range(len(z_states)):
-                    dz_pred.append(eq.compute_derivatives(z_states[j], distiller.transformer))
-                y_pred_full = np.array(dz_pred)
-                # Compute R2 for each dimension and average
-                r2s = []
-                for d in range(dz_states.shape[1]):
-                    y_true_d = dz_states[:, d]
-                    y_pred_d = y_pred_full[:, d]
-                    var_true = np.var(y_true_d)
-                    
-                    if var_true < 1e-4:
-                        # For low variance, use Relative MSE as a proxy for quality
-                        # Score = 1 - (MSE / (mean_magnitude^2 + eps))
-                        mse = np.mean((y_true_d - y_pred_d)**2)
-                        mean_mag = np.mean(np.abs(y_true_d))
-                        r2 = 1.0 - mse / (mean_mag**2 + 1e-6)
-                    else:
-                        r2 = 1 - np.sum((y_true_d - y_pred_d)**2) / (len(y_true_d) * var_true + 1e-9)
-                    r2s.append(r2)
-                r2 = np.mean(r2s)
-                symbolic_r2s.append(r2)
-                print(f"  Hamiltonian Symbolic R2 (mean across dims): {r2:.4f}")
-                print(f"  Sample dz_true (first 5): {dz_states[:5, 0]}")
-                print(f"  Sample dz_pred (first 5): {y_pred_full[:5, 0]}")
-            else:
+        # 4. Calculate Symbolic R2
+        print("\nCalculating Symbolic R2...")
+        symbolic_r2s = []
+        X_poly = distiller.transformer.transform(z_states)
+        X_norm = distiller.transformer.normalize_x(X_poly)
+        Y_norm_true = distiller.transformer.normalize_y(dz_states)
+        
+        for i, eq in enumerate(equations):
+            if eq is not None:
                 y_pred = eq.execute(X_norm)
                 y_true = Y_norm_true[:, i]
                 r2 = 1 - np.sum((y_true - y_pred)**2) / (np.sum((y_true - np.mean(y_true))**2) + 1e-9)
                 symbolic_r2s.append(r2)
                 print(f"  Equation {i} R2: {r2:.4f}")
-        else:
-            symbolic_r2s.append(0.0)
+            else:
+                symbolic_r2s.append(0.0)
 
-    # 5. Symbolic Parsimony Score
-    def get_complexity(expr):
-        if hasattr(expr, 'length_'): return expr.length_
-        return len(str(expr))
+        # 5. Symbolic Parsimony Score
+        def get_complexity(expr):
+            if hasattr(expr, 'length_'): return expr.length_
+            return len(str(expr))
+            
+        parsimony_scores = []
+        for i, eq in enumerate(equations):
+            if eq is not None:
+                score = get_complexity(eq) / (max(0.01, symbolic_r2s[i]) + 1e-6)
+                parsimony_scores.append(score)
         
-    parsimony_scores = []
-    for i, eq in enumerate(equations):
-        if eq is not None:
-            # Use max(0, r2) for parsimony calculation to avoid negative scores
-            score = get_complexity(eq) / (max(0.01, symbolic_r2s[i]) + 1e-6)
-            parsimony_scores.append(score)
-            print(f"  Equation {i} Parsimony Score: {score:.4f}")
-
-    # Output Health Check JSON (simulated with print for now)
-    health_check = {
-        "Symbolic Parsimony": float(np.mean(parsimony_scores)) if parsimony_scores else 0.0,
-        "Latent Correlation": float(np.mean([np.max(corrs[k]) for k in range(args.super_nodes)])),
-        "Flicker Rate": float(flicker_rate),
-        "Symbolic R2": float(np.mean(symbolic_r2s)) if symbolic_r2s else 0.0
-    }
-    print("\n--- Final Health Check ---")
-    for k, v in health_check.items():
-        print(f"{k}: {v:.4f}")
-
-    # Create symbolic transformer and update trainer with symbolic proxy
-    if hasattr(distiller, 'transformer'):
+        # Create symbolic transformer and update trainer with symbolic proxy
         symbolic_transformer = distiller.transformer
-    else:
-        from symbolic import FeatureTransformer
-        symbolic_transformer = FeatureTransformer(args.super_nodes, args.latent_dim)
-        symbolic_transformer.fit(z_states, dz_states)
+        confidence = np.mean(distiller.confidences) if hasattr(distiller, 'confidences') else 0.8
+        trainer.update_symbolic_proxy(equations, symbolic_transformer, weight=args.sym_weight, confidence=confidence)
 
-    # Update trainer with symbolic proxy
-    confidence = np.mean(distiller.confidences) if hasattr(distiller, 'confidences') else 0.8
-    trainer.update_symbolic_proxy(equations, symbolic_transformer, weight=args.sym_weight, confidence=confidence)
-
+        # 6. Run Autonomous Physics Benchmark for Self-Correction
+        try:
+            from physics_benchmark import run_benchmark
+            bench_report = run_benchmark(model, equations, symbolic_r2s, distiller.transformer)
+            
+            energy_drift = bench_report['energy_conservation_error']
+            ood_r2 = bench_report['symbolic_r2_ood']
+            
+            if energy_drift < 1e-5 and ood_r2 > 0.99:
+                print(f"[Verification Loop] Success! Energy Drift: {energy_drift:.2e}, OOD R2: {ood_r2:.4f}")
+                break
+            elif attempt < MAX_RETRIES:
+                print(f"[Verification Loop] Criteria not met. Retrying with higher parsimony...")
+                # Also try to unfreeze GNN bottleneck if possible or adjust its scaling
+                with torch.no_grad():
+                    trainer.model.log_vars.data += 0.1 # Slightly increase uncertainty to allow more flexibility
+            else:
+                print(f"[Verification Loop] Max retries reached. Keeping best effort.")
+        except Exception as e:
+            print(f"[Verification Loop] Benchmark failed: {e}")
+            break
     # 5.5 STAGE 3: Neural-Symbolic Consistency Training (Closed-Loop)
     if trainer.symbolic_proxy is not None:
         print("\n--- Starting Stage 3: Neural-Symbolic Consistency Training ---")
@@ -457,173 +433,41 @@ def main():
     plot_discovery_results(model, vis_sample_dataset, pos[vis_sample_indices], s_heatmap, z_states_plot, assignments, symbolic_predictions=symbolic_predictions)
     plot_training_history(trainer.loss_tracker)
 
-    # 7. Save Results for Validation
-    print("\nSaving results...")
+    # 7. Final Report
     results_dir = "./results"
     os.makedirs(results_dir, exist_ok=True)
-    
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     model_save_path = os.path.join(results_dir, f"model_{timestamp}.pt")
     torch.save(model.state_dict(), model_save_path)
 
-    config_data = {
-        'particles': args.particles,
-        'super_nodes': args.super_nodes,
-        'latent_dim': args.latent_dim,
-        'hidden_dim': args.hidden_dim,
-        'hamiltonian': args.hamiltonian,
-        'min_active': args.min_active,
-        'sim': args.sim,
-        'dt': sim.dt
-    }
-
-    # NEW: Shadow Integration for Stability Score
-    print("\nCalculating Stability Score (1000-step shadow integration)...")
-    stability_score = 0.0
-    if trainer.symbolic_proxy is not None:
-        try:
-            # Integrate 1000 steps
-            initial_z = torch.tensor(z_states[0].reshape(1, -1), dtype=torch.float32, device=device)
-            steps_1000 = 1000
-            dt = sim.dt
-            from visualization import generate_closed_loop_trajectory
-            shadow_traj = generate_closed_loop_trajectory(trainer.symbolic_proxy, initial_z, steps_1000, dt, device=device)
-            # Check for NaNs and finite values
-            # shadow_traj might be a numpy array if generate_closed_loop_trajectory handles conversion
-            if isinstance(shadow_traj, torch.Tensor):
-                is_fin = torch.isfinite(shadow_traj).all()
-                shadow_np = shadow_traj.cpu().numpy()
-            else:
-                is_fin = np.isfinite(shadow_traj).all()
-                shadow_np = shadow_traj
-                
-            if is_fin:
-                # Score based on whether it exploded (drift from mean)
-                drift = np.std(np.linalg.norm(shadow_np, axis=1))
-                stability_score = 1.0 / (1.0 + drift)
-            else:
-                stability_score = 0.0
-            print(f"  Stability Score: {stability_score:.4f}")
-            
-            # NEW: Calculate physical drifts
-            from check_conservation import calculate_symplectic_drift, calculate_energy_drift
-            print("  Calculating Symplectic and Energy Drifts...")
-            
-            # Move symbolic proxy to CPU for drift calculation to ensure stability and consistency
-            trainer.symbolic_proxy.to('cpu')
-            initial_z_cpu = initial_z.to('cpu')
-            
-            symp_drift = calculate_symplectic_drift(trainer.symbolic_proxy, initial_z_cpu, dt, steps=100)
-            
-            # Ground truth energy function (requires decoding)
-            def gt_energy_func(z_in):
-                with torch.no_grad():
-                    # Move to CPU for consistent numpy integration
-                    z_in_cpu = z_in.to('cpu')
-                    z_reshaped = z_in_cpu.view(-1, config_data['super_nodes'], config_data['latent_dim'])
-                    
-                    # Decoder requires s, batch, and stats
-                    model_device = next(trainer.model.parameters()).device
-                    
-                    # For a clean drift calculation, we assume 1-to-1 mapping if possible
-                    # or just use the first particle
-                    n_particles_eval = config_data['particles']
-                    n_super_eval = config_data['super_nodes']
-                    
-                    # Create a dummy batch and hard assignment
-                    # For 4 particles and 2 super-nodes, we assign 2 particles per super-node
-                    eval_batch = torch.zeros(n_particles_eval, dtype=torch.long, device=model_device)
-                    eval_s = torch.zeros(n_particles_eval, n_super_eval, device=model_device)
-                    for i in range(n_particles_eval):
-                        eval_s[i, i % n_super_eval] = 1.0
-                    
-                    # Move inputs to model device
-                    z_in_dev = z_reshaped.to(model_device)
-                    
-                    # Use the model's stats for denormalization
-                    model_stats = trainer.stats
-                    
-                    recon = trainer.model.decoder(z_in_dev, eval_s, eval_batch, stats=model_stats)
-                    pos_pred = recon[:, :2]
-                    vel_pred = recon[:, 2:]
-                    
-                    p_np = pos_pred.cpu().numpy()
-                    v_np = vel_pred.cpu().numpy()
-                    return torch.tensor(sim.energy(p_np, v_np))
-            
-            eng_drift = calculate_energy_drift(trainer.symbolic_proxy, gt_energy_func, initial_z_cpu, dt, steps=100)
-            
-            # Ensure they are scalar floats
-            if hasattr(symp_drift, 'item'): symp_drift = symp_drift.item()
-            if hasattr(eng_drift, 'item'): eng_drift = eng_drift.item()
-            
-            print(f"  Symplectic Drift: {symp_drift:.6f}")
-            print(f"  Energy Drift: {eng_drift:.6f}")
-            
-        except Exception as e:
-            print(f"  Drift calculation failed: {e}")
-            stability_score = 0.0
-            symp_drift = 1.0
-            eng_drift = 1.0
-
-    # NEW: Run Autonomous Physics Benchmark
-    try:
-        from physics_benchmark import run_benchmark
-        # equations, distiller, model, trainer, dataset are available in locals()
-        r2_scores = symbolic_r2s # calculated above
-        bench_report = run_benchmark(model, equations, r2_scores, distiller.transformer)
-        
-        # Merge benchmark into health_check for discovery_report.json
-        health_check.update({
-            "OOD R2": bench_report['symbolic_r2_ood'],
-            "Energy Drift": bench_report['energy_conservation_error'],
-            "Forecast Horizon": bench_report['forecast_horizon'],
-            "Mass Consistency": bench_report['mass_consistency']
-        })
-    except Exception as e:
-        print(f"Benchmark failed: {e}")
-
-    # NEW: discovery_report.json as requested
     def make_serializable(obj):
-        if isinstance(obj, dict):
-            return {k: make_serializable(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [make_serializable(v) for v in obj]
-        elif hasattr(obj, 'item'):
-            return obj.item()
-        elif isinstance(obj, np.float32) or isinstance(obj, np.float64):
-            return float(obj)
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
+        if isinstance(obj, dict): return {k: make_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, list): return [make_serializable(v) for v in obj]
+        elif hasattr(obj, 'item'): return obj.item()
+        elif isinstance(obj, (np.float32, np.float64)): return float(obj)
+        elif isinstance(obj, np.ndarray): return obj.tolist()
         return obj
 
-    report_data = make_serializable({
+    final_report = make_serializable({
         'discovered_sympy': [str(eq) for eq in equations],
-        'recovered_constants': getattr(distiller, 'recovered_constants', {}),
-        'stability_score': stability_score,
-        'symplectic_drift': symp_drift,
-        'energy_drift': eng_drift,
-        'health_check': health_check,
-        'config': config_data
+        'health_check': {
+            "Symbolic R2": float(np.mean(symbolic_r2s)) if symbolic_r2s else 0.0,
+            "Energy Drift": bench_report['energy_conservation_error'] if 'bench_report' in locals() else 1.0,
+            "OOD R2": bench_report['symbolic_r2_ood'] if 'bench_report' in locals() else 0.0,
+            "Lyapunov": bench_report.get('lyapunov_exponent', 0.0) if 'bench_report' in locals() else 0.0,
+            "Stability Score": stability_score if 'stability_score' in locals() else 0.0,
+            "Symplectic Drift": symp_drift if 'symp_drift' in locals() else 1.0
+        },
+        'config': {
+            'particles': args.particles,
+            'super_nodes': args.super_nodes,
+            'sim': args.sim
+        }
     })
     
     with open('discovery_report.json', 'w') as f:
-        json.dump(report_data, f, indent=4)
-    print("Final report saved to discovery_report.json")
-    
-    discovery_data = make_serializable({
-        'config': config_data,
-        'equations': [str(eq) for eq in equations],
-        'health_check': health_check,
-        'model_path': model_save_path
-    })
-    
-    results_json_path = os.path.join(results_dir, f"discovery_{timestamp}.json")
-    with open(results_json_path, 'w') as f:
-        json.dump(discovery_data, f, indent=4)
-    
-    print(f"Results saved to {results_json_path}")
-    print(f"Model saved to {model_save_path}")
+        json.dump(final_report, f, indent=4)
+    print(f"Final report saved. Model: {model_save_path}")
 
 if __name__ == "__main__":
     main()

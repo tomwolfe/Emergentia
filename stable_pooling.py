@@ -205,7 +205,7 @@ class StableHierarchicalPooling(nn.Module):
 
         # Apply Sinkhorn-Knopp instead of Gumbel-Softmax
         # Sinkhorn naturally encourages utilization of all super-nodes
-        s = self.sinkhorn_knopp(logits, tau=tau, iterations=5)
+        s = self.sinkhorn_knopp(logits, tau=tau, iterations=20)
 
         if hard:
             # Straight-through estimator for hard assignments

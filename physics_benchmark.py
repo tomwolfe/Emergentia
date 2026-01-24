@@ -123,6 +123,51 @@ def calculate_parsimony_index(equations, r2_scores):
             
     return float(np.mean(indices)) if indices else 0.0
 
+def calculate_lyapunov_exponent(proxy, z0, steps=1000, dt=0.01, epsilon=1e-6):
+    """
+    Calculates the largest Lyapunov exponent of the discovered symbolic law.
+    A positive exponent indicates chaos/instability.
+    Near-zero or negative indicates stability/conservative behavior.
+    """
+    device = torch.device('cpu')
+    proxy = proxy.to(device)
+    z0 = z0.to(device).view(1, -1)
+    
+    z1 = z0.clone()
+    # Perturb z0 in a random direction
+    v = torch.randn_like(z0)
+    v = v / torch.norm(v)
+    z2 = z1 + epsilon * v
+    
+    lyapunov_sum = 0.0
+    
+    for _ in range(steps):
+        # Evolve both trajectories
+        with torch.no_grad():
+            dz1 = proxy(z1)
+            z1_next = z1 + dz1 * dt
+            
+            dz2 = proxy(z2)
+            z2_next = z2 + dz2 * dt
+            
+            # Distance after evolution
+            dist_next = torch.norm(z1_next - z2_next).item()
+            
+            # Accumulate growth rate
+            if dist_next > 0:
+                lyapunov_sum += np.log(dist_next / epsilon)
+                
+                # Re-normalize z2 to maintain epsilon distance from z1 in the same direction
+                z2 = z1_next + epsilon * (z2_next - z1_next) / dist_next
+                z1 = z1_next
+            else:
+                # If they collapse, it's very stable
+                lyapunov_sum += -10.0 # Arbitrary negative penalty
+                z1 = z1_next
+                z2 = z1 + epsilon * v
+                
+    return float(lyapunov_sum / (steps * dt))
+
 def run_benchmark(model, equations, r2_scores, transformer, test_data_path=None):
     """Runs the full benchmark suite and saves validation_report.json."""
     print("Running Physics Benchmark...")
@@ -162,6 +207,7 @@ def run_benchmark(model, equations, r2_scores, transformer, test_data_path=None)
     forecast_horizon = calculate_forecast_horizon(proxy, z_gt, dt=sim.dt)
     mass_consistency = calculate_mass_consistency(model, test_dataset)
     parsimony = calculate_parsimony_index(equations, r2_scores)
+    lyapunov = calculate_lyapunov_exponent(proxy, z_gt[0], steps=1000, dt=sim.dt)
     
     # Symbolic R2 (OOD)
     # We evaluate how well the proxy predicts dz/dt on OOD data
@@ -178,7 +224,8 @@ def run_benchmark(model, equations, r2_scores, transformer, test_data_path=None)
         "mass_consistency": mass_consistency,
         "parsimony_index": parsimony,
         "symbolic_r2_ood": float(r2_ood),
-        "success": bool(r2_ood > 0.98 and energy_drift < 1e-6)
+        "lyapunov_exponent": lyapunov,
+        "success": bool(r2_ood > 0.98 and energy_drift < 1e-6 and lyapunov < 0.1)
     }
     
     with open('validation_report.json', 'w') as f:
