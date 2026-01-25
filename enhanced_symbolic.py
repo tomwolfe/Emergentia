@@ -119,7 +119,25 @@ class SymPyToTorch(torch.nn.Module):
         self.param_expr = self._replace_numbers_with_params(sympy_expr)
         
         # Mapping SymPy ops to Torch ops
-        # ... (rest of init)
+        self.eps = 1e-10
+        self.op_map = {
+            sp.Add: torch.add,
+            sp.Mul: torch.mul,
+            sp.Pow: self._safe_pow,
+            sp.sin: torch.sin,
+            sp.cos: torch.cos,
+            sp.tan: self._safe_tan,
+            sp.exp: self._safe_exp,
+            sp.log: self._safe_log,
+            sp.Abs: torch.abs,
+        }
+        
+        # Pre-compile the expression for faster evaluation in forward
+        try:
+            self.torch_func = sp.lambdify(self.symbols + list(self.const_map.keys()), 
+                                          self.param_expr, modules='torch')
+        except Exception:
+            self.torch_func = None
 
     def _safe_div(self, x, y):
         return x / (y + torch.sign(y + 1e-12) * self.eps)
@@ -183,7 +201,16 @@ class SymPyToTorch(torch.nn.Module):
         x_inputs: [Batch, n_inputs] tensor
         """
         try:
-            res = self._recursive_eval(self.param_expr, x_inputs)
+            if self.torch_func is not None:
+                # Prepare arguments for lambdified function
+                # First n_inputs are x0, x1, ...
+                # Following are constants c0, c1, ...
+                args = [x_inputs[:, i] for i in range(self.n_inputs)]
+                args.extend(list(self.constants))
+                res = self.torch_func(*args)
+            else:
+                res = self._recursive_eval(self.param_expr, x_inputs)
+            
             # Catch any remaining NaNs or Infs and clamp
             res = torch.nan_to_num(res, nan=0.0, posinf=1e6, neginf=-1e6)
             res = torch.clamp(res, -1e6, 1e6)
@@ -563,22 +590,23 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
             valid_names = [self.transformer.feature_names[j] for j in valid_indices]
 
         # Use SINDy-style pruning if enabled
+        is_quick = self.populations < 500
         if self.use_sindy_pruning:
             sindy_mask = self._sindy_select(X_pruned, y_target, threshold=self.sindy_threshold)
             print(f"  -> SINDy pruned {len(valid_indices)} to {np.sum(sindy_mask)} features.")
             # If SINDy was too aggressive, fall back to variance-based valid_indices
             if np.sum(sindy_mask) < 2:
                 print("  -> SINDy too aggressive, using standard selection.")
-                mask_pruned = self._select_features(X_pruned, y_target, sim_type=sim_type, feature_names=valid_names)
+                mask_pruned = self._select_features(X_pruned, y_target, sim_type=sim_type, feature_names=valid_names, skip_mi=is_quick)
             else:
                 X_sindy = X_pruned[:, sindy_mask]
                 sindy_names = [valid_names[j] for j in np.where(sindy_mask)[0]] if valid_names else None
                 # Further refine with standard feature selector to reach max_features
-                refinement_mask = self._select_features(X_sindy, y_target, sim_type=sim_type, feature_names=sindy_names)
+                refinement_mask = self._select_features(X_sindy, y_target, sim_type=sim_type, feature_names=sindy_names, skip_mi=is_quick)
                 mask_pruned = np.zeros(len(valid_indices), dtype=bool)
                 mask_pruned[np.where(sindy_mask)[0][refinement_mask]] = True
         else:
-            mask_pruned = self._select_features(X_pruned, y_target, sim_type=sim_type, feature_names=valid_names)
+            mask_pruned = self._select_features(X_pruned, y_target, sim_type=sim_type, feature_names=valid_names, skip_mi=is_quick)
 
         full_mask = np.zeros(X_norm.shape[1], dtype=bool)
         full_mask[valid_indices[mask_pruned]] = True

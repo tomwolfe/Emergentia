@@ -75,7 +75,7 @@ class SymbolicDistiller:
                                  function_set=('add', 'sub', 'mul', safe_div, safe_sqrt, safe_log, 'abs', 'neg', safe_inv, square_func, inv_square_func),
                                  max_samples=0.9, n_jobs=n_jobs, random_state=42, verbose=0)
 
-    def _select_features(self, X, y, sim_type=None, feature_names=None):
+    def _select_features(self, X, y, sim_type=None, feature_names=None, skip_mi=False):
         # Sample data if it's too large
         if X.shape[0] > 1000:
             indices = np.random.choice(X.shape[0], 1000, replace=False)
@@ -91,21 +91,25 @@ class SymbolicDistiller:
         
         # 2. Only run slow Mutual Information on top candidates (e.g., top 50)
         # to find non-linear relationships without checking every feature
-        top_k_f = min(50, X.shape[1])
-        top_f_indices = np.argsort(f_scores)[-top_k_f:]
-        
-        mi_scores_subset = mutual_info_regression(X_sample[:, top_f_indices], y_sample, random_state=42)
-        
-        # Combine scores
-        combined_scores = np.zeros(X.shape[1])
-        combined_scores[top_f_indices] = 0.5 * (f_scores[top_f_indices] / (f_scores[top_f_indices].max() + 1e-9)) + \
-                                         0.5 * (mi_scores_subset / (mi_scores_subset.max() + 1e-9))
-        
-        # For those not in top_k_f, use only f_score (but scaled down)
-        remaining_mask = np.ones(X.shape[1], dtype=bool)
-        remaining_mask[top_f_indices] = False
-        if f_scores.max() > 0:
-            combined_scores[remaining_mask] = 0.3 * (f_scores[remaining_mask] / (f_scores.max() + 1e-9))
+        # SKIP if skip_mi is True or if X is very small
+        if skip_mi or X.shape[0] < 50:
+            combined_scores = f_scores / (f_scores.max() + 1e-9)
+        else:
+            top_k_f = min(50, X.shape[1])
+            top_f_indices = np.argsort(f_scores)[-top_k_f:]
+            
+            mi_scores_subset = mutual_info_regression(X_sample[:, top_f_indices], y_sample, random_state=42)
+            
+            # Combine scores
+            combined_scores = np.zeros(X.shape[1])
+            combined_scores[top_f_indices] = 0.5 * (f_scores[top_f_indices] / (f_scores[top_f_indices].max() + 1e-9)) + \
+                                             0.5 * (mi_scores_subset / (mi_scores_subset.max() + 1e-9))
+            
+            # For those not in top_k_f, use only f_score (but scaled down)
+            remaining_mask = np.ones(X.shape[1], dtype=bool)
+            remaining_mask[top_f_indices] = False
+            if f_scores.max() > 0:
+                combined_scores[remaining_mask] = 0.3 * (f_scores[remaining_mask] / (f_scores.max() + 1e-9))
         
         mask = np.zeros(X.shape[1], dtype=bool)
         

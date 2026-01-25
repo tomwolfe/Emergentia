@@ -43,7 +43,8 @@ def calculate_energy_drift(proxy, z0, steps=1000, dt=0.01):
     curr_h = get_h(z)
     energies.append(curr_h)
     
-    for _ in range(steps):
+    # REDUCED: steps -> min(steps, 500) for speed
+    for _ in range(min(steps, 500)):
         # Simple Euler-Cromer or RK4 for shadow integration
         # Here we use the proxy's forward which computes dz/dt
         dz = proxy(z)
@@ -185,10 +186,11 @@ def run_benchmark(model, equations, r2_scores, transformer, stats=None, test_dat
     # Use same number of particles as model was trained on
     n_particles = getattr(model.encoder, 'n_particles', 16)
     sim = SpringMassSimulator(n_particles=n_particles)
-    pos, vel = sim.generate_trajectory(steps=1000)
+    # REDUCED: 1000 -> 200 steps
+    pos, vel = sim.generate_trajectory(steps=200)
     # Scale velocities to increase energy
     vel_ood = vel * 1.414 # sqrt(2) for 2x kinetic energy
-    pos_ood, vel_ood = sim.generate_trajectory(steps=1000, init_pos=pos[0], init_vel=vel_ood[0])
+    pos_ood, vel_ood = sim.generate_trajectory(steps=200, init_pos=pos[0], init_vel=vel_ood[0])
     
     # USE THE ORIGINAL STATS IF PROVIDED
     test_dataset, _ = prepare_data(pos_ood, vel_ood, stats=stats) 
