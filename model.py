@@ -717,9 +717,10 @@ class DiscoveryEngineModel(nn.Module):
         if step_size is None:
             if len(t) > 1:
                 dt_span = (t[1] - t[0]).item()
-                step_size = min(0.001, dt_span)
+                # Use larger steps for training, slightly smaller for evaluation
+                step_size = dt_span / 2 if self.training else dt_span / 5
             else:
-                step_size = 0.001
+                step_size = 0.01
 
         method = 'midpoint' if self.training else 'rk4'
         options = {'step_size': step_size}

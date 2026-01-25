@@ -45,17 +45,17 @@ def profile_train():
     batch_data.seq_len = 20
     
     for _ in range(5):
-        trainer.train_step(batch_data, sim.dt, epoch=100, max_epochs=400) # Past warmup
+        trainer.train_step(batch_data, sim.dt, epoch=20, max_epochs=400) # Stage 1
     
-    print("Starting profile...")
+    print("Starting profile (Stage 2)...")
     start_time = time.time()
     for i in range(10):
         t0 = time.time()
-        trainer.train_step(batch_data, sim.dt, epoch=100 + i, max_epochs=400)
+        trainer.train_step(batch_data, sim.dt, epoch=101 + i, max_epochs=400)
         print(f"Step {i}: {time.time() - t0:.4f}s")
     
     avg_time = (time.time() - start_time) / 10
-    print(f"Average train_step time: {avg_time:.4f}s")
+    print(f"Average train_step time (Stage 2): {avg_time:.4f}s")
 
 if __name__ == "__main__":
     profile_train()

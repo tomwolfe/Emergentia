@@ -75,12 +75,12 @@ class StableHierarchicalPooling(nn.Module):
         """Manually set or update the sparsity weight."""
         self.current_sparsity_weight = weight
 
-    def sinkhorn_knopp(self, logits, tau=1.0, iterations=50):
+    def sinkhorn_knopp(self, logits, tau=1.0, iterations=20):
         """
         Sinkhorn-Knopp algorithm to find a doubly stochastic assignment matrix.
         Ensures each node is assigned to super-nodes (row sum=1) and each super-node
         receives approximately N/K nodes (column sum=N/K).
-        Increased iterations to 50 for better convergence.
+        Reduced iterations to 20 for speed.
         """
         N, K = logits.shape
         # Use log-space for stability
@@ -136,7 +136,7 @@ class StableHierarchicalPooling(nn.Module):
             logits = logits + 5.0 * prev_assignments.detach()
 
         # Apply Sinkhorn-Knopp instead of Gumbel-Softmax
-        s = self.sinkhorn_knopp(logits, tau=tau, iterations=50)
+        s = self.sinkhorn_knopp(logits, tau=tau, iterations=20)
 
         if hard or (current_epoch is not None and total_epochs is not None and current_epoch/total_epochs >= 0.8):
             # Straight-through estimator for hard assignments

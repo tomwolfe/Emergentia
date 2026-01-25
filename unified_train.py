@@ -64,6 +64,10 @@ def main():
     parser.add_argument('--gen', type=int, default=40, help='Symbolic generations')
     args = parser.parse_args()
 
+    if args.quick_symbolic:
+        args.pop = min(args.pop, 1000)
+        args.gen = min(args.gen, 15)
+
     device = get_device() if args.device == 'auto' else args.device
     print(f"Using device: {device}")
 
@@ -262,17 +266,15 @@ def main():
     # flicker rate ...
     print("\nCalculating Flicker Rate...")
     model.eval()
-    s_list = []
     flicker_sample_size = min(30 if args.quick_symbolic else 100, len(dataset_list))
     flicker_indices = np.linspace(0, len(dataset_list)-1, flicker_sample_size, dtype=int)
+    flicker_data = [dataset_list[i] for i in flicker_indices]
+    flicker_batch = Batch.from_data_list(flicker_data).to(device)
     with torch.no_grad():
-        for idx in flicker_indices:
-            data = dataset_list[idx]
-            batch = Batch.from_data_list([data]).to(device)
-            _, s, _, _ = model.encode(batch.x, batch.edge_index, batch.batch)
-            s_list.append(s.cpu())
-    s_all = torch.stack(s_list)
-    flicker_rate = torch.mean(torch.abs(s_all[1:] - s_all[:-1])).item()
+        _, s_all_flicker, _, _ = model.encode(flicker_batch.x, flicker_batch.edge_index, flicker_batch.batch)
+        # Reshape to [sample_size, particles, super_nodes] and take mean over particles
+        s_all_flicker = s_all_flicker.view(flicker_sample_size, -1, args.super_nodes).mean(dim=1)
+    flicker_rate = torch.mean(torch.abs(s_all_flicker[1:] - s_all_flicker[:-1])).item()
 
     # 5.5 STAGE 3: Neural-Symbolic Consistency Training (Closed-Loop)
     if trainer.symbolic_proxy is not None:

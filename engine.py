@@ -90,25 +90,34 @@ def analyze_latent_space(model, dataset, pos_raw, tau=0.1, device='cpu'):
     with the Center of Mass (CoM) of assigned particles.
     """
     model.eval()
-    z_list, com_list = [], []
-
+    
+    # Batch the entire dataset for faster processing
+    if isinstance(dataset, list):
+        full_batch = Batch.from_data_list(dataset).to(device)
+        T = len(dataset)
+    else:
+        full_batch = dataset.to(device)
+        T = getattr(full_batch, 'seq_len', 1)
+        
+    N = full_batch.num_nodes // T
+    
     with torch.no_grad():
-        for t, data in enumerate(dataset):
-            batch = Batch.from_data_list([data]).to(device)
-            z, s, _, _ = model.encode(batch.x, batch.edge_index, batch.batch, tau=tau)
-
-            # Compute CoM for each super-node based on assignment weights s
-            # s: [N, K], pos_raw[t]: [N, 2]
-            s_sum = s.sum(dim=0, keepdim=True) + 1e-9
-            s_norm = s / s_sum
-            curr_pos = torch.tensor(pos_raw[t], dtype=torch.float, device=device)
-            com = torch.matmul(s_norm.t(), curr_pos) # [K, 2]
-
-            z_list.append(z[0].cpu().numpy())
-            com_list.append(com.cpu().numpy())
-
-    z_all = np.array(z_list)   # [T, K, D]
-    com_all = np.array(com_list) # [T, K, 2]
+        z, s, _, _ = model.encode(full_batch.x, full_batch.edge_index, full_batch.batch, tau=tau)
+        
+        # Reshape to [T, N, K] and [T, K, D]
+        s = s.view(T, N, -1)
+        z_all = z.view(T, model.encoder.n_super_nodes, -1).cpu().numpy()
+        
+        # Compute CoM for each super-node based on assignment weights s
+        # s: [T, N, K], pos_raw: [T, N, 2]
+        pos_torch = torch.tensor(pos_raw, dtype=torch.float, device=device)
+        
+        # s_sum: [T, 1, K]
+        s_sum = s.sum(dim=1, keepdim=True) + 1e-9
+        s_norm = s / s_sum
+        
+        # com: [T, K, 2]
+        com_all = torch.matmul(s_norm.transpose(1, 2), pos_torch).cpu().numpy()
 
     avg_corrs = []
     for k in range(model.encoder.n_super_nodes):
@@ -128,30 +137,33 @@ def enhance_physical_mapping(model, dataset, pos_raw, vel_raw, tau=0.1, device='
     to improve physical interpretability.
     """
     model.eval()
-    z_list, pos_com_list, vel_com_list = [], [], []
+    
+    if isinstance(dataset, list):
+        full_batch = Batch.from_data_list(dataset).to(device)
+        T = len(dataset)
+    else:
+        full_batch = dataset.to(device)
+        T = getattr(full_batch, 'seq_len', 1)
+        
+    N = full_batch.num_nodes // T
 
     with torch.no_grad():
-        for t, data in enumerate(dataset):
-            batch = Batch.from_data_list([data]).to(device)
-            z, s, _, _ = model.encode(batch.x, batch.edge_index, batch.batch, tau=tau)
+        z, s, _, _ = model.encode(full_batch.x, full_batch.edge_index, full_batch.batch, tau=tau)
+        
+        # Reshape
+        s = s.view(T, N, -1)
+        z_all = z.view(T, model.encoder.n_super_nodes, -1).cpu().numpy()
+        
+        # s_sum: [T, 1, K]
+        s_sum = s.sum(dim=1, keepdim=True) + 1e-9
+        s_norm = s / s_sum
+        
+        curr_pos = torch.tensor(pos_raw, dtype=torch.float, device=device)
+        curr_vel = torch.tensor(vel_raw, dtype=torch.float, device=device)
 
-            # Compute CoM for each super-node based on assignment weights s
-            # s: [N, K], pos_raw[t]: [N, 2], vel_raw[t]: [N, 2]
-            s_sum = s.sum(dim=0, keepdim=True) + 1e-9
-            s_norm = s / s_sum
-            curr_pos = torch.tensor(pos_raw[t], dtype=torch.float, device=device)
-            curr_vel = torch.tensor(vel_raw[t], dtype=torch.float, device=device)
-
-            pos_com = torch.matmul(s_norm.t(), curr_pos)  # [K, 2]
-            vel_com = torch.matmul(s_norm.t(), curr_vel)  # [K, 2]
-
-            z_list.append(z[0].cpu().numpy())
-            pos_com_list.append(pos_com.cpu().numpy())
-            vel_com_list.append(vel_com.cpu().numpy())
-
-    z_all = np.array(z_list)           # [T, K, D]
-    pos_com_all = np.array(pos_com_list)  # [T, K, 2]
-    vel_com_all = np.array(vel_com_list)  # [T, K, 2]
+        # com: [T, K, 2]
+        pos_com_all = torch.matmul(s_norm.transpose(1, 2), curr_pos).cpu().numpy()
+        vel_com_all = torch.matmul(s_norm.transpose(1, 2), curr_vel).cpu().numpy()
 
     # Calculate correlations for both position and velocity
     all_corrs = []
@@ -455,8 +467,8 @@ class Trainer:
             1.0 * losses_all.get('temporal_consistency', 0.0)
         )
 
-        if not is_warmup:
-            progress_after_warmup = min(1.0, (epoch - int(max_epochs * 0.1)) / 100.0)
+        if not is_warmup and is_stage2:
+            progress_after_warmup = min(1.0, (epoch - stage1_end) / 100.0)
             target_integration_steps = max(4, int(progress_after_warmup * seq_len))
             z_curr_ode = self.hardware.to_ode_device(z_curr)
             

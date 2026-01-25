@@ -67,10 +67,8 @@ class SymbolicDistiller:
         """Returns the length of the program as a measure of complexity."""
         return getattr(program, 'length_', 1)
 
-    def _get_regressor(self, pop, gen, parsimony=0.05):
-        # OPTIMIZATION: Use n_jobs=1 for small populations to avoid overhead
-        # or if we are likely already parallelizing at the target level.
-        n_jobs = -1 if pop >= 1000 else 1
+    def _get_regressor(self, pop, gen, parsimony=0.05, n_jobs=1):
+        # Default to n_jobs=1 to avoid contention with outer parallel loops
         return SymbolicRegressor(population_size=pop, generations=gen, parsimony_coefficient=parsimony,
                                  function_set=('add', 'sub', 'mul', safe_div, safe_sqrt, safe_log, 'abs', 'neg', safe_inv, square_func, inv_square_func),
                                  max_samples=0.9, n_jobs=n_jobs, random_state=42, verbose=0)

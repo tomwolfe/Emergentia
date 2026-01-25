@@ -534,11 +534,11 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
         self.extra_kwargs = kwargs
         self.all_candidates = [] # Store all candidates for analysis
 
-    def _get_regressor(self, pop, gen, parsimony=None):
+    def _get_regressor(self, pop, gen, parsimony=None, n_jobs=1):
         """Override to use parsimony from extra_kwargs if provided."""
         if parsimony is None:
             parsimony = self.extra_kwargs.get('parsimony', 0.05)
-        return super()._get_regressor(pop, gen, parsimony=parsimony)
+        return super()._get_regressor(pop, gen, parsimony=parsimony, n_jobs=n_jobs)
 
     def _sindy_select(self, X, y, threshold=0.05, max_iter=10):
         """

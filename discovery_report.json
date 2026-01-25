@@ -1,17 +1,17 @@
 {
     "discovered_sympy": [
-        "neg(X0)"
+        "0.401248052954778*sqrt(Abs((x0 - 0.54)/((x0 + 1.0e-9)*(inv_square(square(0.641)) + 1.0e-9))))"
     ],
     "health_check": {
         "Symbolic R2": 0.0,
         "Energy Drift": 0.0,
-        "OOD R2": -0.08923666924238205,
-        "Rotational Error": 9.068405067746142e-06,
+        "OOD R2": -0.005980014801025391,
+        "Rotational Error": 1.2180899107887963e-06,
         "Active Super-nodes": 2,
-        "Flicker Rate": 0.00268556852824986
+        "Flicker Rate": 0.0007697955006733537
     },
     "config": {
-        "particles": 8,
+        "particles": 4,
         "super_nodes": 2,
         "sim": "spring",
         "hamiltonian": true
