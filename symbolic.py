@@ -224,7 +224,12 @@ def extract_latent_data(model, dataset, dt, include_hamiltonian=False, return_bo
         dz_vals = None
         
         if include_hamiltonian and hasattr(model.ode_func, 'hamiltonian'):
-            h_vals = model.ode_func.hamiltonian(z_torch).cpu().numpy()
+            # Ensure we get a scalar H per sample: [T, 1]
+            h_out = model.ode_func.hamiltonian(z_torch)
+            if h_out.ndim == 1:
+                h_vals = h_out.cpu().numpy().reshape(-1, 1)
+            else:
+                h_vals = h_out.cpu().numpy()
             
         if not include_hamiltonian or return_both:
             t_span = torch.zeros(1, device=ode_device)
@@ -241,4 +246,151 @@ def extract_latent_data(model, dataset, dt, include_hamiltonian=False, return_bo
     
     derivs = h_vals if include_hamiltonian else dz_vals
     return states, derivs, t_states
+
+class DiscoveryOrchestrator:
+    """
+    Consolidates symbolic discovery logic to prevent configuration drift.
+    Coordinates between data extraction, feature transformation, and various distillers.
+    """
+    def __init__(self, n_super_nodes, latent_dim, config=None):
+        self.n_super_nodes = n_super_nodes
+        self.latent_dim = latent_dim
+        self.config = config or {}
+        
+    def discover(self, model, dataset, dt, hamiltonian=False, sim_type='spring', quick=False, stats=None):
+        from enhanced_symbolic import EnsembleSymbolicDistiller
+        from physics_benchmark import run_benchmark
+        from symmetry_checks import NoetherChecker
+        
+        print(f"\n[Orchestrator] Starting {'Hamiltonian' if hamiltonian else 'Standard'} Discovery...")
+        
+        # 1. Extract Data
+        if hamiltonian:
+            z_states, h_targets, dz_states, t_states = extract_latent_data(
+                model, dataset, dt, include_hamiltonian=True, return_both=True
+            )
+            targets = h_targets
+        else:
+            z_states, targets, t_states = extract_latent_data(
+                model, dataset, dt, include_hamiltonian=False
+            )
+            dz_states = targets
+            
+        # 2. Setup Resources
+        pop_size = self.config.get('pop', 5000)
+        gen_size = self.config.get('gen', 40)
+        max_retries = 0 if quick else 2
+        ensemble_size = 1 if quick else 3
+        
+        best_equations = []
+        best_distiller = None
+        best_bench = {}
+        best_score = -float('inf')
+        
+        # --- SELF-CORRECTION LOOP ---
+        for attempt in range(max_retries + 1):
+            print(f"\n[Orchestrator] Attempt {attempt+1}/{max_retries+1}...")
+            
+            # Adjust parsimony and complexity based on attempt
+            parsimony = 0.01 if attempt == 0 else (0.05 if attempt == 1 else 0.1)
+            max_f = 12 if attempt == 0 else (8 if attempt == 1 else 5)
+            
+            if attempt == max_retries and not quick:
+                pop_size = max(pop_size, 10000)
+                gen_size = max(gen_size, 50)
+
+            distiller = EnsembleSymbolicDistiller(
+                populations=pop_size,
+                generations=gen_size,
+                ensemble_size=ensemble_size,
+                consensus_threshold=max(1, ensemble_size - 1),
+                secondary_optimization=True,
+                parsimony=parsimony,
+                max_features=max_f
+            )
+            
+            try:
+                equations = distiller.distill(
+                    z_states, targets, self.n_super_nodes, self.latent_dim,
+                    sim_type=sim_type, hamiltonian=hamiltonian
+                )
+            except Exception as e:
+                print(f"  [Orchestrator] Distillation failed: {e}")
+                continue
+            
+            # If Hamiltonian, ensure single equation
+            if hamiltonian and len(equations) > 1:
+                equations = [equations[0]]
+
+            if not best_equations:
+                best_equations = equations
+                best_distiller = distiller
+
+            # 4. Calculate Symbolic R2 for basic validation
+            try:
+                # Create a temporary proxy for R2 calculation
+                from symbolic_proxy import SymbolicProxy
+                temp_proxy = SymbolicProxy(
+                    self.n_super_nodes, self.latent_dim, equations, distiller.transformer, 
+                    hamiltonian=hamiltonian
+                ).to(next(model.parameters()).device)
+                
+                device = next(temp_proxy.parameters()).device
+                with torch.no_grad():
+                    z_torch = torch.tensor(z_states, dtype=torch.float32, device=device)
+                    dz_pred = temp_proxy(0, z_torch).cpu().numpy()
+                    
+                r2s = []
+                for i in range(dz_states.shape[1]):
+                    y_true = dz_states[:, i]
+                    y_pred = dz_pred[:, i]
+                    r2 = 1 - np.sum((y_true - y_pred)**2) / (np.sum((y_true - np.mean(y_true))**2) + 1e-9)
+                    r2s.append(r2)
+                mean_r2 = np.mean(r2s)
+            except Exception as e:
+                print(f"  [Orchestrator] R2 calculation failed: {e}")
+                mean_r2 = 0.0
+                r2s = [mean_r2]
+
+            # 5. Run Physics Benchmark
+            try:
+                bench_report = run_benchmark(model, equations, r2s, distiller.transformer, stats=stats)
+                
+                # Symmetry Checks
+                device = next(temp_proxy.parameters()).device
+                n_checker = NoetherChecker(temp_proxy, self.latent_dim)
+                rot_error = n_checker.check_rotational_invariance(torch.tensor(z_states[0:1], dtype=torch.float32, device=device))
+                bench_report['rotational_invariance_error'] = rot_error
+                
+                energy_drift = bench_report.get('energy_conservation_error', 1.0)
+                ood_r2 = bench_report.get('symbolic_r2_ood', 0.0)
+                
+                print(f"  [Orchestrator] Results: OOD R2: {ood_r2:.4f}, Energy Drift: {energy_drift:.2e}, Rot Error: {rot_error:.2e}")
+                
+                # SUCCESS CRITERIA
+                if energy_drift < 1e-5 and ood_r2 > 0.98:
+                    print(f"  [Orchestrator] Criteria met! Finalizing discovery.")
+                    best_equations, best_distiller, best_bench = equations, distiller, bench_report
+                    break
+                
+                # Keep best effort if not perfect
+                current_score = ood_r2 - 0.1 * np.log10(energy_drift + 1e-12)
+                if current_score > best_score:
+                    best_score = current_score
+                    best_equations, best_distiller, best_bench = equations, distiller, bench_report
+                    
+            except Exception as e:
+                print(f"  [Orchestrator] Benchmark failed: {e}")
+                if not best_equations:
+                    best_equations, best_distiller, best_bench = equations, distiller, {}
+
+        return {
+            'equations': best_equations if best_equations is not None else [],
+            'distiller': best_distiller,
+            'z_states': z_states,
+            'targets': targets,
+            'dz_states': dz_states,
+            't_states': t_states,
+            'bench_report': best_bench if best_bench is not None else {}
+        }
 

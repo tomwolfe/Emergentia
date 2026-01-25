@@ -1,33 +1,19 @@
 {
     "discovered_sympy": [
-        "add(add(add(add(add(add(add(add(add(add(add(add(-0.000273, mul(-0.050865, X7)), mul(-0.136195, X11)), mul(-0.202461, X13)), mul(-0.185070, X16)), mul(-0.162273, X18)), mul(-0.261863, X21)), mul(-0.131629, X22)), mul(0.150505, X23)), mul(-0.070981, X24)), mul(0.256980, X25)), mul(-0.070098, X28)), mul(0.198990, X29))",
-        "add(add(add(add(add(add(add(add(add(add(add(add(-0.001532, mul(0.559612, X5)), mul(0.349577, X9)), mul(-0.666932, X11)), mul(0.864776, X13)), mul(-0.394039, X15)), mul(1.032229, X22)), mul(-1.523761, X23)), mul(1.663268, X24)), mul(-0.251649, X25)), mul(-3.498506, X27)), mul(0.736606, X28)), mul(-0.838005, X29))",
-        "X7",
-        "add(add(add(add(add(add(add(add(add(0.000033, mul(0.070965, X3)), mul(0.206912, X7)), mul(0.069791, X10)), mul(-0.158591, X13)), mul(-0.148503, X18)), mul(-0.274533, X22)), mul(-0.234343, X24)), mul(-0.151713, X25)), mul(0.373089, X29))",
-        "add(add(add(add(-0.000074, mul(0.257258, X18)), mul(-0.539577, X19)), mul(-0.528763, X20)), mul(0.741645, X21))",
-        "add(add(add(add(add(add(add(add(add(add(add(0.000044, mul(-0.596012, X0)), mul(0.786188, X2)), mul(0.810349, X3)), mul(1.362849, X6)), mul(-0.102758, X13)), mul(-0.073431, X16)), mul(0.361751, X17)), mul(0.479522, X19)), mul(-0.095679, X21)), mul(-0.223414, X26)), mul(-0.256965, X27))",
-        "add(add(add(add(add(add(add(add(add(add(add(add(-0.000305, mul(-0.319278, X7)), mul(-0.011777, X10)), mul(0.110476, X13)), mul(-0.166371, X15)), mul(0.203243, X16)), mul(-0.022454, X17)), mul(-0.264762, X18)), mul(-0.364913, X19)), mul(-0.190783, X20)), mul(0.006388, X24)), mul(0.004251, X28)), mul(-0.588881, X29))",
-        "sub(X4, log(X2))",
-        "add(add(add(add(add(add(add(add(add(0.000241, mul(0.113319, X0)), mul(0.496535, X4)), mul(0.559214, X6)), mul(-0.861393, X11)), mul(-0.503858, X19)), mul(0.283329, X20)), mul(2.054245, X25)), mul(-0.318008, X26)), mul(1.136262, X29))",
-        "X7",
-        "add(add(add(add(add(add(add(add(add(add(add(0.000077, mul(0.010632, X2)), mul(0.092563, X4)), mul(0.084083, X6)), mul(0.123453, X15)), mul(-0.383287, X16)), mul(0.114000, X18)), mul(0.481423, X19)), mul(0.374639, X20)), mul(-0.243363, X21)), mul(0.196385, X22)), mul(0.284221, X29))",
-        "log(neg(X9))",
-        "add(add(add(add(add(add(add(add(-0.000076, mul(0.212979, X11)), mul(0.193701, X13)), mul(0.345706, X16)), mul(-0.109501, X17)), mul(-0.182916, X19)), mul(-0.217000, X20)), mul(0.276807, X21)), mul(0.178312, X22))",
-        "add(add(add(add(add(add(add(add(add(add(add(add(0.000918, mul(0.212544, X5)), mul(0.231224, X10)), mul(0.409307, X13)), mul(-0.198607, X15)), mul(-0.280001, X19)), mul(-0.534275, X21)), mul(0.747382, X22)), mul(-0.317537, X23)), mul(0.702286, X24)), mul(0.372120, X26)), mul(0.376613, X28)), mul(-0.155436, X29))",
-        "add(add(add(add(add(add(add(add(add(add(add(add(-0.000731, mul(0.117125, X15)), mul(-0.344653, X16)), mul(-2.023143, X17)), mul(0.527966, X18)), mul(1.449269, X20)), mul(-0.405281, X21)), mul(0.444598, X22)), mul(0.197858, X23)), mul(-0.052884, X24)), mul(0.406273, X26)), mul(0.200027, X28)), mul(1.127002, X29))",
-        "add(add(add(add(add(add(add(add(add(add(add(add(0.000365, mul(-0.017330, X0)), mul(0.082736, X3)), mul(0.053233, X7)), mul(-0.004112, X16)), mul(0.342016, X17)), mul(0.388271, X19)), mul(0.358944, X20)), mul(-0.189808, X21)), mul(0.080671, X24)), mul(-0.272830, X26)), mul(0.045020, X28)), mul(0.351675, X29))"
+        "neg(X0)"
     ],
     "health_check": {
-        "Symbolic R2": 0.6498929262161255,
-        "Energy Drift": 0.06557178497314453,
-        "OOD R2": -0.008213099092245102,
-        "Lyapunov": -4.3719423180942085,
-        "Stability Score": 0.0,
-        "Symplectic Drift": 1.0
+        "Symbolic R2": 0.0,
+        "Energy Drift": 0.0,
+        "OOD R2": -0.08923666924238205,
+        "Rotational Error": 9.068405067746142e-06,
+        "Active Super-nodes": 2,
+        "Flicker Rate": 0.00268556852824986
     },
     "config": {
         "particles": 8,
         "super_nodes": 2,
-        "sim": "spring"
+        "sim": "spring",
+        "hamiltonian": true
     }
 }

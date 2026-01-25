@@ -141,6 +141,7 @@ def main():
 
     # Track historical metrics for stability check
     loss_history = []
+    stable_epoch = -1
 
     # Memory-efficient training loop
     for epoch in range(args.epochs):
@@ -159,6 +160,24 @@ def main():
 
         loss, rec, cons = trainer.train_step(batch_data, sim.dt, epoch=epoch, max_epochs=args.epochs)
         last_rec = rec
+        loss_history.append(loss)
+        if len(loss_history) > 100:
+            loss_history.pop(0)
+
+        # NEW: Distillation Gate - Check for stabilization
+        stable_epoch = -1
+        if len(loss_history) >= 20:
+            recent_losses = loss_history[-20:]
+            loss_var = np.var(recent_losses)
+            if last_rec < 0.05 and loss_var < 1e-4:
+                if stable_epoch == -1:
+                    print(f"\n[Distillation Gate] System stabilized at epoch {epoch} (Rec: {last_rec:.4f}, Var: {loss_var:.2e})")
+                    stable_epoch = epoch
+                
+                # If we have been stable for at least 10 epochs AND we are past a minimum training time
+                if epoch >= max(50, stable_epoch + 10):
+                    print(f"[Distillation Gate] Stabilization confirmed. Proceeding to discovery.")
+                    break
 
         # NEW: Jacobian Condition Number Logging - Only if we are going to print
         if epoch % 50 == 0:
@@ -187,29 +206,6 @@ def main():
         elif epoch % 10 == 0:  # Print less frequently to reduce overhead
             print(f"Epoch {epoch:4d} | Loss: {loss:.4f} | Rec: {rec:.4f} | Cons: {cons:.4f}")
 
-        # Learning rate warmup: gradually increase LR for first 25 epochs to focus on reconstruction
-
-        # Early discovery gate - only check late in training with strict criteria
-        if epoch >= 100 and epoch % 40 == 0:  # Check every 40 epochs starting at 100
-            loss_std = np.std(loss_history) if len(loss_history) >= 10 else 1.0  # Larger window
-            if loss_std < 0.01 and last_rec < 0.05:  # Strict criteria
-                print(f"\n[Adaptive Gate] Loss stabilized (std={loss_std:.6f}). Attempting early discovery...")
-
-                # Extract subset for quick check
-                check_dataset = dataset[::max(1, len(dataset)//20)]  # Small subset
-                z_check, dz_check, _ = extract_latent_data(model, check_dataset, sim.dt, include_hamiltonian=args.hamiltonian)
-
-                # Quick GP check with minimal resources
-                distiller = SymbolicDistiller(populations=200, generations=2)  # Minimal
-                eqs = distiller.distill(z_check, dz_check, args.super_nodes, args.latent_dim, hamiltonian=args.hamiltonian)
-
-                # If we found a non-trivial equation with decent potential, we could stop
-                # For now, let's just log it and decide if we want to early exit
-                print(f"[Adaptive Gate] Found candidate: {eqs[0] if eqs else 'None'}")
-                if eqs and len(str(eqs[0])) > 4:  # Moderate criteria
-                    print("[Adaptive Gate] Discovery successful and non-trivial. Finishing training early.")
-                    break
-
         if early_stopping(loss, rec):
             print(f"Early stopping triggered at epoch {epoch}")
             break
@@ -226,37 +222,47 @@ def main():
 
     # 5. Analysis & Symbolic Discovery
     print("\n--- Discovery Health Report ---")
+    from symbolic import DiscoveryOrchestrator
     
-    # Extract data for analysis: h_targets for distillation, dz_states for validation
-    # OPTIMIZATION: Extract both Hamiltonian and Derivatives in one go if needed
-    if args.hamiltonian:
-        z_states, h_targets, dz_states, t_states = extract_latent_data(model, dataset, sim.dt, include_hamiltonian=True, return_both=True)
-    else:
-        z_states, h_targets, t_states = extract_latent_data(model, dataset, sim.dt, include_hamiltonian=False)
-        dz_states = h_targets
+    orchestrator = DiscoveryOrchestrator(
+        args.super_nodes, args.latent_dim, 
+        config={'pop': args.pop, 'gen': args.gen}
+    )
     
-    # 1. Calculate Correlation Matrix between latents and physical CoM
+    discovery_results = orchestrator.discover(
+        model, dataset, sim.dt, 
+        hamiltonian=args.hamiltonian, 
+        sim_type=args.sim, 
+        quick=args.quick_symbolic,
+        stats=stats
+    )
+    
+    equations = discovery_results['equations']
+    distiller = discovery_results['distiller']
+    z_states = discovery_results['z_states']
+    dz_states = discovery_results['dz_states']
+    bench_report = discovery_results['bench_report']
+    
+    # Update trainer with symbolic proxy
+    symbolic_transformer = distiller.transformer
+    confidence = np.mean(distiller.confidences) if hasattr(distiller, 'confidences') else 0.8
+    trainer.update_symbolic_proxy(equations, symbolic_transformer, weight=args.sym_weight, confidence=confidence)
+
+    # Calculate correlation and flicker for the report
+    is_quick = args.quick_symbolic or args.epochs < 50
     print("Calculating Correlation Matrix...")
     sample_size = min(50 if args.quick_symbolic else 200, len(dataset))
     sample_indices = np.linspace(0, len(dataset)-1, sample_size, dtype=int)
-    # OPTIMIZATION: Use already existing dataset_list for much faster indexing
     sample_dataset = [dataset_list[i] for i in sample_indices]
     sample_pos = pos[sample_indices]
     corrs = analyze_latent_space(model, sample_dataset, sample_pos, device=device)
-    
-    print("\nLatent-Physical Correlation Matrix (max correlation per super-node):")
-    max_corrs = []
-    for k in range(args.super_nodes):
-        max_corr = np.max(corrs[k])
-        max_corrs.append(max_corr)
-        print(f"  Super-node {k}: {max_corr:.4f}")
+    max_corrs = [np.max(corrs[k]) for k in range(args.super_nodes)]
     mean_max_corr = np.mean(max_corrs)
 
-    # 2. Calculate Flicker Rate (mean change in assignments S)
+    # flicker rate ...
     print("\nCalculating Flicker Rate...")
     model.eval()
     s_list = []
-    # OPTIMIZATION: Use a subset for flicker rate if quick
     flicker_sample_size = min(30 if args.quick_symbolic else 100, len(dataset_list))
     flicker_indices = np.linspace(0, len(dataset_list)-1, flicker_sample_size, dtype=int)
     with torch.no_grad():
@@ -265,128 +271,9 @@ def main():
             batch = Batch.from_data_list([data]).to(device)
             _, s, _, _ = model.encode(batch.x, batch.edge_index, batch.batch)
             s_list.append(s.cpu())
-    
-    s_all = torch.stack(s_list) # [T_sub, N, K]
+    s_all = torch.stack(s_list)
     flicker_rate = torch.mean(torch.abs(s_all[1:] - s_all[:-1])).item()
-    print(f"  Mean Flicker Rate: {flicker_rate:.6f}")
 
-    from enhanced_symbolic import EnsembleSymbolicDistiller
-    from symmetry_checks import NoetherChecker
-    
-    # --- SELF-CORRECTION LOOP ---
-    # ADAPTIVE RESOURCES: Use more resources for the final attempt
-    is_quick = args.quick_symbolic or args.epochs < 50
-    MAX_RETRIES = 0 if is_quick else 2
-    pop_size = args.pop if is_quick else max(args.pop, 5000)
-    gen_size = args.gen if is_quick else max(args.gen, 30)
-    ensemble_size = 1 if is_quick else 3
-    
-    bench_report = {}
-    for attempt in range(MAX_RETRIES + 1):
-        print(f"\n[Verification Loop] Attempt {attempt+1}/{MAX_RETRIES+1} (Pop={pop_size}, Gen={gen_size})...")
-        
-        # Parsimony Pivot: decrease max_features and increase parsimony if previous failed
-        # Rather than just increasing population, we force simpler models (Occam's Razor)
-        parsimony = 0.01 if attempt == 0 else (0.05 if attempt == 1 else 0.1)
-        max_f = 12 if attempt == 0 else (8 if attempt == 1 else 5)
-        
-        # If we are struggling, increase search resources but keep parsimony high
-        if attempt == MAX_RETRIES and not is_quick:
-            pop_size = 10000
-            gen_size = 50
-            print(f"  [Self-Correction] Final attempt: Escalating to Pop={pop_size}, Gen={gen_size}")
-
-        # ... (rest of loop)
-
-        distiller = EnsembleSymbolicDistiller(
-            populations=pop_size, 
-            generations=gen_size,
-            ensemble_size=ensemble_size,
-            consensus_threshold=max(1, ensemble_size - 1),
-            secondary_optimization=True,
-            parsimony=parsimony,
-            max_features=max_f
-        )
-        
-        equations = distiller.distill(z_states, h_targets, args.super_nodes, args.latent_dim, sim_type=args.sim, hamiltonian=args.hamiltonian)
-        
-        print("\nDiscovered Equations:")
-        for i, eq in enumerate(equations):
-            target = "H" if args.hamiltonian else f"dz_{i}/dt"
-            print(f"{target} = {eq}")
-
-        # 4. Calculate Symbolic R2
-        print("\nCalculating Symbolic R2...")
-        symbolic_r2s = []
-        X_poly = distiller.transformer.transform(z_states)
-        X_norm = distiller.transformer.normalize_x(X_poly)
-        
-        # Create a temporary proxy for R2 calculation
-        temp_proxy = SymbolicProxy(
-            args.super_nodes, args.latent_dim, equations, distiller.transformer, 
-            hamiltonian=args.hamiltonian
-        ).to(device)
-        
-        with torch.no_grad():
-            z_torch = torch.tensor(z_states, dtype=torch.float32, device=device)
-            # Proxy returns dz/dt
-            dz_pred_torch = temp_proxy(0, z_torch)
-            dz_pred = dz_pred_torch.cpu().numpy()
-            
-        # We compare dz_pred with dz_states
-        for i in range(dz_states.shape[1]):
-            y_true = dz_states[:, i]
-            y_pred = dz_pred[:, i]
-            r2 = 1 - np.sum((y_true - y_pred)**2) / (np.sum((y_true - np.mean(y_true))**2) + 1e-9)
-            symbolic_r2s.append(r2)
-            if i < 5 or i == dz_states.shape[1] - 1: # Print some
-                print(f"  Component {i} R2: {r2:.4f}")
-
-        # 5. Symbolic Parsimony Score
-        def get_complexity(expr):
-            if hasattr(expr, 'length_'): return expr.length_
-            return len(str(expr))
-            
-        parsimony_scores = []
-        for i, eq in enumerate(equations):
-            if eq is not None:
-                score = get_complexity(eq) / (max(0.01, symbolic_r2s[i]) + 1e-6)
-                parsimony_scores.append(score)
-        
-        # Create symbolic transformer and update trainer with symbolic proxy
-        symbolic_transformer = distiller.transformer
-        confidence = np.mean(distiller.confidences) if hasattr(distiller, 'confidences') else 0.8
-        trainer.update_symbolic_proxy(equations, symbolic_transformer, weight=args.sym_weight, confidence=confidence)
-
-        # 6. Run Autonomous Physics Benchmark & Symmetry Checks
-        try:
-            from physics_benchmark import run_benchmark
-            bench_report = run_benchmark(model, equations, symbolic_r2s, distiller.transformer, stats=stats)
-            
-            # Add Symmetry Checks
-            n_checker = NoetherChecker(trainer.symbolic_proxy, args.latent_dim)
-            rot_error = n_checker.check_rotational_invariance(torch.tensor(z_states[0:1], dtype=torch.float32, device=device))
-            bench_report['rotational_invariance_error'] = rot_error
-            print(f"  Rotational Invariance Error: {rot_error:.2e}")
-            
-            energy_drift = bench_report['energy_conservation_error']
-            ood_r2 = bench_report['symbolic_r2_ood']
-            
-            if energy_drift < 1e-6 and ood_r2 > 0.99 and rot_error < 1e-3:
-                print(f"[Verification Loop] EXACT PHYSICAL RECOVERY! Energy Drift: {energy_drift:.2e}, OOD R2: {ood_r2:.4f}")
-                break
-            elif attempt < MAX_RETRIES:
-                print(f"[Verification Loop] Criteria not met. Retrying with hyperparam adjustment...")
-                if energy_drift > 1e-5:
-                    args.sym_weight *= 2.0
-                    print(f"  -> Increasing sym_weight to {args.sym_weight}")
-                with torch.no_grad():
-                    trainer.model.log_vars.data += 0.1 
-            else:
-                print(f"[Verification Loop] Max retries reached. Keeping best effort.")
-        except Exception as e:
-            print(f"[Verification Loop] Benchmark failed: {e}")
-            break
     # 5.5 STAGE 3: Neural-Symbolic Consistency Training (Closed-Loop)
     if trainer.symbolic_proxy is not None:
         print("\n--- Starting Stage 3: Neural-Symbolic Consistency Training ---")
@@ -497,17 +384,18 @@ def main():
     final_report = make_serializable({
         'discovered_sympy': [str(eq) for eq in equations],
         'health_check': {
-            "Symbolic R2": float(np.mean(symbolic_r2s)) if symbolic_r2s else 0.0,
-            "Energy Drift": bench_report.get('energy_conservation_error', 1.0) if 'bench_report' in locals() else 1.0,
-            "OOD R2": bench_report.get('symbolic_r2_ood', 0.0) if 'bench_report' in locals() else 0.0,
-            "Lyapunov": bench_report.get('lyapunov_exponent', 0.0) if 'bench_report' in locals() else 0.0,
-            "Stability Score": stability_score if 'stability_score' in locals() else 0.0,
-            "Symplectic Drift": symp_drift if 'symp_drift' in locals() else 1.0
+            "Symbolic R2": float(bench_report.get('symbolic_r2', 0.0)),
+            "Energy Drift": bench_report.get('energy_conservation_error', 1.0),
+            "OOD R2": bench_report.get('symbolic_r2_ood', 0.0),
+            "Rotational Error": bench_report.get('rotational_invariance_error', 0.0),
+            "Active Super-nodes": (model.encoder.pooling.active_mask > 0.5).sum().item(),
+            "Flicker Rate": flicker_rate
         },
         'config': {
             'particles': args.particles,
             'super_nodes': args.super_nodes,
-            'sim': args.sim
+            'sim': args.sim,
+            'hamiltonian': args.hamiltonian
         }
     })
     

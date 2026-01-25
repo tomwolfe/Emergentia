@@ -98,18 +98,27 @@ class BICFeatureSelector:
             # We select features for each output dimension and union them
             union_indices = set()
             n_outputs = y.shape[1] if y.ndim > 1 else 1
+            n_samples, n_features = X_filtered.shape
             
             for i in range(n_outputs):
                 yi = y[:, i] if y.ndim > 1 else y
+                
+                # ALWAYS provide a shrinkage-based noise variance estimate using Ridge baseline.
+                # This ensures stability even when N is not much larger than P or when features are correlated.
+                from sklearn.linear_model import Ridge
+                ridge = Ridge(alpha=1.0).fit(X_filtered, yi)
+                mse = np.mean((yi - ridge.predict(X_filtered))**2)
+                noise_variance = max(mse, 1e-6)
+                
                 # LassoLarsIC is very fast and provides a clear BIC path
-                model = LassoLarsIC(criterion='bic', max_iter=500)
+                model = LassoLarsIC(criterion='bic', max_iter=500, noise_variance=noise_variance)
                 model.fit(X_filtered, yi)
                 
                 # Get indices of non-zero coefficients
                 nonzero = np.where(np.abs(model.coef_) > 1e-10)[0]
                 union_indices.update([mapping[idx] for idx in nonzero])
             
-            selected_filtered_indices = np.array(list(union_indices))
+            selected_filtered_indices = np.array(list(union_indices), dtype=int)
             
             if len(selected_filtered_indices) > self.max_features:
                 # If too many, take those with largest combined importance
@@ -124,7 +133,7 @@ class BICFeatureSelector:
                 
                 # Take top indices from the mapping (indices in X_filtered)
                 top_mapped_indices = np.argsort(importance)[-self.max_features:]
-                selected_filtered_indices = [mapping[idx] for idx in top_mapped_indices]
+                selected_filtered_indices = np.array([mapping[idx] for idx in top_mapped_indices], dtype=int)
         except Exception as e:
             print(f"Warning: BIC selection failed ({e}), falling back to f_regression.")
             from sklearn.feature_selection import f_regression
