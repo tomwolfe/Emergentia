@@ -1,9 +1,9 @@
 {
-    "energy_conservation_error": 0.031800512290061984,
-    "forecast_horizon": 27,
+    "energy_conservation_error": 0.06557178497314453,
+    "forecast_horizon": 39,
     "mass_consistency": 0.0,
-    "parsimony_index": -0.057699672877788544,
-    "symbolic_r2_ood": -0.018277406692504883,
-    "lyapunov_exponent": -2.0129356517557437,
+    "parsimony_index": -0.11161331087350845,
+    "symbolic_r2_ood": -0.008213099092245102,
+    "lyapunov_exponent": -4.3719423180942085,
     "success": false
 }
