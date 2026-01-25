@@ -28,8 +28,10 @@ class EquivariantGNNLayer(MessagePassing):
     def __init__(self, in_channels, out_channels, hidden_dim=64):
         super(EquivariantGNNLayer, self).__init__(aggr='mean')
         # Scalar message network
+        # +5 for: dist_sq, dot(v, r), 1/r^2, 1/r^6, 1/r^12
         self.phi_e = nn.Sequential(
-            nn.Linear(2 * in_channels + 2, hidden_dim), # +2 for dist_sq and dot(v, r)
+            nn.Linear(2 * in_channels + 5, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.Softplus(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.Softplus(),
@@ -37,13 +39,15 @@ class EquivariantGNNLayer(MessagePassing):
         )
         # Vector message network (outputs a scalar weight for the rel_pos vector)
         self.phi_v = nn.Sequential(
-            nn.Linear(2 * in_channels + 2, hidden_dim),
+            nn.Linear(2 * in_channels + 5, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.Softplus(),
             nn.Linear(hidden_dim, 1)
         )
         # Node update network
         self.phi_h = nn.Sequential(
             nn.Linear(in_channels + hidden_dim + 1, hidden_dim), # +1 for vector message norm
+            nn.LayerNorm(hidden_dim),
             nn.Softplus(),
             nn.Linear(hidden_dim, out_channels)
         )
@@ -76,8 +80,14 @@ class EquivariantGNNLayer(MessagePassing):
         return self.shortcut(x) + h_update
 
     def message(self, x_i, x_j, dist_sq, dot_vr, rel_pos):
+        # Physics-informed features with stability protection
+        # Clamp instead of tanh to allow for sharper signals (like 1/r^12)
+        r2_inv = torch.clamp(1.0 / (dist_sq + 0.05), max=20.0)
+        r6_inv = torch.clamp(r2_inv**3, max=400.0)
+        r12_inv = torch.clamp(r6_inv**2, max=160000.0)
+        
         # Scalar message
-        tmp = torch.cat([x_i, x_j, dist_sq, dot_vr], dim=1)
+        tmp = torch.cat([x_i, x_j, dist_sq, dot_vr, r2_inv, r6_inv, r12_inv], dim=1)
         m_h = self.phi_e(tmp)
         
         # Vector message weight
@@ -617,9 +627,9 @@ class DiscoveryEngineModel(nn.Module):
         # This layer is used ONLY for alignment loss and does not affect discovery
         self.linear_aligner = nn.ModuleList([nn.Linear(latent_dim, 2) for _ in range(n_super_nodes)])
 
-        # Learnable loss log-variances for automatic loss balancing
-        # 0: rec, 1: cons, 2: assign, 3: ortho, 4: l2, 5: lvr, 6: align, 7: pruning, 8: sep, 9: conn, 10: sparsity, 11: mi, 12: sym, 13: var, 14: hinge, 15: smooth, 16: anchor
-        self.log_vars = nn.Parameter(torch.zeros(17)) 
+        # Learnable loss log-variances for automatic loss balancing (one per head)
+        # 0: Reconstruction, 1: Structural, 2: Physicality, 3: Symbolic
+        self.log_vars = nn.Parameter(torch.zeros(4)) 
         
     def get_latent_variance_loss(self, z):
         """

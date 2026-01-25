@@ -14,7 +14,7 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
     dp/dt = -∂H/∂q - γp
     """
     
-    def __init__(self, populations=2000, generations=40, stopping_criteria=0.001, max_features=12,
+    def __init__(self, populations=5000, generations=100, stopping_criteria=0.001, max_features=15,
                  enforce_hamiltonian_structure=True, estimate_dissipation=True,
                  perform_coordinate_alignment=True):
         super().__init__(populations, generations, stopping_criteria, max_features)
@@ -135,7 +135,9 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
         print(f"  -> Initializing FeatureTransformer (Enforce Separable: {enforce_separable})...")
         # For non-separable, we include raw latents to allow H(q,p) coupling
         include_raw = not enforce_separable
-        self.transformer = FeatureTransformer(n_super_nodes, latent_dim, box_size=box_size, include_raw_latents=include_raw, sim_type=sim_type)
+        self.transformer = FeatureTransformer(n_super_nodes, latent_dim, box_size=box_size, 
+                                             include_raw_latents=include_raw, sim_type=sim_type,
+                                             feature_selection_method='bic')
 
         # If we have a model and it has a hamiltonian method, we should try to get the scalar H as target
         # for better GP discovery of the energy function topology.
@@ -169,12 +171,20 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
 
         # Target for GP is either V(q) or full H(q, p)
         if enforce_separable:
-            # STRUCTURAL FIX: Enforce H = sum(p^2/2) + V(q)
+            # STRUCTURAL FIX: Enforce H = sum(p^2/2m) + V(q)
             # We calculate the kinetic energy term and subtract it from the target H to get V(q)
             d_sub = latent_dim // 2
             z_reshaped = aligned_latent_states.reshape(-1, n_super_nodes, latent_dim)
             p_vals = z_reshaped[:, :, d_sub:]
-            ke_term = 0.5 * np.sum(p_vals**2, axis=(1, 2))
+            
+            # Use learned masses if available, otherwise default to 1.0
+            masses = np.ones(n_super_nodes)
+            if model is not None and hasattr(model.ode_func, 'get_masses'):
+                import torch
+                masses = model.ode_func.get_masses().detach().cpu().numpy().flatten()
+            
+            # T = sum(p^2 / 2m)
+            ke_term = 0.5 * np.sum(p_vals**2 / masses.reshape(1, -1, 1), axis=(1, 2))
             gp_targets = h_targets.flatten() - ke_term
             target_name = "Potential V(q)"
         else:
@@ -241,45 +251,49 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
             print(f"Warning: Failed to validate {target_name} stability: {e}")
             h_conf = 0.0
             
-            # Estimate dissipation coefficients γ and masses m
-            dissipation_coeffs = np.zeros(n_super_nodes)
-            masses = np.ones(n_super_nodes)
-            if model is not None:
-                if self.estimate_dissipation and hasattr(model.ode_func, 'gamma'):
-                    import torch
-                    dissipation_coeffs = torch.exp(model.ode_func.gamma).detach().cpu().numpy().flatten()
-                if hasattr(model.ode_func, 'get_masses'):
-                    import torch
-                    masses = model.ode_func.get_masses().detach().cpu().numpy().flatten()
-        
-                # Wrap it in a class that can compute derivatives
+        # Estimate dissipation coefficients γ and masses m
+        dissipation_coeffs = np.zeros(n_super_nodes)
+        masses = np.ones(n_super_nodes)
+        if model is not None:
+            if self.estimate_dissipation and hasattr(model.ode_func, 'gamma'):
+                import torch
+                dissipation_coeffs = torch.exp(model.ode_func.gamma).detach().cpu().numpy().flatten()
+            if hasattr(model.ode_func, 'get_masses'):
+                import torch
+                masses = model.ode_func.get_masses().detach().cpu().numpy().flatten()
+    
+        # Wrap it in a class that can compute derivatives
+        try:
+            from symbolic_utils import gp_to_sympy
+            import sympy as sp
+            
+            expr_str = str(h_prog)
+            n_vars = X_norm.shape[1] # Number of selected features
+            sympy_expr = gp_to_sympy(expr_str)
+            
+            sympy_vars = [sp.Symbol(f'X{i}') for i in range(n_vars)]
+            grad_funcs = []
+            for var in sympy_vars:
                 try:
-                    from symbolic_utils import gp_to_sympy
-                    import sympy as sp
-                    
-                    expr_str = str(h_prog)
-                    n_vars = X_norm.shape[1] # Number of selected features
-                    sympy_expr = gp_to_sympy(expr_str)
-                    
-                    sympy_vars = [sp.Symbol(f'X{i}') for i in range(n_vars)]
-                    grad_funcs = []
-                    for var in sympy_vars:
-                        grad_expr = sp.diff(sympy_expr, var)
-                        grad_funcs.append(sp.lambdify(sympy_vars, grad_expr, 'numpy'))
-                        
-                    ham_eq = HamiltonianEquation(
-                        h_prog, h_mask, n_super_nodes, latent_dim, 
-                        dissipation_coeffs=dissipation_coeffs,
-                        masses=masses,
-                        sympy_expr=sympy_expr,
-                        grad_funcs=grad_funcs,
-                        enforce_separable=enforce_separable
-                    )
-                    print(f"  -> Successfully enabled analytical gradients for discovered {target_name}.")
-                except Exception as e:
-                    print(f"  -> Fallback to numerical gradients: {e}")
-                    ham_eq = HamiltonianEquation(h_prog, h_mask, n_super_nodes, latent_dim, dissipation_coeffs, masses=masses, enforce_separable=enforce_separable)
-                self.feature_masks = [h_mask]
+                    grad_expr = sp.diff(sympy_expr, var)
+                    grad_funcs.append(sp.lambdify(sympy_vars, grad_expr, 'numpy'))
+                except:
+                    grad_funcs.append(None)
+                
+            ham_eq = HamiltonianEquation(
+                h_prog, h_mask, n_super_nodes, latent_dim, 
+                dissipation_coeffs=dissipation_coeffs,
+                masses=masses,
+                sympy_expr=sympy_expr,
+                grad_funcs=grad_funcs,
+                enforce_separable=enforce_separable
+            )
+            print(f"  -> Successfully enabled analytical gradients for discovered {target_name}.")
+        except Exception as e:
+            print(f"  -> Fallback to numerical gradients: {e}")
+            ham_eq = HamiltonianEquation(h_prog, h_mask, n_super_nodes, latent_dim, dissipation_coeffs, masses=masses, enforce_separable=enforce_separable)
+            
+        self.feature_masks = [h_mask]
         self.confidences = [h_conf]
         self.transformer.selected_feature_indices = h_mask
         

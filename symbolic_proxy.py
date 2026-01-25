@@ -50,6 +50,8 @@ class SymbolicProxy(nn.Module):
                     self.is_hamiltonian = True
                     if hasattr(eq, 'dissipation_coeffs'):
                         self.register_buffer('dissipation', torch.from_numpy(eq.dissipation_coeffs).float())
+                    if hasattr(eq, 'masses'):
+                        self.register_buffer('masses', torch.from_numpy(eq.masses).float())
                     self.sym_modules.append(SymPyToTorch(sympy_expr, n_inputs))
                 else:
                     self.sym_modules.append(SymPyToTorch(sympy_expr, n_inputs))
@@ -73,7 +75,28 @@ class SymbolicProxy(nn.Module):
                 
                 X_norm = self.torch_transformer(z_flat)
                 H_norm = self.sym_modules[0](X_norm)
-                H = self.torch_transformer.denormalize_y(H_norm)
+                V = self.torch_transformer.denormalize_y(H_norm)
+                
+                # Safety clamp for potential
+                V = torch.clamp(V, -1e3, 1e3)
+                
+                # SEPARABLE HAMILTONIAN FIX:
+                # If the symbolic part only represents the potential V(q),
+                # we must add the kinetic term T(p) = sum(p^2 / 2m)
+                # We assume m=1.0 for now unless masses are stored.
+                d_sub = self.latent_dim // 2
+                batch_size = z_flat.size(0)
+                z_reshaped = z_flat.view(batch_size, self.n_super_nodes, self.latent_dim)
+                p_vals = z_reshaped[:, :, d_sub:]
+                
+                # T = sum(p^2 / 2m)
+                if hasattr(self, 'masses'):
+                    m = self.masses.view(1, self.n_super_nodes, 1)
+                    T = 0.5 * torch.sum(p_vals**2 / m, dim=(1, 2)).view(-1, 1)
+                else:
+                    T = 0.5 * torch.sum(p_vals**2, dim=(1, 2)).view(-1, 1)
+                
+                H = V + torch.clamp(T, max=1e3)
                 
                 if not H.requires_grad:
                     H = H + 0.0 * z_flat.sum()
@@ -87,8 +110,8 @@ class SymbolicProxy(nn.Module):
                     dH_dz = torch.zeros_like(z_flat)
                 else:
                     # CLAMP GRADIENTS for stability during stage 3
-                    # Using a tighter clamp (5.0) to prevent aggressive alignment from diverging
-                    dH_dz = torch.clamp(dH_dz, -5.0, 5.0)
+                    # Using a very tight clamp to prevent divergence
+                    dH_dz = torch.clamp(dH_dz, -2.0, 2.0)
             
             d_sub = self.latent_dim // 2
             dz_dt = torch.zeros_like(z_flat)

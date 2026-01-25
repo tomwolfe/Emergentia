@@ -67,7 +67,7 @@ class SymbolicDistiller:
         """Returns the length of the program as a measure of complexity."""
         return getattr(program, 'length_', 1)
 
-    def _get_regressor(self, pop, gen, parsimony=0.05, n_jobs=1):
+    def _get_regressor(self, pop, gen, parsimony=0.005, n_jobs=1):
         # Default to n_jobs=1 to avoid contention with outer parallel loops
         return SymbolicRegressor(population_size=pop, generations=gen, parsimony_coefficient=parsimony,
                                  function_set=('add', 'sub', 'mul', safe_div, safe_sqrt, safe_log, 'abs', 'neg', safe_inv, square_func, inv_square_func),
@@ -297,21 +297,37 @@ class DiscoveryOrchestrator:
                 pop_size = max(pop_size, 10000)
                 gen_size = max(gen_size, 50)
 
-            distiller = EnsembleSymbolicDistiller(
-                populations=pop_size,
-                generations=gen_size,
-                ensemble_size=ensemble_size,
-                consensus_threshold=max(1, ensemble_size - 1),
-                secondary_optimization=True,
-                parsimony=parsimony,
-                max_features=max_f
-            )
+            # Choose distiller based on hamiltonian flag
+            if hamiltonian:
+                from hamiltonian_symbolic import HamiltonianSymbolicDistiller
+                distiller = HamiltonianSymbolicDistiller(
+                    populations=pop_size,
+                    generations=gen_size,
+                    max_features=max_f,
+                    enforce_hamiltonian_structure=True
+                )
+            else:
+                distiller = EnsembleSymbolicDistiller(
+                    populations=pop_size,
+                    generations=gen_size,
+                    ensemble_size=ensemble_size,
+                    consensus_threshold=max(1, ensemble_size - 1),
+                    secondary_optimization=True,
+                    parsimony=parsimony,
+                    max_features=max_f
+                )
             
             try:
-                equations = distiller.distill(
-                    z_states, targets, self.n_super_nodes, self.latent_dim,
-                    sim_type=sim_type, hamiltonian=hamiltonian
-                )
+                if hamiltonian:
+                    equations = distiller.distill(
+                        z_states, targets, self.n_super_nodes, self.latent_dim,
+                        sim_type=sim_type, model=model, quick=quick
+                    )
+                else:
+                    equations = distiller.distill(
+                        z_states, targets, self.n_super_nodes, self.latent_dim,
+                        sim_type=sim_type, hamiltonian=hamiltonian
+                    )
             except Exception as e:
                 print(f"  [Orchestrator] Distillation failed: {e}")
                 continue

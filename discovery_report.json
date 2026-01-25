@@ -1,19 +1,19 @@
 {
     "discovered_sympy": [
-        "0.401248052954778*sqrt(Abs((x0 - 0.54)/((x0 + 1.0e-9)*(inv_square(square(0.641)) + 1.0e-9))))"
+        "SeparableHamiltonian(V=mul(X2, -0.787), m=[1.0254632 1.0587116], T=p^2/(2m))"
     ],
     "health_check": {
         "Symbolic R2": 0.0,
-        "Energy Drift": 0.0,
-        "OOD R2": -0.005980014801025391,
-        "Rotational Error": 1.2180899107887963e-06,
+        "Energy Drift": 0.5879522214231022,
+        "OOD R2": -28.00316047668457,
+        "Rotational Error": 0.0,
         "Active Super-nodes": 2,
-        "Flicker Rate": 0.0007697955006733537
+        "Flicker Rate": 0.0005957777029834688
     },
     "config": {
-        "particles": 4,
+        "particles": 2,
         "super_nodes": 2,
-        "sim": "spring",
+        "sim": "lj",
         "hamiltonian": true
     }
 }

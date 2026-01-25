@@ -49,13 +49,13 @@ def main():
     parser.add_argument('--hamiltonian', action='store_true')
     parser.add_argument('--non_separable', action='store_true', help='Use non-separable Hamiltonian H(q, p)')
     parser.add_argument('--device', type=str, default='auto')
-    parser.add_argument('--batch_size', type=int, default=5, help='Sequence length of each window')
+    parser.add_argument('--batch_size', type=int, default=10, help='Sequence length of each window')
     parser.add_argument('--traj_batch_size', type=int, default=4, help='Number of trajectories to process in parallel')
     parser.add_argument('--eval_every', type=int, default=10, help='Evaluate every N epochs')
     parser.add_argument('--quick_symbolic', action='store_true', help='Use quick symbolic distillation')
     parser.add_argument('--memory_efficient', action='store_true', help='Use memory-efficient mode')
     parser.add_argument('--latent_dim', type=int, default=8, help='Dimension of latent space')
-    parser.add_argument('--hidden_dim', type=int, default=128, help='Hidden dimension of the model')
+    parser.add_argument('--hidden_dim', type=int, default=256, help='Hidden dimension of the model')
     parser.add_argument('--consistency_weight', type=float, default=0.001, help='Weight for consistency loss')
     parser.add_argument('--spatial_weight', type=float, default=0.1, help='Very low weight for spatial loss')
     parser.add_argument('--sym_weight', type=float, default=1.0, help='Weight for symbolic loss')
@@ -65,8 +65,8 @@ def main():
     args = parser.parse_args()
 
     if args.quick_symbolic:
-        args.pop = min(args.pop, 1000)
-        args.gen = min(args.gen, 15)
+        args.pop = min(args.pop, 5000)
+        args.gen = min(args.gen, 50)
 
     device = get_device() if args.device == 'auto' else args.device
     print(f"Using device: {device}")
@@ -104,7 +104,7 @@ def main():
         hidden_dim=args.hidden_dim,
         hamiltonian=args.hamiltonian,
         min_active_super_nodes=args.min_active,
-        dissipative=True # Enabled by default
+        dissipative=False # Disabled for exact recovery of conservative laws
     ).to(device)
 
     # If Hamiltonian, set separable flag based on argument
@@ -136,7 +136,7 @@ def main():
     )
 
     # Very patient early stopping to allow full training
-    early_stopping = ImprovedEarlyStopping(patience=60, ignore_epochs=50, monitor_rec=True, rec_threshold=0.1)  # Very patient
+    early_stopping = ImprovedEarlyStopping(patience=100, ignore_epochs=100, monitor_rec=True, rec_threshold=0.05)  # More patient
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(trainer.optimizer, T_max=args.epochs)
 
     # 4. Training Loop
@@ -162,7 +162,7 @@ def main():
             batch_data = Batch.from_data_list(window).to(device)
             batch_data.seq_len = args.batch_size
 
-        loss, rec, cons = trainer.train_step(batch_data, sim.dt, epoch=epoch, max_epochs=args.epochs)
+        loss, rec, cons = trainer.train_step(batch_data, sim.dt * (sim.sub_steps if args.sim == 'lj' else 2), epoch=epoch, max_epochs=args.epochs)
         last_rec = rec
         loss_history.append(loss)
         if len(loss_history) > 100:
@@ -233,8 +233,9 @@ def main():
         config={'pop': args.pop, 'gen': args.gen}
     )
     
+    dt_effective = sim.dt * (sim.sub_steps if args.sim == 'lj' else 2)
     discovery_results = orchestrator.discover(
-        model, dataset, sim.dt, 
+        model, dataset, dt_effective, 
         hamiltonian=args.hamiltonian, 
         sim_type=args.sim, 
         quick=args.quick_symbolic,
@@ -296,6 +297,7 @@ def main():
         # Unfreeze encoder and symbolic proxy for joint optimization
         for p in trainer.model.encoder.parameters(): p.requires_grad = True
         
+        dt_effective = sim.dt * (sim.sub_steps if args.sim == 'lj' else 2)
         for s3_epoch in range(stage3_epochs):
             # Sample window
             indices = np.random.randint(0, len(pre_batched_windows_raw), size=args.traj_batch_size)
@@ -306,7 +308,7 @@ def main():
             
             # Step with higher symbolic weight
             # We want to force the encoder to align with the symbolic proxy
-            loss, rec, cons = trainer.train_step(batch_data, sim.dt, epoch=args.epochs + s3_epoch, max_epochs=args.epochs + stage3_epochs)
+            loss, rec, cons = trainer.train_step(batch_data, dt_effective, epoch=args.epochs + s3_epoch, max_epochs=args.epochs + stage3_epochs)
             
             if s3_epoch % 10 == 0:
                 print(f"Stage 3 | Epoch {s3_epoch:2d} | Loss: {loss:.4f} | Rec: {rec:.4f} | Cons: {cons:.4f}")
@@ -338,7 +340,7 @@ def main():
     assignments = torch.argmax(s_0, dim=1).cpu().numpy()
 
     # Extract z_states for visualization using the same indices
-    vis_z_states, _, _ = extract_latent_data(model, vis_sample_dataset, sim.dt, include_hamiltonian=args.hamiltonian)
+    vis_z_states, _, _ = extract_latent_data(model, vis_sample_dataset, dt_effective, include_hamiltonian=args.hamiltonian)
     z_states_plot = vis_z_states.reshape(-1, args.super_nodes, args.latent_dim) if len(vis_z_states) > 0 else np.zeros((vis_sample_size, args.super_nodes, args.latent_dim))
 
     # NEW: Generate symbolic predictions if symbolic equations exist
@@ -353,7 +355,7 @@ def main():
 
             # Integrate using the same number of steps as the neural trajectory
             steps = z_states_plot.shape[0]
-            dt = sim.dt # Use simulator dt
+            dt = dt_effective # Use correct dt
 
             # Generate closed-loop trajectory
             symbolic_traj_flat = generate_closed_loop_trajectory(trainer.symbolic_proxy, initial_z, steps, dt, device=device)

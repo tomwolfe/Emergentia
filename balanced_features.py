@@ -294,18 +294,20 @@ class BalancedFeatureTransformer:
     def _get_dim(self, name):
         """Helper to get dimension of a feature by name."""
         if 'sum_inv_d' in name:
-            try:
-                n = int(re.search(r'd(\d+)', name).group(1))
-                return (-n, 0, 0) # L^-n
-            except: return (-1, 0, 0)
+            # Treat all inverse distance powers as having a generic "potential" dimension
+            # to allow them to be combined in the symbolic search.
+            return (-1, 0, 0) 
         if 'sum_d' in name: return (1, 0, 0)
-        if 'p' in name and '2_sum' in name: return (0, 2, -2) # P^2 ~ M^2 L^2 T^-2 (simplified to P^2)
+        if 'p' in name and '2_sum' in name: return (0, 2, -2) # P^2
         if name.startswith('z'):
             try:
-                idx = int(re.search(r'z(\d+)', name).group(1))
-                dim_idx = idx % self.latent_dim
-                if dim_idx < self.latent_dim // 2: return (1, 0, 0) # Q ~ L
-                return (0, 1, -1) # P ~ M L T^-1 (simplified to P)
+                # Use regex to find the dimension index within the latent dim
+                match = re.search(r'z(\d+)', name)
+                if match:
+                    idx = int(match.group(1))
+                    dim_idx = idx % self.latent_dim
+                    if dim_idx < self.latent_dim // 2: return (1, 0, 0) # Q ~ L
+                    return (0, 1, -1) # P ~ M L T^-1
             except: pass
         return (0, 0, 0) # Dimensionless or unknown
 

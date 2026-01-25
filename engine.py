@@ -409,7 +409,7 @@ class Trainer:
         stage1_end = int(max_epochs * 0.15)
         is_stage1 = epoch < stage1_end
         is_stage2 = epoch >= stage1_end
-        is_warmup = epoch < int(max_epochs * 0.1)
+        is_warmup = is_stage1 # Align warmup with stage 1
 
         loss_multipliers = torch.ones(17, device=self.device)
         if is_stage1:
@@ -424,7 +424,7 @@ class Trainer:
             if hasattr(self.model.encoder.pooling, 'apply_hard_revival'):
                 self.model.encoder.pooling.apply_hard_revival()
 
-        compute_consistency = (epoch >= (int(max_epochs * 0.1) // 2)) and (epoch % self.skip_consistency_freq == 0)
+        compute_consistency = (epoch >= stage1_end) and (epoch % self.skip_consistency_freq == 0)
         self.optimizer.zero_grad(set_to_none=True)
 
         tau, hard, tf_ratio, entropy_weight = self._get_schedules(epoch, max_epochs)
@@ -543,8 +543,7 @@ class Trainer:
         loss_assign, loss_pruning, loss_sparsity, loss_ortho, loss_sep, loss_conn, loss_anchor = loss_assign / norm_factor, loss_pruning / norm_factor, loss_sparsity / norm_factor, loss_ortho / norm_factor, loss_sep / norm_factor, loss_conn / norm_factor, loss_anchor / norm_factor
         loss_align, loss_mi = loss_align / (norm_factor * self.model.encoder.n_super_nodes), loss_mi / (norm_factor * self.model.encoder.n_super_nodes)
 
-        with torch.no_grad(): self.model.log_vars[4:6].clamp_(min=0.0)
-        lvars = torch.clamp(self.model.log_vars, min=-6.0, max=5.0)
+        lvars_raw = self.model.log_vars.detach().cpu().numpy()
         raw_losses = {'rec': loss_rec, 'cons': loss_cons, 'assign': loss_assign, 'ortho': loss_ortho, 'l2': loss_l2, 'lvr': loss_lvr, 'align': loss_align, 'pruning': loss_pruning, 'sep': loss_sep, 'conn': loss_conn, 'sparsity': loss_sparsity, 'mi': loss_mi, 'sym': loss_sym, 'var': loss_var, 'hinge': loss_hinge, 'smooth': loss_smooth, 'anchor': loss_anchor, 'curv': loss_curv, 'activity': (torch.relu(1.0 - torch.norm(z_vel, dim=-1)).mean() if len(z_vel) > 0 else self.model.get_activity_penalty(z_preds)) * 1000.0}
         
         # Base weights for stability during warmup/stage1
@@ -567,17 +566,29 @@ class Trainer:
         }
 
         # Apply learned uncertainty weighting (log_vars) after stage 1
+        # Use log_vars[1:4] for Structural, Physicality, and Symbolic heads
+        lvars = torch.clamp(self.model.log_vars, min=-4.0, max=5.0)
+        
         loss = 0.0
         if not is_stage1:
-            for i, (name, h_loss) in enumerate(head_losses_dict.items()):
-                loss += h_loss * torch.exp(-lvars[i]) + lvars[i]
+            # 1. Reconstruction head gets a fixed HIGH weight
+            loss += 1000.0 * head_losses_dict['ReconstructionLoss']
+            
+            # 2. Other heads use learned uncertainty weighting
+            other_heads = ['StructuralLoss', 'PhysicalityLoss', 'SymbolicConsistencyLoss']
+            for i, name in enumerate(other_heads):
+                # i+1 because lvars[0] is reserved for Rec (but we use fixed weight above)
+                loss += head_losses_dict[name] * torch.exp(-lvars[i+1]) + lvars[i+1]
         else:
             loss = sum(head_losses_dict.values())
 
         if self.use_pcgrad and (epoch > int(max_epochs * 0.1)) and not is_stage1:
             self._apply_pcgrad(head_losses_dict)
         else:
-            loss = torch.clamp(loss + 0.1 * torch.sum(lvars**2), 1e-4, 1e5)
+            # Add a small regularization to log_vars
+            lvar_reg = 0.02 * torch.sum(lvars**2)
+            loss = loss + lvar_reg
+            
             if self.enable_gradient_accumulation: (loss / self.grad_acc_steps).backward()
             else: loss.backward()
 

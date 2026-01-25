@@ -21,7 +21,7 @@ class SpringMassSimulator:
         xv, yv = np.meshgrid(x, y)
         self.pos = np.stack([xv.flatten()[:n_particles], yv.flatten()[:n_particles]], axis=1)
         # Random initial velocity
-        self.vel = np.random.randn(n_particles, 2) * 0.5
+        self.vel = np.random.randn(n_particles, 2) * 1.0
 
         # Create initial adjacency info
         self.radius = self.dynamic_radius if self.dynamic_radius else 1.1 * self.spring_dist
