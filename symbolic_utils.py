@@ -42,6 +42,7 @@ def create_safe_functions():
     safe_square_func = make_function(function=_safe_square, name='square', arity=1)
     safe_inv_square_func = make_function(function=_safe_inv_square, name='inv_square', arity=1)
     
+    # Return both names for compatibility across different files
     return safe_sqrt_func, safe_log_func, safe_div_func, safe_inv_func, safe_square_func, safe_inv_square_func
 
 def gp_to_sympy(expr_str, n_features=None):

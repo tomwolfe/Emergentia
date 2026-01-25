@@ -151,21 +151,17 @@ def main():
     # Track historical metrics for stability check
     loss_history = []
     stable_epoch = -1
+    flicker_rate = 1.0
 
     # Memory-efficient training loop
     for epoch in range(args.epochs):
         # OPTIMIZATION: Sample from pre-batched windows
         if args.traj_batch_size > 1:
             indices = np.random.randint(0, len(pre_batched_windows), size=args.traj_batch_size)
-            # Combine batches if traj_batch_size > 1
-            # Note: For small N, traj_batch_size=1 is often enough and faster
             batch_list = [pre_batched_windows[i] for i in indices]
-            # Convert back to data list for multi-window batching if needed, 
-            # but simpler to just use 1 window for small systems
             if args.particles * args.traj_batch_size < 32:
-                batch_data = batch_list[0] # Just use first for speed if system is small
+                batch_data = batch_list[0] 
             else:
-                # Fallback to slower combination if really needed
                 sampled_data = []
                 for b in batch_list: sampled_data.extend(b.to_data_list())
                 batch_data = Batch.from_data_list(sampled_data).to(device)
@@ -179,22 +175,31 @@ def main():
         if len(loss_history) > 100:
             loss_history.pop(0)
 
-        # NEW: Distillation Gate - Check for stabilization
-        stable_epoch = -1
-        if len(loss_history) >= 20:
+        # DISTILLATION GATE: Check for manifold stabilization and flicker rate
+        if epoch > 50 and epoch % 10 == 0:
+            model.eval()
+            with torch.no_grad():
+                # Calculate flicker rate on a subset
+                flicker_batch = pre_batched_windows[0]
+                _, s_all_flicker, _, _ = model.encode(flicker_batch.x, flicker_batch.edge_index, flicker_batch.batch)
+                s_all_flicker = s_all_flicker.view(args.batch_size, -1, args.super_nodes).mean(dim=1)
+                flicker_rate = torch.mean(torch.abs(s_all_flicker[1:] - s_all_flicker[:-1])).item()
+            model.train()
+
             recent_losses = loss_history[-20:]
             loss_var = np.var(recent_losses)
-            if last_rec < 0.05 and loss_var < 1e-4:
+            
+            # Stricter Gate: Rec < 0.02 and Flicker < 0.01
+            if last_rec < 0.02 and flicker_rate < 0.01 and loss_var < 1e-4:
                 if stable_epoch == -1:
-                    print(f"\n[Distillation Gate] System stabilized at epoch {epoch} (Rec: {last_rec:.4f}, Var: {loss_var:.2e})")
+                    print(f"\n[Distillation Gate] System stabilized at epoch {epoch} (Rec: {last_rec:.4f}, Flicker: {flicker_rate:.4f})")
                     stable_epoch = epoch
                 
-                # If we have been stable for at least 10 epochs AND we are past a minimum training time
-                if epoch >= max(50, stable_epoch + 10):
+                if epoch >= stable_epoch + 20:
                     print(f"[Distillation Gate] Stabilization confirmed. Proceeding to discovery.")
                     break
 
-        # NEW: Jacobian Condition Number Logging - Only if we are going to print
+        # Jacobian Condition Number Logging
         if epoch % 50 == 0:
             try:
                 model.eval()
@@ -239,90 +244,80 @@ def main():
     print("\n--- Discovery Health Report ---")
     from symbolic import DiscoveryOrchestrator
     
-    orchestrator = DiscoveryOrchestrator(
-        args.super_nodes, args.latent_dim, 
-        config={'pop': args.pop, 'gen': args.gen}
-    )
-    
-    dt_effective = sim.dt * (sim.sub_steps if args.sim == 'lj' else 2)
-    discovery_results = orchestrator.discover(
-        model, dataset, dt_effective, 
-        hamiltonian=args.hamiltonian, 
-        sim_type=args.sim, 
-        quick=args.quick_symbolic,
-        stats=stats
-    )
-    
-    equations = discovery_results['equations']
-    distiller = discovery_results['distiller']
-    z_states = discovery_results['z_states']
-    dz_states = discovery_results['dz_states']
-    bench_report = discovery_results['bench_report']
-    
-    # Update trainer with symbolic proxy
-    symbolic_transformer = distiller.transformer
-    confidence = np.mean(distiller.confidences) if hasattr(distiller, 'confidences') else 0.8
-    trainer.update_symbolic_proxy(equations, symbolic_transformer, weight=args.sym_weight, confidence=confidence)
+    max_discovery_attempts = 3
+    discovery_success = False
+    parsimony_coeff = 0.01
 
-    # Calculate correlation and flicker for the report
-    is_quick = args.quick_symbolic or args.epochs < 50
-    print("Calculating Correlation Matrix...")
-    sample_size = min(50 if args.quick_symbolic else 200, len(dataset))
-    sample_indices = np.linspace(0, len(dataset)-1, sample_size, dtype=int)
-    sample_dataset = [dataset_list[i] for i in sample_indices]
-    sample_pos = pos[sample_indices]
-    corrs = analyze_latent_space(model, sample_dataset, sample_pos, device=device)
-    max_corrs = [np.max(corrs[k]) for k in range(args.super_nodes)]
-    mean_max_corr = np.mean(max_corrs)
-
-    # flicker rate ...
-    print("\nCalculating Flicker Rate...")
-    model.eval()
-    flicker_sample_size = min(30 if args.quick_symbolic else 100, len(dataset_list))
-    flicker_indices = np.linspace(0, len(dataset_list)-1, flicker_sample_size, dtype=int)
-    flicker_data = [dataset_list[i] for i in flicker_indices]
-    flicker_batch = Batch.from_data_list(flicker_data).to(device)
-    with torch.no_grad():
-        _, s_all_flicker, _, _ = model.encode(flicker_batch.x, flicker_batch.edge_index, flicker_batch.batch)
-        # Reshape to [sample_size, particles, super_nodes] and take mean over particles
-        s_all_flicker = s_all_flicker.view(flicker_sample_size, -1, args.super_nodes).mean(dim=1)
-    flicker_rate = torch.mean(torch.abs(s_all_flicker[1:] - s_all_flicker[:-1])).item()
-
-    # 5.5 STAGE 3: Neural-Symbolic Consistency Training (Closed-Loop)
-    if trainer.symbolic_proxy is not None:
-        print("\n--- Starting Stage 3: Neural-Symbolic Consistency Training ---")
-        # ADAPTIVE AGGRESSION: Increase epochs and weight if correlation is low
-        # Proportional to main training epochs
-        stage3_base = max(1, int(args.epochs * 0.15)) if is_quick else 30
-        stage3_epochs = stage3_base
-        if mean_max_corr < 0.9:
-            stage3_epochs = int(stage3_base * 2)
-            print(f"  [Adaptive] Low correlation ({mean_max_corr:.4f}). Doubling Stage 3 epochs to {stage3_epochs}.")
+    for attempt in range(max_discovery_attempts):
+        print(f"\n[Self-Correction] Discovery Attempt {attempt + 1}/{max_discovery_attempts}...")
         
-        trainer.model.train()
-        # Increase symbolic weight to force alignment
-        trainer.symbolic_weight = 50.0 if mean_max_corr >= 0.9 else 150.0 # Much more aggressive if low corr
-        if mean_max_corr < 0.9:
-            print(f"  [Adaptive] Setting symbolic_weight to {trainer.symbolic_weight} for stronger alignment.")
-        
-        # Unfreeze encoder and symbolic proxy for joint optimization
-        for p in trainer.model.encoder.parameters(): p.requires_grad = True
+        orchestrator = DiscoveryOrchestrator(
+            args.super_nodes, args.latent_dim, 
+            config={'pop': args.pop, 'gen': args.gen, 'parsimony': parsimony_coeff, 'max_retries': 0}
+        )
         
         dt_effective = sim.dt * (sim.sub_steps if args.sim == 'lj' else 2)
-        for s3_epoch in range(stage3_epochs):
-            # Sample window
-            batch_data = pre_batched_windows[np.random.randint(0, len(pre_batched_windows))]
-            
-            # Step with higher symbolic weight
-            # We want to force the encoder to align with the symbolic proxy
-            loss, rec, cons = trainer.train_step(batch_data, dt_effective, epoch=args.epochs + s3_epoch, max_epochs=args.epochs + stage3_epochs)
-            
-            if s3_epoch % 10 == 0:
-                print(f"Stage 3 | Epoch {s3_epoch:2d} | Loss: {loss:.4f} | Rec: {rec:.4f} | Cons: {cons:.4f}")
+        discovery_results = orchestrator.discover(
+            model, dataset, dt_effective, 
+            hamiltonian=args.hamiltonian, 
+            sim_type=args.sim, 
+            quick=args.quick_symbolic,
+            stats=stats
+        )
+        
+        equations = discovery_results['equations']
+        distiller = discovery_results['distiller']
+        z_states = discovery_results['z_states']
+        dz_states = discovery_results['dz_states']
+        bench_report = discovery_results['bench_report']
+        
+        # Check success from benchmark
+        if bench_report.get('success', False) or (bench_report.get('symbolic_r2_ood', 0) > 0.98 and bench_report.get('energy_conservation_error', 1.0) < 1e-6):
+            print(f"[Self-Correction] Attempt {attempt + 1} Succeeded!")
+            discovery_success = True
+        
+        # Update trainer with symbolic proxy
+        symbolic_transformer = distiller.transformer
+        confidence = np.mean(distiller.confidences) if hasattr(distiller, 'confidences') else 0.8
+        trainer.update_symbolic_proxy(equations, symbolic_transformer, weight=args.sym_weight, confidence=confidence)
 
-    # 6. Visualization - OPTIMIZED
-    # Visualization - OPTIMIZED
-    print("Visualizing results...")
+        # STAGE 3: Neural-Symbolic Consistency Training (Closed-Loop)
+        if trainer.symbolic_proxy is not None:
+            print(f"\n--- Starting Stage 3 (Attempt {attempt + 1}): Neural-Symbolic Consistency Training ---")
+            
+            # Calculate correlation for adaptive weight
+            model.eval()
+            sample_size = min(50 if args.quick_symbolic else 200, len(dataset))
+            sample_indices = np.linspace(0, len(dataset)-1, sample_size, dtype=int)
+            sample_dataset = [dataset_list[i] for i in sample_indices]
+            sample_pos = pos[sample_indices]
+            corrs = analyze_latent_space(model, sample_dataset, sample_pos, device=device)
+            max_corrs = [np.max(corrs[k]) for k in range(args.super_nodes)]
+            mean_max_corr = np.mean(max_corrs)
+            
+            stage3_epochs = 100 if not discovery_success else 30
+            trainer.model.train()
+            trainer.symbolic_weight = 100.0 if discovery_success else 200.0
+            
+            for p in trainer.model.encoder.parameters(): p.requires_grad = True
+            
+            for s3_epoch in range(stage3_epochs):
+                batch_data = pre_batched_windows[np.random.randint(0, len(pre_batched_windows))]
+                loss, rec, cons = trainer.train_step(batch_data, dt_effective, epoch=args.epochs + s3_epoch, max_epochs=args.epochs + stage3_epochs)
+                if s3_epoch % 20 == 0:
+                    print(f"Stage 3 | Epoch {s3_epoch:2d} | Loss: {loss:.4f} | Rec: {rec:.4f} | Cons: {cons:.4f}")
+
+        if discovery_success:
+            break
+        else:
+            print(f"[Self-Correction] Attempt {attempt + 1} failed. Increasing parsimony and retrying...")
+            parsimony_coeff *= 2.0
+            # Perform additional Stage 3 is already done above
+
+    # 5.5 Final metrics calculation
+    print("\nCalculating Final Metrics...")
+    # Calculate correlation and flicker for the report
+
     # Only compute assignments for a moderate subset to reduce computation
     vis_sample_size = min(20, len(dataset))  # Larger
     vis_sample_indices = np.linspace(0, len(dataset)-1, vis_sample_size, dtype=int)

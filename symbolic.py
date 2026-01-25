@@ -19,7 +19,7 @@ warnings.filterwarnings('ignore')
 
 # Sanitized Symbolic Primitives
 from symbolic_utils import create_safe_functions, gp_to_sympy
-safe_sqrt, safe_log, safe_div, safe_inv, square_func, inv_square_func = create_safe_functions()
+safe_sqrt, safe_log, safe_div, safe_inv, safe_square, safe_inv_square = create_safe_functions()
 from balanced_features import BalancedFeatureTransformer as FeatureTransformer
 
 class OptimizedExpressionProgram:
@@ -70,7 +70,7 @@ class SymbolicDistiller:
     def _get_regressor(self, pop, gen, parsimony=0.005, n_jobs=1):
         # Default to n_jobs=1 to avoid contention with outer parallel loops
         return SymbolicRegressor(population_size=pop, generations=gen, parsimony_coefficient=parsimony,
-                                 function_set=('add', 'sub', 'mul', safe_div, safe_sqrt, safe_log, 'abs', 'neg', safe_inv, square_func, inv_square_func),
+                                 function_set=('add', 'sub', 'mul', safe_div, safe_sqrt, safe_log, 'abs', 'neg', safe_inv, safe_square, safe_inv_square),
                                  max_samples=0.9, n_jobs=n_jobs, random_state=42, verbose=0)
 
     def _select_features(self, X, y, sim_type=None, feature_names=None, skip_mi=False, quick=False):
@@ -281,7 +281,7 @@ class DiscoveryOrchestrator:
         # 2. Setup Resources
         pop_size = self.config.get('pop', 5000)
         gen_size = self.config.get('gen', 40)
-        max_retries = 0 if quick else 2
+        max_retries = self.config.get('max_retries', 0 if quick else 2)
         ensemble_size = 1 if quick else 3
         
         best_equations = []
@@ -294,8 +294,9 @@ class DiscoveryOrchestrator:
             print(f"\n[Orchestrator] Attempt {attempt+1}/{max_retries+1}...")
             
             # Adjust parsimony and complexity based on attempt
-            parsimony = 0.01 if attempt == 0 else (0.05 if attempt == 1 else 0.1)
-            max_f = 12 if attempt == 0 else (8 if attempt == 1 else 5)
+            # Respect config if provided
+            parsimony = self.config.get('parsimony', 0.01 if attempt == 0 else (0.05 if attempt == 1 else 0.1))
+            max_f = self.config.get('max_features', 12 if attempt == 0 else (8 if attempt == 1 else 5))
             
             if attempt == max_retries and not quick:
                 pop_size = max(pop_size, 10000)
@@ -308,7 +309,8 @@ class DiscoveryOrchestrator:
                     populations=pop_size,
                     generations=gen_size,
                     max_features=max_f,
-                    enforce_hamiltonian_structure=True
+                    enforce_hamiltonian_structure=True,
+                    parsimony=parsimony
                 )
             else:
                 distiller = EnsembleSymbolicDistiller(

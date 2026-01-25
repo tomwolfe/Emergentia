@@ -24,6 +24,7 @@ class SymbolicProxy(nn.Module):
 
         # 2. Initialize differentiable symbolic modules
         self.sym_modules = nn.ModuleList()
+        self.separable = False
 
         # Calculate n_inputs as the number of features AFTER feature selection
         try:
@@ -48,6 +49,11 @@ class SymbolicProxy(nn.Module):
 
                 if hasattr(eq, 'compute_derivatives') or "Hamiltonian" in str(eq):
                     self.is_hamiltonian = True
+                    if hasattr(eq, 'enforce_separable'):
+                        self.separable = eq.enforce_separable
+                    elif "SeparableHamiltonian" in str(eq):
+                        self.separable = True
+                    
                     if hasattr(eq, 'dissipation_coeffs'):
                         self.register_buffer('dissipation', torch.from_numpy(eq.dissipation_coeffs).float())
                     if hasattr(eq, 'masses'):
@@ -75,28 +81,33 @@ class SymbolicProxy(nn.Module):
                 
                 X_norm = self.torch_transformer(z_flat)
                 H_norm = self.sym_modules[0](X_norm)
-                V = self.torch_transformer.denormalize_y(H_norm)
+                # Symbolic module outputs normalized H (or V)
+                # Denormalize to get physical potential
+                V_pred = self.torch_transformer.denormalize_y(H_norm)
                 
                 # Safety clamp for potential
-                V = torch.clamp(V, -1e3, 1e3)
+                V_pred = torch.clamp(V_pred, -1e3, 1e3)
                 
-                # SEPARABLE HAMILTONIAN FIX:
-                # If the symbolic part only represents the potential V(q),
-                # we must add the kinetic term T(p) = sum(p^2 / 2m)
-                # We assume m=1.0 for now unless masses are stored.
-                d_sub = self.latent_dim // 2
-                batch_size = z_flat.size(0)
-                z_reshaped = z_flat.view(batch_size, self.n_super_nodes, self.latent_dim)
-                p_vals = z_reshaped[:, :, d_sub:]
-                
-                # T = sum(p^2 / 2m)
-                if hasattr(self, 'masses'):
-                    m = self.masses.view(1, self.n_super_nodes, 1)
-                    T = 0.5 * torch.sum(p_vals**2 / m, dim=(1, 2)).view(-1, 1)
+                if self.separable:
+                    # SEPARABLE HAMILTONIAN FIX:
+                    # If the symbolic part only represents the potential V(q),
+                    # we must add the kinetic term T(p) = sum(p^2 / 2m)
+                    d_sub = self.latent_dim // 2
+                    batch_size = z_flat.size(0)
+                    z_reshaped = z_flat.view(batch_size, self.n_super_nodes, self.latent_dim)
+                    p_vals = z_reshaped[:, :, d_sub:]
+                    
+                    # T = sum(p^2 / 2m)
+                    if hasattr(self, 'masses'):
+                        m = self.masses.view(1, self.n_super_nodes, 1)
+                        T = 0.5 * torch.sum(p_vals**2 / m, dim=(1, 2)).view(-1, 1)
+                    else:
+                        T = 0.5 * torch.sum(p_vals**2, dim=(1, 2)).view(-1, 1)
+                    
+                    H = V_pred + torch.clamp(T, max=1e3)
                 else:
-                    T = 0.5 * torch.sum(p_vals**2, dim=(1, 2)).view(-1, 1)
-                
-                H = V + torch.clamp(T, max=1e3)
+                    # Non-separable: the symbolic model already represents full H(q, p)
+                    H = V_pred
                 
                 if not H.requires_grad:
                     H = H + 0.0 * z_flat.sum()

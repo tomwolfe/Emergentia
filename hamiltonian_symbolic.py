@@ -16,11 +16,17 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
     
     def __init__(self, populations=5000, generations=100, stopping_criteria=0.001, max_features=15,
                  enforce_hamiltonian_structure=True, estimate_dissipation=True,
-                 perform_coordinate_alignment=True):
+                 perform_coordinate_alignment=True, parsimony=0.005):
         super().__init__(populations, generations, stopping_criteria, max_features)
         self.enforce_hamiltonian_structure = enforce_hamiltonian_structure
         self.estimate_dissipation = estimate_dissipation
         self.perform_coordinate_alignment = perform_coordinate_alignment
+        self.parsimony = parsimony
+
+    def _get_regressor(self, pop, gen, parsimony=None, n_jobs=1):
+        if parsimony is None:
+            parsimony = self.parsimony
+        return super()._get_regressor(pop, gen, parsimony=parsimony, n_jobs=n_jobs)
 
     def _perform_coordinate_alignment(self, latent_states, n_super_nodes, latent_dim):
         """

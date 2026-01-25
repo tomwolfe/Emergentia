@@ -97,6 +97,16 @@ python physics_benchmark.py
 - `loss_functions.py`: Advanced loss computation modules including **GradNorm Balancer**, **Loss Tracker**, and meta-loss grouping.
 - `hardware_manager.py`: Device management and optimization for different hardware backends (CPU/MPS/CUDA).
 - `symbolic_proxy.py`: Differentiable **Symbolic Proxy** enabling end-to-end gradient flow from symbolic equations back to the GNN encoder.
+- `stable_pooling.py`: Enhanced pooling mechanism with sparsity scheduling and hard revival strategies.
+- `symbolic_utils.py`: Utilities for safe symbolic function definitions and expression conversion.
+- `visualization.py`: Tools for plotting discovery results and training history.
+- `verify_physics.py`: Physics validation utilities for checking discovered equations.
+- `validate_discovery.py`: Comprehensive validation framework for symbolic discoveries.
+- `check_conservation.py`: Conservation law verification tools.
+- `common_losses.py`: Shared loss function implementations.
+- `config.yaml`: Configuration file for hyperparameters and experimental settings.
+- `discovery_report.json`: Output file containing the final discovery report.
+- `validation_report.json`: Output file containing the validation results.
 
 ## Testing
 
