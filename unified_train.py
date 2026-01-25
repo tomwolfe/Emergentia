@@ -65,8 +65,8 @@ def main():
     args = parser.parse_args()
 
     if args.quick_symbolic:
-        args.pop = min(args.pop, 5000)
-        args.gen = min(args.gen, 50)
+        args.pop = min(args.pop, 1000) # Much lower for quick run
+        args.gen = min(args.gen, 20)   # Much lower for quick run
 
     device = get_device() if args.device == 'auto' else args.device
     print(f"Using device: {device}")
@@ -82,15 +82,19 @@ def main():
     pos, vel = sim.generate_trajectory(steps=args.steps)
     dataset_list, stats = prepare_data(pos, vel, radius=1.5 if args.sim == 'spring' else 2.0, device=device)
     
-    # OPTIMIZATION: Store raw windows of the trajectory to allow flexible batching
+    # OPTIMIZATION: Pre-batch windows into Batch objects to avoid overhead in main loop
     print(f"Preparing windows (size {args.batch_size})...")
-    pre_batched_windows_raw = []
+    pre_batched_windows = []
     if len(dataset_list) > args.batch_size:
         for i in range(len(dataset_list) - args.batch_size + 1):
             window = dataset_list[i : i + args.batch_size]
-            pre_batched_windows_raw.append(window)
+            batch = Batch.from_data_list(window).to(device)
+            batch.seq_len = args.batch_size
+            pre_batched_windows.append(batch)
     else:
-        pre_batched_windows_raw.append(dataset_list)
+        batch = Batch.from_data_list(dataset_list).to(device)
+        batch.seq_len = len(dataset_list)
+        pre_batched_windows.append(batch)
 
     # Full dataset for analysis
     dataset = Batch.from_data_list(dataset_list).to(device)
@@ -132,7 +136,8 @@ def main():
         max_epochs=args.epochs,
         sparsity_scheduler=sparsity_scheduler,
         consistency_weight=args.consistency_weight,
-        spatial_weight=args.spatial_weight
+        spatial_weight=args.spatial_weight,
+        quick=args.quick_symbolic
     )
 
     # Very patient early stopping to allow full training
@@ -149,18 +154,24 @@ def main():
 
     # Memory-efficient training loop
     for epoch in range(args.epochs):
-        # OPTIMIZATION: Sample multiple windows and batch them together
+        # OPTIMIZATION: Sample from pre-batched windows
         if args.traj_batch_size > 1:
-            indices = np.random.randint(0, len(pre_batched_windows_raw), size=args.traj_batch_size)
-            sampled_data = []
-            for i in indices:
-                sampled_data.extend(pre_batched_windows_raw[i])
-            batch_data = Batch.from_data_list(sampled_data).to(device)
-            batch_data.seq_len = args.batch_size
+            indices = np.random.randint(0, len(pre_batched_windows), size=args.traj_batch_size)
+            # Combine batches if traj_batch_size > 1
+            # Note: For small N, traj_batch_size=1 is often enough and faster
+            batch_list = [pre_batched_windows[i] for i in indices]
+            # Convert back to data list for multi-window batching if needed, 
+            # but simpler to just use 1 window for small systems
+            if args.particles * args.traj_batch_size < 32:
+                batch_data = batch_list[0] # Just use first for speed if system is small
+            else:
+                # Fallback to slower combination if really needed
+                sampled_data = []
+                for b in batch_list: sampled_data.extend(b.to_data_list())
+                batch_data = Batch.from_data_list(sampled_data).to(device)
+                batch_data.seq_len = args.batch_size
         else:
-            window = pre_batched_windows_raw[np.random.randint(0, len(pre_batched_windows_raw))]
-            batch_data = Batch.from_data_list(window).to(device)
-            batch_data.seq_len = args.batch_size
+            batch_data = pre_batched_windows[np.random.randint(0, len(pre_batched_windows))]
 
         loss, rec, cons = trainer.train_step(batch_data, sim.dt * (sim.sub_steps if args.sim == 'lj' else 2), epoch=epoch, max_epochs=args.epochs)
         last_rec = rec
@@ -300,11 +311,7 @@ def main():
         dt_effective = sim.dt * (sim.sub_steps if args.sim == 'lj' else 2)
         for s3_epoch in range(stage3_epochs):
             # Sample window
-            indices = np.random.randint(0, len(pre_batched_windows_raw), size=args.traj_batch_size)
-            sampled_data = []
-            for i in indices: sampled_data.extend(pre_batched_windows_raw[i])
-            batch_data = Batch.from_data_list(sampled_data).to(device)
-            batch_data.seq_len = args.batch_size
+            batch_data = pre_batched_windows[np.random.randint(0, len(pre_batched_windows))]
             
             # Step with higher symbolic weight
             # We want to force the encoder to align with the symbolic proxy

@@ -189,7 +189,8 @@ class Trainer:
     def __init__(self, model, lr=5e-4, device='cpu', stats=None, align_anneal_epochs=1000,
                  warmup_epochs=20, max_epochs=1000, sparsity_scheduler=None, hard_assignment_start=0.7,
                  skip_consistency_freq=2, enable_gradient_accumulation=False, grad_acc_steps=1,
-                 enhanced_balancer=None, consistency_weight=1.0, spatial_weight=1.0, use_pcgrad=False):
+                 enhanced_balancer=None, consistency_weight=1.0, spatial_weight=1.0, use_pcgrad=False,
+                 quick=False):
         self.model = model.to(device)
         self.device = torch.device(device)
         self.hardware = HardwareManager(device)
@@ -200,13 +201,14 @@ class Trainer:
         self.warmup_epochs = warmup_epochs
         self.sparsity_scheduler = sparsity_scheduler
         self.hard_assignment_start = hard_assignment_start
-        self.skip_consistency_freq = skip_consistency_freq
+        self.skip_consistency_freq = skip_consistency_freq if not quick else 5
         self.enable_gradient_accumulation = enable_gradient_accumulation
         self.grad_acc_steps = grad_acc_steps
         self.enhanced_balancer = enhanced_balancer
         self.consistency_weight = consistency_weight
         self.spatial_weight = spatial_weight
-        self.use_pcgrad = use_pcgrad
+        self.use_pcgrad = use_pcgrad if not quick else False
+        self.quick = quick
 
         # Initialize consolidated loss modules from factory
         self.loss_modules = LossFactory.create_loss_modules()
@@ -494,14 +496,16 @@ class Trainer:
         else:
             z_preds = z_all_target
 
-        # OPTIMIZATION: Skip expensive losses if weight is zero
+        # OPTIMIZATION: Skip expensive losses if weight is zero or if in quick mode
         loss_curv = torch.tensor(0.0, device=self.device)
         if is_stage2 and not is_stage1:
-             loss_curv = self._compute_hamiltonian_conservation_loss(z_preds)
+             if not self.quick or epoch % 10 == 0:
+                 loss_curv = self._compute_hamiltonian_conservation_loss(z_preds)
 
         loss_sym = torch.tensor(0.0, device=self.device)
         if self.symbolic_proxy is not None and not is_warmup:
-            loss_sym = self._compute_symbolic_loss(z_curr, is_warmup)
+            if not self.quick or epoch % 5 == 0:
+                loss_sym = self._compute_symbolic_loss(z_curr, is_warmup)
 
         loss_l2 = torch.mean(z_preds**2) * 0.1
         z_vel = (z_preds[1:] - z_preds[:-1]) / dt

@@ -73,7 +73,7 @@ class SymbolicDistiller:
                                  function_set=('add', 'sub', 'mul', safe_div, safe_sqrt, safe_log, 'abs', 'neg', safe_inv, square_func, inv_square_func),
                                  max_samples=0.9, n_jobs=n_jobs, random_state=42, verbose=0)
 
-    def _select_features(self, X, y, sim_type=None, feature_names=None, skip_mi=False):
+    def _select_features(self, X, y, sim_type=None, feature_names=None, skip_mi=False, quick=False):
         # Sample data if it's too large
         if X.shape[0] > 1000:
             indices = np.random.choice(X.shape[0], 1000, replace=False)
@@ -88,9 +88,8 @@ class SymbolicDistiller:
         f_scores = np.nan_to_num(f_scores)
         
         # 2. Only run slow Mutual Information on top candidates (e.g., top 50)
-        # to find non-linear relationships without checking every feature
-        # SKIP if skip_mi is True or if X is very small
-        if skip_mi or X.shape[0] < 50:
+        # SKIP if skip_mi is True, or quick is True, or if X is very small
+        if skip_mi or quick or X.shape[0] < 50:
             combined_scores = f_scores / (f_scores.max() + 1e-9)
         else:
             top_k_f = min(50, X.shape[1])
@@ -128,9 +127,9 @@ class SymbolicDistiller:
         except:
             return False
 
-    def _distill_single_target(self, i, X, y, targets_shape_1=None, latent_states_shape_1=None, is_hamiltonian=False, skip_deep_search=False, sim_type=None):
+    def _distill_single_target(self, i, X, y, targets_shape_1=None, latent_states_shape_1=None, is_hamiltonian=False, skip_deep_search=False, sim_type=None, quick=False):
         print(f"    -> [Target {i}] Selecting top {self.max_features} features...")
-        mask = self._select_features(X, y, sim_type=sim_type)
+        mask = self._select_features(X, y, sim_type=sim_type, quick=quick)
         X_sel = X[:, mask]
         
         # Display selected feature names if available
@@ -186,10 +185,15 @@ class SymbolicDistiller:
             # Regress a SINGLE target: the scalar Hamiltonian H
             # We assume the first column of targets is H if hamiltonian=True is passed
             # or that extract_latent_data was called with include_hamiltonian=True
-            res, mask, score = self._distill_single_target(0, X_norm, Y_norm[:, 0], 1, latent_dim, is_hamiltonian=True, skip_deep_search=quick, sim_type=sim_type)
+            res, mask, score = self._distill_single_target(0, X_norm, Y_norm[:, 0], 1, latent_dim, is_hamiltonian=True, skip_deep_search=quick, sim_type=sim_type, quick=quick)
             return [res]
         
-        results = Parallel(n_jobs=-1)(delayed(self._distill_single_target)(i, X_norm, Y_norm[:, i], targets.shape[1], latent_dim, skip_deep_search=quick, sim_type=sim_type) for i in range(targets.shape[1]))
+        # Avoid Parallel overhead for single target even if not hamiltonian
+        if targets.shape[1] == 1:
+            res, mask, score = self._distill_single_target(0, X_norm, Y_norm[:, 0], targets.shape[1], latent_dim, skip_deep_search=quick, sim_type=sim_type, quick=quick)
+            return [res]
+
+        results = Parallel(n_jobs=-1)(delayed(self._distill_single_target)(i, X_norm, Y_norm[:, i], targets.shape[1], latent_dim, skip_deep_search=quick, sim_type=sim_type, quick=quick) for i in range(targets.shape[1]))
         return [r[0] for r in results]
 
 def extract_latent_data(model, dataset, dt, include_hamiltonian=False, return_both=False):
@@ -368,7 +372,7 @@ class DiscoveryOrchestrator:
 
             # 5. Run Physics Benchmark
             try:
-                bench_report = run_benchmark(model, equations, r2s, distiller.transformer, stats=stats)
+                bench_report = run_benchmark(model, equations, r2s, distiller.transformer, stats=stats, quick=quick)
                 
                 # Symmetry Checks
                 device = next(temp_proxy.parameters()).device

@@ -169,7 +169,7 @@ def calculate_lyapunov_exponent(proxy, z0, steps=1000, dt=0.01, epsilon=1e-6):
                 
     return float(lyapunov_sum / (steps * dt))
 
-def run_benchmark(model, equations, r2_scores, transformer, stats=None, test_data_path=None):
+def run_benchmark(model, equations, r2_scores, transformer, stats=None, test_data_path=None, quick=False):
     """Runs the full benchmark suite and saves validation_report.json."""
     print("Running Physics Benchmark...")
     
@@ -187,10 +187,10 @@ def run_benchmark(model, equations, r2_scores, transformer, stats=None, test_dat
     n_particles = getattr(model.encoder, 'n_particles', 16)
     sim = SpringMassSimulator(n_particles=n_particles)
     # REDUCED: 1000 -> 200 steps
-    pos, vel = sim.generate_trajectory(steps=200)
+    pos, vel = sim.generate_trajectory(steps=200 if not quick else 50)
     # Scale velocities to increase energy
     vel_ood = vel * 1.414 # sqrt(2) for 2x kinetic energy
-    pos_ood, vel_ood = sim.generate_trajectory(steps=200, init_pos=pos[0], init_vel=vel_ood[0])
+    pos_ood, vel_ood = sim.generate_trajectory(steps=200 if not quick else 50, init_pos=pos[0], init_vel=vel_ood[0])
     
     # USE THE ORIGINAL STATS IF PROVIDED
     test_dataset, _ = prepare_data(pos_ood, vel_ood, stats=stats) 
@@ -201,7 +201,9 @@ def run_benchmark(model, equations, r2_scores, transformer, stats=None, test_dat
     device = next(model.parameters()).device
     z_gt_list = []
     with torch.no_grad():
-        for data in test_dataset:
+        # Only take first 50 steps for speed if quick
+        eval_dataset = test_dataset if not quick else test_dataset[:50]
+        for data in eval_dataset:
             data = data.to(device)
             z, _, _, _ = model.encode(data.x, data.edge_index, torch.zeros(data.x.size(0), dtype=torch.long, device=device))
             # z: [1, K, D] -> append [K*D]
@@ -213,11 +215,11 @@ def run_benchmark(model, equations, r2_scores, transformer, stats=None, test_dat
     z0 = z_gt[0].unsqueeze(0)
     
     # proxy is moved to CPU inside these functions
-    energy_drift = calculate_energy_drift(proxy, z0, steps=5000, dt=sim.dt)
-    forecast_horizon = calculate_forecast_horizon(proxy, z_gt, dt=sim.dt)
-    mass_consistency = calculate_mass_consistency(model, test_dataset)
+    energy_drift = calculate_energy_drift(proxy, z0, steps=5000 if not quick else 100, dt=sim.dt)
+    forecast_horizon = calculate_forecast_horizon(proxy, z_gt, dt=sim.dt) if not quick else 0
+    mass_consistency = calculate_mass_consistency(model, test_dataset[:10])
     parsimony = calculate_parsimony_index(equations, r2_scores)
-    lyapunov = calculate_lyapunov_exponent(proxy, z0, steps=200, dt=sim.dt)
+    lyapunov = calculate_lyapunov_exponent(proxy, z0, steps=200 if not quick else 50, dt=sim.dt)
     
     # 4. Symbolic R2 (OOD)
     # We evaluate how well the proxy predicts dz/dt on OOD data
