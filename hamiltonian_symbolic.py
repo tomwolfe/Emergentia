@@ -198,16 +198,21 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
             gp_targets = h_targets.flatten()
             target_name = "Hamiltonian H(q, p)"
 
+        # Check for NaN values in targets before fitting
+        if np.any(np.isnan(gp_targets)) or np.any(np.isinf(gp_targets)):
+            print(f"  -> ERROR: gp_targets contains NaN or Inf values. Cannot proceed with distillation.")
+            return None
+
         print(f"  -> Fitting FeatureTransformer to {aligned_latent_states.shape[0]} samples...")
         self.transformer.fit(aligned_latent_states, gp_targets)
-        
+
         if enforce_separable:
             # STRICT COORDINATE SEPARATION: Prune p-related features from the potential search
             # Potential V(q) MUST NOT see any momentum-related features or raw latents
             d_sub = latent_dim // 2
             q_mask = np.ones(len(self.transformer.feature_names), dtype=bool)
             for idx, name in enumerate(self.transformer.feature_names):
-                if "p" in name: 
+                if "p" in name:
                     q_mask[idx] = False
                     continue
                 import re
@@ -220,22 +225,22 @@ class HamiltonianSymbolicDistiller(SymbolicDistiller):
         else:
             # For non-separable, we allow all features
             q_mask = np.ones(len(self.transformer.feature_names), dtype=bool)
-        
+
         X_all = self.transformer.transform(aligned_latent_states)
-        
+
         # Manually normalize all features before slicing
         X_norm_full = (X_all - self.transformer.x_poly_mean) / self.transformer.x_poly_std
         X_norm = X_norm_full[:, q_mask]
-        
+
         # Temporarily update transformer feature names to reflect selected features for the GP search
         original_names = self.transformer.feature_names
         self.transformer.feature_names = [n for i, n in enumerate(original_names) if q_mask[i]]
-        
+
         Y_norm = self.transformer.normalize_y(gp_targets)
 
         # Distill the function
         y_target = Y_norm[:, 0] if Y_norm.ndim > 1 else Y_norm
-        
+
         # Ensure reasonable search depth but respect user settings
         print(f"  -> Starting symbolic regression for {target_name} (Pop: {self.populations}, Gen: {self.generations})...")
         h_prog, h_mask_relative, h_conf = self._distill_single_target(0, X_norm, y_target, 1, latent_dim, skip_deep_search=quick, sim_type=sim_type)

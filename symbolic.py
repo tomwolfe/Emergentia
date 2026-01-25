@@ -128,6 +128,11 @@ class SymbolicDistiller:
             return False
 
     def _distill_single_target(self, i, X, y, targets_shape_1=None, latent_states_shape_1=None, is_hamiltonian=False, skip_deep_search=False, sim_type=None, quick=False):
+        # Check for NaN values in X and y before processing
+        if np.any(np.isnan(X)) or np.any(np.isinf(X)) or np.any(np.isnan(y)) or np.any(np.isinf(y)):
+            print(f"    -> [Target {i}] ERROR: Input X or y contains NaN or Inf values. Returning None.")
+            return None, None, 0.0
+
         print(f"    -> [Target {i}] Selecting top {self.max_features} features...")
         mask = self._select_features(X, y, sim_type=sim_type, quick=quick)
         X_sel = X[:, mask]
@@ -176,6 +181,11 @@ class SymbolicDistiller:
         return OptimizedExpressionProgram(program_str), mask, score
 
     def distill(self, latent_states, targets, n_super_nodes, latent_dim, box_size=None, hamiltonian=False, quick=False, sim_type=None):
+        # Check for NaN values in targets before processing
+        if np.any(np.isnan(targets)) or np.any(np.isinf(targets)):
+            print(f"  -> ERROR: Targets contain NaN or Inf values. Cannot proceed with distillation.")
+            return None
+
         self.transformer = FeatureTransformer(n_super_nodes, latent_dim, box_size=box_size, sim_type=sim_type)
         self.transformer.fit(latent_states, targets)
         X_norm = self.transformer.normalize_x(self.transformer.transform(latent_states))
@@ -334,10 +344,20 @@ class DiscoveryOrchestrator:
                         z_states, targets, self.n_super_nodes, self.latent_dim,
                         sim_type=sim_type, hamiltonian=hamiltonian
                     )
+
+                # Check if distillation returned None
+                if equations is None:
+                    print(f"  [Orchestrator] Distillation returned None, skipping to next attempt")
+                    continue
             except Exception as e:
                 print(f"  [Orchestrator] Distillation failed: {e}")
                 continue
-            
+
+            # Check if distillation produced valid equations
+            if not equations or distiller is None:
+                print(f"  [Orchestrator] Distillation produced no equations, skipping to next attempt")
+                continue
+
             # If Hamiltonian, ensure single equation
             if hamiltonian and len(equations) > 1:
                 equations = [equations[0]]
@@ -351,15 +371,15 @@ class DiscoveryOrchestrator:
                 # Create a temporary proxy for R2 calculation
                 from symbolic_proxy import SymbolicProxy
                 temp_proxy = SymbolicProxy(
-                    self.n_super_nodes, self.latent_dim, equations, distiller.transformer, 
+                    self.n_super_nodes, self.latent_dim, equations, distiller.transformer,
                     hamiltonian=hamiltonian
                 ).to(next(model.parameters()).device)
-                
+
                 device = next(temp_proxy.parameters()).device
                 with torch.no_grad():
                     z_torch = torch.tensor(z_states, dtype=torch.float32, device=device)
                     dz_pred = temp_proxy(0, z_torch).cpu().numpy()
-                    
+
                 r2s = []
                 for i in range(dz_states.shape[1]):
                     y_true = dz_states[:, i]

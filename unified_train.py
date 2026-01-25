@@ -277,6 +277,10 @@ def main():
             discovery_success = True
         
         # Update trainer with symbolic proxy
+        if distiller is None:
+            print(f"  [Orchestrator] Distillation failed, skipping symbolic proxy update for attempt {attempt + 1}")
+            continue  # Skip to next attempt
+
         symbolic_transformer = distiller.transformer
         confidence = np.mean(distiller.confidences) if hasattr(distiller, 'confidences') else 0.8
         trainer.update_symbolic_proxy(equations, symbolic_transformer, weight=args.sym_weight, confidence=confidence)
