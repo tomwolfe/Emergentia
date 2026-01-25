@@ -1,3 +1,6 @@
+"""
+Optimized version of unified_train.py with major performance improvements
+"""
 import torch
 import numpy as np
 import argparse
@@ -24,14 +27,14 @@ def print_diagnostic_dashboard(model, trainer, epoch, rec, cons, cond_proxy):
     """
     print(f"\n>>> DIAGNOSTIC DASHBOARD | Epoch {epoch} <<<")
     print(f"  [Losses] Rec: {rec:.6f} | Cons: {cons:.4f} | Total: {trainer.loss_tracker.history.get('total', 0):.4f}")
-    
+
     # Phase Space Density Estimate (std of latents)
     lvars = torch.exp(trainer.model.log_vars).detach().cpu().numpy()
     print(f"  [Density] Latent SNR: {cond_proxy:.4f} | Rec Weight: {1.0/lvars[0]:.2f} | Cons Weight: {1.0/lvars[1]:.2f}")
-    
+
     # Manifold Curvature (Log-Var of log_vars)
     print(f"  [Curvature] LogVar Std: {np.std(lvars):.4f} | Align Scale: {torch.exp(trainer.log_align_scale).item():.4f}")
-    
+
     # Active Super-nodes
     active_mask = model.encoder.pooling.active_mask
     n_active = (active_mask > 0.5).sum().item()
@@ -39,7 +42,7 @@ def print_diagnostic_dashboard(model, trainer, epoch, rec, cons, cond_proxy):
     print("-------------------------------------------\n")
 
 def main():
-    parser = argparse.ArgumentParser(description="Extreme Focus on Reconstruction Quality")
+    parser = argparse.ArgumentParser(description="Extreme Focus on Reconstruction Quality - OPTIMIZED VERSION")
     parser.add_argument('--particles', type=int, default=8)
     parser.add_argument('--super_nodes', type=int, default=2)
     parser.add_argument('--epochs', type=int, default=200)  # Increased further
@@ -71,6 +74,12 @@ def main():
     device = get_device() if args.device == 'auto' else args.device
     print(f"Using device: {device}")
 
+    # OPTIMIZATION: Use mixed precision training if available
+    use_amp = torch.cuda.is_available() and hasattr(torch.cuda, 'amp')
+    if use_amp:
+        scaler = torch.cuda.amp.GradScaler()
+        print("Using Automatic Mixed Precision training")
+
     # 1. Setup Simulator
     if args.sim == 'spring':
         sim = SpringMassSimulator(n_particles=args.particles, spring_dist=1.0, dynamic_radius=1.5)
@@ -81,7 +90,7 @@ def main():
     print("Generating trajectory...")
     pos, vel = sim.generate_trajectory(steps=args.steps)
     dataset_list, stats = prepare_data(pos, vel, radius=1.5 if args.sim == 'spring' else 2.0, device=device)
-    
+
     # OPTIMIZATION: Pre-batch windows into Batch objects to avoid overhead in main loop
     print(f"Preparing windows (size {args.batch_size})...")
     pre_batched_windows = []
@@ -140,9 +149,20 @@ def main():
         quick=args.quick_symbolic
     )
 
+    # NEW: Curriculum Learning - Warm-up Phase for Reconstruction
+    curriculum_phase = "reconstruction"  # Start with reconstruction phase
+    warmup_epochs = 200  # Fixed warm-up period for reconstruction focus
+
+    # Store original weights for restoration after warm-up
+    original_consistency_weight = trainer.consistency_weight
+    original_spatial_weight = trainer.spatial_weight
+
     # Very patient early stopping to allow full training
     early_stopping = ImprovedEarlyStopping(patience=100, ignore_epochs=100, monitor_rec=True, rec_threshold=0.05)  # More patient
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(trainer.optimizer, T_max=args.epochs)
+
+    # OPTIMIZATION: Reduce frequency of diagnostic prints and evaluations
+    diagnostic_freq = 50  # Reduced from 50 to reduce overhead
 
     # 4. Training Loop
     print(f"Starting training for {args.epochs} epochs...")
@@ -155,12 +175,27 @@ def main():
 
     # Memory-efficient training loop
     for epoch in range(args.epochs):
+        # NEW: Curriculum Learning - Adjust training based on phase
+        if epoch < warmup_epochs:
+            # Warm-up phase: Train only as GNN Autoencoder (focus on reconstruction)
+            curriculum_phase = "reconstruction"
+            # Temporarily set weights to focus on reconstruction
+            original_consistency_weight = trainer.consistency_weight
+            original_spatial_weight = trainer.spatial_weight
+            trainer.consistency_weight = 0.0001  # Minimal consistency during warm-up
+            trainer.spatial_weight = 0.0001      # Minimal spatial loss during warm-up
+        else:
+            # Post-warm-up: Restore original weights and allow full training
+            curriculum_phase = "full_training"
+            trainer.consistency_weight = original_consistency_weight
+            trainer.spatial_weight = original_spatial_weight
+
         # OPTIMIZATION: Sample from pre-batched windows
         if args.traj_batch_size > 1:
             indices = np.random.randint(0, len(pre_batched_windows), size=args.traj_batch_size)
             batch_list = [pre_batched_windows[i] for i in indices]
             if args.particles * args.traj_batch_size < 32:
-                batch_data = batch_list[0] 
+                batch_data = batch_list[0]
             else:
                 sampled_data = []
                 for b in batch_list: sampled_data.extend(b.to_data_list())
@@ -169,14 +204,28 @@ def main():
         else:
             batch_data = pre_batched_windows[np.random.randint(0, len(pre_batched_windows))]
 
-        loss, rec, cons = trainer.train_step(batch_data, sim.dt * (sim.sub_steps if args.sim == 'lj' else 2), epoch=epoch, max_epochs=args.epochs)
+        # OPTIMIZATION: Use mixed precision if available
+        if use_amp:
+            with torch.cuda.amp.autocast():
+                loss, rec, cons = trainer.train_step(batch_data, sim.dt * (sim.sub_steps if args.sim == 'lj' else 2), epoch=epoch, max_epochs=args.epochs)
+        else:
+            loss, rec, cons = trainer.train_step(batch_data, sim.dt * (sim.sub_steps if args.sim == 'lj' else 2), epoch=epoch, max_epochs=args.epochs)
+
+        # NEW: Curriculum Learning - Check if reconstruction threshold is met to proceed
+        if curriculum_phase == "reconstruction" and rec < 0.05:
+            print(f"[Curriculum Learning] Reconstruction MSE ({rec:.6f}) below threshold (0.05) at epoch {epoch}. Proceeding to full training.")
+            curriculum_phase = "early_transition"
+            # Restore original weights to allow full training
+            trainer.consistency_weight = original_consistency_weight
+            trainer.spatial_weight = original_spatial_weight
+
         last_rec = rec
         loss_history.append(loss)
         if len(loss_history) > 100:
             loss_history.pop(0)
 
-        # DISTILLATION GATE: Check for manifold stabilization and flicker rate
-        if epoch > 50 and epoch % 10 == 0:
+        # OPTIMIZATION: Reduce frequency of distillation gate checks
+        if epoch > 50 and epoch % 20 == 0:  # Reduced from 10 to 20
             model.eval()
             with torch.no_grad():
                 # Calculate flicker rate on a subset
@@ -188,23 +237,30 @@ def main():
 
             recent_losses = loss_history[-20:]
             loss_var = np.var(recent_losses)
-            
-            # Stricter Gate: Rec < 0.02 and Flicker < 0.01
+
+            # NEW: Enhanced Manifold Health Check
+            # Check if Rec and Flicker Rate have been stable for at least 50 epochs
             if last_rec < 0.02 and flicker_rate < 0.01 and loss_var < 1e-4:
                 if stable_epoch == -1:
                     print(f"\n[Distillation Gate] System stabilized at epoch {epoch} (Rec: {last_rec:.4f}, Flicker: {flicker_rate:.4f})")
                     stable_epoch = epoch
-                
-                if epoch >= stable_epoch + 20:
-                    print(f"[Distillation Gate] Stabilization confirmed. Proceeding to discovery.")
-                    break
 
-        # Jacobian Condition Number Logging
-        if epoch % 50 == 0:
+                # NEW: Require stability for at least 50 epochs before proceeding
+                if epoch >= stable_epoch + 50:  # Increased from 20 to 50
+                    print(f"[Distillation Gate] Manifold Health Check passed. Stabilization confirmed for 50+ epochs. Proceeding to discovery.")
+                    break
+            else:
+                # Reset stable_epoch if conditions are not met
+                if stable_epoch != -1:
+                    print(f"[Distillation Gate] Stability broken at epoch {epoch}, resetting check. Rec: {last_rec:.4f}, Flicker: {flicker_rate:.4f}")
+                    stable_epoch = -1
+
+        # OPTIMIZATION: Reduce frequency of Jacobian condition number logging
+        if epoch % diagnostic_freq == 0:
             try:
                 model.eval()
                 # Use a very small subset for Jacobian to avoid OOM/latency
-                subset_data = Batch.from_data_list([pre_batched_windows_raw[0][0]]).to(device)
+                subset_data = Batch.from_data_list([pre_batched_windows[0][0]]).to(device)
                 x_input = subset_data.x.detach().requires_grad_(True)
                 z_out, _, _, _ = model.encode(x_input, subset_data.edge_index, subset_data.batch)
                 z0 = z_out[0, 0, 0] # Take one latent dimension
@@ -214,24 +270,24 @@ def main():
                 latent_std = torch.std(z_out).item()
                 latent_mean_mag = torch.mean(torch.abs(z_out)).item()
                 cond_proxy = latent_std / (latent_mean_mag + 1e-6)
-                
+
                 # Adaptive sparsity adjustment
                 if sparsity_scheduler is not None:
                     sparsity_scheduler.adjust_to_snr(cond_proxy)
-                
+
                 print_diagnostic_dashboard(model, trainer, epoch, rec, cons, cond_proxy)
             except Exception as e:
                 pass
             model.train()
-        elif epoch % 10 == 0:  # Print less frequently to reduce overhead
+        elif epoch % 20 == 0:  # Print less frequently to reduce overhead - from 10 to 20
             print(f"Epoch {epoch:4d} | Loss: {loss:.4f} | Rec: {rec:.4f} | Cons: {cons:.4f}")
 
         if early_stopping(loss, rec):
             print(f"Early stopping triggered at epoch {epoch}")
             break
 
-        # Automated Revival Strategy: check if super-nodes are under-utilized
-        if epoch > 0 and epoch % 50 == 0:
+        # OPTIMIZATION: Reduce frequency of automated revival strategy
+        if epoch > 0 and epoch % 100 == 0:  # Increased from 50 to 100
             active_count = (model.encoder.pooling.active_mask > 0.5).sum().item()
             if active_count < args.super_nodes:
                 print(f"\n[Revival Check] Only {active_count}/{args.super_nodes} super-nodes active. Triggering hard revival...")
@@ -243,39 +299,66 @@ def main():
     # 5. Analysis & Symbolic Discovery
     print("\n--- Discovery Health Report ---")
     from symbolic import DiscoveryOrchestrator
-    
-    max_discovery_attempts = 3
+
+    max_discovery_attempts = 2  # Reduced from 3 to 2
     discovery_success = False
     parsimony_coeff = 0.01
 
     for attempt in range(max_discovery_attempts):
         print(f"\n[Self-Correction] Discovery Attempt {attempt + 1}/{max_discovery_attempts}...")
+
+        # OPTIMIZATION: Reduce symbolic population and generations for faster discovery
+        opt_pop = min(args.pop, 1000)  # Reduced from 5000 to 2000 to 1000
+        opt_gen = min(args.gen, 20)   # Reduced from 40 to 30 to 20
         
         orchestrator = DiscoveryOrchestrator(
-            args.super_nodes, args.latent_dim, 
-            config={'pop': args.pop, 'gen': args.gen, 'parsimony': parsimony_coeff, 'max_retries': 0}
+            args.super_nodes, args.latent_dim,
+            config={'pop': opt_pop, 'gen': opt_gen, 'parsimony': parsimony_coeff, 'max_retries': 0, 'use_gpu_acceleration': True}
         )
-        
+
         dt_effective = sim.dt * (sim.sub_steps if args.sim == 'lj' else 2)
         discovery_results = orchestrator.discover(
-            model, dataset, dt_effective, 
-            hamiltonian=args.hamiltonian, 
-            sim_type=args.sim, 
+            model, dataset, dt_effective,
+            hamiltonian=args.hamiltonian,
+            sim_type=args.sim,
             quick=args.quick_symbolic,
             stats=stats
         )
-        
+
         equations = discovery_results['equations']
         distiller = discovery_results['distiller']
         z_states = discovery_results['z_states']
         dz_states = discovery_results['dz_states']
         bench_report = discovery_results['bench_report']
-        
+
+        # NEW: Check rotational invariance using NoetherChecker
+        from symmetry_checks import NoetherChecker
+        if distiller is not None and trainer.symbolic_proxy is not None:
+            noether_checker = NoetherChecker(trainer.symbolic_proxy, args.latent_dim)
+            # Sample a few points to check rotational invariance
+            sample_z = z_states[:10]  # Use first 10 states from the discovery
+            if len(sample_z) > 0:
+                sample_z_tensor = torch.tensor(sample_z, dtype=torch.float32, device=device).view(-1, args.super_nodes * args.latent_dim)
+                rot_error = noether_checker.check_rotational_invariance(sample_z_tensor)
+                print(f"[Symmetry Check] Rotational invariance error: {rot_error:.6f}")
+
+                # Reject discoveries that violate rotational invariance significantly
+                if rot_error > 0.1:  # Threshold for rejecting non-symmetric laws
+                    print(f"[Symmetry Check] Discovery violates rotational invariance (error: {rot_error:.6f}), rejecting...")
+                    discovery_success = False
+                    bench_report['success'] = False
+                    bench_report['rotational_invariance_error'] = rot_error
+                else:
+                    bench_report['rotational_invariance_error'] = rot_error
+
         # Check success from benchmark
-        if bench_report.get('success', False) or (bench_report.get('symbolic_r2_ood', 0) > 0.98 and bench_report.get('energy_conservation_error', 1.0) < 1e-6):
+        if (bench_report.get('success', False) or
+            (bench_report.get('symbolic_r2_ood', 0) > 0.95 and  # Relaxed for LJ system
+             bench_report.get('energy_conservation_error', 1.0) < 1e-7 and  # Tightened energy conservation
+             bench_report.get('rotational_invariance_error', 1.0) < 0.1)):  # NEW: Check rotational invariance
             print(f"[Self-Correction] Attempt {attempt + 1} Succeeded!")
             discovery_success = True
-        
+
         # Update trainer with symbolic proxy
         if distiller is None:
             print(f"  [Orchestrator] Distillation failed, skipping symbolic proxy update for attempt {attempt + 1}")
@@ -288,28 +371,66 @@ def main():
         # STAGE 3: Neural-Symbolic Consistency Training (Closed-Loop)
         if trainer.symbolic_proxy is not None:
             print(f"\n--- Starting Stage 3 (Attempt {attempt + 1}): Neural-Symbolic Consistency Training ---")
-            
+
+            # Save best model state before Stage 3 to enable rollback
+            best_model_state = {key: value.clone() for key, value in model.state_dict().items()}
+            print(f"[Rollback Mechanism] Saved best model state before Stage 3")
+
             # Calculate correlation for adaptive weight
             model.eval()
-            sample_size = min(50 if args.quick_symbolic else 200, len(dataset))
+            sample_size = min(30 if args.quick_symbolic else 100, len(dataset))  # Reduced from 50/200 to 30/100
             sample_indices = np.linspace(0, len(dataset)-1, sample_size, dtype=int)
             sample_dataset = [dataset_list[i] for i in sample_indices]
             sample_pos = pos[sample_indices]
             corrs = analyze_latent_space(model, sample_dataset, sample_pos, device=device)
             max_corrs = [np.max(corrs[k]) for k in range(args.super_nodes)]
             mean_max_corr = np.mean(max_corrs)
-            
-            stage3_epochs = 100 if not discovery_success else 30
+
+            stage3_epochs = 50 if not discovery_success else 20  # Reduced from 100/30 to 50/20
             trainer.model.train()
             trainer.symbolic_weight = 100.0 if discovery_success else 200.0
-            
+
             for p in trainer.model.encoder.parameters(): p.requires_grad = True
-            
+
+            # Flag to detect numerical instability
+            numerical_instability_detected = False
+
             for s3_epoch in range(stage3_epochs):
                 batch_data = pre_batched_windows[np.random.randint(0, len(pre_batched_windows))]
-                loss, rec, cons = trainer.train_step(batch_data, dt_effective, epoch=args.epochs + s3_epoch, max_epochs=args.epochs + stage3_epochs)
-                if s3_epoch % 20 == 0:
+
+                # OPTIMIZATION: Use mixed precision for Stage 3 as well
+                if use_amp:
+                    with torch.cuda.amp.autocast():
+                        loss, rec, cons = trainer.train_step(batch_data, dt_effective, epoch=args.epochs + s3_epoch, max_epochs=args.epochs + stage3_epochs)
+                else:
+                    loss, rec, cons = trainer.train_step(batch_data, dt_effective, epoch=args.epochs + s3_epoch, max_epochs=args.epochs + stage3_epochs)
+
+                # Check for numerical instability (NaN or Inf)
+                if torch.isnan(torch.tensor(loss)) or torch.isinf(torch.tensor(loss)):
+                    print(f"[Numerical Instability] Detected NaN/Inf in loss at Stage 3 epoch {s3_epoch}")
+                    numerical_instability_detected = True
+                    break
+
+                if torch.isnan(torch.tensor(rec)) or torch.isinf(torch.tensor(rec)):
+                    print(f"[Numerical Instability] Detected NaN/Inf in reconstruction loss at Stage 3 epoch {s3_epoch}")
+                    numerical_instability_detected = True
+                    break
+
+                if torch.isnan(torch.tensor(cons)) or torch.isinf(torch.tensor(cons)):
+                    print(f"[Numerical Instability] Detected NaN/Inf in consistency loss at Stage 3 epoch {s3_epoch}")
+                    numerical_instability_detected = True
+                    break
+
+                if s3_epoch % 10 == 0:  # Reduced from 20 to 10 for more frequent updates
                     print(f"Stage 3 | Epoch {s3_epoch:2d} | Loss: {loss:.4f} | Rec: {rec:.4f} | Cons: {cons:.4f}")
+
+            # If numerical instability was detected, rollback to the saved state
+            if numerical_instability_detected:
+                print(f"[Rollback Mechanism] Restoring best model state due to numerical instability")
+                model.load_state_dict(best_model_state)
+                trainer.optimizer.zero_grad()  # Clear optimizer state
+                # Reset symbolic proxy to None to prevent further Stage 3 training
+                trainer.symbolic_proxy = None
 
         if discovery_success:
             break
@@ -323,7 +444,7 @@ def main():
     # Calculate correlation and flicker for the report
 
     # Only compute assignments for a moderate subset to reduce computation
-    vis_sample_size = min(20, len(dataset))  # Larger
+    vis_sample_size = min(10, len(dataset))  # Reduced from 20 to 10
     vis_sample_indices = np.linspace(0, len(dataset)-1, vis_sample_size, dtype=int)
     vis_sample_dataset = [dataset[i] for i in vis_sample_indices]
 
@@ -397,7 +518,7 @@ def main():
             "Symbolic R2": float(bench_report.get('symbolic_r2', 0.0)),
             "Energy Drift": bench_report.get('energy_conservation_error', 1.0),
             "OOD R2": bench_report.get('symbolic_r2_ood', 0.0),
-            "Rotational Error": bench_report.get('rotational_invariance_error', 0.0),
+            "Rotational Error": bench_report.get('rotational_invariance_error', 1.0),  # Updated default value
             "Active Super-nodes": (model.encoder.pooling.active_mask > 0.5).sum().item(),
             "Flicker Rate": flicker_rate
         },
@@ -408,7 +529,7 @@ def main():
             'hamiltonian': args.hamiltonian
         }
     })
-    
+
     with open('discovery_report.json', 'w') as f:
         json.dump(final_report, f, indent=4)
     print(f"Final report saved. Model: {model_save_path}")

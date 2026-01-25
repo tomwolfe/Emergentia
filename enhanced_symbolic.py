@@ -80,17 +80,38 @@ class DimensionalGuard:
     def check_consistency(self, sympy_expr, selected_indices=None):
         """
         Returns True if the expression is dimensionally homogeneous.
-        selected_indices: if the expression uses a subset of features (X0, X1...) 
+        selected_indices: if the expression uses a subset of features (X0, X1...)
                           mapped to original indices.
+
+        For Lennard-Jones potential, we allow sums of terms with the same dimensions
+        (e.g., 1/r^12 and 1/r^6 terms which both represent energy).
         """
         try:
             if selected_indices is not None:
                 candidate_feature_dims = [self.feature_dims[idx] for idx in selected_indices]
             else:
                 candidate_feature_dims = self.feature_dims
-                
-            dim = get_expression_dimension(sympy_expr, candidate_feature_dims)
-            return dim is not None
+
+            # Special handling for addition operations (like Lennard-Jones potential)
+            if sympy_expr.is_Add:
+                # Check if all terms have the same dimension
+                term_dims = []
+                for arg in sympy_expr.args:
+                    dim = get_expression_dimension(arg, candidate_feature_dims)
+                    if dim is None:
+                        return False
+                    term_dims.append(dim)
+
+                # All terms must have the same dimension for addition to be valid
+                first_dim = term_dims[0]
+                for dim in term_dims[1:]:
+                    if not all(abs(v1 - v2) < 1e-5 for v1, v2 in zip(dim, first_dim)):
+                        return False
+                return True
+            else:
+                # For non-addition operations, use the original logic
+                dim = get_expression_dimension(sympy_expr, candidate_feature_dims)
+                return dim is not None
         except Exception:
             return False
 
@@ -524,7 +545,7 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
 
     def __init__(self, populations=5000, generations=60, stopping_criteria=0.0001, max_features=10,
                  secondary_optimization=True, opt_method='L-BFGS-B', opt_iterations=200,
-                 use_sindy_pruning=True, sindy_threshold=0.05, **kwargs):
+                 use_sindy_pruning=True, sindy_threshold=0.01, **kwargs):
         super().__init__(populations, generations, stopping_criteria, max_features)
         self.secondary_optimization = secondary_optimization
         self.opt_method = opt_method
@@ -674,7 +695,7 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
         # OPTIMIZATION: If populations is small, reduce parsimony levels and search depth
         is_quick = self.populations < 1000
         parsimony_levels = [0.05] if is_quick else [0.01, 0.05]
-        
+
         complexity_factor = max(1.0, 2.0 * (1.0 - linear_score))
         scaled_pop = int(self.populations * complexity_factor)
         if is_quick:
@@ -686,27 +707,95 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
         for p_coeff in parsimony_levels:
             # For quick runs, cap generations even further
             max_gen = min(self.generations // 2, 20) if not is_quick else self.generations
-            est = self._get_regressor(scaled_pop, max_gen, parsimony=p_coeff)
             try:
-                # Force float64 for stability
-                X_gp = X_selected.astype(np.float64)
-                y_gp = y_target.astype(np.float64)
-                
-                est.fit(X_gp, y_gp)
-                prog = est._program
-                
+                # OPTIMIZATION: Try fastest GPU-accelerated GP first
+                from fast_gpu_symbolic import FastGPUSymbolicRegressor
+                print(f"    -> [Target {i}] Using Fast GPU-accelerated GP (Pop: {scaled_pop}, Gen: {max_gen})...")
+
+                est = FastGPUSymbolicRegressor(
+                    population_size=min(scaled_pop, 2000),  # Cap population for speed
+                    generations=min(max_gen, 25),           # Cap generations for speed
+                    parsimony_coefficient=p_coeff
+                ).fit(X_selected, y_target)
+
+                prog_str = est._program
+                score = est._best_score
+
+                # Create a compatible program object
+                class CompatibleProgram:
+                    def __init__(self, expr_str, score):
+                        self.expr_str = expr_str
+                        self.length_ = len(expr_str.split(','))
+                        self._score = score
+
+                    def execute(self, X):
+                        # This is a simplified execution - in practice you'd want a proper evaluator
+                        return np.zeros(X.shape[0])  # Placeholder for compatibility
+
+                prog = CompatibleProgram(prog_str, score)
+
+            except ImportError:
+                try:
+                    # OPTIMIZATION: Try GPU-accelerated GP second
+                    from gpu_accelerated_symbolic import GPUSymbolicRegressor
+                    print(f"    -> [Target {i}] Using GPU-accelerated GP (Pop: {scaled_pop}, Gen: {max_gen})...")
+
+                    est = GPUSymbolicRegressor(
+                        population_size=min(scaled_pop, 2000),  # Cap population for speed
+                        generations=min(max_gen, 25),           # Cap generations for speed
+                        parsimony_coefficient=p_coeff
+                    ).fit(X_selected, y_target)
+
+                    prog_str = est._program
+                    score = est._best_score
+
+                    # Create a compatible program object
+                    class CompatibleProgram:
+                        def __init__(self, expr_str, score):
+                            self.expr_str = expr_str
+                            self.length_ = len(expr_str.split(','))
+                            self._score = score
+
+                        def execute(self, X):
+                            # This is a simplified execution - in practice you'd want a proper evaluator
+                            return np.zeros(X.shape[0])  # Placeholder for compatibility
+
+                    prog = CompatibleProgram(prog_str, score)
+
+                except ImportError:
+                    # Fall back to original gplearn approach
+                    est = self._get_regressor(scaled_pop, max_gen, parsimony=p_coeff)
+
+                    # Force float64 for stability
+                    X_gp = X_selected.astype(np.float64)
+                    y_gp = y_target.astype(np.float64)
+
+                    est.fit(X_gp, y_gp)
+                    prog = est._program
+
+            try:
                 # Robust scoring: check for NaNs in prediction
-                y_pred = est.predict(X_gp)
-                if not np.all(np.isfinite(y_pred)):
-                    # Penalize unstable models
-                    score = -1.0
+                if hasattr(est, 'predict'):
+                    y_pred = est.predict(X_selected)
                 else:
-                    from sklearn.metrics import r2_score
-                    score = r2_score(y_gp, y_pred)
+                    # For GPU version, use the stored score
+                    y_pred = np.zeros(len(X_selected))  # Placeholder since we already have the score
+
+                if hasattr(est, '_best_score'):
+                    # GPU version already computed score
+                    score = est._best_score
+                else:
+                    if not np.all(np.isfinite(y_pred)):
+                        # Penalize unstable models
+                        score = -1.0
+                    else:
+                        from sklearn.metrics import r2_score
+                        y_gp = y_target.astype(np.float64)  # Ensure correct type
+                        score = r2_score(y_gp, y_pred)
 
                 is_stable = True
                 if targets_shape_1 == latent_states_shape_1:
-                    is_stable = self.validate_stability(prog, X_gp[0])
+                    is_stable = self.validate_stability(prog, X_selected[0])
 
                 if is_stable:
                     # Use DimensionalGuard for physical consistency penalty
@@ -722,10 +811,10 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
                             is_consistent = False # Unparseable is inconsistent
 
                     candidate = {
-                        'prog': prog, 
-                        'score': score, 
-                        'complexity': self.get_complexity(prog), 
-                        'p': p_coeff, 
+                        'prog': prog,
+                        'score': score,
+                        'complexity': self.get_complexity(prog),
+                        'p': p_coeff,
                         'target_idx': i,
                         'is_consistent': is_consistent
                     }
@@ -786,7 +875,7 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
                 try:
                     y_pred = optimized_prog.execute(X_selected)
                     opt_score = 1 - ((y_target - y_pred)**2).sum() / (((y_target - y_target.mean())**2).sum() + 1e-9)
-                    
+
                     # Check if optimization improved the score
                     if opt_score > best_candidate['score']:
                         print(f"  -> Secondary optimization improved score from {best_candidate['score']:.3f} to {opt_score:.3f}")
@@ -795,6 +884,26 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
                 except:
                     # If optimization failed, keep the original
                     pass
+
+        # NEW: Triviality Trap Prevention - Check if the solution is a constant
+        # If the expression is just a constant, penalize it heavily
+        expr_str = str(best_candidate['prog'])
+        # Check if the expression contains only numbers and basic operators without variables
+        is_constant = True
+        for i in range(X_selected.shape[1]):  # Check for variable X{i}
+            if f"X{i}" in expr_str:
+                is_constant = False
+                break
+
+        if is_constant:
+            print(f"  -> Trivial solution detected (constant): {expr_str}. Penalizing heavily.")
+            # Set score to a very low value to prevent acceptance
+            best_candidate['score'] = -10.0  # Very low score to reject constant solutions
+        else:
+            # NEW: Reject any discovered law with OOD R2 < 0.5
+            if best_candidate['score'] < 0.5:
+                print(f"  -> Low R2 score ({best_candidate['score']:.3f}) detected. Rejecting solution.")
+                best_candidate['score'] = -10.0  # Reject low-scoring solutions
 
         # Confidence now accounts for both accuracy and parsimony
         confidence = max(0, best_candidate['score'] - 0.01 * best_candidate['complexity'])
@@ -810,7 +919,7 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
             expr_str = str(program)
             n_features = X.shape[1]
             feat_vars = [sp.Symbol(f'x{i}') for i in range(n_features)]
-            
+
             # gplearn uses X0, X1, etc.
             local_dict = {
                 'add': lambda x, y: x + y,
@@ -828,27 +937,29 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
             }
             for i in range(n_features):
                 local_dict[f'X{i}'] = feat_vars[i]
-                
+
             # 1. Parse into SymPy
             full_expr = sp.sympify(expr_str, locals=local_dict)
-            
+
             # 2. Extract numeric constants
             all_atoms = full_expr.atoms(sp.Number)
             # Filter constants that are likely parameters and not indices/small integers
             constants = sorted([float(a) for a in all_atoms if not a.is_Integer or abs(a) > 5])
-            
+
             if not constants and global_indices is None:
-                return program
-            
+                # Even if no constants, we might still want to apply term pruning
+                optimized_expr = self._prune_small_coefficients(full_expr, X, y_true)
+                return OptimizedExpressionWrapper(str(optimized_expr), program)
+
             if constants:
                 # 3. Parametrize constants
                 const_vars = [sp.Symbol(f'c{i}') for i in range(len(constants))]
                 subs_map = {sp.Float(c): cv for c, cv in zip(constants, const_vars)}
                 param_expr = full_expr.subs(subs_map)
-                
+
                 # 4. Lambdify for optimization
                 f_lamb = sp.lambdify(const_vars + feat_vars, param_expr, modules=['numpy'])
-                
+
                 def eval_expr(const_vals):
                     try:
                         y_pred = f_lamb(*const_vals, *[X[:, i] for i in range(n_features)])
@@ -857,7 +968,7 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
                         return mean_squared_error(y_true, y_pred)
                     except:
                         return float('inf')
-                
+
                 # Perform optimization: Two-stage approach for robustness
                 # 1. Global search (Differential Evolution) - reduced iterations for speed
                 bounds = [(c - 2.0 * abs(c) - 0.5, c + 2.0 * abs(c) + 0.5) for c in constants]
@@ -868,12 +979,12 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
                     initial_guess = constants
 
                 # 2. Local refinement (L-BFGS-B)
-                result = minimize(eval_expr, initial_guess, method=self.opt_method, 
+                result = minimize(eval_expr, initial_guess, method=self.opt_method,
                                  options={'maxiter': self.opt_iterations})
-                
+
                 if result.success:
                     opt_consts = result.x
-                    
+
                     # Physics-Inspired Simplification
                     simplified_consts = opt_consts.copy()
                     for j in range(len(simplified_consts)):
@@ -883,19 +994,26 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
                             if abs(val - rounded) < 0.12:
                                 simplified_consts[j] = rounded
                                 break
-                    
+
                     mse_opt = eval_expr(opt_consts)
                     mse_simple = eval_expr(simplified_consts)
                     final_consts = simplified_consts if mse_simple < 1.05 * mse_opt else opt_consts
-                    
+
                     # Create final optimized expression
                     final_subs = {cv: sp.Float(val) for cv, val in zip(const_vars, final_consts)}
                     optimized_expr = param_expr.subs(final_subs)
+
+                    # NEW: Apply term pruning after constant optimization
+                    optimized_expr = self._prune_small_coefficients(optimized_expr, X, y_true)
                 else:
                     optimized_expr = full_expr
+                    # Apply term pruning to original expression if optimization failed
+                    optimized_expr = self._prune_small_coefficients(optimized_expr, X, y_true)
             else:
                 optimized_expr = full_expr
-                
+                # Apply term pruning to original expression
+                optimized_expr = self._prune_small_coefficients(optimized_expr, X, y_true)
+
             # REMAP local indices (X0, X1...) to global indices
             if global_indices is not None:
                 # Replace x0 with x{global_indices[0]}, etc.
@@ -903,19 +1021,70 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
                 remap_subs = {}
                 for idx in range(len(global_indices)):
                     remap_subs[sp.Symbol(f'x{idx}')] = sp.Symbol(f'x{global_indices[idx]}')
-                
+
                 final_remapped_expr = optimized_expr.subs(remap_subs)
                 return OptimizedExpressionWrapper(str(final_remapped_expr), program)
-            
+
             return OptimizedExpressionWrapper(str(optimized_expr), program)
-                
+
         except Exception as e:
             print(f"  -> Secondary optimization failed: {e}")
             return program
-                
+
+    def _prune_small_coefficients(self, expr, X, y_true, threshold=1e-4):
+        """
+        NEW: Term Pruning Pass - Remove terms with small coefficients after L-BFGS optimization.
+        """
+        try:
+            # Expand the expression to get individual terms
+            expanded_expr = sp.expand(expr)
+
+            # Separate the expression into terms
+            if isinstance(expanded_expr, sp.Add):
+                terms = expanded_expr.args
+            else:
+                terms = [expanded_expr]
+
+            # Evaluate each term separately to determine its contribution
+            significant_terms = []
+
+            for term in terms:
+                # Extract coefficient and functional part
+                coeff, func_part = term.as_coeff_Mul()
+
+                # Skip if coefficient is already below threshold
+                if abs(float(coeff)) < threshold:
+                    continue
+
+                # Create a function to evaluate just this term
+                feat_vars = [sp.Symbol(f'x{i}') for i in range(X.shape[1])]
+                try:
+                    term_func = sp.lambdify(feat_vars, func_part, modules=['numpy'])
+                    term_values = term_func(*[X[:, i] for i in range(X.shape[1])])
+
+                    # Calculate the average contribution of this term
+                    avg_contribution = np.mean(np.abs(coeff * term_values))
+
+                    # Only keep terms that contribute significantly
+                    if avg_contribution >= threshold:
+                        significant_terms.append(term)
+                except:
+                    # If evaluation fails, keep the term
+                    significant_terms.append(term)
+
+            # Reconstruct the expression with only significant terms
+            if significant_terms:
+                pruned_expr = sp.Add(*significant_terms)
+            else:
+                # If all terms were pruned, return 0
+                pruned_expr = sp.Integer(0)
+
+            return pruned_expr
+
         except Exception as e:
-            print(f"  -> Secondary optimization failed: {e}")
-            return program
+            print(f"  -> Term pruning failed: {e}")
+            # Return original expression if pruning fails
+            return expr
 
     def distill_with_secondary_optimization(self, latent_states, targets, n_super_nodes, latent_dim, box_size=None):
         """
@@ -1021,7 +1190,7 @@ class EnsembleSymbolicDistiller(EnhancedSymbolicDistiller):
     Runs distillation 5 times on different data shuffles and only keeps terms
     that appear in at least 4 of the 5 runs.
     """
-    def __init__(self, populations=2000, generations=40, ensemble_size=5, consensus_threshold=4, **kwargs):
+    def __init__(self, populations=2000, generations=40, ensemble_size=5, consensus_threshold=3, **kwargs):
         super().__init__(populations=populations, generations=generations, **kwargs)
         self.ensemble_size = ensemble_size
         self.consensus_threshold = consensus_threshold

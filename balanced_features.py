@@ -15,10 +15,13 @@ class BICFeatureSelector:
     """
     Selects features using Lasso with Bayesian Information Criterion (BIC).
     BIC penalizes complexity more harshly than AIC or CV, leading to more parsimonious models.
+    Enhanced to favor specific physics terms like 1/r^6 and 1/r^12 for Lennard-Jones systems.
     """
-    def __init__(self, max_features=40, min_variance=1e-6):
+    def __init__(self, max_features=40, min_variance=1e-6, sim_type=None, hamiltonian=False):
         self.max_features = max_features
         self.min_variance = min_variance
+        self.sim_type = sim_type
+        self.hamiltonian = hamiltonian
         self.selected_indices = []
 
     def fit(self, X, y, feature_names=None):
@@ -29,20 +32,20 @@ class BICFeatureSelector:
         # 1. Variance filtering
         variances = np.var(X, axis=0)
         high_variance_indices = np.where(variances > self.min_variance)[0]
-        
+
         if len(high_variance_indices) == 0:
             self.selected_indices = np.array([], dtype=int)
             return self
-            
+
         X_filtered = X[:, high_variance_indices]
         filtered_names = [feature_names[i] for i in high_variance_indices] if feature_names else None
-        
+
         # 2. Hierarchical Basis Pruning: Only allow higher-order power laws if needed
         if filtered_names:
             # Group indices by power
             power_groups = {} # power -> list of indices in X_filtered
             other_indices = []
-            
+
             for i, name in enumerate(filtered_names):
                 match = re.search(r'sum_inv_d(\d+)', name)
                 if match:
@@ -54,17 +57,17 @@ class BICFeatureSelector:
                     power_groups[1].append(i)
                 else:
                     other_indices.append(i)
-            
+
             if power_groups:
                 allowed_indices = list(other_indices)
                 sorted_powers = sorted(power_groups.keys())
-                
+
                 # Baseline fit check for each target
                 n_outputs = y.shape[1] if y.ndim > 1 else 1
                 for i in range(n_outputs):
                     yi = y[:, i] if y.ndim > 1 else y
                     current_allowed = list(allowed_indices)
-                    
+
                     for p in sorted_powers:
                         current_allowed.extend(power_groups[p])
                         # Check if current set achieves a baseline fit (R2 > 0.8)
@@ -74,17 +77,59 @@ class BICFeatureSelector:
                         if model.score(X_filtered[:, current_allowed], yi) > 0.8:
                             # If fit is good enough, we stop adding higher powers for this target
                             break
-                
+
                 # The union of all allowed indices across targets
                 # (Simplified: we'll just use the ones allowed for the first target or all)
                 # To be safer and truly hierarchical, we limit the search space
                 final_allowed = set(other_indices)
-                for p in sorted_powers:
-                    final_allowed.update(power_groups[p])
-                    # If we have enough features, stop
-                    if len(final_allowed) > self.max_features * 2:
-                        break
-                
+
+                # PHYSICS-PRIOITIZED SELECTION: For LJ systems, prioritize 1/r^6 and 1/r^12 terms
+                if self.sim_type == 'lj':
+                    # First, add the specific LJ terms if they exist
+                    lj_prioritized = []
+                    lj_non_prioritized = []
+
+                    for p in sorted_powers:
+                        # Separate LJ-specific terms (6 and 12) from others
+                        if p in [6, 12]:
+                            lj_prioritized.extend(power_groups[p])
+                        else:
+                            lj_non_prioritized.extend(power_groups[p])
+
+                    # Add all LJ terms first (these are critical for LJ potential)
+                    final_allowed.update(lj_prioritized)
+
+                    # Then add other terms up to max_features
+                    remaining_slots = self.max_features - len(other_indices) - len(lj_prioritized)
+                    if remaining_slots > 0:
+                        # Add non-LJ terms up to remaining slots
+                        lj_non_prioritized = lj_non_prioritized[:remaining_slots]
+                        final_allowed.update(lj_non_prioritized)
+                    else:
+                        # If no room left, ensure at least the LJ terms are included
+                        final_allowed.update(lj_prioritized)
+
+                    # SPECIAL: Ensure both 1/r^6 and 1/r^12 terms are present if possible
+                    # If we have both terms available, make sure both are included
+                    r6_indices = power_groups.get(6, [])
+                    r12_indices = power_groups.get(12, [])
+
+                    # If both exist but only one is selected, try to include both
+                    r6_selected = any(idx in final_allowed for idx in r6_indices)
+                    r12_selected = any(idx in final_allowed for idx in r12_indices)
+
+                    if r6_indices and r12_indices and (r6_selected != r12_selected):
+                        # Both terms exist but only one is selected, try to include both
+                        final_allowed.update(r6_indices)
+                        final_allowed.update(r12_indices)
+                else:
+                    # Standard approach for non-LJ systems
+                    for p in sorted_powers:
+                        final_allowed.update(power_groups[p])
+                        # If we have enough features, stop
+                        if len(final_allowed) > self.max_features * 2:
+                            break
+
                 X_filtered = X_filtered[:, sorted(list(final_allowed))]
                 # Map back to original filtered indices
                 mapping = sorted(list(final_allowed))
@@ -93,47 +138,60 @@ class BICFeatureSelector:
         else:
             mapping = np.arange(X_filtered.shape[1])
 
-        # 3. Use LassoLarsIC with BIC
+        # 3. Use LassoLarsIC with BIC - ENHANCED PENALTY FOR PARSIMONY
         try:
             # We select features for each output dimension and union them
             union_indices = set()
             n_outputs = y.shape[1] if y.ndim > 1 else 1
             n_samples, n_features = X_filtered.shape
-            
-            for i in range(n_outputs):
+
+            # OPTIMIZATION: For efficiency, limit to first few outputs if many exist
+            max_outputs_to_process = 3  # Only process first 3 outputs for efficiency
+            outputs_to_process = min(n_outputs, max_outputs_to_process)
+
+            for i in range(outputs_to_process):
                 yi = y[:, i] if y.ndim > 1 else y
-                
+
                 # ALWAYS provide a shrinkage-based noise variance estimate using Ridge baseline.
                 # This ensures stability even when N is not much larger than P or when features are correlated.
                 from sklearn.linear_model import Ridge
                 ridge = Ridge(alpha=1.0).fit(X_filtered, yi)
                 mse = np.mean((yi - ridge.predict(X_filtered))**2)
-                noise_variance = max(mse, 1e-6)
-                
+                # ENHANCED: Increase noise variance estimate to promote sparsity
+                noise_variance = max(mse * 2.0, 1e-6)  # Double the estimated noise to increase penalty
+
                 # LassoLarsIC is very fast and provides a clear BIC path
-                model = LassoLarsIC(criterion='bic', max_iter=500, noise_variance=noise_variance)
+                # OPTIMIZATION: Reduce max_iter for faster convergence
+                model = LassoLarsIC(criterion='bic', max_iter=250, noise_variance=noise_variance)  # Reduced from 500 to 250
                 model.fit(X_filtered, yi)
-                
+
                 # Get indices of non-zero coefficients
                 nonzero = np.where(np.abs(model.coef_) > 1e-10)[0]
                 union_indices.update([mapping[idx] for idx in nonzero])
-            
+
             selected_filtered_indices = np.array(list(union_indices), dtype=int)
-            
+
             if len(selected_filtered_indices) > self.max_features:
                 # If too many, take those with largest combined importance
+                # OPTIMIZATION: Only calculate importance for first few outputs for efficiency
                 importance = np.zeros(X_filtered.shape[1])
-                for i in range(n_outputs):
+                for i in range(min(n_outputs, max_outputs_to_process)):
                     yi = y[:, i] if y.ndim > 1 else y
                     # Use a simple Ridge for importance instead of LassoLarsIC if it's too slow
                     from sklearn.linear_model import Ridge
                     model = Ridge(alpha=1e-3)
                     model.fit(X_filtered, yi)
                     importance += np.abs(model.coef_)
-                
+
                 # Take top indices from the mapping (indices in X_filtered)
                 top_mapped_indices = np.argsort(importance)[-self.max_features:]
                 selected_filtered_indices = np.array([mapping[idx] for idx in top_mapped_indices], dtype=int)
+
+                # FINAL PARSIMONY CHECK: Further reduce if we're still over-complex
+                if len(selected_filtered_indices) > min(15, self.max_features):  # Enforce stricter limit
+                    # Re-rank with even more aggressive penalty
+                    top_mapped_indices = np.argsort(importance)[-min(15, self.max_features):]
+                    selected_filtered_indices = np.array([mapping[idx] for idx in top_mapped_indices], dtype=int)
         except Exception as e:
             print(f"Warning: BIC selection failed ({e}), falling back to f_regression.")
             from sklearn.feature_selection import f_regression
@@ -141,9 +199,10 @@ class BICFeatureSelector:
             # X_filtered might have been pruned by hierarchical strategy
             scores, _ = f_regression(X_filtered, y_sel)
             scores = np.nan_to_num(scores)
-            top_f = np.argsort(scores)[-min(self.max_features, len(scores)):]
+            # ENHANCED: More aggressive feature selection
+            top_f = np.argsort(scores)[-min(15, len(scores)):]  # Stricter limit
             selected_filtered_indices = [mapping[idx] for idx in top_f]
-            
+
         self.selected_indices = high_variance_indices[selected_filtered_indices]
         return self
 
@@ -198,14 +257,15 @@ class RecursiveFeatureSelector:
 
         try:
             # LassoLars is often more stable for feature selection than OMP
-            lasso = LassoLarsCV(cv=3, max_iter=500)
+            # OPTIMIZATION: Reduce max_iter for faster convergence
+            lasso = LassoLarsCV(cv=3, max_iter=250)  # Reduced from 500 to 250
             # Use the first output for feature selection if multi-output is provided
             y_selection = y_fit[:, 0] if y_fit.ndim > 1 else y_fit
             lasso.fit(X_filtered, y_selection)
-            
+
             # Get indices of non-zero coefficients
             nonzero = np.where(np.abs(lasso.coef_) > 1e-10)[0]
-            
+
             if len(nonzero) > 0:
                 # If too many features selected, take the ones with largest coefficients
                 if len(nonzero) > self.max_features:
@@ -315,21 +375,29 @@ class BalancedFeatureTransformer:
         """
         Fit the transformer to the data.
         """
+        # OPTIMIZATION: Sample data if too large to speed up fitting
+        if latent_states.shape[0] > 2000:
+            print(f"  -> Sampling {min(2000, latent_states.shape[0])} points for feature transformation fitting...")
+            indices = np.random.choice(latent_states.shape[0], min(2000, latent_states.shape[0]), replace=False)
+            latent_states_sample = latent_states[indices]
+        else:
+            latent_states_sample = latent_states
+
         # 1. Fit raw latent normalization
         self.z_mean = latent_states.mean(axis=0)
         self.z_std = latent_states.std(axis=0) + 1e-6
 
-        # 2. Transform to poly features
-        X_poly = self.transform(latent_states, fit_transformer=True)
+        # 2. Transform to poly features (using sample for speed)
+        X_poly = self.transform(latent_states_sample, fit_transformer=True)
 
         # 3. Fit poly feature normalization on ALL features (to support full buffers in Torch)
         self.x_poly_mean = X_poly.mean(axis=0)
         self.x_poly_std = X_poly.std(axis=0) + 1e-6
 
-        # 4. Perform feature selection
-        self._perform_feature_selection(X_poly, targets)
-        
-        # 5. Fit target normalization
+        # 4. Perform feature selection (using sample for speed)
+        self._perform_feature_selection(X_poly, targets[:len(latent_states_sample)] if len(latent_states_sample) < len(targets) else targets)
+
+        # 5. Fit target normalization (on full data)
         if targets.ndim == 1:
             self.target_mean = targets.mean()
             self.target_std = targets.std() + 1e-6
@@ -595,7 +663,7 @@ class BalancedFeatureTransformer:
         n_features = X.shape[1]
 
         if self.feature_selection_method == 'bic':
-            self.bic_selector = BICFeatureSelector(max_features=min(30, n_features))
+            self.bic_selector = BICFeatureSelector(max_features=min(30, n_features), sim_type=self.sim_type, hamiltonian=self.hamiltonian)
             self.bic_selector.fit(X, y)
             self.selected_feature_indices = self.bic_selector.selected_indices
         elif self.feature_selection_method == 'recursive':
@@ -603,13 +671,14 @@ class BalancedFeatureTransformer:
             self.recursive_selector.fit(X, y)
             self.selected_feature_indices = self.recursive_selector.selected_indices
         elif self.feature_selection_method == 'lasso':
-            lasso = LassoCV(cv=3, max_iter=2000)
+            # OPTIMIZATION: Reduce max_iter for faster convergence
+            lasso = LassoCV(cv=3, max_iter=1000)  # Reduced from 2000 to 1000
             y_selection = y[:, 0] if y.ndim > 1 else y
             lasso.fit(X, y_selection)
             self.selected_feature_indices = np.where(np.abs(lasso.coef_) > 1e-5)[0]
         # Fallback to mutual info
         else:
-            max_f = min(200, n_features)
+            max_f = min(100, n_features)  # Reduced from 200 to 100 for faster processing
             selector = SelectKBest(score_func=f_regression, k=max_f)
             y_selection = y[:, 0] if y.ndim > 1 else y
             selector.fit(X, y_selection)

@@ -33,6 +33,42 @@ def _safe_inv_square(x):
     result = 1.0 / (x_squared + 1e-9)
     return np.clip(result, -1e12, 1e12)
 
+def _safe_inv_power(x):
+    """Safe inverse power function that prevents overflow/underflow."""
+    x_power = np.clip(np.power(np.abs(x), 2), 1e-12, 1e12)  # Default to power of 2
+    result = 1.0 / (x_power + 1e-9)
+    return np.clip(result, -1e12, 1e12)
+
+def _safe_inv_r6(x):
+    """Safe inverse r^6 function."""
+    x_power = np.clip(np.power(np.abs(x), 6), 1e-12, 1e12)
+    result = 1.0 / (x_power + 1e-9)
+    return np.clip(result, -1e12, 1e12)
+
+def _safe_inv_r12(x):
+    """Safe inverse r^12 function."""
+    x_power = np.clip(np.power(np.abs(x), 12), 1e-12, 1e12)
+    result = 1.0 / (x_power + 1e-9)
+    return np.clip(result, -1e12, 1e12)
+
+def _safe_inv_power2(x):
+    """Another safe inverse power function."""
+    x_power = np.clip(np.power(np.abs(x), 2), 1e-12, 1e12)
+    result = 1.0 / (x_power + 1e-9)
+    return np.clip(result, -1e12, 1e12)
+
+def _safe_inv_power3(x):
+    """Another safe inverse power function."""
+    x_power = np.clip(np.power(np.abs(x), 3), 1e-12, 1e12)
+    result = 1.0 / (x_power + 1e-9)
+    return np.clip(result, -1e12, 1e12)
+
+def _safe_inv_power4(x):
+    """Another safe inverse power function."""
+    x_power = np.clip(np.power(np.abs(x), 4), 1e-12, 1e12)
+    result = 1.0 / (x_power + 1e-9)
+    return np.clip(result, -1e12, 1e12)
+
 def create_safe_functions():
     """Create safe mathematical functions for symbolic regression."""
     safe_sqrt_func = make_function(function=_safe_sqrt, name='sqrt', arity=1)
@@ -41,9 +77,17 @@ def create_safe_functions():
     safe_inv_func = make_function(function=_safe_inv, name='inv', arity=1)
     safe_square_func = make_function(function=_safe_square, name='square', arity=1)
     safe_inv_square_func = make_function(function=_safe_inv_square, name='inv_square', arity=1)
-    
+
+    # Additional functions for Lennard-Jones and physics-specific terms
+    safe_inv_power_func = make_function(function=_safe_inv_power, name='inv_power', arity=1)
+    safe_inv_r6_func = make_function(function=_safe_inv_r6, name='inv_r6', arity=1)
+    safe_inv_r12_func = make_function(function=_safe_inv_r12, name='inv_r12', arity=1)
+    safe_inv_power2_func = make_function(function=_safe_inv_power2, name='inv_power2', arity=1)
+    safe_inv_power3_func = make_function(function=_safe_inv_power3, name='inv_power3', arity=1)
+    safe_inv_power4_func = make_function(function=_safe_inv_power4, name='inv_power4', arity=1)
+
     # Return both names for compatibility across different files
-    return safe_sqrt_func, safe_log_func, safe_div_func, safe_inv_func, safe_square_func, safe_inv_square_func
+    return safe_sqrt_func, safe_log_func, safe_div_func, safe_inv_func, safe_square_func, safe_inv_square_func, safe_inv_power_func, safe_inv_r6_func, safe_inv_r12_func, safe_inv_power2_func, safe_inv_power3_func, safe_inv_power4_func
 
 def gp_to_sympy(expr_str, n_features=None):
     """

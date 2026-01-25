@@ -444,22 +444,41 @@ class HamiltonianODEFunc(nn.Module):
         """
         # y: [batch_size, latent_dim * n_super_nodes]
         d_sub = self.latent_dim // 2
-        
-        # Ensure we are in a grad-enabled context
-        with torch.set_grad_enabled(True):
-            # Optimization: Only detach and set requires_grad if not already present
-            # This preserves the graph for higher-order derivatives
-            y_in = y if y.requires_grad else y.detach().requires_grad_(True)
-            H_val = self.hamiltonian(y_in)
-            H = H_val.sum()
-            
-            # Use create_graph=True to allow for higher-order derivatives (Jacobians)
-            dH = torch.autograd.grad(H, y_in, create_graph=True, retain_graph=True, allow_unused=True)[0]
-            
-            if dH is None:
-                dH = torch.zeros_like(y_in)
-            else:
-                dH = torch.nan_to_num(dH, nan=0.0, posinf=1e2, neginf=-1e2)
+
+        # OPTIMIZATION: Skip gradient computation if not needed for higher-order derivatives
+        # This reduces computation during training when gradients are computed elsewhere
+        if torch.is_grad_enabled():
+            with torch.set_grad_enabled(True):
+                # Optimization: Only detach and set requires_grad if not already present
+                # This preserves the graph for higher-order derivatives
+                y_in = y if y.requires_grad else y.detach().requires_grad_(True)
+                H_val = self.hamiltonian(y_in)
+                H = H_val.sum()
+
+                # Use create_graph=True to allow for higher-order derivatives (Jacobians)
+                dH = torch.autograd.grad(H, y_in, create_graph=True, retain_graph=True, allow_unused=True)[0]
+
+                if dH is None:
+                    dH = torch.zeros_like(y_in)
+                else:
+                    dH = torch.nan_to_num(dH, nan=0.0, posinf=1e2, neginf=-1e2)
+        else:
+            # OPTIMIZATION: If gradients not needed, use a faster path
+            with torch.no_grad():
+                H_val = self.hamiltonian(y)
+
+            # For inference without gradients, we still need to compute derivatives
+            with torch.set_grad_enabled(True):
+                y_in = y.detach().requires_grad_(True)
+                H_val = self.hamiltonian(y_in)
+                H = H_val.sum()
+
+                dH = torch.autograd.grad(H, y_in, create_graph=False, retain_graph=False, allow_unused=True)[0]
+
+                if dH is None:
+                    dH = torch.zeros_like(y_in)
+                else:
+                    dH = torch.nan_to_num(dH, nan=0.0, posinf=1e2, neginf=-1e2)
 
         dH = torch.clamp(dH, -1e2, 1e2)
         dH_view = dH.view(-1, self.n_super_nodes, 2, d_sub)
@@ -703,24 +722,18 @@ class DiscoveryEngineModel(nn.Module):
         z0_flat = z0.reshape(z0.size(0), -1).to(torch.float32)
         t = t.to(torch.float32)
 
-        # Optimization: Cache the target device and is_mps flag
-        if not hasattr(self, '_cached_target_device'):
-            ode_device = next(self.ode_func.parameters()).device
-            is_mps = (str(z0.device) == 'mps' or str(ode_device) == 'mps')
-            self._cached_target_device = torch.device('cpu') if is_mps else ode_device
-            self._is_mps_fix = is_mps
-        
-        target_device = self._cached_target_device
+        # OPTIMIZATION: Keep ODE integration on the same device as the model to avoid transfers
+        target_device = z0.device  # Keep on the same device as input
         original_device = z0.device
 
         # Determine chunk size if not provided
         if chunk_size is None:
-            chunk_size = 20 if self._is_mps_fix else 100
-            
-        y0 = z0_flat if z0_flat.device == target_device else z0_flat.to(target_device)
-        t_ode = t if t.device == target_device else t.to(target_device)
+            chunk_size = 20 if str(target_device) == 'mps' else 100
 
-        # Ensure ode_func is on target_device
+        y0 = z0_flat  # Already on correct device
+        t_ode = t  # Already on correct device
+
+        # Ensure ode_func is on target_device (same as input)
         if next(self.ode_func.parameters()).device != target_device:
             self.ode_func.to(target_device)
 
@@ -736,6 +749,16 @@ class DiscoveryEngineModel(nn.Module):
         options = {'step_size': step_size}
         solver_fn = odeint_adjoint if (self.hamiltonian and self.training) else odeint
 
+        # OPTIMIZATION: Use faster solver options during training
+        if self.training:
+            # Use faster, less accurate solver during training
+            fast_options = {'step_size': min(step_size * 2, 0.02)}  # Larger steps during training
+            solver_method = 'euler'  # Faster Euler method during training
+        else:
+            # Use more accurate solver during evaluation
+            fast_options = options
+            solver_method = method
+
         # Chunked Integration Loop
         if len(t) > chunk_size:
             zt_flat_list = []
@@ -743,26 +766,23 @@ class DiscoveryEngineModel(nn.Module):
             for i in range(0, len(t) - 1, chunk_size - 1):
                 end_idx = min(i + chunk_size, len(t))
                 t_chunk = t_ode[i:end_idx]
-                
-                # Adjust t_chunk to be relative to 0 if necessary for the solver, 
+
+                # Adjust t_chunk to be relative to 0 if necessary for the solver,
                 # but odeint usually handles absolute t.
-                out_chunk = solver_fn(self.ode_func, curr_y0, t_chunk, method=method, options=options)
-                
+                out_chunk = solver_fn(self.ode_func, curr_y0, t_chunk, method=solver_method, options=fast_options)
+
                 # Avoid duplicating the overlapping point
                 if i == 0:
                     zt_flat_list.append(out_chunk)
                 else:
                     zt_flat_list.append(out_chunk[1:])
-                
+
                 curr_y0 = out_chunk[-1]
             zt_flat = torch.cat(zt_flat_list, dim=0)
         else:
-            zt_flat = solver_fn(self.ode_func, y0, t_ode, method=method, options=options)
+            zt_flat = solver_fn(self.ode_func, y0, t_ode, method=solver_method, options=fast_options)
 
-        # Final cleanup and return
-        if zt_flat.device != original_device:
-            zt_flat = zt_flat.to(original_device)
-
+        # Final cleanup and return - already on correct device
         if torch.isnan(zt_flat).any():
             zt_flat = torch.nan_to_num(zt_flat, nan=0.0, posinf=1e2, neginf=-1e2)
 
