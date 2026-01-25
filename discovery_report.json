@@ -1,17 +1,17 @@
 {
     "discovered_sympy": [
-        "SeparableHamiltonian(V=add(sub(neg(X0), X10), neg(X0)), m=[1.000633  0.9987631], T=p^2/(2m))"
+        "SeparableHamiltonian(V=X4, m=[1.0130506 1.0178983], T=p^2/(2m))"
     ],
     "health_check": {
         "Symbolic R2": 0.0,
-        "Energy Drift": 0.0005295680924300955,
-        "OOD R2": -1.1225974559783936,
-        "Rotational Error": 0.0,
+        "Energy Drift": 1.4911176421444473e-05,
+        "OOD R2": -0.010791029781103134,
+        "Rotational Error": 1.655511441522058e-08,
         "Active Super-nodes": 2,
-        "Flicker Rate": 0.0011980112176388502
+        "Flicker Rate": 1.0
     },
     "config": {
-        "particles": 2,
+        "particles": 4,
         "super_nodes": 2,
         "sim": "lj",
         "hamiltonian": true
