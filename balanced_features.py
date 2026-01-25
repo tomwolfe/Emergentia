@@ -126,13 +126,14 @@ class BICFeatureSelector:
                 top_mapped_indices = np.argsort(importance)[-self.max_features:]
                 selected_filtered_indices = [mapping[idx] for idx in top_mapped_indices]
         except Exception as e:
-            print(f"Warning: BIC selection failed ({e}), falling back to mutual info.")
-            from sklearn.feature_selection import mutual_info_regression
+            print(f"Warning: BIC selection failed ({e}), falling back to f_regression.")
+            from sklearn.feature_selection import f_regression
             y_sel = y[:, 0] if y.ndim > 1 else y
             # X_filtered might have been pruned by hierarchical strategy
-            mi = mutual_info_regression(X_filtered, y_sel)
-            top_mi = np.argsort(mi)[-min(self.max_features, len(mi)):]
-            selected_filtered_indices = [mapping[idx] for idx in top_mi]
+            scores, _ = f_regression(X_filtered, y_sel)
+            scores = np.nan_to_num(scores)
+            top_f = np.argsort(scores)[-min(self.max_features, len(scores)):]
+            selected_filtered_indices = [mapping[idx] for idx in top_f]
             
         self.selected_indices = high_variance_indices[selected_filtered_indices]
         return self
