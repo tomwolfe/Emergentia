@@ -68,11 +68,12 @@ class SymbolicDistiller:
         return getattr(program, 'length_', 1)
 
     def _get_regressor(self, pop, gen, parsimony=0.05):
-        # Use n_jobs=-1 to utilize all available CPU cores for GP
-        # Added max_samples=0.9 to speed up fitness evaluation and reduce memory
+        # OPTIMIZATION: Use n_jobs=1 for small populations to avoid overhead
+        # or if we are likely already parallelizing at the target level.
+        n_jobs = -1 if pop >= 1000 else 1
         return SymbolicRegressor(population_size=pop, generations=gen, parsimony_coefficient=parsimony,
                                  function_set=('add', 'sub', 'mul', safe_div, safe_sqrt, safe_log, 'abs', 'neg', safe_inv, square_func, inv_square_func),
-                                 max_samples=0.9, n_jobs=-1, random_state=42, verbose=0)
+                                 max_samples=0.9, n_jobs=n_jobs, random_state=42, verbose=0)
 
     def _select_features(self, X, y, sim_type=None, feature_names=None):
         # Sample data if it's too large
@@ -189,7 +190,7 @@ class SymbolicDistiller:
         results = Parallel(n_jobs=-1)(delayed(self._distill_single_target)(i, X_norm, Y_norm[:, i], targets.shape[1], latent_dim, skip_deep_search=quick, sim_type=sim_type) for i in range(targets.shape[1]))
         return [r[0] for r in results]
 
-def extract_latent_data(model, dataset, dt, include_hamiltonian=False):
+def extract_latent_data(model, dataset, dt, include_hamiltonian=False, return_both=False):
     model.eval()
     device = next(model.parameters()).device
     
@@ -207,7 +208,6 @@ def extract_latent_data(model, dataset, dt, include_hamiltonian=False):
         
         # Check for NaN in z before proceeding
         if torch.isnan(z_all).any():
-            print("DEBUG: NaN detected in encoded z")
             z_all = torch.nan_to_num(z_all)
 
         # Reshape to [T, K*D]
@@ -216,22 +216,25 @@ def extract_latent_data(model, dataset, dt, include_hamiltonian=False):
         ode_device = next(model.ode_func.parameters()).device
         z_torch = z_flat.to(ode_device)
         
+        h_vals = None
+        dz_vals = None
+        
         if include_hamiltonian and hasattr(model.ode_func, 'hamiltonian'):
-            # Extract scalar Hamiltonian for all steps at once
-            H_all = model.ode_func.hamiltonian(z_torch)
-            derivs = H_all.cpu().numpy()
-        else:
-            # Extract dynamics derivative for all steps at once
-            # Most ODE functions support batched inputs
-            t_span = torch.zeros(1, device=ode_device) # Time-invariant assumption for distillation
-            dz_all = model.ode_func(t_span, z_torch)
+            h_vals = model.ode_func.hamiltonian(z_torch).cpu().numpy()
             
-            if torch.isnan(dz_all).any():
-                dz_all = torch.nan_to_num(dz_all)
-            
-            derivs = dz_all.cpu().numpy()
+        if not include_hamiltonian or return_both:
+            t_span = torch.zeros(1, device=ode_device)
+            dz_vals = model.ode_func(t_span, z_torch)
+            if torch.isnan(dz_vals).any():
+                dz_vals = torch.nan_to_num(dz_vals)
+            dz_vals = dz_vals.cpu().numpy()
 
         states = z_flat.cpu().numpy()
+        t_states = np.linspace(0, seq_len * dt, seq_len)
 
-    return states, derivs, np.linspace(0, seq_len * dt, seq_len)
+    if return_both:
+        return states, h_vals, dz_vals, t_states
+    
+    derivs = h_vals if include_hamiltonian else dz_vals
+    return states, derivs, t_states
 

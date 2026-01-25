@@ -21,7 +21,7 @@ class BICFeatureSelector:
         self.min_variance = min_variance
         self.selected_indices = []
 
-    def fit(self, X, y):
+    def fit(self, X, y, feature_names=None):
         # 0. Clean input data
         X = np.nan_to_num(X, nan=0.0, posinf=1e6, neginf=-1e6)
         y = np.nan_to_num(y, nan=0.0, posinf=1e6, neginf=-1e6)
@@ -35,8 +35,65 @@ class BICFeatureSelector:
             return self
             
         X_filtered = X[:, high_variance_indices]
+        filtered_names = [feature_names[i] for i in high_variance_indices] if feature_names else None
         
-        # 2. Use LassoLarsIC with BIC
+        # 2. Hierarchical Basis Pruning: Only allow higher-order power laws if needed
+        if filtered_names:
+            # Group indices by power
+            power_groups = {} # power -> list of indices in X_filtered
+            other_indices = []
+            
+            for i, name in enumerate(filtered_names):
+                match = re.search(r'sum_inv_d(\d+)', name)
+                if match:
+                    p = int(match.group(1))
+                    if p not in power_groups: power_groups[p] = []
+                    power_groups[p].append(i)
+                elif 'sum_inv_d' in name: # case for 'sum_inv_d' which is d1
+                    if 1 not in power_groups: power_groups[1] = []
+                    power_groups[1].append(i)
+                else:
+                    other_indices.append(i)
+            
+            if power_groups:
+                allowed_indices = list(other_indices)
+                sorted_powers = sorted(power_groups.keys())
+                
+                # Baseline fit check for each target
+                n_outputs = y.shape[1] if y.ndim > 1 else 1
+                for i in range(n_outputs):
+                    yi = y[:, i] if y.ndim > 1 else y
+                    current_allowed = list(allowed_indices)
+                    
+                    for p in sorted_powers:
+                        current_allowed.extend(power_groups[p])
+                        # Check if current set achieves a baseline fit (R2 > 0.8)
+                        from sklearn.linear_model import Ridge
+                        model = Ridge(alpha=1e-3)
+                        model.fit(X_filtered[:, current_allowed], yi)
+                        if model.score(X_filtered[:, current_allowed], yi) > 0.8:
+                            # If fit is good enough, we stop adding higher powers for this target
+                            break
+                
+                # The union of all allowed indices across targets
+                # (Simplified: we'll just use the ones allowed for the first target or all)
+                # To be safer and truly hierarchical, we limit the search space
+                final_allowed = set(other_indices)
+                for p in sorted_powers:
+                    final_allowed.update(power_groups[p])
+                    # If we have enough features, stop
+                    if len(final_allowed) > self.max_features * 2:
+                        break
+                
+                X_filtered = X_filtered[:, sorted(list(final_allowed))]
+                # Map back to original filtered indices
+                mapping = sorted(list(final_allowed))
+            else:
+                mapping = np.arange(X_filtered.shape[1])
+        else:
+            mapping = np.arange(X_filtered.shape[1])
+
+        # 3. Use LassoLarsIC with BIC
         try:
             # We select features for each output dimension and union them
             union_indices = set()
@@ -50,28 +107,32 @@ class BICFeatureSelector:
                 
                 # Get indices of non-zero coefficients
                 nonzero = np.where(np.abs(model.coef_) > 1e-10)[0]
-                union_indices.update(nonzero)
+                union_indices.update([mapping[idx] for idx in nonzero])
             
             selected_filtered_indices = np.array(list(union_indices))
             
             if len(selected_filtered_indices) > self.max_features:
                 # If too many, take those with largest combined importance
-                # (This is a heuristic, but necessary to cap complexity)
                 importance = np.zeros(X_filtered.shape[1])
                 for i in range(n_outputs):
                     yi = y[:, i] if y.ndim > 1 else y
-                    model = LassoLarsIC(criterion='bic')
+                    # Use a simple Ridge for importance instead of LassoLarsIC if it's too slow
+                    from sklearn.linear_model import Ridge
+                    model = Ridge(alpha=1e-3)
                     model.fit(X_filtered, yi)
                     importance += np.abs(model.coef_)
                 
-                top_indices = np.argsort(importance)[-self.max_features:]
-                selected_filtered_indices = top_indices
+                # Take top indices from the mapping (indices in X_filtered)
+                top_mapped_indices = np.argsort(importance)[-self.max_features:]
+                selected_filtered_indices = [mapping[idx] for idx in top_mapped_indices]
         except Exception as e:
             print(f"Warning: BIC selection failed ({e}), falling back to mutual info.")
             from sklearn.feature_selection import mutual_info_regression
             y_sel = y[:, 0] if y.ndim > 1 else y
+            # X_filtered might have been pruned by hierarchical strategy
             mi = mutual_info_regression(X_filtered, y_sel)
-            selected_filtered_indices = np.argsort(mi)[-min(self.max_features, len(mi)):]
+            top_mi = np.argsort(mi)[-min(self.max_features, len(mi)):]
+            selected_filtered_indices = [mapping[idx] for idx in top_mi]
             
         self.selected_indices = high_variance_indices[selected_filtered_indices]
         return self

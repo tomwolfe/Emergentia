@@ -75,90 +75,12 @@ class StableHierarchicalPooling(nn.Module):
         """Manually set or update the sparsity weight."""
         self.current_sparsity_weight = weight
 
-    def forward(self, x, batch, pos=None, tau=1.0, hard=False, prev_assignments=None, current_epoch=None, total_epochs=None):
-        """
-        Forward pass of hierarchical pooling with enhanced stability.
-
-        Args:
-            x (Tensor): Node features [N, in_channels]
-            batch (Tensor): Batch assignment [N]
-            pos (Tensor, optional): Node positions [N, 2]
-            tau (float): Temperature for Gumbel-Softmax
-            hard (bool): Whether to use hard sampling
-            prev_assignments (Tensor, optional): Previous assignment matrix for consistency
-            current_epoch (int, optional): Current training epoch for hard assignment gate
-            total_epochs (int, optional): Total training epochs for hard assignment gate
-
-        Returns:
-            Tuple of (pooled_features, assignment_matrix, losses, super_node_positions)
-        """
-        # x: [N, in_channels], batch: [N], pos: [N, 2]
-        if x.size(0) == 0:
-            return torch.zeros((0, self.n_super_nodes, x.size(1)), device=x.device), \
-                   torch.zeros((0, self.n_super_nodes), device=x.device), \
-                   {'entropy': torch.tensor(0.0, device=x.device),
-                    'diversity': torch.tensor(0.0, device=x.device),
-                    'spatial': torch.tensor(0.0, device=x.device),
-                    'pruning': torch.tensor(0.0, device=x.device),
-                    'temporal_consistency': torch.tensor(0.0, device=x.device),
-                    'collapse_prevention': torch.tensor(0.0, device=x.device),
-                    'balance': torch.tensor(0.0, device=x.device)}, \
-                   None
-
-        # Ensure minimum number of super-nodes remain active to prevent total collapse
-        # We check this at the start to ensure the mask used for logits is valid
-        n_active_pre = (self.active_mask > 0.5).sum().item()
-        if n_active_pre < self.min_active_super_nodes:
-            # If history is available, use it to revive the most promising nodes
-            if self.history_counter > 0:
-                _, most_needed_indices = torch.topk(self.assignment_history, self.min_active_super_nodes, largest=True)
-            else:
-                # Otherwise just pick the first few
-                most_needed_indices = torch.arange(self.min_active_super_nodes, device=x.device)
-            self.active_mask.zero_()
-            self.active_mask[most_needed_indices] = 1.0
-
-        logits = self.assign_mlp(x) * self.scaling
-
-        # NEW: Logit Smoothing (EMA) to prevent "banding" and temporal chatter
-        if self.logits_ema is not None and self.logits_ema.size(0) == logits.size(0):
-            logits = self.logit_ema_alpha * self.logits_ema.detach() + (1.0 - self.logit_ema_alpha) * logits
-        
-        # Update EMA buffer
-        self.logits_ema = logits.detach()
-
-        # NEW: Assignment Persistence - bias logits by previous assignments to stabilize flickering
-        if prev_assignments is not None and prev_assignments.size(0) == x.size(0):
-            # persistence_gain = 10.0 to favor previous identity without locking it too hard
-            logits = logits + 10.0 * prev_assignments.detach()
-
-        # Apply active_mask to logits (soft mask to allow for revival)
-        # Use detach() to prevent inplace modification errors during backward pass
-        mask = self.active_mask.detach().unsqueeze(0)
-
-        # IMPLEMENT HARD ASSIGNMENT GATE: Force hard assignments during last 20% of training
-        if current_epoch is not None and total_epochs is not None:
-            progress = current_epoch / total_epochs
-            if progress >= 0.8:  # Last 20% of training
-                hard = True  # Force hard assignments to settle into discrete clusters
-
-        # During training, use a softer mask to allow potential reactivation
-        if self.training:
-            # -5.0 is enough to suppress but allows much more gradient flow than -10.0
-            # Also add a small random exploration factor to logits of inactive nodes
-            # INCREASED: More noise during first 100 epochs to force utilization of all super-nodes
-            noise_scale = 2.0 if (current_epoch is not None and current_epoch < 100) else 0.5
-            exploration = torch.randn_like(logits) * noise_scale * (1.0 - mask)
-            logits = logits + (mask - 1.0) * 5.0 + exploration
-        else:
-            # Harder mask during inference
-            logits = logits.masked_fill(mask == 0, -1e9)
-
-    def sinkhorn_knopp(self, logits, tau=1.0, iterations=3):
+    def sinkhorn_knopp(self, logits, tau=1.0, iterations=50):
         """
         Sinkhorn-Knopp algorithm to find a doubly stochastic assignment matrix.
         Ensures each node is assigned to super-nodes (row sum=1) and each super-node
         receives approximately N/K nodes (column sum=N/K).
+        Increased iterations to 50 for better convergence.
         """
         N, K = logits.shape
         # Use log-space for stability
@@ -189,8 +111,18 @@ class StableHierarchicalPooling(nn.Module):
                     'pruning': torch.tensor(0.0, device=x.device),
                     'temporal_consistency': torch.tensor(0.0, device=x.device),
                     'collapse_prevention': torch.tensor(0.0, device=x.device),
-                    'balance': torch.tensor(0.0, device=x.device)}, \
+                    'balance': torch.tensor(0.0, device=x.device)},	\
                    None
+
+        # Ensure minimum number of super-nodes remain active
+        n_active_pre = (self.active_mask > 0.5).sum().item()
+        if n_active_pre < self.min_active_super_nodes:
+            if self.history_counter > 0:
+                _, most_needed_indices = torch.topk(self.assignment_history, self.min_active_super_nodes, largest=True)
+            else:
+                most_needed_indices = torch.arange(self.min_active_super_nodes, device=x.device)
+            self.active_mask.zero_()
+            self.active_mask[most_needed_indices] = 1.0
 
         logits = self.assign_mlp(x) * self.scaling
 
@@ -204,103 +136,62 @@ class StableHierarchicalPooling(nn.Module):
             logits = logits + 5.0 * prev_assignments.detach()
 
         # Apply Sinkhorn-Knopp instead of Gumbel-Softmax
-        # Sinkhorn naturally encourages utilization of all super-nodes
-        s = self.sinkhorn_knopp(logits, tau=tau, iterations=20)
+        s = self.sinkhorn_knopp(logits, tau=tau, iterations=50)
 
-        if hard:
+        if hard or (current_epoch is not None and total_epochs is not None and current_epoch/total_epochs >= 0.8):
             # Straight-through estimator for hard assignments
             s_hard = torch.zeros_like(s).scatter_(-1, torch.argmax(s, dim=-1, keepdim=True), 1.0)
             s = (s_hard - s).detach() + s
 
         avg_s = s.mean(dim=0)
 
-
         # COMPETITIVE DROPOUT: Randomly zero out most active super-node during training to force distribution
         if self.training and torch.rand(1).item() < 0.1:
             most_active_idx = torch.argmax(avg_s)
-            # Create a mask to zero out the most active super-node
             dropout_mask = torch.ones_like(s)
             dropout_mask[:, most_active_idx] = 0.0
             s = s * dropout_mask
-            # Re-normalize to ensure probabilities sum to 1
             s = s / (s.sum(dim=-1, keepdim=True) + 1e-9)
             avg_s = s.mean(dim=0)
 
-        # Update assignment history for future revival decisions
         self.assignment_history.copy_(0.9 * self.assignment_history + 0.1 * avg_s.detach())
         self.history_counter += 1
 
-        # Update active_mask with exponential moving average for smoother updates
-        # We allow updates during both soft and hard training to maintain consistency
         if self.training:
-            # Moving average update for the mask to avoid rapid flickering
             current_active = (avg_s > self.pruning_threshold).float()
-
-            # STOCHASTIC REVIVAL: Occasionally give inactive nodes a chance to revive
-            # if they show even minor signs of life (e.g. avg_s > pruning_threshold / 5)
             revival_threshold = self.pruning_threshold / 5.0
             revival_candidate = (avg_s > revival_threshold).float()
-
-            # Combine current_active with a small probability of reviving revival_candidates
-            revival_mask = (torch.rand_like(self.active_mask) < 0.2).float() * revival_candidate # Increased prob from 0.1
+            revival_mask = (torch.rand_like(self.active_mask) < 0.2).float() * revival_candidate
             effective_active = torch.clamp(current_active + revival_mask, 0, 1)
 
-            # Use faster EMA for quicker mask adaptation - INCREASED TO 0.05
-            ema_rate = 0.05 # Increased from 0.01 to 0.05 for faster mask adaptation
-            if hard:
-                ema_rate *= 0.5 # Slower updates during hard sampling
-
+            ema_rate = 0.05
             self.active_mask.copy_((1.0 - ema_rate) * self.active_mask + ema_rate * effective_active)
 
-            # Ensure minimum number of super-nodes remain active to prevent total collapse
             n_active_now = (self.active_mask > 0.5).sum().item()
             if n_active_now < self.min_active_super_nodes:
-                # Force-revive the nodes with highest average assignments to meet minimum requirement
                 _, most_needed_indices = torch.topk(avg_s, self.min_active_super_nodes, largest=True)
                 new_active = self.active_mask.clone()
                 new_active.zero_()
                 new_active[most_needed_indices] = 1.0
-                self.active_mask.copy_(new_active)  # Direct reset instead of EMA to enforce constraint
+                self.active_mask.copy_(new_active)
 
-            # Double-check that the constraint is met after update
-            n_active_final = (self.active_mask > 0.5).sum().item()
-            if n_active_final < self.min_active_super_nodes:
-                # If still below minimum, force activation of top nodes
-                _, forced_indices = torch.topk(avg_s, self.min_active_super_nodes, largest=True)
-                self.active_mask[forced_indices] = 1.0
-
-        # FINAL HARD CHECK: Perform a hard check at the end to ensure constraint is met
         final_check = (self.active_mask > 0.5).sum().item()
         if final_check < self.min_active_super_nodes:
-            # Emergency activation: activate nodes with highest avg_s values
             _, emergency_indices = torch.topk(avg_s, self.min_active_super_nodes, largest=True)
             self.active_mask.zero_()
             self.active_mask[emergency_indices] = 1.0
 
         entropy = -torch.mean(torch.sum(s * torch.log(s + 1e-9), dim=1))
-        
-        # STABILITY FIX: Change diversity_loss from raw entropy to KL(Uniform || avg_s)
-        # This makes the loss positive-definite and prevents the "negative divergence" trap.
         uniform_p = torch.full_like(avg_s, 1.0 / self.n_super_nodes)
         diversity_loss = torch.sum(uniform_p * torch.log(uniform_p / (avg_s + 1e-9)))
-        
-        pruning_loss = torch.mean(torch.abs(avg_s * (1 - self.active_mask))) # Penalize usage of "inactive" nodes
-
-        # Sparsity loss to encourage finding the minimal scale
+        pruning_loss = torch.mean(torch.abs(avg_s * (1 - self.active_mask)))
         sparsity_loss = torch.sum(self.active_mask) / self.n_super_nodes
 
-        # NEW: Temporal consistency loss to prevent flickering
         temporal_consistency_loss = torch.tensor(0.0, device=x.device)
         if prev_assignments is not None and prev_assignments.size(0) > 0:
-            # Compare current assignments with previous ones
-            # Use MSE to penalize large changes in assignment probabilities
             temporal_consistency_loss = F.mse_loss(s, prev_assignments.expand_as(s).detach())
 
-        # NEW: Collapse prevention loss to ensure assignments are distributed
-        # This penalizes situations where most assignments go to a single super-node
         collapse_prevention_loss = self._compute_collapse_prevention_loss(avg_s)
-
-        # NEW: Balance loss to encourage equal usage of super-nodes
         balance_loss = self._compute_balance_loss(avg_s)
 
         spatial_loss = torch.tensor(0.0, device=x.device)
@@ -315,12 +206,12 @@ class StableHierarchicalPooling(nn.Module):
 
         assign_losses = {
             'entropy': entropy,
-            'diversity': diversity_loss * 1.0, # Reduced from 200x to 1x to prevent loss dominance
+            'diversity': diversity_loss * 1.0,
             'spatial': spatial_loss,
             'pruning': pruning_loss,
             'sparsity': sparsity_loss * self.current_sparsity_weight,
             'temporal_consistency': temporal_consistency_loss * self.temporal_consistency_weight,
-            'collapse_prevention': collapse_prevention_loss * (self.collapse_prevention_weight * 5.0), # 5x stronger as requested
+            'collapse_prevention': collapse_prevention_loss * (self.collapse_prevention_weight * 5.0),
             'balance': balance_loss
         }
 
@@ -343,57 +234,30 @@ class StableHierarchicalPooling(nn.Module):
         if batch is not None:
             out = scatter(x_expanded, batch, dim=0, reduce='sum').to(torch.float32)
         else:
-            # Return appropriate shape when batch is None
             out = torch.zeros((0, self.n_super_nodes, x.size(1)), device=x.device, dtype=x.dtype)
 
         return out, s, assign_losses, super_node_mu
 
     def _compute_collapse_prevention_loss(self, avg_assignments):
-        """
-        Compute loss to prevent all assignments from collapsing to a single super-node.
-        Uses a combination of variance and an entropy-based penalty.
-        """
         from common_losses import compute_collapse_prevention_loss as common_collapse_loss
         return common_collapse_loss(avg_assignments, self.n_super_nodes)
 
     def _compute_balance_loss(self, avg_assignments):
-        """
-        Compute loss to encourage balanced usage of super-nodes using KL divergence
-        and a Max-Min penalty to prevent single super-node dominance.
-        """
         from common_losses import compute_balance_loss as common_balance_loss
         loss = common_balance_loss(avg_assignments, self.n_super_nodes)
-        # Harsher Diversity: penalize difference between most and least used super-nodes
-        # INCREASED: Stronger penalty on max assignments to prevent resolution collapse
         loss += 5.0 * (avg_assignments.max() - avg_assignments.min())
         return loss
 
     def apply_hard_revival(self):
-        """
-        Simplified revival logic: reset active mask and let Sinkhorn redistribute nodes.
-        """
         if not self.training:
             return
-
         print(f"  [Sinkhorn Revival] Resetting active mask to encourage redistribution...")
         self.active_mask.fill_(1.0)
-        # Clear logit EMA to remove persistence bias
         self.logits_ema = None
 
 
 class DynamicLossBalancer:
-    """
-    Enhanced dynamic loss balancer that adjusts weights based on training progress,
-    loss magnitudes, and relative importance of stability vs reconstruction.
-    """
-
     def __init__(self, initial_weights=None, adaptation_rate=0.02, priority_losses=None):
-        """
-        Args:
-            initial_weights: Dict of initial loss weights
-            adaptation_rate: Rate at which weights adapt
-            priority_losses: List of losses that should be prioritized if they don't decrease
-        """
         self.initial_weights = initial_weights or {}
         self.adaptation_rate = adaptation_rate
         self.priority_losses = priority_losses or ['collapse_prevention', 'balance', 'entropy']
@@ -403,70 +267,40 @@ class DynamicLossBalancer:
 
     def update_weights(self, current_losses):
         self.step_count += 1
-
         for loss_name, loss_value in current_losses.items():
             val = loss_value.item()
             if loss_name not in self.loss_history:
                 self.loss_history[loss_name] = []
                 self.current_weights[loss_name] = self.initial_weights.get(loss_name, 1.0)
-
             self.loss_history[loss_name].append(val)
             if len(self.loss_history[loss_name]) > 50:
                 self.loss_history[loss_name].pop(0)
-
-            # Weight adaptation logic
             if len(self.loss_history[loss_name]) >= 20:
                 recent_avg = sum(self.loss_history[loss_name][-10:]) / 10
                 older_avg = sum(self.loss_history[loss_name][:10]) / 10
-                
                 if older_avg > 0:
                     ratio = recent_avg / older_avg
-                    
-                    # If loss is not decreasing (ratio close to 1.0 or higher)
                     if ratio > 0.95:
-                        # Prioritize stability and structural losses more aggressively
                         boost = 1.0 + self.adaptation_rate
                         if loss_name in self.priority_losses:
                             boost += self.adaptation_rate * 2.0
                         self.current_weights[loss_name] *= boost
-                    # If loss is decreasing very fast, reduce weight
                     elif ratio < 0.2:
                         self.current_weights[loss_name] *= (1.0 - self.adaptation_rate)
-
-                # Clamp weights
                 min_w = 0.05 if loss_name not in self.priority_losses else 0.5
                 max_w = 20.0
                 self.current_weights[loss_name] = max(min_w, min(max_w, self.current_weights[loss_name]))
 
     def get_balanced_losses(self, raw_losses):
-        """
-        Apply current weights to raw losses.
-
-        Args:
-            raw_losses: Dict of raw loss values
-
-        Returns:
-            weighted_losses: Dict of weighted loss values
-        """
         self.update_weights(raw_losses)
-
         weighted_losses = {}
         for loss_name, loss_value in raw_losses.items():
             weight = self.current_weights.get(loss_name, 1.0)
             weighted_losses[loss_name] = loss_value * weight
-
         return weighted_losses
 
 
 class SparsityScheduler:
-    """
-    Sparsity scheduler that gradually increases sparsity pressure.
-    This prevents resolution collapse by allowing the model to find a good
-    representation before aggressively pruning super-nodes.
-    
-    NEW: Adaptive adjustment based on Latent SNR to prevent resolution collapse.
-    """
-
     def __init__(self, initial_weight=0.0, target_weight=0.1, warmup_steps=1000, 
                  max_steps=5000, schedule_type='sigmoid'):
         self.initial_weight = initial_weight
@@ -483,48 +317,31 @@ class SparsityScheduler:
         return self.get_weight()
 
     def adjust_to_snr(self, snr):
-        """
-        Adaptive adjustment: If SNR is low, reduce sparsity pressure to prevent collapse.
-        If SNR is high, we can afford more sparsity.
-        """
         self.last_snr = snr
-        # Threshold for "healthy" SNR is around 1.0 - 2.0 based on logs
         if snr < 1.0:
-            # Scale target weight down if SNR is poor
-            # Reduces sparsity pressure linearly as SNR drops below 1.0
             reduction_factor = max(0.1, snr)
             self.target_weight = self.base_target_weight * reduction_factor
         else:
-            # Restore to base target weight if SNR is healthy
             self.target_weight = self.base_target_weight
 
     def get_weight(self):
         if self.current_step < self.warmup_steps:
             return self.initial_weight
-        
-        # Calculate progress relative to the remaining steps after warmup
         progress = min(1.0, (self.current_step - self.warmup_steps) / max(1, self.max_steps - self.warmup_steps))
-        
         if self.schedule_type == 'linear':
             weight = self.initial_weight + progress * (self.target_weight - self.initial_weight)
         elif self.schedule_type == 'cosine':
             import math
             weight = self.target_weight + 0.5 * (self.initial_weight - self.target_weight) * (1 + math.cos(math.pi * progress))
         elif self.schedule_type == 'sigmoid':
-            # Sigmoid schedule for smoother transition
-            # Stays low for longer if we shift the midpoint or increase steepness
             steepness = 12.0
             midpoint = 0.5
             import math
-            # Shifted sigmoid to stay near zero longer
             sig = 1 / (1 + math.exp(-steepness * (progress - midpoint)))
-            # Re-normalize sigmoid to [0, 1] range within the progress window
             sig_min = 1 / (1 + math.exp(-steepness * (0 - midpoint)))
             sig_max = 1 / (1 + math.exp(-steepness * (1 - midpoint)))
             sig = (sig - sig_min) / (sig_max - sig_min)
-            
             weight = self.initial_weight + sig * (self.target_weight - self.initial_weight)
         else:
             weight = self.target_weight
-            
         return weight

@@ -87,7 +87,8 @@ class SymbolicProxy(nn.Module):
                     dH_dz = torch.zeros_like(z_flat)
                 else:
                     # CLAMP GRADIENTS for stability during stage 3
-                    dH_dz = torch.clamp(dH_dz, -10.0, 10.0)
+                    # Using a tighter clamp (5.0) to prevent aggressive alignment from diverging
+                    dH_dz = torch.clamp(dH_dz, -5.0, 5.0)
             
             d_sub = self.latent_dim // 2
             dz_dt = torch.zeros_like(z_flat)
@@ -105,7 +106,8 @@ class SymbolicProxy(nn.Module):
                     gamma = self.dissipation[k]
                     dz_dt[:, p_start:p_end] -= gamma * z_flat[:, p_start:p_end]
             
-            return self.output_gain * dz_dt
+            # Final output clipping for safety
+            return torch.clamp(self.output_gain * dz_dt, -10.0, 10.0)
 
         X_norm = self.torch_transformer(z_flat)
 
@@ -129,4 +131,5 @@ class SymbolicProxy(nn.Module):
         Y_norm_pred = torch.stack(y_preds, dim=1).squeeze(-1)
         Y_pred = self.torch_transformer.denormalize_y(Y_norm_pred)
 
-        return self.output_gain * Y_pred.to(torch.float32)
+        # Final output clipping for safety
+        return torch.clamp(self.output_gain * Y_pred.to(torch.float32), -10.0, 10.0)

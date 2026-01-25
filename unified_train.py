@@ -228,21 +228,19 @@ def main():
     print("\n--- Discovery Health Report ---")
     
     # Extract data for analysis: h_targets for distillation, dz_states for validation
-    # OPTIMIZATION: Call extract_latent_data only once and decide based on hamiltonian
-    z_states, derivs_all, t_states = extract_latent_data(model, dataset, sim.dt, include_hamiltonian=args.hamiltonian)
+    # OPTIMIZATION: Extract both Hamiltonian and Derivatives in one go if needed
     if args.hamiltonian:
-        h_targets = derivs_all
-        # Need dz_states for R2 calculation
-        _, dz_states, _ = extract_latent_data(model, dataset, sim.dt, include_hamiltonian=False)
+        z_states, h_targets, dz_states, t_states = extract_latent_data(model, dataset, sim.dt, include_hamiltonian=True, return_both=True)
     else:
-        h_targets = derivs_all
-        dz_states = derivs_all
+        z_states, h_targets, t_states = extract_latent_data(model, dataset, sim.dt, include_hamiltonian=False)
+        dz_states = h_targets
     
     # 1. Calculate Correlation Matrix between latents and physical CoM
     print("Calculating Correlation Matrix...")
-    sample_size = min(100 if args.quick_symbolic else 200, len(dataset))
+    sample_size = min(50 if args.quick_symbolic else 200, len(dataset))
     sample_indices = np.linspace(0, len(dataset)-1, sample_size, dtype=int)
-    sample_dataset = [dataset[i] for i in sample_indices]
+    # OPTIMIZATION: Use already existing dataset_list for much faster indexing
+    sample_dataset = [dataset_list[i] for i in sample_indices]
     sample_pos = pos[sample_indices]
     corrs = analyze_latent_space(model, sample_dataset, sample_pos, device=device)
     
@@ -259,7 +257,7 @@ def main():
     model.eval()
     s_list = []
     # OPTIMIZATION: Use a subset for flicker rate if quick
-    flicker_sample_size = min(50 if args.quick_symbolic else len(dataset_list), len(dataset_list))
+    flicker_sample_size = min(30 if args.quick_symbolic else 100, len(dataset_list))
     flicker_indices = np.linspace(0, len(dataset_list)-1, flicker_sample_size, dtype=int)
     with torch.no_grad():
         for idx in flicker_indices:
@@ -278,42 +276,27 @@ def main():
     # --- SELF-CORRECTION LOOP ---
     # ADAPTIVE RESOURCES: Use more resources for the final attempt
     is_quick = args.quick_symbolic or args.epochs < 50
-    MAX_RETRIES = 1 if is_quick else 2
-    pop_size = 2000 if is_quick else max(args.pop, 5000)
-    gen_size = 15 if is_quick else max(args.gen, 30)
-    ensemble_size = 2 if is_quick else 3
+    MAX_RETRIES = 0 if is_quick else 2
+    pop_size = args.pop if is_quick else max(args.pop, 5000)
+    gen_size = args.gen if is_quick else max(args.gen, 30)
+    ensemble_size = 1 if is_quick else 3
     
     bench_report = {}
     for attempt in range(MAX_RETRIES + 1):
-        print(f"\n[Verification Loop] Attempt {attempt+1}/{MAX_RETRIES+1}...")
+        print(f"\n[Verification Loop] Attempt {attempt+1}/{MAX_RETRIES+1} (Pop={pop_size}, Gen={gen_size})...")
         
-        # Adjust parsimony based on attempt
+        # Parsimony Pivot: decrease max_features and increase parsimony if previous failed
+        # Rather than just increasing population, we force simpler models (Occam's Razor)
         parsimony = 0.01 if attempt == 0 else (0.05 if attempt == 1 else 0.1)
+        max_f = 12 if attempt == 0 else (8 if attempt == 1 else 5)
         
-        # If we are struggling, increase search resources
+        # If we are struggling, increase search resources but keep parsimony high
         if attempt == MAX_RETRIES and not is_quick:
             pop_size = 10000
             gen_size = 50
             print(f"  [Self-Correction] Final attempt: Escalating to Pop={pop_size}, Gen={gen_size}")
 
-        # NEW: If first attempt failed badly, try to retrain the GNN for a few epochs
-        if attempt > 0 and bench_report.get('symbolic_r2_ood', 0) < 0.5:
-            print(f"  [Self-Correction] Discovery failed (R2={bench_report.get('symbolic_r2_ood', 0):.4f}). Retraining GNN...")
-            trainer.model.train()
-            # Temporary aggressive training
-            for extra_epoch in range(20):
-                indices = np.random.randint(0, len(pre_batched_windows_raw), size=args.traj_batch_size)
-                sampled_data = []
-                for i in indices: sampled_data.extend(pre_batched_windows_raw[i])
-                batch_data = Batch.from_data_list(sampled_data).to(device)
-                batch_data.seq_len = args.batch_size
-                trainer.train_step(batch_data, sim.dt, epoch=args.epochs + extra_epoch, max_epochs=args.epochs + 20)
-            
-            # Re-extract data
-            z_states, derivs_all, t_states = extract_latent_data(model, dataset, sim.dt, include_hamiltonian=args.hamiltonian)
-            h_targets = derivs_all
-            if not args.hamiltonian: dz_states = derivs_all
-            else: _, dz_states, _ = extract_latent_data(model, dataset, sim.dt, include_hamiltonian=False)
+        # ... (rest of loop)
 
         distiller = EnsembleSymbolicDistiller(
             populations=pop_size, 
@@ -321,7 +304,8 @@ def main():
             ensemble_size=ensemble_size,
             consensus_threshold=max(1, ensemble_size - 1),
             secondary_optimization=True,
-            parsimony=parsimony
+            parsimony=parsimony,
+            max_features=max_f
         )
         
         equations = distiller.distill(z_states, h_targets, args.super_nodes, args.latent_dim, sim_type=args.sim, hamiltonian=args.hamiltonian)
@@ -407,7 +391,8 @@ def main():
     if trainer.symbolic_proxy is not None:
         print("\n--- Starting Stage 3: Neural-Symbolic Consistency Training ---")
         # ADAPTIVE AGGRESSION: Increase epochs and weight if correlation is low
-        stage3_base = 15 if is_quick else 30
+        # Proportional to main training epochs
+        stage3_base = max(1, int(args.epochs * 0.15)) if is_quick else 30
         stage3_epochs = stage3_base
         if mean_max_corr < 0.9:
             stage3_epochs = int(stage3_base * 2)

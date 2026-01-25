@@ -643,14 +643,22 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
             
             return LinearProgram(ridge, selected_indices), full_mask, linear_score
 
-        parsimony_levels = [0.01, 0.05] # Reduced from [0.001, 0.01, 0.05, 0.1]
-        complexity_factor = max(1.0, 2.0 * (1.0 - linear_score)) # Reduced from 3.0
+        # OPTIMIZATION: If populations is small, reduce parsimony levels and search depth
+        is_quick = self.populations < 1000
+        parsimony_levels = [0.05] if is_quick else [0.01, 0.05]
+        
+        complexity_factor = max(1.0, 2.0 * (1.0 - linear_score))
         scaled_pop = int(self.populations * complexity_factor)
-        scaled_pop = min(scaled_pop, 5000) # Reduced from 10000
+        if is_quick:
+            scaled_pop = self.populations # Don't scale up if quick
+        else:
+            scaled_pop = min(scaled_pop, 5000)
 
         candidates = []
         for p_coeff in parsimony_levels:
-            est = self._get_regressor(scaled_pop, min(self.generations // 2, 20), parsimony=p_coeff) # Cap gens
+            # For quick runs, cap generations even further
+            max_gen = min(self.generations // 2, 20) if not is_quick else self.generations
+            est = self._get_regressor(scaled_pop, max_gen, parsimony=p_coeff)
             try:
                 # Force float64 for stability
                 X_gp = X_selected.astype(np.float64)
@@ -674,16 +682,16 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
 
                 if is_stable:
                     # Use DimensionalGuard for physical consistency penalty
-                    dim_penalty = 0.0
+                    is_consistent = True
                     if hasattr(self, 'transformer') and hasattr(self.transformer, 'feature_dims'):
                         guard = DimensionalGuard(self.transformer.feature_dims)
                         selected_indices = np.where(full_mask)[0]
                         local_dict = {f'X{j}': sp.Symbol(f'x{j}') for j in range(len(selected_indices))}
                         try:
                             candidate_sympy = sp.sympify(str(prog), locals=local_dict)
-                            dim_penalty = guard.get_penalty(candidate_sympy, selected_indices)
+                            is_consistent = guard.check_consistency(candidate_sympy, selected_indices)
                         except:
-                            dim_penalty = 0.2 # Small penalty for unparseable but stable
+                            is_consistent = False # Unparseable is inconsistent
 
                     candidate = {
                         'prog': prog, 
@@ -691,7 +699,7 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
                         'complexity': self.get_complexity(prog), 
                         'p': p_coeff, 
                         'target_idx': i,
-                        'dim_penalty': dim_penalty
+                        'is_consistent': is_consistent
                     }
                     candidates.append(candidate)
                     self.all_candidates.append(candidate)
@@ -701,13 +709,20 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
         if not candidates:
             return None, full_mask, 0.0
 
-        # Pareto Frontier Selection: HARSHER COMPLEXITY PENALTY
+        # Pareto Frontier Selection: HARSHER COMPLEXITY PENALTY & HARD DIMENSIONAL CONSTRAINT
+        # First, try to only keep consistent candidates
+        consistent_candidates = [c for c in candidates if c.get('is_consistent', False)]
+        if consistent_candidates:
+            candidates = consistent_candidates
+            print(f"  -> Target_{i}: Found {len(candidates)} dimensionally consistent candidates.")
+        else:
+            print(f"  -> Target_{i}: WARNING: No dimensionally consistent candidates found. Using inconsistent ones.")
+
         for c in candidates:
-            # Adjusted score: R2 penalized by complexity and dimension
-            if c['score'] < 0.9:
-                c['pareto_score'] = c['score'] - 0.02 * c['complexity'] - c.get('dim_penalty', 0.0)
-            else:
-                c['pareto_score'] = c['score'] - 0.04 * c['complexity'] - c.get('dim_penalty', 0.0)
+            # Adjusted score: R2 penalized by complexity
+            # Harsher penalty if not consistent (though we prefer consistent ones)
+            penalty_scale = 0.04 if c.get('is_consistent', False) else 0.1
+            c['pareto_score'] = c['score'] - penalty_scale * c['complexity']
 
         candidates.sort(key=lambda x: x['pareto_score'], reverse=True)
         best_candidate = candidates[0]
@@ -886,7 +901,7 @@ class EnhancedSymbolicDistiller(SymbolicDistiller):
         Y_norm = self.transformer.normalize_y(targets)
 
         from joblib import Parallel, delayed
-        results = Parallel(n_jobs=1)(
+        results = Parallel(n_jobs=-1)(
             delayed(self._distill_single_target)(i, X_norm, Y_norm, targets.shape[1], latent_states.shape[1])
             for i in range(targets.shape[1])
         )
@@ -1010,6 +1025,10 @@ class EnsembleSymbolicDistiller(EnhancedSymbolicDistiller):
             X_run = X_norm[idx]
             y_run = yi_norm[idx]
             
+            # OPTIMIZATION: If populations is small, reduce search depth and parsimony levels
+            # and set n_jobs=1 for the regressor since we parallelize at the target level
+            is_very_quick = self.populations < 500
+            
             prog, _, _ = self._distill_single_target(target_idx, X_run, y_run.reshape(-1, 1), 
                                                     targets_shape_1=n_targets, 
                                                     latent_states_shape_1=latent_dim * n_super_nodes,
@@ -1017,22 +1036,36 @@ class EnsembleSymbolicDistiller(EnhancedSymbolicDistiller):
             return prog
 
         self.confidences = []
+        
+        # 1. Prepare all tasks for global parallelization
+        all_tasks = []
         for i in range(n_targets):
-            print(f"\n[Ensemble] Distilling target {i}/{n_targets-1} (Size: {len(X_norm)}, Ensemble: {self.ensemble_size})...")
             yi_norm = Y_norm[:, i] if Y_norm.ndim > 1 else Y_norm
-            
-            # 1. Run multiple independent distillations in parallel
-            # We use a smaller number of jobs to avoid memory explosion, but enough to speed up
-            n_jobs = min(self.ensemble_size, 8) 
-            run_expressions = Parallel(n_jobs=n_jobs)(
-                delayed(run_ensemble_member)(i, X_norm, yi_norm) for _ in range(self.ensemble_size)
-            )
-            
+            for _ in range(self.ensemble_size):
+                all_tasks.append((i, yi_norm))
+        
+        print(f"\n[Ensemble] Distilling {n_targets} targets with ensemble size {self.ensemble_size} (Total tasks: {len(all_tasks)})")
+        
+        # 2. Run all tasks in parallel
+        # Use n_jobs=-1 to use all cores for the target-level parallelization
+        all_progs = Parallel(n_jobs=-1)(
+            delayed(run_ensemble_member)(t_idx, X_norm, y_norm) for t_idx, y_norm in all_tasks
+        )
+        
+        # 3. Group and Process Consensus
+        for i in range(n_targets):
+            # Extract results for this target
+            run_expressions = [all_progs[j] for j, (t_idx, _) in enumerate(all_tasks) if t_idx == i]
             run_expressions = [p for p in run_expressions if p is not None]
             
             if not run_expressions:
                 final_equations.append(None)
                 self.confidences.append(0.0)
+                continue
+
+            if self.ensemble_size == 1:
+                final_equations.append(run_expressions[0])
+                self.confidences.append(0.7)
                 continue
 
             # 2. Extract and canonicalize terms from all runs
