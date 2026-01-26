@@ -11,7 +11,7 @@ from gplearn.functions import make_function
 class PhysicsSim:
     def __init__(self, n=8, mode='lj'):
         self.n, self.mode, self.dt = n, mode, 0.01
-        self.pos = np.random.rand(n, 2) * 2.0 # More interaction
+        self.pos = np.random.rand(n, 2) * 2.0
         self.vel = np.random.randn(n, 2) * 0.1
     
     def compute_forces(self, pos):
@@ -24,7 +24,7 @@ class PhysicsSim:
             f = 24 * 1.0 * (2 * d_inv**13 - d_inv**7) * (diff / dist)
         return np.sum(np.nan_to_num(f), axis=1)
 
-    def generate(self, steps=1000):
+    def generate(self, steps=800):
         traj_p, traj_v = [], []
         for _ in range(steps):
             f = self.compute_forces(self.pos)
@@ -32,6 +32,20 @@ class PhysicsSim:
             self.pos += self.vel * self.dt
             traj_p.append(self.pos.copy()); traj_v.append(self.vel.copy())
         return torch.tensor(np.array(traj_p), dtype=torch.float32), torch.tensor(np.array(traj_v), dtype=torch.float32)
+
+class TrajectoryScaler:
+    def __init__(self):
+        self.mu_p, self.std_p = 0, 1
+        self.mu_v, self.std_v = 0, 1
+
+    def fit(self, p, v):
+        self.mu_p = p.mean(dim=(0, 1), keepdim=True)
+        self.std_p = p.std(dim=(0, 1), keepdim=True) + 1e-6
+        self.mu_v = v.mean(dim=(0, 1), keepdim=True)
+        self.std_v = v.std(dim=(0, 1), keepdim=True) + 1e-6
+
+    def transform(self, p, v):
+        return (p - self.mu_p) / self.std_p, (v - self.mu_v) / self.std_v
 
 # 2. CORE ARCHITECTURE
 class EquiLayer(MessagePassing):
@@ -68,7 +82,7 @@ class DiscoveryNet(nn.Module):
     def get_potential(self, q):
         k = q.size(1)
         q_i, q_j = q.unsqueeze(2), q.unsqueeze(1)
-        dist = torch.sqrt(torch.sum((q_i - q_j)**2, dim=-1, keepdim=True) + 1e-6)
+        dist = torch.sqrt(torch.sum((q_i - q_j)**2, dim=-1, keepdim=True) + 1e-5)
         mask = torch.triu(torch.ones(k, k, device=q.device), diagonal=1).bool()
         dist_flat = dist[:, mask]
         return self.V_pair(dist_flat).sum(dim=1)
@@ -82,18 +96,20 @@ class DiscoveryNet(nn.Module):
 # 3. TRAINING & DISCOVERY
 def train_discovery(mode='lj'):
     sim = PhysicsSim(mode=mode)
-    p_traj, v_traj = sim.generate(1000)
+    p_traj_raw, v_traj_raw = sim.generate(800)
+    scaler = TrajectoryScaler(); scaler.fit(p_traj_raw, v_traj_raw)
+    p_traj, v_traj = scaler.transform(p_traj_raw, v_traj_raw)
     
     num_particles = p_traj.size(1)
     model = DiscoveryNet(k=num_particles, particle_latent_dim=4)
-    opt = torch.optim.Adam(model.parameters(), lr=5e-4)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-4)
     
     edge_index = torch.combinations(torch.arange(num_particles)).t()
     edge_index = torch.cat([edge_index, edge_index.flip(0)], dim=1)
     
     print(f"Training Discovery Pipeline for {mode}...")
     for epoch in range(1201):
-        idx = np.random.randint(0, 950)
+        idx = np.random.randint(0, 750)
         x = torch.cat([p_traj[idx], v_traj[idx]], dim=-1)
         z, s = model.encode(x, p_traj[idx], edge_index, torch.zeros(num_particles, dtype=torch.long))
         
@@ -107,34 +123,31 @@ def train_discovery(mode='lj'):
         q_next, p_next = z_next[:, :, :2], z_next[:, :, 2:]
         a_next, _ = model.get_forces(q_next)
         p_next_pred = p + 0.5 * (a + a_next) * dt
-        
         l_dyn = torch.nn.functional.mse_loss(q_next_pred, q_next) + torch.nn.functional.mse_loss(p_next_pred, p_next)
         
-        # PHYSICAL ANCHORING (Crucial for Goal B)
         l_anchor_q = torch.nn.functional.mse_loss(q.squeeze(0), p_traj[idx])
         l_anchor_p = torch.nn.functional.mse_loss(p.squeeze(0), v_traj[idx])
 
-        w_dyn = min(200.0, epoch / 2.0)
+        w_dyn = min(100.0, epoch / 5.0)
         loss = l_rec * 0.1 + l_dyn * w_dyn + l_anchor_q * 1.0 + l_anchor_p * 1.0
         
         opt.zero_grad(); loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         
         if epoch % 200 == 0: 
-            print(f"Epoch {epoch:4d} | Loss: {loss.item():.6f} (Dyn: {l_dyn.item():.8f}, AnchQ: {l_anchor_q.item():.4f}, AnchP: {l_anchor_p.item():.4f})")
+            print(f"Epoch {epoch:4d} | Loss: {loss.item():.6f} (Dyn: {l_dyn.item():.8f}, AnchQ: {l_anchor_q.item():.4f})")
 
     print("\nDistilling Symbolic Law...")
     model.eval()
     dist_list, V_list = [], []
     with torch.no_grad():
-        test_d = torch.linspace(0.4, 3.0, 500).unsqueeze(-1)
+        test_d = torch.linspace(0.2, 5.0, 500).unsqueeze(-1)
         v_vals = model.V_pair(test_d).squeeze(-1)
         for d, v in zip(test_d, v_vals):
             dist_list.append([d.item()]); V_list.append(v.item())
 
     X_train, y_train = np.array(dist_list), np.array(V_list)
-    # Symbolic Regressor with physics bias
     inv2 = make_function(function=lambda x: 1.0/(x**2 + 1e-4), name='inv2', arity=1)
     inv6 = make_function(function=lambda x: 1.0/(x**6 + 1e-4), name='inv6', arity=1)
     est = SymbolicRegressor(population_size=5000, generations=40,
