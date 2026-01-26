@@ -47,134 +47,147 @@ class EquiLayer(MessagePassing):
         return self.f(torch.cat([x_i, x_j, dist], dim=-1))
 
 class DiscoveryNet(nn.Module):
-    def __init__(self, k=2, particle_latent_dim=4):  # Each particle has 4 latent dimensions (2 pos + 2 mom)
+    def __init__(self, k=2, particle_latent_dim=4):  # Each latent particle: 2 pos + 2 mom
         super().__init__()
-        self.k = k  # Number of particles/components
-        self.d = particle_latent_dim  # Dimensions per particle
-        self.total_latent_dim = k * particle_latent_dim  # Total dimensions
-        self.enc = EquiLayer(input_dim=4, output_dim=16)  # Input: 4 (pos+vel), Output: 16 (internal representation)
+        self.k = k
+        self.d = particle_latent_dim
+        self.d_q = particle_latent_dim // 2
+        self.enc = EquiLayer(input_dim=4, output_dim=16)
         self.pool = nn.Linear(16, k)
-        self.to_z = nn.Linear(k * 16, self.total_latent_dim)  # Changed from 16 to k*16=2*16=32, output total_latent_dim
-        self.V_net = nn.Sequential(nn.Linear(k * (particle_latent_dim//2), 32), nn.Softplus(), nn.Linear(32, 1))
-        self.dec = nn.Sequential(nn.Linear(self.total_latent_dim, 16), nn.SiLU(), nn.Linear(16, 8*4))  # Output 32 features for 8 particles
+        self.to_z = nn.Linear(16, particle_latent_dim) 
+        # Potential acting on pairwise distances
+        self.V_pair = nn.Sequential(nn.Linear(1, 32), nn.Softplus(), nn.Linear(32, 1))
+        self.dec_bridge = nn.Linear(k * particle_latent_dim, 8 * 4)
+        self.dec = nn.Sequential(nn.Linear(particle_latent_dim, 16), nn.SiLU(), nn.Linear(16, 4))
 
     def encode(self, x, pos, edge_index, batch):
         h = torch.relu(self.enc(x, pos, edge_index))
-        s = torch.softmax(self.pool(h), dim=-1)
-        # The scatter operation creates [num_batches, k, hidden_dim] = [1, 2, 16]
-        # We need to reshape or aggregate to get the final latent representation
-        pooled_h = scatter(s.unsqueeze(-1) * h.unsqueeze(1), batch, dim=0, reduce='sum')  # [1, 2, 16]
-        # Reshape to [1, 2*16] then apply a transformation to get [1, latent_dim]
-        pooled_flat = pooled_h.view(pooled_h.size(0), -1)  # [1, 2*16] = [1, 32]
-        # Apply a linear transformation to get the desired latent dimension
-        z = self.to_z(pooled_flat)  # This needs adjustment since to_z expects input size 16, not 32
+        s = torch.softmax(self.pool(h), dim=-1) # [num_nodes, k]
+        # Soft-pooling to k super-nodes
+        pooled_h = scatter(s.unsqueeze(-1) * h.unsqueeze(1), batch, dim=0, reduce='sum') # [batch, k, 16]
+        z = self.to_z(pooled_h) # [batch, k, d]
         return z, s
 
-    def get_force(self, z):
-        z = z.requires_grad_(True)
-        q = z.view(z.size(0), self.k, self.d)[:, :, :self.d//2].reshape(z.size(0), -1)
-        V = self.V_net(q)
-        dVdq = torch.autograd.grad(V.sum(), z, create_graph=True)[0]
-        # Hamiltonian: dq/dt = p, dp/dt = -dV/dq
-        p = z.view(z.size(0), self.k, 2, self.d//2)[:, :, 1].reshape(z.size(0), -1)
-        dqdt = p.reshape(z.size(0), -1)
-        dpdt = -dVdq.view(z.size(0), self.k, 2, self.d//2)[:, :, 0].reshape(z.size(0), -1)
-        return torch.cat([dqdt, dpdt], dim=-1), V
+    def decode(self, z):
+        # z: [batch, k, d]
+        h_flat = z.view(z.size(0), -1)
+        out = self.dec_bridge(h_flat)
+        return out.view(z.size(0), 8, 4)
+
+    def get_potential(self, q):
+        # q: [batch, k, d_q]
+        k = q.size(1)
+        q_i = q.unsqueeze(2) # [batch, k, 1, d_q]
+        q_j = q.unsqueeze(1) # [batch, 1, k, d_q]
+        # Differentiable norm with epsilon
+        dist = torch.sqrt(torch.sum((q_i - q_j)**2, dim=-1, keepdim=True) + 1e-6) # [batch, k, k, 1]
+        
+        mask = torch.triu(torch.ones(k, k, device=q.device), diagonal=1).bool()
+        dist_flat = dist[:, mask] # [batch, k*(k-1)/2, 1]
+        v_pairs = self.V_pair(dist_flat)
+        return v_pairs.sum(dim=1)
+
+    def get_forces(self, q):
+        q = q.requires_grad_(True)
+        V = self.get_potential(q)
+        dVdq = torch.autograd.grad(V.sum(), q, create_graph=True)[0]
+        return -dVdq, V
 
 # 3. TRAINING & DISCOVERY
 def train_discovery(mode='lj'):
     sim = PhysicsSim(mode=mode)
-    p, v = sim.generate(400)
-    model = DiscoveryNet(k=2, particle_latent_dim=4)  # Each particle has 4 dimensions (2 pos + 2 mom)
+    p_traj, v_traj = sim.generate(400)
+    model = DiscoveryNet(k=2, particle_latent_dim=4)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
     
-    # Prepare Graph Data
     edge_index = torch.combinations(torch.arange(8)).t()
     edge_index = torch.cat([edge_index, edge_index.flip(0)], dim=1)
     
     print(f"Training Neural-Hamiltonian for {mode}...")
-    for epoch in range(300):
+    for epoch in range(400):
         idx = np.random.randint(0, 350)
-        x = torch.cat([p[idx], v[idx]], dim=-1)
-        z, s = model.encode(x, p[idx], edge_index, torch.zeros(8, dtype=torch.long))
+        x = torch.cat([p_traj[idx], v_traj[idx]], dim=-1)
+        z, s = model.encode(x, p_traj[idx], edge_index, torch.zeros(8, dtype=torch.long))
         
         # Reconstruction Loss
-        # Decode the single latent vector to reconstruct all particles
-        decoded_features = model.dec(z)
-        decoded = decoded_features.view(8, 4)  # Reshape to [8, 4]
-        l_rec = torch.nn.functional.mse_loss(decoded, x)
+        decoded = model.decode(z)
+        l_rec = torch.nn.functional.mse_loss(decoded, x.unsqueeze(0))
         
-        # Hamiltonian Consistency Loss
-        dz_dt, V = model.get_force(z)
-        z_next, _ = model.encode(torch.cat([p[idx+1], v[idx+1]], dim=-1), p[idx+1], edge_index, torch.zeros(8, dtype=torch.long))
-        l_dyn = torch.nn.functional.mse_loss(z + dz_dt * sim.dt, z_next)
+        # Hamiltonian Consistency Loss (Velocity Verlet)
+        q = z[:, :, :2]
+        p = z[:, :, 2:]
+        a, V = model.get_forces(q)
         
-        loss = l_rec + l_dyn * 0.1
+        dt = sim.dt
+        q_next_pred = q + p * dt + 0.5 * a * (dt**2)
+        
+        z_next, _ = model.encode(torch.cat([p_traj[idx+1], v_traj[idx+1]], dim=-1), p_traj[idx+1], edge_index, torch.zeros(8, dtype=torch.long))
+        q_next = z_next[:, :, :2]
+        p_next = z_next[:, :, 2:]
+        
+        a_next, V_next = model.get_forces(q_next)
+        p_next_pred = p + 0.5 * (a + a_next) * dt
+        
+        l_dyn = torch.nn.functional.mse_loss(q_next_pred, q_next) + torch.nn.functional.mse_loss(p_next_pred, p_next)
+        
+        # Weighted Loss (1:1 ratio as requested)
+        loss = l_rec + l_dyn * 1.0
+        
         opt.zero_grad(); loss.backward(); opt.step()
-        if epoch % 50 == 0: print(f"Epoch {epoch} | Loss: {loss.item():.6f}")
+        if epoch % 50 == 0: print(f"Epoch {epoch} | Loss: {loss.item():.6f} (Rec: {l_rec.item():.6f}, Dyn: {l_dyn.item():.6f})")
 
     # 4. SYMBOLIC DISTILLATION
-    print("\nDistilling Symbolic Law...")
+    print("\nDistilling Symbolic Law from Pairwise Distances...")
     model.eval()
-    # Process trajectory data to collect inputs for symbolic regression
-    all_x = torch.cat([p, v], dim=-1)
-    z_list = []
-
-    # Process each time step separately (keeping gradients for symbolic regression)
-    for t_idx in range(min(100, p.size(0))):  # Limit for efficiency
-        x_t = all_x[t_idx]  # Shape: [8, 4]
-        p_t = p[t_idx]      # Shape: [8, 2]
-        z_t, _ = model.encode(x_t, p_t, edge_index, torch.zeros(8, dtype=torch.long))
-        z_list.append(z_t.detach())  # Detach for storage but compute V with fresh graph
-
-    # Now compute potentials with gradients enabled
-    q_list = []
+    dist_list = []
     V_list = []
-    for t_idx in range(len(z_list)):
-        # Recompute with gradient tracking for symbolic regression
-        x_t = all_x[t_idx]  # Shape: [8, 4]
-        p_t = p[t_idx]      # Shape: [8, 2]
-        z_t, _ = model.encode(x_t, p_t, edge_index, torch.zeros(8, dtype=torch.long))
-        z_t.requires_grad_(True)  # Enable gradients for symbolic regression
+    
+    with torch.no_grad():
+        for t_idx in range(min(200, p_traj.size(0))):
+            x_t = torch.cat([p_traj[t_idx], v_traj[t_idx]], dim=-1)
+            z_t, _ = model.encode(x_t, p_traj[t_idx], edge_index, torch.zeros(8, dtype=torch.long))
+            q_t = z_t[:, :, :2]
+            
+            # Compute pairwise distances in latent space
+            q_i = q_t.unsqueeze(2)
+            q_j = q_t.unsqueeze(1)
+            dists = torch.norm(q_i - q_j, dim=-1)
+            mask = torch.triu(torch.ones(model.k, model.k), diagonal=1).bool()
+            dist_flat = dists[0, mask]
+            
+            # We want to map each distance to its potential contribution
+            # Since V = sum(V_pair(dist)), we can just use V_pair directly if we had it
+            # But SymbolicRegressor will fit the total V. 
+            # If k=2, there is only one distance.
+            dist_list.append(dist_flat.cpu().numpy())
+            V_list.append(model.get_potential(q_t).cpu().numpy())
 
-        _, V_t = model.get_force(z_t)
-        # Extract position components for symbolic regression
-        q_t = z_t.view(1, model.k, model.d)[:, :, :model.d//2].reshape(1, -1)
-
-        q_list.append(q_t.detach().cpu().numpy())
-        V_list.append(V_t.detach().cpu().numpy())
-
-    q_all = np.vstack(q_list).squeeze()
-    y = np.hstack(V_list).squeeze()
+    X_train = np.array(dist_list) # [N, k*(k-1)/2]
+    y_train = np.array(V_list).squeeze()
 
     # Physics Basis Functions
     inv2 = make_function(function=lambda x: 1.0/(x**2 + 1e-4), name='inv2', arity=1)
     inv6 = make_function(function=lambda x: 1.0/(x**6 + 1e-4), name='inv6', arity=1)
 
-    est = SymbolicRegressor(population_size=1000, generations=20,
+    est = SymbolicRegressor(population_size=1000, generations=30,
                             function_set=('add', 'sub', 'mul', 'div', inv2, inv6),
-                            parsimony_coefficient=0.01, verbose=1)
-    est.fit(q_all, y)
+                            parsimony_coefficient=0.005, verbose=1)
+    est.fit(X_train, y_train)
 
-    print(f"\nDiscovered Potential V(q): {est._program}")
+    print(f"\nDiscovered Potential V(dist): {est._program}")
 
-    # Sympy Cleanup - Handle custom functions properly
     try:
-        # Convert the expression to a form that Sympy can handle
         expr_str = str(est._program)
-        # Replace custom functions with standard sympy notation
         expr_str = expr_str.replace('inv2(', '1/(').replace('**2)', '**2)')
         expr_str = expr_str.replace('inv6(', '1/(').replace('**6)', '**6)')
-
-        X0, X1, X2, X3 = sp.symbols('q1_x q1_y q2_x q2_y')
-        # Replace X variables with proper symbols
-        expr_str = expr_str.replace('X0', 'q1_x').replace('X1', 'q1_y').replace('X2', 'q2_x').replace('X3', 'q2_y')
-
+        
+        # X0 is the distance between the two latent particles (if k=2)
+        r = sp.symbols('r')
+        expr_str = expr_str.replace('X0', 'r')
         expr = sp.sympify(expr_str)
-        print(f"Simplified Physics: {sp.simplify(expr)}")
+        print(f"Simplified Physics: V(r) = {sp.simplify(expr)}")
     except Exception as e:
-        print(f"Could not simplify expression with Sympy: {e}")
-        print("Raw discovered expression:", est._program)
+        print(f"Raw discovered expression: {est._program}")
 
 if __name__ == "__main__":
     train_discovery(mode='lj')
