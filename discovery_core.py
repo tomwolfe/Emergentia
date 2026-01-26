@@ -10,6 +10,8 @@ import time
 # Device detection
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
 print(f"Using device: {device}")
+if device.type == 'cuda':
+    torch.backends.cudnn.benchmark = True
 
 # Custom functions for gplearn
 def _square(x):
@@ -177,15 +179,17 @@ def train_discovery(mode='lj'):
     print(f"\n--- Training Discovery Pipeline: {mode} ---")
     
     for epoch in range(2001):
-        # Calculate forces for the entire trajectory once per epoch to reuse computations
-        a_s, _ = model.get_forces(p_s)
-        
         idxs = np.random.randint(0, len(p_s)-1, size=128)
+        
+        # Optimize force calculation: Batch p_t and p_{t+1} to compute forces in one go
+        p_batch = torch.cat([p_s[idxs], p_s[idxs+1]], dim=0)
+        a_all, _ = model.get_forces(p_batch)
+        
+        a = a_all[:128]
+        a_next = a_all[128:]
+        
         q, p = p_s[idxs], v_s[idxs]
         q_next, p_next = p_s[idxs+1], v_s[idxs+1]
-        
-        a = a_s[idxs]
-        a_next = a_s[idxs+1]
         
         q_next_pred = q + p + 0.5 * a
         p_next_pred = p + 0.5 * (a + a_next)
@@ -215,9 +219,9 @@ def train_discovery(mode='lj'):
     print("\nDistilling Symbolic Force...")
     model.eval()
     
-    # Smart sampling for GPlearn: 400 log-spaced near well, 400 linear for tail
-    r_log = np.logspace(np.log10(0.05), np.log10(1.5), 400)
-    r_lin = np.linspace(1.5, 5.0, 400)
+    # Smart sampling for GPlearn: 150 log-spaced near well, 150 linear for tail
+    r_log = np.logspace(np.log10(0.05), np.log10(1.5), 150)
+    r_lin = np.linspace(1.5, 5.0, 150)
     r_samples = np.concatenate([r_log, r_lin]).astype(np.float32).reshape(-1, 1)
 
     r_torch = torch.tensor(r_samples, dtype=torch.float32, device=device, requires_grad=True)
@@ -225,9 +229,9 @@ def train_discovery(mode='lj'):
     v_vals = model.V_pair(feat)
     force_vals = -torch.autograd.grad(v_vals.sum(), r_torch)[0].cpu().detach().numpy().flatten()
 
-    est = SymbolicRegressor(population_size=800, generations=30,
+    est = SymbolicRegressor(population_size=500, generations=15,
                             function_set=('add', 'sub', 'mul', 'div', 'inv', 'neg', square),
-                            n_jobs=-1, parsimony_coefficient=0.001, 
+                            n_jobs=-1, parsimony_coefficient=0.005, 
                             verbose=0, random_state=42)
     est.fit(r_samples, force_vals)
     best_expr = str(est._program)
