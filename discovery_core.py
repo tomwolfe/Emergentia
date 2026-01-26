@@ -142,26 +142,46 @@ def validate_discovered_law(expr, mode, device='cpu'):
         f_torch_func = sp.lambdify(r_sym, expanded_expr, 'torch')
         f_torch_func = optional_compile(f_torch_func)
     except: return 1e6
+
     sim_gt = PhysicsSim(n=8, mode=mode, seed=42, device=device)
     p_gt, _ = sim_gt.generate(steps=50)
     curr_pos, curr_vel = sim_gt.pos.clone(), sim_gt.vel.clone()
     p_disc = torch.zeros_like(p_gt)
     mask = (~torch.eye(8, device=device).bool()).unsqueeze(-1)
+
     with torch.inference_mode():
         for i in range(50):
             diff = curr_pos.unsqueeze(1) - curr_pos.unsqueeze(0)
             dist = torch.norm(diff, dim=-1, keepdim=True)
             dist_clip = torch.clamp(dist, min=0.1)
+
             try:
                 mag = f_torch_func(dist_clip)
-                if not isinstance(mag, torch.Tensor): mag = torch.full_like(dist_clip, float(mag))
-                mag = torch.nan_to_num(mag, nan=0.0, posinf=1000.0, neginf=-1000.0)
-                f = torch.sum(mag * (diff / dist_clip) * mask, dim=1)
-            except: f = torch.zeros_like(curr_pos)
+                if not isinstance(mag, torch.Tensor):
+                    mag = torch.full_like(dist_clip, float(mag))
+
+                # Enhanced numerical stability: more aggressive clamping and NaN handling
+                mag = torch.nan_to_num(mag, nan=0.0, posinf=1e6, neginf=-1e6)
+                # Further clamp extremely large values to prevent simulation blow-up
+                mag = torch.clamp(mag, min=-1e6, max=1e6)
+
+                f = torch.sum(mag * (diff / torch.clamp(dist_clip, min=1e-6)) * mask, dim=1)
+            except:
+                # If evaluation fails, return a large error value
+                return 1e6
+
             curr_vel += f * sim_gt.dt
             curr_pos += curr_vel * sim_gt.dt
             p_disc[i] = curr_pos
-    return torch.mean((p_gt - p_disc)**2).item()
+
+    # Calculate MSE and handle potential numerical issues
+    mse = torch.mean((p_gt - p_disc)**2).item()
+
+    # If MSE is infinite or NaN, return a large error value
+    if not np.isfinite(mse):
+        return 1e6
+
+    return mse
 
 def extract_coefficients(expr, mode='lj'):
     """
@@ -175,12 +195,13 @@ def extract_coefficients(expr, mode='lj'):
         try:
             # First, expand and simplify the expression to get it in a standard form
             simplified_expr = sp.simplify(expr)
+            expanded_expr = sp.expand(simplified_expr)
 
             # For Lennard-Jones potential, we expect the form: 48*(1/r^13) - 24*(1/r^7)
             # Let's try to identify terms with r^(-13) and r^(-7) specifically
 
             # Approach 1: Use as_ordered_terms to separate individual terms
-            terms = simplified_expr.as_ordered_terms() if hasattr(simplified_expr, 'as_ordered_terms') else [simplified_expr]
+            terms = expanded_expr.as_ordered_terms() if hasattr(expanded_expr, 'as_ordered_terms') else [expanded_expr]
 
             coeff_r_neg13 = 0
             coeff_r_neg7 = 0
@@ -191,34 +212,83 @@ def extract_coefficients(expr, mode='lj'):
                     # Extract the coefficient of r^(-13)
                     coeff = term.as_coefficient(r**(-13))
                     if coeff is not None:
-                        coeff_r_neg13 = float(coeff)
+                        try:
+                            coeff_r_neg13 = float(coeff)
+                        except:
+                            # If conversion to float fails, try evaluating numerically
+                            coeff_r_neg13 = float(sp.N(coeff))
                     else:
                         # Alternative method: divide the term by r^(-13) and simplify
                         simplified_coeff = sp.simplify(term / r**(-13))
                         if not simplified_coeff.has(r):  # If it's just a number
-                            coeff_r_neg13 = float(simplified_coeff)
+                            try:
+                                coeff_r_neg13 = float(simplified_coeff)
+                            except:
+                                coeff_r_neg13 = 0
 
                 # Check if this term contains r^(-7)
                 elif term.has(r**(-7)):
                     # Extract the coefficient of r^(-7)
                     coeff = term.as_coefficient(r**(-7))
                     if coeff is not None:
-                        coeff_r_neg7 = float(coeff)
+                        try:
+                            coeff_r_neg7 = float(coeff)
+                        except:
+                            # If conversion to float fails, try evaluating numerically
+                            coeff_r_neg7 = float(sp.N(coeff))
                     else:
                         # Alternative method: divide the term by r^(-7) and simplify
                         simplified_coeff = sp.simplify(term / r**(-7))
                         if not simplified_coeff.has(r):  # If it's just a number
-                            coeff_r_neg7 = float(simplified_coeff)
+                            try:
+                                coeff_r_neg7 = float(simplified_coeff)
+                            except:
+                                coeff_r_neg7 = 0
 
-            # If we didn't find the expected terms, try using collect
+            # If we didn't find the expected terms with as_ordered_terms, try using collect
             if coeff_r_neg13 == 0 and coeff_r_neg7 == 0:
-                collected = sp.collect(simplified_expr, [r**(-13), r**(-7)], evaluate=False)
+                collected = sp.collect(expanded_expr, [r**(-13), r**(-7)], evaluate=False)
                 if collected:
                     for power_term, coeff in collected.items():
                         if power_term == r**(-13):
-                            coeff_r_neg13 = float(coeff) if not coeff.has(r) else 0
+                            try:
+                                coeff_r_neg13 = float(coeff) if not coeff.has(r) else 0
+                            except:
+                                coeff_r_neg13 = 0
                         elif power_term == r**(-7):
-                            coeff_r_neg7 = float(coeff) if not coeff.has(r) else 0
+                            try:
+                                coeff_r_neg7 = float(coeff) if not coeff.has(r) else 0
+                            except:
+                                coeff_r_neg7 = 0
+
+            # If still no coefficients found, try a more general approach
+            if coeff_r_neg13 == 0 and coeff_r_neg7 == 0:
+                # Try to match against the expected form: A*r^(-13) + B*r^(-7)
+                # by substituting specific values and solving
+                try:
+                    # Substitute r=1 to get an equation
+                    val_at_1 = float(expanded_expr.subs(r, 1))
+
+                    # Try to solve for coefficients by substituting multiple points
+                    r_vals = [0.5, 1.0, 1.5, 2.0]
+                    eqns = []
+                    for rval in r_vals:
+                        lhs = float(expanded_expr.subs(r, rval))
+                        rhs_A = float((rval**(-13)))
+                        rhs_B = float((rval**(-7)))
+                        eqns.append((lhs, rhs_A, rhs_B))
+
+                    # Solve the system of equations: lhs = A*rhs_A + B*rhs_B
+                    # Using least squares approach
+                    A_matrix = np.array([[eq[1], eq[2]] for eq in eqns])
+                    b_vector = np.array([eq[0] for eq in eqns])
+
+                    # Solve using least squares
+                    coeffs_fit, residuals, rank, s = np.linalg.lstsq(A_matrix, b_vector, rcond=None)
+                    coeff_r_neg13, coeff_r_neg7 = coeffs_fit[0], coeffs_fit[1]
+                except:
+                    # If all methods fail, return zeros
+                    pass
 
             return {
                 'coeff_r_neg13': coeff_r_neg13,
@@ -240,44 +310,49 @@ def extract_coefficients(expr, mode='lj'):
             r = sp.Symbol('r')
             # Simplify the expression to get it in standard form
             simplified_expr = sp.simplify(expr)
+            expanded_expr = sp.expand(simplified_expr)
 
             # The expected form is -k*(r-1) = -k*r + k
             # So we need to extract coefficients of r^1 and the constant term
-            coeff_r = simplified_expr.coeff(r, 1)  # Coefficient of r^1
-            const_term = simplified_expr.subs(r, 0)  # Constant term when r=0
+            coeff_r = expanded_expr.coeff(r, 1)  # Coefficient of r^1
+            const_term = expanded_expr.subs(r, 0)  # Constant term when r=0
 
-            # For the form -k*(r-1), we expect it to be expanded as -k*r + k
-            # So if we have -k*r + k, the coefficient of r is -k and the constant is k
-            # Therefore k = -coeff_r if the expression is in the form -k*r + k
-            # And const_term should equal k, so k should also equal const_term
-            # Take the most appropriate value based on the form
+            # For the form -k*(r-1) = -k*r + k, the coefficient of r is -k and the constant term is k
+            # So k = -coeff_r (since the coefficient of r should be -k)
+            k_from_r_coeff = -float(coeff_r) if coeff_r is not None else 0
+            k_from_const = float(const_term) if const_term is not None else 0
 
-            # More robust approach: try to factor the expression
-            factored = sp.factor(simplified_expr)
-
-            # Check if it's in the form k*(r-1) or -k*(r-1)
-            if factored.is_Mul:
-                args = factored.args
-                for arg in args:
-                    if arg.equals(r - 1):
-                        # Expression is k*(r-1), so the other factor is k
-                        k_value = abs(float(factored / (r - 1)))
-                        break
-                    elif arg.equals(-(r - 1)) or arg.equals(1 - r):
-                        # Expression is k*(-(r-1)) = -k*(r-1), so the other factor is -k
-                        k_value = abs(float(factored / (-(r - 1))))
-                        break
-                else:
-                    # If not in the exact form, use the coefficient of r
-                    k_value = abs(float(coeff_r)) if coeff_r is not None else 0
+            # Take the average if both are valid, or use the one that makes more sense
+            if abs(k_from_r_coeff - k_from_const) < 1:  # Both are similar
+                k_extracted = (abs(k_from_r_coeff) + abs(k_from_const)) / 2.0
             else:
-                # If not factored nicely, use the coefficient of r
-                k_value = abs(float(coeff_r)) if coeff_r is not None else 0
+                # Use the coefficient of r (which should be -k for -k*(r-1) form)
+                k_extracted = abs(k_from_r_coeff)
+
+            # More robust approach: try to factor the expression to match -k*(r-1)
+            try:
+                factored = sp.factor(expanded_expr)
+                # Check if it's in the form -k*(r-1) or k*(1-r)
+                if factored.is_Mul:
+                    args = factored.args
+                    for arg in args:
+                        if arg.equals(r - 1):
+                            # Expression is coeff*(r-1), so the other factor is the coefficient
+                            k_val = -abs(float(factored / (r - 1)))  # Negative because we expect -k*(r-1)
+                            k_extracted = abs(k_val)
+                            break
+                        elif arg.equals(1 - r):
+                            # Expression is coeff*(1-r), which is -coeff*(r-1), so the effective k is coeff
+                            k_val = abs(float(factored / (1 - r)))
+                            k_extracted = abs(k_val)
+                            break
+            except:
+                pass  # If factoring fails, use the coefficient-based approach
 
             return {
                 'coeff_r': float(coeff_r) if coeff_r is not None else 0,
                 'const_term': float(const_term) if const_term is not None else 0,
-                'k_extracted': k_value,
+                'k_extracted': k_extracted,
                 'expected_k': 10,  # Expected spring constant
             }
         except Exception as e:
@@ -468,37 +543,62 @@ def train_discovery(mode='lj'):
     # Use the basis functions as input variables for symbolic regression
     # For LJ mode, only use basic arithmetic operations since basis functions are provided
 
-    # Implement iterative search for parsimony_coefficient
-    p_coeff = 0.01  # Start with a low parsimony coefficient
-    max_depth_threshold = 10  # Increase only if formula depth exceeds this
+    # Implement iterative search for parsimony_coefficient with stronger basis function enforcement
+    p_coeff = 0.001  # Start with a very low parsimony coefficient to prioritize basis functions
+    max_depth_threshold = 8  # Lower threshold to prevent overly complex expressions
 
-    # Restrict function set for LJ mode to prevent 'mathematical loops'
+    # Restrict function set for LJ mode to strongly encourage use of basis functions
     if mode == 'lj':
         f_set = ['add', 'sub', 'mul', 'div']  # Allow division to help form ratios
-        # Reduced population size and generations for efficiency
-        population_size = 300  # Smaller population to focus on simpler solutions
-        generations = 30  # Increased generations for better search
+        # Use larger population and generations but with stronger basis function emphasis
+        population_size = 500  # Larger population to better explore basis combinations
+        generations = 50  # More generations to allow convergence
     else:
         f_set = ['add', 'sub', 'mul']  # Limit operations for spring too to keep it simple
-        population_size = 300  # Smaller population for consistency
-        generations = 30  # Increased generations for better search
+        population_size = 500  # Larger population for consistency
+        generations = 50  # More generations for better convergence
 
-    # Iterative search for optimal parsimony coefficient
+    # Iterative search for optimal parsimony coefficient with stronger constraints
     est = None
-    for attempt in range(5):  # Try up to 5 times with increasing parsimony
-        est = SymbolicRegressor(population_size=population_size, generations=generations, function_set=f_set,
-                                parsimony_coefficient=p_coeff, metric='mse', random_state=42,
-                                max_samples=0.9, stopping_criteria=0.0001)
+    best_est = None
+    best_score = float('-inf')
+
+    for attempt in range(8):  # Try up to 8 times with different parsimony values
+        est = SymbolicRegressor(population_size=population_size,
+                                generations=generations,
+                                function_set=f_set,
+                                parsimony_coefficient=p_coeff,
+                                metric='mse',
+                                random_state=42,
+                                max_samples=0.9,
+                                stopping_criteria=0.0001,
+                                const_range=(-50.0, 50.0),  # Wider constant range for better fitting
+                                init_depth=(2, 6),  # Moderate initial depth
+                                init_method='half and half',
+                                verbose=0)
+
         est.fit(X_basis, f_mag_phys)
 
-        # Check if the formula depth is acceptable
-        if est._program.depth_ <= max_depth_threshold:
-            break  # Acceptable depth, stop searching
+        # Evaluate the current estimator
+        score = -est._program.raw_fitness_  # Negative because lower MSE is better
 
-        # If depth is too high, increase parsimony coefficient and try again
-        p_coeff *= 2.0  # Double the parsimony coefficient
-        print(f"Parsimony attempt {attempt+1}: depth={est._program.depth_}, p_coeff={p_coeff:.4f}")
+        # Check if this is the best performing model so far
+        if score > best_score:
+            best_score = score
+            best_est = est
+            # Check if the formula depth is acceptable
+            if est._program.depth_ <= max_depth_threshold:
+                break  # Acceptable depth and good performance, stop searching
 
+        # If depth is too high or performance is poor, adjust parsimony coefficient
+        if est._program.depth_ > max_depth_threshold:
+            p_coeff *= 1.5  # Increase parsimony to penalize complexity
+        else:
+            p_coeff *= 0.8  # Slightly decrease to allow more complexity if depth is OK
+        print(f"Parsimony attempt {attempt+1}: depth={est._program.depth_}, p_coeff={p_coeff:.4f}, raw_fitness={est._program.raw_fitness_:.4f}")
+
+    # Use the best estimator found
+    est = best_est
     print(f"Final parsimony coefficient: {p_coeff:.4f}, depth: {est._program.depth_}")
 
     # Map the symbolic regressor variables (X0, X1, etc.) back to physical variables (r)
