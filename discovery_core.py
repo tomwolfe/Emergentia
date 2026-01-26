@@ -125,8 +125,10 @@ def validate_discovered_law(expr, mode, scaler, n_particles=16):
 
 # 2. CORE ARCHITECTURE
 class DiscoveryNet(nn.Module):
-    def __init__(self):
+    def __init__(self, n=12):
         super().__init__()
+        self.n = n
+        self.register_buffer('mask', ~torch.eye(n).bool())
         self.V_pair = nn.Sequential(
             nn.Linear(3, 128), 
             nn.Tanh(), 
@@ -140,9 +142,8 @@ class DiscoveryNet(nn.Module):
         dist = torch.norm(diff, dim=-1, keepdim=True)
         dist = torch.clamp(dist, min=0.05)
         
-        n = pos_scaled.size(1)
-        mask = ~torch.eye(n, device=pos_scaled.device).bool()
-        dist_flat = dist[:, mask].view(pos_scaled.size(0), -1, 1)
+        # Use pre-calculated mask
+        dist_flat = dist[:, self.mask].view(pos_scaled.size(0), -1, 1)
         
         r = dist_flat
         features = torch.cat([r, 1.0/r, 1.0/(r**2)], dim=-1)
