@@ -23,7 +23,7 @@ class PhysicsSim:
             f = 24 * 1.0 * (2 * (1.0/dist)**13 - (1.0/dist)**7) * (diff / dist)
         return np.sum(np.nan_to_num(f), axis=1)
 
-    def generate(self, steps=200):
+    def generate(self, steps=400):
         traj_p, traj_v = [], []
         for _ in range(steps):
             f = self.compute_forces(self.pos)
@@ -32,12 +32,27 @@ class PhysicsSim:
             traj_p.append(self.pos.copy()); traj_v.append(self.vel.copy())
         return torch.tensor(np.array(traj_p), dtype=torch.float32), torch.tensor(np.array(traj_v), dtype=torch.float32)
 
+class TrajectoryScaler:
+    def __init__(self):
+        self.mu_p, self.std_p = 0, 1
+        self.mu_v, self.std_v = 0, 1
+
+    def fit(self, p, v):
+        self.mu_p = p.mean(dim=(0, 1), keepdim=True)
+        self.std_p = p.std(dim=(0, 1), keepdim=True) + 1e-6
+        self.mu_v = v.mean(dim=(0, 1), keepdim=True)
+        self.std_v = v.std(dim=(0, 1), keepdim=True) + 1e-6
+
+    def transform(self, p, v):
+        return (p - self.mu_p) / self.std_p, (v - self.mu_v) / self.std_v
+
+    def inverse_transform(self, p_norm, v_norm):
+        return p_norm * self.std_p + self.mu_p, v_norm * self.std_v + self.mu_v
+
 # 2. CORE ARCHITECTURE
 class EquiLayer(MessagePassing):
     def __init__(self, input_dim, output_dim=16):
         super().__init__(aggr='mean')
-        self.input_dim = input_dim
-        self.output_dim = output_dim
         self.f = nn.Sequential(nn.Linear(input_dim*2 + 1, output_dim), nn.SiLU(), nn.Linear(output_dim, output_dim))
     def forward(self, x, pos, edge_index):
         rel_pos = pos[edge_index[0]] - pos[edge_index[1]]
@@ -47,43 +62,36 @@ class EquiLayer(MessagePassing):
         return self.f(torch.cat([x_i, x_j, dist], dim=-1))
 
 class DiscoveryNet(nn.Module):
-    def __init__(self, k=2, particle_latent_dim=4):  # Each latent particle: 2 pos + 2 mom
+    def __init__(self, k=2, particle_latent_dim=4):
         super().__init__()
         self.k = k
         self.d = particle_latent_dim
-        self.d_q = particle_latent_dim // 2
         self.enc = EquiLayer(input_dim=4, output_dim=16)
         self.pool = nn.Linear(16, k)
         self.to_z = nn.Linear(16, particle_latent_dim) 
-        # Potential acting on pairwise distances
         self.V_pair = nn.Sequential(nn.Linear(1, 32), nn.Softplus(), nn.Linear(32, 1))
-        self.dec_bridge = nn.Linear(k * particle_latent_dim, 8 * 4)
         self.dec = nn.Sequential(nn.Linear(particle_latent_dim, 16), nn.SiLU(), nn.Linear(16, 4))
 
     def encode(self, x, pos, edge_index, batch):
         h = torch.relu(self.enc(x, pos, edge_index))
         s = torch.softmax(self.pool(h), dim=-1) # [num_nodes, k]
-        # Soft-pooling to k super-nodes
         pooled_h = scatter(s.unsqueeze(-1) * h.unsqueeze(1), batch, dim=0, reduce='sum') # [batch, k, 16]
         z = self.to_z(pooled_h) # [batch, k, d]
         return z, s
 
-    def decode(self, z):
-        # z: [batch, k, d]
-        h_flat = z.view(z.size(0), -1)
-        out = self.dec_bridge(h_flat)
-        return out.view(z.size(0), 8, 4)
+    def decode(self, z, s):
+        # General Decoder: maps k super-nodes back to N particles using assignment s
+        # z: [batch, k, d], s: [num_nodes, k]
+        h_nodes = torch.matmul(s, z) # [batch, num_nodes, d]
+        return self.dec(h_nodes)
 
     def get_potential(self, q):
-        # q: [batch, k, d_q]
         k = q.size(1)
-        q_i = q.unsqueeze(2) # [batch, k, 1, d_q]
-        q_j = q.unsqueeze(1) # [batch, 1, k, d_q]
-        # Differentiable norm with epsilon
-        dist = torch.sqrt(torch.sum((q_i - q_j)**2, dim=-1, keepdim=True) + 1e-6) # [batch, k, k, 1]
-        
+        q_i = q.unsqueeze(2)
+        q_j = q.unsqueeze(1)
+        dist = torch.sqrt(torch.sum((q_i - q_j)**2, dim=-1, keepdim=True) + 1e-6)
         mask = torch.triu(torch.ones(k, k, device=q.device), diagonal=1).bool()
-        dist_flat = dist[:, mask] # [batch, k*(k-1)/2, 1]
+        dist_flat = dist[:, mask]
         v_pairs = self.V_pair(dist_flat)
         return v_pairs.sum(dim=1)
 
@@ -96,98 +104,96 @@ class DiscoveryNet(nn.Module):
 # 3. TRAINING & DISCOVERY
 def train_discovery(mode='lj'):
     sim = PhysicsSim(mode=mode)
-    p_traj, v_traj = sim.generate(400)
+    p_traj_raw, v_traj_raw = sim.generate(400)
+    
+    scaler = TrajectoryScaler()
+    scaler.fit(p_traj_raw, v_traj_raw)
+    p_traj, v_traj = scaler.transform(p_traj_raw, v_traj_raw)
+    
     model = DiscoveryNet(k=2, particle_latent_dim=4)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
     
-    edge_index = torch.combinations(torch.arange(8)).t()
+    num_particles = p_traj.size(1)
+    edge_index = torch.combinations(torch.arange(num_particles)).t()
     edge_index = torch.cat([edge_index, edge_index.flip(0)], dim=1)
     
     print(f"Training Neural-Hamiltonian for {mode}...")
     for epoch in range(400):
         idx = np.random.randint(0, 350)
         x = torch.cat([p_traj[idx], v_traj[idx]], dim=-1)
-        z, s = model.encode(x, p_traj[idx], edge_index, torch.zeros(8, dtype=torch.long))
+        z, s = model.encode(x, p_traj[idx], edge_index, torch.zeros(num_particles, dtype=torch.long))
         
         # Reconstruction Loss
-        decoded = model.decode(z)
+        decoded = model.decode(z, s)
         l_rec = torch.nn.functional.mse_loss(decoded, x.unsqueeze(0))
         
         # Hamiltonian Consistency Loss (Velocity Verlet)
-        q = z[:, :, :2]
-        p = z[:, :, 2:]
+        q, p = z[:, :, :2], z[:, :, 2:]
         a, V = model.get_forces(q)
         
         dt = sim.dt
         q_next_pred = q + p * dt + 0.5 * a * (dt**2)
         
-        z_next, _ = model.encode(torch.cat([p_traj[idx+1], v_traj[idx+1]], dim=-1), p_traj[idx+1], edge_index, torch.zeros(8, dtype=torch.long))
-        q_next = z_next[:, :, :2]
-        p_next = z_next[:, :, 2:]
+        x_next = torch.cat([p_traj[idx+1], v_traj[idx+1]], dim=-1)
+        z_next, _ = model.encode(x_next, p_traj[idx+1], edge_index, torch.zeros(num_particles, dtype=torch.long))
+        q_next, p_next = z_next[:, :, :2], z_next[:, :, 2:]
         
-        a_next, V_next = model.get_forces(q_next)
+        a_next, _ = model.get_forces(q_next)
         p_next_pred = p + 0.5 * (a + a_next) * dt
-        
         l_dyn = torch.nn.functional.mse_loss(q_next_pred, q_next) + torch.nn.functional.mse_loss(p_next_pred, p_next)
         
-        # Weighted Loss (1:1 ratio as requested)
-        loss = l_rec + l_dyn * 1.0
+        # Centroid Alignment Loss
+        # target_q should match the centroid of particles in s
+        centroids = torch.matmul(s.t(), p_traj[idx]) / (s.sum(0, keepdim=True).t() + 1e-6)
+        l_centroid = torch.nn.functional.mse_loss(q.squeeze(0), centroids)
+
+        # Weight Scheduler
+        w_dyn = min(1.0, epoch / 200.0)
+        loss = l_rec + l_dyn * w_dyn + l_centroid * 0.1
         
-        opt.zero_grad(); loss.backward(); opt.step()
-        if epoch % 50 == 0: print(f"Epoch {epoch} | Loss: {loss.item():.6f} (Rec: {l_rec.item():.6f}, Dyn: {l_dyn.item():.6f})")
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+        
+        if epoch % 50 == 0: 
+            print(f"Epoch {epoch} | Loss: {loss.item():.6f} (Rec: {l_rec.item():.4f}, Dyn: {l_dyn.item():.4f}, Cent: {l_centroid.item():.4f})")
 
     # 4. SYMBOLIC DISTILLATION
-    print("\nDistilling Symbolic Law from Pairwise Distances...")
+    print("\nDistilling Symbolic Law...")
     model.eval()
-    dist_list = []
-    V_list = []
+    dist_list, V_list = [], []
     
     with torch.no_grad():
         for t_idx in range(min(200, p_traj.size(0))):
             x_t = torch.cat([p_traj[t_idx], v_traj[t_idx]], dim=-1)
-            z_t, _ = model.encode(x_t, p_traj[t_idx], edge_index, torch.zeros(8, dtype=torch.long))
+            z_t, _ = model.encode(x_t, p_traj[t_idx], edge_index, torch.zeros(num_particles, dtype=torch.long))
             q_t = z_t[:, :, :2]
-            
-            # Compute pairwise distances in latent space
-            q_i = q_t.unsqueeze(2)
-            q_j = q_t.unsqueeze(1)
-            dists = torch.norm(q_i - q_j, dim=-1)
-            mask = torch.triu(torch.ones(model.k, model.k), diagonal=1).bool()
-            dist_flat = dists[0, mask]
-            
-            # We want to map each distance to its potential contribution
-            # Since V = sum(V_pair(dist)), we can just use V_pair directly if we had it
-            # But SymbolicRegressor will fit the total V. 
-            # If k=2, there is only one distance.
-            dist_list.append(dist_flat.cpu().numpy())
-            V_list.append(model.get_potential(q_t).cpu().numpy())
+            dist = torch.norm(q_t[0, 0] - q_t[0, 1])
+            dist_list.append([dist.item()])
+            V_list.append(model.get_potential(q_t).item())
 
-    X_train = np.array(dist_list) # [N, k*(k-1)/2]
-    y_train = np.array(V_list).squeeze()
-
-    # Physics Basis Functions
+    X_train, y_train = np.array(dist_list), np.array(V_list)
     inv2 = make_function(function=lambda x: 1.0/(x**2 + 1e-4), name='inv2', arity=1)
     inv6 = make_function(function=lambda x: 1.0/(x**6 + 1e-4), name='inv6', arity=1)
 
     est = SymbolicRegressor(population_size=1000, generations=30,
                             function_set=('add', 'sub', 'mul', 'div', inv2, inv6),
-                            parsimony_coefficient=0.005, verbose=1)
+                            parsimony_coefficient=0.01, verbose=0)
     est.fit(X_train, y_train)
 
-    print(f"\nDiscovered Potential V(dist): {est._program}")
-
+    print(f"Raw Expression: {est._program}")
     try:
-        expr_str = str(est._program)
-        expr_str = expr_str.replace('inv2(', '1/(').replace('**2)', '**2)')
-        expr_str = expr_str.replace('inv6(', '1/(').replace('**6)', '**6)')
-        
-        # X0 is the distance between the two latent particles (if k=2)
-        r = sp.symbols('r')
-        expr_str = expr_str.replace('X0', 'r')
-        expr = sp.sympify(expr_str)
-        print(f"Simplified Physics: V(r) = {sp.simplify(expr)}")
-    except Exception as e:
-        print(f"Raw discovered expression: {est._program}")
+        locals_dict = {
+            'add': lambda a, b: a + b, 'sub': lambda a, b: a - b,
+            'mul': lambda a, b: a * b, 'div': lambda a, b: a / b,
+            'inv2': lambda a: 1.0 / a**2, 'inv6': lambda a: 1.0 / a**6,
+            'X0': sp.Symbol('r')
+        }
+        expr = sp.sympify(str(est._program), locals=locals_dict)
+        print(f"Simplified Discovered Potential: V(r) = {sp.simplify(expr)}")
+    except:
+        print("SymPy simplification failed, but regression succeeded.")
 
 if __name__ == "__main__":
     train_discovery(mode='lj')
