@@ -157,35 +157,42 @@ class DiscoveryNet(nn.Module):
 
 # 3. TRAINING & DISCOVERY
 def train_discovery(mode='lj'):
+    t_start = time.time()
     sim = PhysicsSim(mode=mode)
     p_traj, v_traj = sim.generate(1500)
     
     scaler = TrajectoryScaler(dt=sim.dt)
     scaler.fit(p_traj, v_traj)
     p_s, v_s = scaler.transform(p_traj, v_traj)
+    p_s, v_s = p_s.to(device), v_s.to(device)
     
-    model = DiscoveryNet()
+    model = DiscoveryNet().to(device)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=2000)
+    
+    # Pre-calculate consistency features
+    r_large = torch.linspace(2.0, 5.0, 20, device=device).view(-1, 1)
+    feat_large = torch.cat([r_large, 1.0/r_large, 1.0/(r_large**2)], dim=-1)
     
     print(f"\n--- Training Discovery Pipeline: {mode} ---")
     
     for epoch in range(2001):
+        # Calculate forces for the entire trajectory once per epoch to reuse computations
+        a_s, _ = model.get_forces(p_s)
+        
         idxs = np.random.randint(0, len(p_s)-1, size=128)
         q, p = p_s[idxs], v_s[idxs]
         q_next, p_next = p_s[idxs+1], v_s[idxs+1]
         
-        a, V = model.get_forces(q)
+        a = a_s[idxs]
+        a_next = a_s[idxs+1]
         
         q_next_pred = q + p + 0.5 * a
-        a_next, _ = model.get_forces(q_next)
         p_next_pred = p + 0.5 * (a + a_next)
         
         l_dyn = torch.nn.functional.mse_loss(q_next_pred, q_next) + \
                 torch.nn.functional.mse_loss(p_next_pred, p_next)
 
-        r_large = torch.linspace(2.0, 5.0, 20).view(-1, 1)
-        feat_large = torch.cat([r_large, 1.0/r_large, 1.0/(r_large**2)], dim=-1)
         v_inf = model.V_pair(feat_large)
         l_cons = torch.mean(v_inf**2)
         
@@ -202,28 +209,30 @@ def train_discovery(mode='lj'):
             a_mag = a.abs().mean().item()
             print(f"Epoch {epoch:4d} | Loss: {loss.item():.4e} | Dyn: {l_dyn.item():.4e} | a_mag: {a_mag:.4e}")
 
+    t_train = time.time()
+    print(f"Training Phase Duration: {t_train - t_start:.2f}s")
+    
     print("\nDistilling Symbolic Force...")
     model.eval()
     
-    diff = p_s[::10].unsqueeze(2) - p_s[::10].unsqueeze(1)
-    dist = torch.norm(diff, dim=-1)
-    mask = (dist > 0.05) & (dist < 5.0)
-    r_samples = dist[mask].detach().numpy()
-    if len(r_samples) > 2000:
-        r_samples = np.random.choice(r_samples, 2000, replace=False)
-    r_samples = np.sort(r_samples).reshape(-1, 1)
+    # Smart sampling for GPlearn: 400 log-spaced near well, 400 linear for tail
+    r_log = np.logspace(np.log10(0.05), np.log10(1.5), 400)
+    r_lin = np.linspace(1.5, 5.0, 400)
+    r_samples = np.concatenate([r_log, r_lin]).astype(np.float32).reshape(-1, 1)
 
-    r_torch = torch.tensor(r_samples, dtype=torch.float32, requires_grad=True)
+    r_torch = torch.tensor(r_samples, dtype=torch.float32, device=device, requires_grad=True)
     feat = torch.cat([r_torch, 1.0/r_torch, 1.0/(r_torch**2)], dim=-1)
     v_vals = model.V_pair(feat)
-    force_vals = -torch.autograd.grad(v_vals.sum(), r_torch)[0].detach().numpy().flatten()
+    force_vals = -torch.autograd.grad(v_vals.sum(), r_torch)[0].cpu().detach().numpy().flatten()
 
-    est = SymbolicRegressor(population_size=2000, generations=50,
+    est = SymbolicRegressor(population_size=800, generations=30,
                             function_set=('add', 'sub', 'mul', 'div', 'inv', 'neg', square),
                             n_jobs=-1, parsimony_coefficient=0.001, 
                             verbose=0, random_state=42)
     est.fit(r_samples, force_vals)
     best_expr = str(est._program)
+    t_symbolic = time.time()
+    print(f"Symbolic Phase Duration: {t_symbolic - t_train:.2f}s")
 
     try:
         locals_dict = {'add':lambda a,b:a+b, 'sub':lambda a,b:a-b, 'mul':lambda a,b:a*b, 
@@ -233,15 +242,17 @@ def train_discovery(mode='lj'):
         print(f"SUCCESS: Discovered F_scaled(r_scaled) = {expr}")
         
         mse = validate_discovered_law(expr, mode, scaler)
+        t_val = time.time()
+        print(f"Validation Phase Duration: {t_val - t_symbolic:.2f}s")
         
         r_plot = np.linspace(max(0.1, r_samples.min()), min(5.0, r_samples.max()), 100)
         r_plot_phys = r_plot * scaler.p_scale
         v_gt = np.array([sim.get_ground_truth_potential(r) for r in r_plot_phys])
         
         with torch.no_grad():
-            r_t = torch.tensor(r_plot.reshape(-1, 1), dtype=torch.float32)
+            r_t = torch.tensor(r_plot.reshape(-1, 1), dtype=torch.float32, device=device)
             feat_p = torch.cat([r_t, 1.0/r_t, 1.0/(r_t**2)], dim=-1)
-            v_nn_scaled = model.V_pair(feat_p).numpy().flatten()
+            v_nn_scaled = model.V_pair(feat_p).cpu().numpy().flatten()
             v_nn = v_nn_scaled * (scaler.p_scale**2 / sim.dt**2)
             v_nn -= (v_nn[-1] - v_gt[-1])
 
