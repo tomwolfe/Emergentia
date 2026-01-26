@@ -10,6 +10,7 @@ import warnings
 import os
 import datetime
 import concurrent.futures
+from concurrent.futures import ProcessPoolExecutor
 
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
@@ -261,30 +262,41 @@ def train_discovery(mode='lj'):
     p_traj, f_traj = sim.generate(1200)
     scaler = TrajectoryScaler(mode=mode)
     p_s, f_s = scaler.transform(p_traj, f_traj)
+    
     # Train DiscoveryNet with default hidden size first
     model = DiscoveryNet(n_particles=sim.n, hidden_size=128).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-4)
-    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, 'min', patience=50, factor=0.5)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, 'min', patience=25, factor=0.5)
 
     print(f"\n--- Training {mode} on {device} ---")
     best_loss = 1e6
-    epochs = 400 if mode == 'spring' else 1200
+    epochs = 200 if mode == 'spring' else 600  # Reduced epochs
     patience_counter = 0
-    patience_limit = 100  # Number of epochs to wait before considering convergence
-    min_epochs = 50  # Minimum number of epochs to train before allowing early stopping
+    patience_limit = 15  # Reduced patience for early stopping
+    min_epochs = 20  # Reduced min_epochs
+    
+    # Track previous losses for early stopping based on minimal improvement
+    prev_losses = []
+    improvement_threshold = 1e-7
 
     for epoch in range(epochs):
         idxs = np.random.randint(0, p_s.shape[0], size=512)
         f_pred = model(p_s[idxs])
         loss = torch.nn.functional.mse_loss(f_pred, f_s[idxs])
         opt.zero_grad(); loss.backward(); opt.step(); sched.step(loss.detach())
+        
         if loss.item() < best_loss:
             best_loss = loss.item()
             patience_counter = 0  # Reset patience counter when we find a better loss
         else:
             patience_counter += 1
 
-        if epoch % 200 == 0: print(f"Epoch {epoch} | Loss: {loss.item():.2e}")
+        # Track recent losses for improvement checking
+        prev_losses.append(loss.item())
+        if len(prev_losses) > 15:  # Keep last 15 losses
+            prev_losses.pop(0)
+
+        if epoch % 100 == 0: print(f"Epoch {epoch} | Loss: {loss.item():.2e}")
 
         # Early stopping: if loss is below threshold AND we've trained for minimum epochs, break the loop
         threshold = 0.05 if mode == 'spring' else 0.5
@@ -296,36 +308,56 @@ def train_discovery(mode='lj'):
         if patience_counter >= patience_limit and epoch >= min_epochs:
             print(f"No improvement for {patience_limit} epochs, stopping at epoch {epoch}")
             break
+            
+        # Check for minimal improvement over recent epochs
+        if len(prev_losses) >= 15:
+            recent_improvement = abs(prev_losses[0] - prev_losses[-1])
+            if recent_improvement < improvement_threshold and epoch >= min_epochs:
+                print(f"Loss improvement too small ({recent_improvement:.2e}), stopping at epoch {epoch}")
+                break
 
     threshold = 0.05 if mode == 'spring' else 0.5
 
-    # Short-Circuit: If the 128-hidden network reaches the threshold, skip the 32-hidden network training entirely
-    # (Since we only enter this condition if best_loss > threshold, the short-circuit is already implemented)
-    if best_loss > threshold:
+    # Check if the loss is within 2x of the threshold - if so, don't retry with smaller network
+    if best_loss <= threshold * 2:  # Within 2x of threshold, skip smaller network
+        print(f"Initial NN Loss {best_loss:.4f} is within 2x threshold, skipping smaller hidden layer...")
+    elif best_loss > threshold:
         print(f"Initial NN Loss {best_loss:.4f} > {threshold}, trying smaller hidden layer...")
         # Retrain with smaller hidden layer (32 neurons) to force smoother representation
         # Use even smaller learning rate for fine-tuning
         model = DiscoveryNet(n_particles=sim.n, hidden_size=32).to(device)
         opt = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)
-        sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, 'min', patience=50, factor=0.5)
+        sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, 'min', patience=25, factor=0.5)
 
         best_loss = 1e6
         patience_counter = 0
-        patience_limit = 100  # Number of epochs to wait before considering convergence
-        min_epochs = 50  # Minimum number of epochs to train before allowing early stopping
+        patience_limit = 15  # Reduced patience for early stopping
+        min_epochs = 20  # Reduced min_epochs
+        
+        # Track previous losses for early stopping based on minimal improvement
+        prev_losses = []
+        improvement_threshold = 1e-7
+
+        epochs = 200 if mode == 'spring' else 600  # Same reduced epochs for smaller network
 
         for epoch in range(epochs):
             idxs = np.random.randint(0, p_s.shape[0], size=512)
             f_pred = model(p_s[idxs])
             loss = torch.nn.functional.mse_loss(f_pred, f_s[idxs])
             opt.zero_grad(); loss.backward(); opt.step(); sched.step(loss.detach())
+            
             if loss.item() < best_loss:
                 best_loss = loss.item()
                 patience_counter = 0  # Reset patience counter when we find a better loss
             else:
                 patience_counter += 1
 
-            if epoch % 200 == 0: print(f"Epoch {epoch} (smaller net) | Loss: {loss.item():.2e}")
+            # Track recent losses for improvement checking
+            prev_losses.append(loss.item())
+            if len(prev_losses) > 15:  # Keep last 15 losses
+                prev_losses.pop(0)
+
+            if epoch % 100 == 0: print(f"Epoch {epoch} (smaller net) | Loss: {loss.item():.2e}")
 
             # Early stopping: if loss is below threshold AND we've trained for minimum epochs, break the loop
             if loss.item() < threshold and epoch >= min_epochs:
@@ -336,6 +368,13 @@ def train_discovery(mode='lj'):
             if patience_counter >= patience_limit and epoch >= min_epochs:
                 print(f"No improvement for {patience_limit} epochs, stopping at epoch {epoch} (smaller net)")
                 break
+                
+            # Check for minimal improvement over recent epochs
+            if len(prev_losses) >= 15:
+                recent_improvement = abs(prev_losses[0] - prev_losses[-1])
+                if recent_improvement < improvement_threshold and epoch >= min_epochs:
+                    print(f"Loss improvement too small ({recent_improvement:.2e}), stopping at epoch {epoch} (smaller net)")
+                    break
 
     if best_loss > threshold:
         print(f"Skipping SR: NN Loss {best_loss:.4f} > {threshold}")
@@ -347,7 +386,7 @@ def train_discovery(mode='lj'):
 
     # Create the same basis functions that the neural network uses internally
     dist_tensor = torch.tensor(r_phys / scaler.p_scale, device=device, dtype=torch.float32)
-    with torch.no_grad():
+    with torch.inference_mode():
         # Get the features that the neural network uses internally
         features = model._get_features(dist_tensor)
         f_mag_phys = scaler.inverse_transform_f(model.predict_mag(torch.tensor(r_phys/scaler.p_scale, device=device))).cpu().numpy().ravel()
@@ -369,42 +408,24 @@ def train_discovery(mode='lj'):
 
     # Use the basis functions as input variables for symbolic regression
     # For LJ mode, only use basic arithmetic operations since basis functions are provided
-    p_coeff = 0.05  # Increased p_coeff to strongly favor simpler formulas
+    p_coeff = 0.1  # Increased p_coeff to strongly favor simpler formulas
 
     # Restrict function set for LJ mode to prevent 'mathematical loops'
     if mode == 'lj':
         f_set = ['add', 'sub', 'mul']
-        # Increase population size and generations for LJ mode to allow more exploration
-        # within the restricted function set
-        population_size = 2000
-        generations = 25
+        # Reduced population size and generations for efficiency
+        population_size = 500
+        generations = 10
     else:
         f_set = ['add', 'sub', 'mul']  # Limit operations for spring too to keep it simple
-        population_size = 1000
-        generations = 15
+        population_size = 500
+        generations = 10
 
-    # Single fit with one retry option instead of the attempt loop
+    # Single fit without retry logic
     est = SymbolicRegressor(population_size=population_size, generations=generations, function_set=f_set,
                             parsimony_coefficient=p_coeff, metric='mse', random_state=42,
                             max_samples=0.9, stopping_criteria=0.0001)
     est.fit(X_basis, f_mag_phys)
-
-    # If the result is poor, do exactly one retry with different parameters
-    if est._program.depth_ > 10 or est._program.depth_ == 0:  # If formula depth exceeds 10 or is 0 (constant), try again
-        print(f"Depth {est._program.depth_} unsuitable, retrying with adjusted parameters")
-        # Use different parameters for retry depending on the mode
-        if mode == 'lj':
-            # For LJ mode, try with different population size and generations to find both terms
-            est_retry = SymbolicRegressor(population_size=3000, generations=30, function_set=f_set,
-                                          parsimony_coefficient=p_coeff, metric='mse', random_state=43,
-                                          max_samples=0.9, stopping_criteria=0.0001)
-        else:
-            # For spring mode, try with higher parsimony to get simpler formula
-            est_retry = SymbolicRegressor(population_size=population_size, generations=generations, function_set=f_set,
-                                          parsimony_coefficient=p_coeff * 3, metric='mse', random_state=43,
-                                          max_samples=0.9, stopping_criteria=0.0001)
-        est_retry.fit(X_basis, f_mag_phys)
-        est = est_retry  # Use the retry result
 
     # Map the symbolic regressor variables (X0, X1, etc.) back to physical variables (r)
     # The X_basis contains features derived from r, so we need to map them back properly
@@ -512,15 +533,12 @@ def run_single_mode(mode):
         return f"Error in {mode}: {str(e)}"
 
 if __name__ == "__main__":
-
     modes = ['spring', 'lj']
 
     print(f"Starting discovery on {len(modes)} modes in parallel...")
 
-    # Use ThreadPoolExecutor instead of ProcessPoolExecutor to avoid pickling issues
-    # with complex PyTorch objects and compiled functions
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-
+    # Use ProcessPoolExecutor instead of ThreadPoolExecutor to bypass GIL
+    with ProcessPoolExecutor() as executor:
         futures = {executor.submit(run_single_mode, mode): mode for mode in modes}
 
         results = []
@@ -529,9 +547,8 @@ if __name__ == "__main__":
             try:
                 results.append(future.result())
             except Exception as e:
-                print(f"Exception in thread for mode {futures[future]}: {e}")
-
+                print(f"Exception in process for mode {futures[future]}: {e}")
 
     print("\n--- Final Results ---")
-
-    for r in results: print(r)
+    for r in results: 
+        print(r)
