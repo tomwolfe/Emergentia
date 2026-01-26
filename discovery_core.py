@@ -88,12 +88,12 @@ def validate_discovered_law(expr, mode, n_particles=8, device='cpu'):
         return 1e6
 
     sim_gt = PhysicsSim(n=n_particles, mode=mode, seed=42, device=device)
-    p_gt, _, _ = sim_gt.generate(steps=100)
+    p_gt, _, _ = sim_gt.generate(steps=50)
     curr_pos, curr_vel = sim_gt.pos.clone(), sim_gt.vel.clone()
-    p_disc = torch.zeros((100, n_particles, 2), device=device)
+    p_disc = torch.zeros((50, n_particles, 2), device=device)
     
     with torch.inference_mode():
-        for i in range(100):
+        for i in range(50):
             diff = curr_pos.unsqueeze(1) - curr_pos.unsqueeze(0)
             dist = torch.norm(diff, dim=-1, keepdim=True)
             dist_clip = torch.clamp(dist, min=1e-8)
@@ -150,7 +150,7 @@ class DiscoveryNet(nn.Module):
 def train_discovery(mode='lj'):
     device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
     sim = PhysicsSim(mode=mode, device=device)
-    p_traj, v_traj, f_traj = sim.generate(1500)
+    p_traj, v_traj, f_traj = sim.generate(1000)
     scaler = TrajectoryScaler(mode=mode)
     p_s, f_s = scaler.transform(p_traj, f_traj)
     
@@ -158,7 +158,7 @@ def train_discovery(mode='lj'):
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
     
     print(f"--- Training: {mode} on {device} ---")
-    for epoch in range(501):
+    for epoch in range(301):
         idxs = np.random.randint(0, p_s.shape[0], size=512)
         f_pred = model(p_s[idxs])
         loss = torch.nn.functional.mse_loss(f_pred, f_s[idxs])
@@ -167,11 +167,15 @@ def train_discovery(mode='lj'):
         loss.backward()
         opt.step()
         
+        if loss.item() < 1e-5:
+            print(f"[{mode}] Converged at epoch {epoch} | Loss: {loss.item():.2e}")
+            break
+
         if epoch % 100 == 0: 
             print(f"[{mode}] Epoch {epoch} | Loss: {loss.item():.2e}")
 
     # Symbolic Extraction
-    r_phys = np.linspace(0.8 if mode == 'lj' else 0.4, 4.0, 500).astype(np.float32).reshape(-1, 1)
+    r_phys = np.linspace(0.8 if mode == 'lj' else 0.4, 4.0, 150).astype(np.float32).reshape(-1, 1)
     r_scaled = torch.tensor(r_phys / scaler.p_scale, dtype=torch.float32, device=device)
     
     with torch.no_grad():
@@ -179,9 +183,12 @@ def train_discovery(mode='lj'):
     
     f_mag_phys = scaler.inverse_transform_f(f_mag_scaled).ravel()
 
-    # Spring should be simpler, LJ can be complex
+    # Mode-dependent SR parameters
+    pop_size = 500 if mode == 'spring' else 1000
+    gens = 10 if mode == 'spring' else 20
     p_coeff = 0.05 if mode == 'spring' else 0.005
-    est = SymbolicRegressor(population_size=2000, generations=40,
+    
+    est = SymbolicRegressor(population_size=pop_size, generations=gens,
                             function_set=('add', 'sub', 'mul', 'div', inv),
                             metric='mse', max_samples=0.9, n_jobs=-1, 
                             verbose=1,
