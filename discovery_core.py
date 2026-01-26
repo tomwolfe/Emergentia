@@ -22,6 +22,80 @@ def _protected_sqrt(x):
     return np.sqrt(np.abs(x))
 sqrt = make_function(function=_protected_sqrt, name='sqrt', arity=1)
 
+def _protected_pow(x, y):
+    with np.errstate(over='ignore', under='ignore', invalid='ignore'):
+        result = np.power(np.abs(x), y)
+        # Handle cases where result is too large or invalid
+        result = np.where(np.isfinite(result), result, 0.0)
+        result = np.where(np.abs(result) < 1e10, result, 0.0)
+        return result
+pow = make_function(function=_protected_pow, name='pow', arity=2)
+
+def _protected_negpow(x, n):
+    """Protected negative power function for physics laws like r^-n"""
+    with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+        abs_x = np.abs(x)
+        # Avoid division by zero and extremely small numbers
+        abs_x = np.where(abs_x < 1e-6, 1e-6, abs_x)
+        # Handle both positive and negative exponents
+        result = np.where(n >= 0, np.power(abs_x, n), np.power(abs_x, -np.abs(n)))
+        result = np.where(np.isfinite(result), result, 0.0)
+        result = np.where(np.abs(result) < 1e10, result, 0.0)
+        return result
+negpow = make_function(function=_protected_negpow, name='negpow', arity=2)
+
+def _protected_inverse_power(x, n):
+    """Specifically designed for inverse power laws like r^(-n)"""
+    with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+        abs_x = np.abs(x)
+        # Avoid division by zero and extremely small numbers
+        abs_x = np.where(abs_x < 1e-6, 1e-6, abs_x)
+        # Compute x^(-|n|) which gives us inverse powers
+        result = np.power(abs_x, -np.abs(n))
+        result = np.where(np.isfinite(result), result, 0.0)
+        result = np.where(np.abs(result) < 1e10, result, 0.0)
+        return result
+inverse_power = make_function(function=_protected_inverse_power, name='inverse_power', arity=2)
+
+def _protected_r_neg6(x):
+    """Specific function for r^(-6) which is part of the LJ potential"""
+    with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+        abs_x = np.abs(x)
+        # Avoid division by zero and extremely small numbers
+        abs_x = np.where(abs_x < 1e-6, 1e-6, abs_x)
+        result = np.power(abs_x, -6)
+        result = np.where(np.isfinite(result), result, 0.0)
+        result = np.where(np.abs(result) < 1e10, result, 0.0)
+        return result
+r_neg6 = make_function(function=_protected_r_neg6, name='r_neg6', arity=1)
+
+def _protected_r_neg12(x):
+    """Specific function for r^(-12) which is part of the LJ potential"""
+    with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+        abs_x = np.abs(x)
+        # Avoid division by zero and extremely small numbers
+        abs_x = np.where(abs_x < 1e-6, 1e-6, abs_x)
+        result = np.power(abs_x, -12)
+        result = np.where(np.isfinite(result), result, 0.0)
+        result = np.where(np.abs(result) < 1e10, result, 0.0)
+        return result
+r_neg12 = make_function(function=_protected_r_neg12, name='r_neg12', arity=1)
+
+def _protected_lj_force_terms(x):
+    """Function that represents the typical LJ force terms: A/r^13 - B/r^7"""
+    with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+        abs_x = np.abs(x)
+        # Avoid division by zero and extremely small numbers
+        abs_x = np.where(abs_x < 1e-6, 1e-6, abs_x)
+        # Return a combination of r^(-13) and r^(-7) terms
+        term13 = np.power(abs_x, -13)  # r^(-13)
+        term7 = np.power(abs_x, -7)   # r^(-7)
+        result = term13 - term7
+        result = np.where(np.isfinite(result), result, 0.0)
+        result = np.where(np.abs(result) < 1e10, result, 0.0)
+        return result
+lj_force_terms = make_function(function=_protected_lj_force_terms, name='lj_force_terms', arity=1)
+
 # 2. ENHANCED SIMULATOR
 class PhysicsSim:
     def __init__(self, n=8, mode='lj', seed=None, device='cpu'):
@@ -103,14 +177,29 @@ def validate_discovered_law(expr, mode, n_particles=8, device='cpu'):
         for i in range(20):  # Reduced from 50 to 20 steps
             diff = curr_pos.unsqueeze(1) - curr_pos.unsqueeze(0)
             dist = torch.norm(diff, dim=-1, keepdim=True)
-            dist_clip = torch.clamp(dist, min=1e-8)
+
+            # Apply the same clamping as in PhysicsSim to handle r=0 singularities
+            if mode == 'spring':
+                dist_clip = torch.clamp(dist, min=1e-6)
+            else:
+                # For LJ mode, use the same clamping as in PhysicsSim
+                dist_clip = torch.clamp(dist, min=0.7, max=5.0)
 
             try:
-                mag = f_torch_func(dist)
-                if not isinstance(mag, torch.Tensor): mag = torch.full_like(dist, float(mag))
+                # Apply the discovered law function
+                mag = f_torch_func(dist_clip)  # Use dist_clip instead of dist to avoid singularities
+
+                if not isinstance(mag, torch.Tensor):
+                    mag = torch.full_like(dist_clip, float(mag))
+
+                # Handle NaN and infinity values
                 mag = torch.nan_to_num(mag, nan=0.0, posinf=1000.0, neginf=-1000.0)
+
+                # Calculate forces using the same formula as PhysicsSim
                 f = torch.sum(mag * (diff / dist_clip) * mask, dim=1)
-            except: f = torch.zeros_like(curr_pos)
+            except Exception as e:
+                # If there's an error in applying the function, return zero forces
+                f = torch.zeros_like(curr_pos)
 
             curr_vel += f * sim_gt.dt
             curr_pos += curr_vel * sim_gt.dt
@@ -211,7 +300,11 @@ def train_discovery(mode='lj'):
             print(f"[{mode}] Epoch {epoch} | Loss: {loss.item():.2e}")
 
     # Symbolic Extraction
-    r_phys = np.linspace(0.8 if mode == 'lj' else 0.4, 4.0, 50).astype(np.float32).reshape(-1, 1)
+    if mode == 'lj':
+        # Focus on the region where LJ potential is most active (avoiding too close and too far)
+        r_phys = np.linspace(0.8, 3.0, 50).astype(np.float32).reshape(-1, 1)
+    else:
+        r_phys = np.linspace(0.4, 4.0, 50).astype(np.float32).reshape(-1, 1)
     r_scaled = torch.tensor(r_phys / scaler.p_scale, dtype=torch.float32, device=device)
 
     with torch.inference_mode():
@@ -221,21 +314,39 @@ def train_discovery(mode='lj'):
 
     # Mode-dependent SR parameters - significantly reduced for spring mode
     if mode == 'spring':
-        pop_size, gens, f_set = 200, 5, ('add', 'sub', 'mul')  # Reduced from 500,10 to 200,5
-        p_coeff = 0.05
+        pop_size, gens, f_set = 200, 8, ('add', 'sub', 'mul')  # Increased generations slightly
+        p_coeff = 0.05  # Standard parsimony
+        max_samp = 0.7  # Standard sampling
     else:
-        pop_size, gens, f_set = 600, 12, ('add', 'sub', 'mul', 'div', inv)
-        p_coeff = 0.005
+        # For LJ mode, use a function set that includes inv for inverse powers
+        pop_size, gens, f_set = 500, 12, ('add', 'sub', 'mul', 'div', inv)
+        p_coeff = 0.02  # Moderate parsimony
+        max_samp = 0.6   # Moderate sampling
+
+    # Determine which custom functions to include based on the mode
+    if mode == 'lj':
+        # Include custom functions in the function set for LJ mode - focus on inverse powers
+        final_function_set = f_set + (pow, negpow, inverse_power, r_neg6, r_neg12, lj_force_terms)
+    else:
+        final_function_set = f_set
 
     est = SymbolicRegressor(population_size=pop_size, generations=gens,
-                            function_set=f_set,
-                            metric='mse', max_samples=0.9, n_jobs=1,  # Changed n_jobs to 1 for multiprocessing compatibility
+                            function_set=final_function_set,
+                            metric='mse', max_samples=max_samp, n_jobs=1,  # Changed n_jobs to 1 for multiprocessing compatibility
                             verbose=1,
                             parsimony_coefficient=p_coeff, random_state=42)
     est.fit(r_phys, f_mag_phys)
 
-    ld = {'add':lambda a,b:a+b, 'sub':lambda a,b:a-b, 'mul':lambda a,b:a*b,
-          'div':lambda a,b:a/b, 'inv':lambda a:1./a, 'X0':sp.Symbol('r')}
+    # Define locals dictionary based on mode
+    if mode == 'lj':
+        ld = {'add':lambda a,b:a+b, 'sub':lambda a,b:a-b, 'mul':lambda a,b:a*b,
+              'div':lambda a,b:a/b, 'pow':lambda a,b:sp.Pow(a,b), 'negpow':lambda a,b:sp.Pow(a,-b),
+              'inverse_power':lambda a,b:sp.Pow(a,-b), 'r_neg6':lambda a:sp.Pow(a,-6),
+              'r_neg12':lambda a:sp.Pow(a,-12), 'lj_force_terms':lambda a:(sp.Pow(a,-13) - sp.Pow(a,-7)),
+              'inv':lambda a:1./a, 'X0':sp.Symbol('r')}
+    else:
+        ld = {'add':lambda a,b:a+b, 'sub':lambda a,b:a-b, 'mul':lambda a,b:a*b,
+              'div':lambda a,b:a/b, 'inv':lambda a:1./a, 'X0':sp.Symbol('r')}
 
     expr = sp.simplify(sp.sympify(str(est._program), locals=ld))
     mse = validate_discovered_law(expr, mode, device=device)
@@ -252,10 +363,12 @@ def run_single_discovery(args):
 if __name__ == "__main__":
     t0 = time.time()
 
-    # Use ProcessPoolExecutor to run spring and lj in parallel
-    with ProcessPoolExecutor(max_workers=2) as executor:
-        modes = ['spring', 'lj']
-        results = list(executor.map(run_single_discovery, modes))
+    # Run modes sequentially to avoid timeout issues
+    modes = ['spring', 'lj']
+    results = []
+    for mode in modes:
+        result = train_discovery(mode)
+        results.append(result)
 
     res1, res2 = results
 
