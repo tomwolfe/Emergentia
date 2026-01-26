@@ -52,7 +52,7 @@ class PhysicsSim:
         f = f_mag * (diff / dist_clip) * mask
         return torch.sum(f, dim=1)
 
-    def generate(self, steps=1000):
+    def generate(self, steps=600):
         traj_p = torch.zeros((steps, self.n, 2), device=self.device)
         traj_v = torch.zeros((steps, self.n, 2), device=self.device)
         traj_f = torch.zeros((steps, self.n, 2), device=self.device)
@@ -150,7 +150,7 @@ class DiscoveryNet(nn.Module):
 def train_discovery(mode='lj'):
     device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
     sim = PhysicsSim(mode=mode, device=device)
-    p_traj, v_traj, f_traj = sim.generate(1000)
+    p_traj, v_traj, f_traj = sim.generate(600)
     scaler = TrajectoryScaler(mode=mode)
     p_s, f_s = scaler.transform(p_traj, f_traj)
     
@@ -158,7 +158,7 @@ def train_discovery(mode='lj'):
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
     
     print(f"--- Training: {mode} on {device} ---")
-    for epoch in range(301):
+    for epoch in range(151):
         idxs = np.random.randint(0, p_s.shape[0], size=512)
         f_pred = model(p_s[idxs])
         loss = torch.nn.functional.mse_loss(f_pred, f_s[idxs])
@@ -175,7 +175,7 @@ def train_discovery(mode='lj'):
             print(f"[{mode}] Epoch {epoch} | Loss: {loss.item():.2e}")
 
     # Symbolic Extraction
-    r_phys = np.linspace(0.8 if mode == 'lj' else 0.4, 4.0, 150).astype(np.float32).reshape(-1, 1)
+    r_phys = np.linspace(0.8 if mode == 'lj' else 0.4, 4.0, 50).astype(np.float32).reshape(-1, 1)
     r_scaled = torch.tensor(r_phys / scaler.p_scale, dtype=torch.float32, device=device)
     
     with torch.no_grad():
@@ -184,12 +184,15 @@ def train_discovery(mode='lj'):
     f_mag_phys = scaler.inverse_transform_f(f_mag_scaled).ravel()
 
     # Mode-dependent SR parameters
-    pop_size = 500 if mode == 'spring' else 1000
-    gens = 10 if mode == 'spring' else 20
-    p_coeff = 0.05 if mode == 'spring' else 0.005
+    if mode == 'spring':
+        pop_size, gens, f_set = 500, 10, ('add', 'sub', 'mul')
+        p_coeff = 0.05
+    else:
+        pop_size, gens, f_set = 600, 12, ('add', 'sub', 'mul', 'div', inv)
+        p_coeff = 0.005
     
     est = SymbolicRegressor(population_size=pop_size, generations=gens,
-                            function_set=('add', 'sub', 'mul', 'div', inv),
+                            function_set=f_set,
                             metric='mse', max_samples=0.9, n_jobs=-1, 
                             verbose=1,
                             parsimony_coefficient=p_coeff, random_state=42)
