@@ -2,10 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import sympy as sp
-from torch_geometric.nn import MessagePassing
-from torch_geometric.utils import scatter
 from gplearn.genetic import SymbolicRegressor
-from gplearn.functions import make_function
 
 # 1. ENHANCED SIMULATOR & VALIDATION
 class PhysicsSim:
