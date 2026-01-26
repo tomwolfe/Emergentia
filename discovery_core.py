@@ -15,7 +15,7 @@ warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 def optional_compile(func, **kwargs):
     # Disable torch.compile to avoid pickling issues with multiprocessing
-    # and known issues with inductor backend
+    # and known issues with inductor backend as mentioned in original code
     return func
 
 # 1. PROTECTED CUSTOM FUNCTIONS
@@ -223,13 +223,20 @@ def train_discovery(mode='lj'):
         idxs = np.random.randint(0, p_s.shape[0], size=512)
         f_pred = model(p_s[idxs])
         loss = torch.nn.functional.mse_loss(f_pred, f_s[idxs])
-        opt.zero_grad(); loss.backward(); opt.step(); sched.step(loss)
+        opt.zero_grad(); loss.backward(); opt.step(); sched.step(loss.detach())
         if loss.item() < best_loss: best_loss = loss.item()
         if epoch % 200 == 0: print(f"Epoch {epoch} | Loss: {loss.item():.2e}")
 
+        # Early stopping: if loss is below threshold, break the loop
+        threshold = 0.05 if mode == 'spring' else 0.5
+        if loss.item() < threshold:
+            print(f"Early stopping at epoch {epoch}, loss: {loss.item():.2e}")
+            break
+
     threshold = 0.05 if mode == 'spring' else 0.5
 
-    # If neural network loss is still too high, try with smaller hidden layer
+    # Short-Circuit: If the 128-hidden network reaches the threshold, skip the 32-hidden network training entirely
+    # (Since we only enter this condition if best_loss > threshold, the short-circuit is already implemented)
     if best_loss > threshold:
         print(f"Initial NN Loss {best_loss:.4f} > {threshold}, trying smaller hidden layer...")
         # Retrain with smaller hidden layer (32 neurons) to force smoother representation
@@ -242,9 +249,14 @@ def train_discovery(mode='lj'):
             idxs = np.random.randint(0, p_s.shape[0], size=512)
             f_pred = model(p_s[idxs])
             loss = torch.nn.functional.mse_loss(f_pred, f_s[idxs])
-            opt.zero_grad(); loss.backward(); opt.step(); sched.step(loss)
+            opt.zero_grad(); loss.backward(); opt.step(); sched.step(loss.detach())
             if loss.item() < best_loss: best_loss = loss.item()
             if epoch % 200 == 0: print(f"Epoch {epoch} (smaller net) | Loss: {loss.item():.2e}")
+
+            # Early stopping: if loss is below threshold, break the loop
+            if loss.item() < threshold:
+                print(f"Early stopping at epoch {epoch} (smaller net), loss: {loss.item():.2e}")
+                break
 
     if best_loss > threshold:
         print(f"Skipping SR: NN Loss {best_loss:.4f} > {threshold}")
@@ -261,33 +273,36 @@ def train_discovery(mode='lj'):
         features = model._get_features(dist_tensor)
         f_mag_phys = scaler.inverse_transform_f(model.predict_mag(torch.tensor(r_phys/scaler.p_scale, device=device))).cpu().numpy().ravel()
 
-        # Convert features to numpy for symbolic regression
-        X_basis = features.cpu().numpy()
+        # Basis Pruning: In the LJ mode, limit the X_basis sent to SymbolicRegressor to only the r^{-7} and r^{-13} terms
+        if mode == 'lj':
+            # Select only the r^{-7} and r^{-13} columns from the features
+            # The features are [dist, inv_r, inv_r**6, inv_r**12, inv_r**7, inv_r**13]
+            # So we want indices 4 (inv_r**7 = r^{-7}) and 5 (inv_r**13 = r^{-13})
+            X_basis = features[:, [4, 5]].cpu().numpy()
+        else:
+            # For other modes, use all features
+            X_basis = features.cpu().numpy()
 
     # Use the basis functions as input variables for symbolic regression
     # For LJ mode, only use basic arithmetic operations since basis functions are provided
-    p_coeff, f_set = 0.005, ['add', 'sub', 'mul']
+    p_coeff, f_set = 0.01, ['add', 'sub', 'mul']  # Changed initial p_coeff to 0.01 to favor simpler formulas
     if mode != 'lj':  # Only add extra functions for non-LJ modes
         f_set += ['div', inv, negpow]
 
-    # Simplicity First loop: if formula depth exceeds 10, simplify further
-    for attempt in range(5):
-        est = SymbolicRegressor(population_size=2000, generations=30, function_set=f_set,
-                                parsimony_coefficient=p_coeff, metric='mse', random_state=42,
-                                max_samples=0.9, stopping_criteria=0.0001)
-        est.fit(X_basis, f_mag_phys)
-        if est._program.depth_ <= 10: break
+    # Single fit with one retry option instead of the attempt loop
+    est = SymbolicRegressor(population_size=1000, generations=15, function_set=f_set,
+                            parsimony_coefficient=p_coeff, metric='mse', random_state=42,
+                            max_samples=0.9, stopping_criteria=0.0001)
+    est.fit(X_basis, f_mag_phys)
 
-        # If depth is still too high, increase parsimony coefficient
-        if est._program.depth_ > 10:
-            p_coeff *= 10  # Increase by an order of magnitude as required
-            print(f"Attempt {attempt}: Depth {est._program.depth_} too high, p_coeff -> {p_coeff}")
-
-            # If we're still having issues after increasing parsimony, simplify function set further
-            if attempt >= 2 and mode == 'lj':
-                # For LJ mode, restrict to only addition and subtraction after failed attempts
-                f_set = ['add', 'sub']
-                print(f"Attempt {attempt}: Simplifying function set to {f_set} for LJ mode")
+    # If the result is poor, do exactly one retry with p_coeff * 5
+    if est._program.depth_ > 10:  # If formula depth exceeds 10, try again with higher parsimony
+        print(f"Depth {est._program.depth_} too high, retrying with p_coeff * 5")
+        est_retry = SymbolicRegressor(population_size=1000, generations=15, function_set=f_set,
+                                      parsimony_coefficient=p_coeff * 5, metric='mse', random_state=42,
+                                      max_samples=0.9, stopping_criteria=0.0001)
+        est_retry.fit(X_basis, f_mag_phys)
+        est = est_retry  # Use the retry result
 
     ld = {'inv': lambda x: 1/x, 'negpow': lambda x,n: x**(-abs(n)), 'add': lambda x,y: x+y, 'sub': lambda x,y: x-y, 'mul': lambda x,y: x*y, 'div': lambda x,y: x/y}
     expr = sp.simplify(sp.sympify(str(est._program), locals=ld))
