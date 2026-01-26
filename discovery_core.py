@@ -143,39 +143,36 @@ def validate_discovered_law(expr, mode, device='cpu'):
         f_torch_func = optional_compile(f_torch_func)
     except: return 1e6
 
-    sim_gt = PhysicsSim(n=8, mode=mode, seed=42, device=device)
-    p_gt, _ = sim_gt.generate(steps=50)
-    curr_pos, curr_vel = sim_gt.pos.clone(), sim_gt.vel.clone()
-    p_disc = torch.zeros_like(p_gt)
-    mask = (~torch.eye(8, device=device).bool()).unsqueeze(-1)
+    # Generate a static vector of 200 points between 0.5 and 3.5 for validation
+    r_test = torch.linspace(0.5, 3.5, 200, device=device, dtype=torch.float32).reshape(-1, 1)
 
-    with torch.inference_mode():
-        for i in range(50):
-            diff = curr_pos.unsqueeze(1) - curr_pos.unsqueeze(0)
-            dist = torch.norm(diff, dim=-1, keepdim=True)
-            dist_clip = torch.clamp(dist, min=0.1)
+    # Compute the ground truth forces based on the physics mode
+    with torch.no_grad():
+        if mode == 'spring':
+            # Ground truth for spring: -10.0 * (r - 1.0)
+            f_ground_truth = -10.0 * (r_test - 1.0)
+        else:  # LJ mode
+            # Ground truth for LJ: 24.0 * (2 * (1/r)^13 - (1/r)^7)
+            r_inv = 1.0 / torch.clamp(r_test, min=0.8, max=5.0)
+            r_inv_13 = torch.clamp(torch.pow(r_inv, 13), max=1e10)
+            r_inv_7 = torch.clamp(torch.pow(r_inv, 7), max=1e6)
+            f_ground_truth = 24.0 * (2 * r_inv_13 - r_inv_7)
 
-            try:
-                mag = f_torch_func(dist_clip)
-                if not isinstance(mag, torch.Tensor):
-                    mag = torch.full_like(dist_clip, float(mag))
+        # Compute the predicted forces using the discovered formula
+        try:
+            f_predicted = f_torch_func(r_test)
+            if not isinstance(f_predicted, torch.Tensor):
+                f_predicted = torch.full_like(r_test, float(f_predicted))
 
-                # Enhanced numerical stability: more aggressive clamping and NaN handling
-                mag = torch.nan_to_num(mag, nan=0.0, posinf=1e6, neginf=-1e6)
-                # Further clamp extremely large values to prevent simulation blow-up
-                mag = torch.clamp(mag, min=-1e6, max=1e6)
+            # Handle potential numerical issues
+            f_predicted = torch.nan_to_num(f_predicted, nan=0.0, posinf=1e6, neginf=-1e6)
+            f_predicted = torch.clamp(f_predicted, min=-1e6, max=1e6)
+        except:
+            # If evaluation fails, return a large error value
+            return 1e6
 
-                f = torch.sum(mag * (diff / torch.clamp(dist_clip, min=1e-6)) * mask, dim=1)
-            except:
-                # If evaluation fails, return a large error value
-                return 1e6
-
-            curr_vel += f * sim_gt.dt
-            curr_pos += curr_vel * sim_gt.dt
-            p_disc[i] = curr_pos
-
-    # Calculate MSE and handle potential numerical issues
-    mse = torch.mean((p_gt - p_disc)**2).item()
+    # Calculate MSE between predicted and ground truth forces
+    mse = torch.mean((f_ground_truth - f_predicted)**2).item()
 
     # If MSE is infinite or NaN, return a large error value
     if not np.isfinite(mse):
@@ -374,18 +371,18 @@ def train_discovery(mode='lj'):
     scaler = TrajectoryScaler(mode=mode)
     p_s, f_s = scaler.transform(p_traj, f_traj)
     
-    # Train DiscoveryNet with default hidden size first
-    model = DiscoveryNet(n_particles=sim.n, hidden_size=128).to(device)
+    # Train DiscoveryNet with fixed hidden size
+    model = DiscoveryNet(n_particles=sim.n, hidden_size=64).to(device)  # Fixed hidden size of 64
     opt = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, 'min', patience=25, factor=0.5)
 
     print(f"\n--- Training {mode} on {device} ---")
     best_loss = 1e6
-    epochs = 200 if mode == 'spring' else 600  # Reduced epochs
+    epochs = 100 if mode == 'spring' else 250  # Reduced epochs: 100 for spring, 250 for lj
     patience_counter = 0
     patience_limit = 15  # Reduced patience for early stopping
     min_epochs = 20  # Reduced min_epochs
-    
+
     # Track previous losses for early stopping based on minimal improvement
     prev_losses = []
     improvement_threshold = 1e-7
@@ -400,7 +397,7 @@ def train_discovery(mode='lj'):
         loss = torch.mean(torch.log(torch.cosh(diff + 1e-12)))  # Add small epsilon to prevent log(0)
 
         opt.zero_grad(); loss.backward(); opt.step(); sched.step(loss.detach())
-        
+
         if loss.item() < best_loss:
             best_loss = loss.item()
             patience_counter = 0  # Reset patience counter when we find a better loss
@@ -412,19 +409,13 @@ def train_discovery(mode='lj'):
         if len(prev_losses) > 15:  # Keep last 15 losses
             prev_losses.pop(0)
 
-        if epoch % 100 == 0: print(f"Epoch {epoch} | Loss: {loss.item():.2e}")
-
-        # Early stopping: if loss is below threshold AND we've trained for minimum epochs, break the loop
-        threshold = 0.05 if mode == 'spring' else 0.5
-        if loss.item() < threshold and epoch >= min_epochs:
-            print(f"Early stopping at epoch {epoch}, loss: {loss.item():.2e}")
-            break
+        if epoch % 50 == 0: print(f"Epoch {epoch} | Loss: {loss.item():.2e}")
 
         # Additional early stopping based on patience
         if patience_counter >= patience_limit and epoch >= min_epochs:
             print(f"No improvement for {patience_limit} epochs, stopping at epoch {epoch}")
             break
-            
+
         # Check for minimal improvement over recent epochs
         if len(prev_losses) >= 15:
             recent_improvement = abs(prev_losses[0] - prev_losses[-1])
@@ -433,69 +424,6 @@ def train_discovery(mode='lj'):
                 break
 
     threshold = 0.05 if mode == 'spring' else 0.5
-
-    # Check if the loss is within 2x of the threshold - if so, don't retry with smaller network
-    if best_loss <= threshold * 2:  # Within 2x of threshold, skip smaller network
-        print(f"Initial NN Loss {best_loss:.4f} is within 2x threshold, skipping smaller hidden layer...")
-    elif best_loss > threshold:
-        print(f"Initial NN Loss {best_loss:.4f} > {threshold}, trying smaller hidden layer...")
-        # Retrain with smaller hidden layer (32 neurons) to force smoother representation
-        # Use even smaller learning rate for fine-tuning
-        model = DiscoveryNet(n_particles=sim.n, hidden_size=32).to(device)
-        opt = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)
-        sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, 'min', patience=25, factor=0.5)
-
-        best_loss = 1e6
-        patience_counter = 0
-        patience_limit = 15  # Reduced patience for early stopping
-        min_epochs = 20  # Reduced min_epochs
-        
-        # Track previous losses for early stopping based on minimal improvement
-        prev_losses = []
-        improvement_threshold = 1e-7
-
-        epochs = 200 if mode == 'spring' else 600  # Same reduced epochs for smaller network
-
-        for epoch in range(epochs):
-            idxs = np.random.randint(0, p_s.shape[0], size=512)
-            f_pred = model(p_s[idxs])
-
-            # Use Log-Cosh loss instead of MSE to handle large force values at small distances
-            # Log-Cosh is less sensitive to outliers than MSE
-            diff = f_pred - f_s[idxs]
-            loss = torch.mean(torch.log(torch.cosh(diff + 1e-12)))  # Add small epsilon to prevent log(0)
-
-            opt.zero_grad(); loss.backward(); opt.step(); sched.step(loss.detach())
-            
-            if loss.item() < best_loss:
-                best_loss = loss.item()
-                patience_counter = 0  # Reset patience counter when we find a better loss
-            else:
-                patience_counter += 1
-
-            # Track recent losses for improvement checking
-            prev_losses.append(loss.item())
-            if len(prev_losses) > 15:  # Keep last 15 losses
-                prev_losses.pop(0)
-
-            if epoch % 100 == 0: print(f"Epoch {epoch} (smaller net) | Loss: {loss.item():.2e}")
-
-            # Early stopping: if loss is below threshold AND we've trained for minimum epochs, break the loop
-            if loss.item() < threshold and epoch >= min_epochs:
-                print(f"Early stopping at epoch {epoch} (smaller net), loss: {loss.item():.2e}")
-                break
-
-            # Additional early stopping based on patience
-            if patience_counter >= patience_limit and epoch >= min_epochs:
-                print(f"No improvement for {patience_limit} epochs, stopping at epoch {epoch} (smaller net)")
-                break
-                
-            # Check for minimal improvement over recent epochs
-            if len(prev_losses) >= 15:
-                recent_improvement = abs(prev_losses[0] - prev_losses[-1])
-                if recent_improvement < improvement_threshold and epoch >= min_epochs:
-                    print(f"Loss improvement too small ({recent_improvement:.2e}), stopping at epoch {epoch} (smaller net)")
-                    break
 
     if best_loss > threshold:
         print(f"Skipping SR: NN Loss {best_loss:.4f} > {threshold}")
@@ -543,63 +471,35 @@ def train_discovery(mode='lj'):
     # Use the basis functions as input variables for symbolic regression
     # For LJ mode, only use basic arithmetic operations since basis functions are provided
 
-    # Implement iterative search for parsimony_coefficient with stronger basis function enforcement
-    p_coeff = 0.001  # Start with a very low parsimony coefficient to prioritize basis functions
-    max_depth_threshold = 8  # Lower threshold to prevent overly complex expressions
+    # Set optimized parameters for symbolic regression
+    population_size = 200  # Reduced population size
+    generations = 10  # Reduced number of generations
 
     # Restrict function set for LJ mode to strongly encourage use of basis functions
     if mode == 'lj':
         f_set = ['add', 'sub', 'mul', 'div']  # Allow division to help form ratios
-        # Use larger population and generations but with stronger basis function emphasis
-        population_size = 500  # Larger population to better explore basis combinations
-        generations = 50  # More generations to allow convergence
     else:
         f_set = ['add', 'sub', 'mul']  # Limit operations for spring too to keep it simple
-        population_size = 500  # Larger population for consistency
-        generations = 50  # More generations for better convergence
 
-    # Iterative search for optimal parsimony coefficient with stronger constraints
-    est = None
-    best_est = None
-    best_score = float('-inf')
+    # Run SymbolicRegressor once with optimized parameters
+    est = SymbolicRegressor(population_size=population_size,
+                            generations=generations,
+                            function_set=f_set,
+                            parsimony_coefficient=0.001,  # Fixed parsimony coefficient
+                            metric='mse',
+                            random_state=42,
+                            max_samples=0.9,
+                            stopping_criteria=0.0001,
+                            const_range=(-50.0, 50.0),  # Wider constant range for better fitting
+                            init_depth=(2, 6),  # Moderate initial depth
+                            init_method='half and half',
+                            verbose=0)
 
-    for attempt in range(8):  # Try up to 8 times with different parsimony values
-        est = SymbolicRegressor(population_size=population_size,
-                                generations=generations,
-                                function_set=f_set,
-                                parsimony_coefficient=p_coeff,
-                                metric='mse',
-                                random_state=42,
-                                max_samples=0.9,
-                                stopping_criteria=0.0001,
-                                const_range=(-50.0, 50.0),  # Wider constant range for better fitting
-                                init_depth=(2, 6),  # Moderate initial depth
-                                init_method='half and half',
-                                verbose=0)
+    est.fit(X_basis, f_mag_phys)
+    print(f"SR completed: depth={est._program.depth_}, fitness={est._program.raw_fitness_:.4f}")
 
-        est.fit(X_basis, f_mag_phys)
-
-        # Evaluate the current estimator
-        score = -est._program.raw_fitness_  # Negative because lower MSE is better
-
-        # Check if this is the best performing model so far
-        if score > best_score:
-            best_score = score
-            best_est = est
-            # Check if the formula depth is acceptable
-            if est._program.depth_ <= max_depth_threshold:
-                break  # Acceptable depth and good performance, stop searching
-
-        # If depth is too high or performance is poor, adjust parsimony coefficient
-        if est._program.depth_ > max_depth_threshold:
-            p_coeff *= 1.5  # Increase parsimony to penalize complexity
-        else:
-            p_coeff *= 0.8  # Slightly decrease to allow more complexity if depth is OK
-        print(f"Parsimony attempt {attempt+1}: depth={est._program.depth_}, p_coeff={p_coeff:.4f}, raw_fitness={est._program.raw_fitness_:.4f}")
-
-    # Use the best estimator found
-    est = best_est
-    print(f"Final parsimony coefficient: {p_coeff:.4f}, depth: {est._program.depth_}")
+    # Define the parsimony coefficient that was used
+    p_coeff = 0.001
 
     # Map the symbolic regressor variables (X0, X1, etc.) back to physical variables (r)
     # Using a robust sympy-based substitution system instead of string replacement
