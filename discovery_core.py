@@ -109,6 +109,8 @@ def validate_discovered_law(expr, mode, scaler, n_particles=16):
             r_scaled = dist / p_scale
             try:
                 mag_scaled = f_torch_func(r_scaled)
+                if not isinstance(mag_scaled, torch.Tensor):
+                    mag_scaled = torch.full_like(dist, float(mag_scaled))
                 mag_scaled = torch.nan_to_num(mag_scaled, nan=0.0, posinf=10.0, neginf=-10.0)
                 
                 f_pair = (mag_scaled * a_factor) * (diff / dist_clip)
@@ -166,6 +168,15 @@ def train_discovery(mode='lj'):
     scaler.fit(p_traj, v_traj)
     p_s, v_s = scaler.transform(p_traj, v_traj)
     
+    # Calculate GT a_mag for reference
+    with torch.no_grad():
+        gt_a_list = []
+        for i in range(len(p_traj)-1):
+            f = sim.compute_forces(p_traj[i])
+            a_scaled = f * (sim.dt**2 / scaler.p_scale)
+            gt_a_list.append(a_scaled.abs().mean().item())
+        print(f"GT Mean Scaled a_mag: {np.mean(gt_a_list):.4e}")
+
     model = DiscoveryNet().to(device)
     opt = torch.optim.Adam(model.parameters(), lr=2e-3, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=1000)
@@ -176,13 +187,13 @@ def train_discovery(mode='lj'):
     print(f"\n--- Training Discovery Pipeline: {mode} ---")
     
     for epoch in range(1001):
-        idxs = np.random.randint(0, len(p_s)-1, size=64)
+        idxs = np.random.randint(0, len(p_s)-1, size=128)
         
         p_batch = torch.cat([p_s[idxs], p_s[idxs+1]], dim=0)
         a_all, _ = model.get_forces(p_batch)
         
-        a = a_all[:64]
-        a_next = a_all[64:]
+        a = a_all[:128]
+        a_next = a_all[128:]
         
         q, p = p_s[idxs], v_s[idxs]
         q_next, p_next = p_s[idxs+1], v_s[idxs+1]
@@ -196,8 +207,8 @@ def train_discovery(mode='lj'):
         v_inf = model.V_pair(feat_large)
         l_cons = torch.mean(v_inf**2)
         
-        l_cons_weight = 0.0 if epoch < 500 else 100.0
-        loss = l_dyn * 1e7 + l_cons * l_cons_weight
+        l_cons_weight = 0.0 if epoch < 500 else 1.0
+        loss = l_dyn * 1e8 + l_cons * l_cons_weight
         
         opt.zero_grad()
         loss.backward()
@@ -209,7 +220,7 @@ def train_discovery(mode='lj'):
             a_mag = a.abs().mean().item()
             print(f"Epoch {epoch:4d} | Loss: {loss.item():.4e} | Dyn: {l_dyn.item():.4e} | a_mag: {a_mag:.4e}")
 
-        if l_dyn < 1e-8 and epoch > 600:
+        if l_dyn < 1e-9 and epoch > 600:
             print(f"Early exit at epoch {epoch}")
             break
 
@@ -224,10 +235,12 @@ def train_discovery(mode='lj'):
     feat = torch.cat([r_torch, torch.pow(r_torch, -1), torch.pow(r_torch, -2)], dim=-1)
     v_vals = model.V_pair(feat)
     force_vals = -torch.autograd.grad(v_vals.sum(), r_torch)[0].cpu().detach().numpy().flatten()
+    
+    print(f"Mean Force Mag: {np.mean(np.abs(force_vals)):.4e}")
 
     est = SymbolicRegressor(population_size=600, generations=20,
                             function_set=('add', 'sub', 'mul', 'div', 'neg', square),
-                            max_samples=0.5, stopping_criteria=0.00001,
+                            max_samples=0.5, stopping_criteria=1e-6,
                             n_jobs=-1, parsimony_coefficient=1e-5, 
                             verbose=0, random_state=42)
     est.fit(r_samples, force_vals)
@@ -260,8 +273,10 @@ def train_discovery(mode='lj'):
         r_s = sp.Symbol('r')
         v_disc_expr = -sp.integrate(expr, r_s)
         v_disc_func = sp.lambdify(r_s, v_disc_expr, 'numpy')
-        v_disc_scaled = v_disc_func(r_plot)
-        v_disc = v_disc_scaled * (scaler.p_scale**2 / sim.dt**2)
+        v_disc_out = v_disc_func(r_plot)
+        if not isinstance(v_disc_out, np.ndarray):
+            v_disc_out = np.full_like(r_plot, v_disc_out)
+        v_disc = v_disc_out * (scaler.p_scale**2 / sim.dt**2)
         v_disc -= (v_disc[-1] - v_gt[-1])
 
         plt.figure(figsize=(8, 5))
