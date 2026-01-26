@@ -219,9 +219,9 @@ def train_discovery(mode='lj'):
     print("\nDistilling Symbolic Force...")
     model.eval()
     
-    # Smart sampling for GPlearn: 150 log-spaced near well, 150 linear for tail
-    r_log = np.logspace(np.log10(0.05), np.log10(1.5), 150)
-    r_lin = np.linspace(1.5, 5.0, 150)
+    # Smart sampling for GPlearn: 400 log-spaced near well, 400 linear for tail
+    r_log = np.logspace(np.log10(0.05), np.log10(1.5), 400)
+    r_lin = np.linspace(1.5, 5.0, 400)
     r_samples = np.concatenate([r_log, r_lin]).astype(np.float32).reshape(-1, 1)
 
     r_torch = torch.tensor(r_samples, dtype=torch.float32, device=device, requires_grad=True)
@@ -229,9 +229,9 @@ def train_discovery(mode='lj'):
     v_vals = model.V_pair(feat)
     force_vals = -torch.autograd.grad(v_vals.sum(), r_torch)[0].cpu().detach().numpy().flatten()
 
-    est = SymbolicRegressor(population_size=600, generations=20,
+    est = SymbolicRegressor(population_size=800, generations=30,
                             function_set=('add', 'sub', 'mul', 'div', 'inv', 'neg', square),
-                            n_jobs=-1, parsimony_coefficient=0.002, 
+                            n_jobs=-1, parsimony_coefficient=0.001, 
                             verbose=0, random_state=42)
     est.fit(r_samples, force_vals)
     best_expr = str(est._program)
