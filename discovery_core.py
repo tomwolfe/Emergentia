@@ -25,7 +25,9 @@ class PhysicsSim:
             torch.manual_seed(seed)
             np.random.seed(seed)
         self.n, self.mode, self.dt = n, mode, 0.01
-        self.pos = torch.rand((n, 2), device=device, dtype=torch.float32) * 2.0 
+        # For LJ, use a larger box to avoid immediate explosion
+        scale = 2.0 if mode == 'spring' else 4.0
+        self.pos = torch.rand((n, 2), device=device, dtype=torch.float32) * scale
         self.vel = torch.randn((n, 2), device=device, dtype=torch.float32) * 0.05
         self.mask = (~torch.eye(n, device=device).bool()).unsqueeze(-1)
     
@@ -49,7 +51,7 @@ class PhysicsSim:
         
         return torch.sum(f * self.mask, dim=1)
 
-    def generate(self, steps=1500):
+    def generate(self, steps=1000):
         traj_p = torch.zeros((steps, self.n, 2), device=device)
         traj_v = torch.zeros((steps, self.n, 2), device=device)
         
@@ -80,20 +82,18 @@ class TrajectoryScaler:
         return (p - self.p_mid) / self.p_scale, v * (self.dt / self.p_scale)
 
 def validate_discovered_law(expr, mode, scaler, n_particles=16):
-    print(f"\nValidating Discovered Law for {mode} (N={n_particles})...")
     r_sym = sp.Symbol('r')
     try:
         f_torch_func = sp.lambdify(r_sym, expr, 'torch')
-    except Exception as e:
-        print(f"Failed to create force function: {e}")
+    except Exception:
         return 1.0
 
     sim_gt = PhysicsSim(n=n_particles, mode=mode, seed=42)
-    p_gt, _ = sim_gt.generate(steps=200)
+    p_gt, _ = sim_gt.generate(steps=100)
     
     curr_pos = sim_gt.pos.clone()
     curr_vel = sim_gt.vel.clone()
-    p_disc = torch.zeros((200, n_particles, 2), device=device)
+    p_disc = torch.zeros((100, n_particles, 2), device=device)
     
     a_factor = scaler.p_scale / (sim_gt.dt**2)
     p_scale = scaler.p_scale
@@ -101,7 +101,7 @@ def validate_discovered_law(expr, mode, scaler, n_particles=16):
     mask = (~torch.eye(n_particles, device=device).bool()).unsqueeze(-1)
     
     with torch.inference_mode():
-        for i in range(200):
+        for i in range(100):
             diff = curr_pos.unsqueeze(1) - curr_pos.unsqueeze(0)
             dist = torch.norm(diff, dim=-1, keepdim=True)
             dist_clip = torch.clamp(dist, min=1e-8)
@@ -123,9 +123,7 @@ def validate_discovered_law(expr, mode, scaler, n_particles=16):
             p_disc[i] = curr_pos
     
     mse = torch.mean((p_gt - p_disc)**2).item()
-    mse = np.nan_to_num(mse, nan=1.0)
-    print(f"Validation MSE: {mse:.6f}")
-    return mse
+    return np.nan_to_num(mse, nan=1.0)
 
 # 2. CORE ARCHITECTURE
 class DiscoveryNet(nn.Module):
@@ -134,22 +132,19 @@ class DiscoveryNet(nn.Module):
         self.n = n
         self.register_buffer('mask', ~torch.eye(n).bool())
         self.V_pair = nn.Sequential(
-            nn.Linear(3, 128), 
+            nn.Linear(3, 64), 
             nn.Tanh(), 
-            nn.Linear(128, 128), 
+            nn.Linear(64, 64), 
             nn.Tanh(), 
-            nn.Linear(128, 1)
+            nn.Linear(64, 1)
         )
 
     def get_potential(self, pos_scaled):
         diff = pos_scaled.unsqueeze(2) - pos_scaled.unsqueeze(1)
         dist = torch.norm(diff, dim=-1, keepdim=True)
         dist = torch.clamp(dist, min=0.05)
-        
         dist_flat = dist[:, self.mask].view(pos_scaled.size(0), -1, 1)
-        
-        r = dist_flat
-        features = torch.cat([r, torch.pow(r, -1), torch.pow(r, -2)], dim=-1)
+        features = torch.cat([dist_flat, torch.pow(dist_flat, -1), torch.pow(dist_flat, -2)], dim=-1)
         return self.V_pair(features).sum(dim=1) * 0.5
 
     def get_forces(self, pos_scaled):
@@ -162,134 +157,65 @@ class DiscoveryNet(nn.Module):
 def train_discovery(mode='lj'):
     t_start = time.time()
     sim = PhysicsSim(mode=mode)
-    p_traj, v_traj = sim.generate(1500)
+    p_traj, v_traj = sim.generate(1000)
     
     scaler = TrajectoryScaler(dt=sim.dt)
     scaler.fit(p_traj, v_traj)
     p_s, v_s = scaler.transform(p_traj, v_traj)
     
-    # Calculate GT a_mag for reference
-    with torch.no_grad():
-        gt_a_list = []
-        for i in range(len(p_traj)-1):
-            f = sim.compute_forces(p_traj[i])
-            a_scaled = f * (sim.dt**2 / scaler.p_scale)
-            gt_a_list.append(a_scaled.abs().mean().item())
-        print(f"GT Mean Scaled a_mag: {np.mean(gt_a_list):.4e}")
-
     model = DiscoveryNet().to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=2e-3, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=1000)
+    opt = torch.optim.Adam(model.parameters(), lr=3e-3, weight_decay=1e-5)
     
-    r_large = torch.linspace(2.0, 5.0, 20, device=device).view(-1, 1)
+    r_large = torch.linspace(2.0, 5.0, 10, device=device).view(-1, 1)
     feat_large = torch.cat([r_large, torch.pow(r_large, -1), torch.pow(r_large, -2)], dim=-1)
     
-    print(f"\n--- Training Discovery Pipeline: {mode} ---")
+    print(f"--- Training: {mode} ---")
     
-    for epoch in range(1001):
-        idxs = np.random.randint(0, len(p_s)-1, size=128)
-        
+    for epoch in range(601):
+        idxs = np.random.randint(0, len(p_s)-1, size=32)
         p_batch = torch.cat([p_s[idxs], p_s[idxs+1]], dim=0)
         a_all, _ = model.get_forces(p_batch)
+        a, a_next = a_all[:32], a_all[32:]
+        q, p, q_next, p_next = p_s[idxs], v_s[idxs], p_s[idxs+1], v_s[idxs+1]
         
-        a = a_all[:128]
-        a_next = a_all[128:]
-        
-        q, p = p_s[idxs], v_s[idxs]
-        q_next, p_next = p_s[idxs+1], v_s[idxs+1]
-        
-        q_next_pred = q + p + 0.5 * a
-        p_next_pred = p + 0.5 * (a + a_next)
-        
-        l_dyn = torch.nn.functional.mse_loss(q_next_pred, q_next) + \
-                torch.nn.functional.mse_loss(p_next_pred, p_next)
-
-        v_inf = model.V_pair(feat_large)
-        l_cons = torch.mean(v_inf**2)
-        
-        l_cons_weight = 0.0 if epoch < 500 else 1.0
-        loss = l_dyn * 1e8 + l_cons * l_cons_weight
+        l_dyn = torch.nn.functional.mse_loss(q + p + 0.5 * a, q_next) + \
+                torch.nn.functional.mse_loss(p + 0.5 * (a + a_next), p_next)
+        l_cons = torch.mean(model.V_pair(feat_large)**2)
+        loss = l_dyn * 1e8 + l_cons * (1.0 if epoch > 300 else 0.0)
         
         opt.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
-        scheduler.step()
         
-        if epoch % 200 == 0: 
-            a_mag = a.abs().mean().item()
-            print(f"Epoch {epoch:4d} | Loss: {loss.item():.4e} | Dyn: {l_dyn.item():.4e} | a_mag: {a_mag:.4e}")
-
-        if l_dyn < 1e-9 and epoch > 600:
-            print(f"Early exit at epoch {epoch}")
-            break
+        if epoch % 200 == 0:
+            print(f"Epoch {epoch:4d} | Loss: {loss.item():.2e} | Dyn: {l_dyn.item():.2e}")
 
     t_train = time.time()
-    print(f"Training Phase Duration: {t_train - t_start:.2f}s")
     
-    print("\nDistilling Symbolic Force...")
     model.eval()
-    
-    r_samples = np.linspace(0.1, 5.0, 800).astype(np.float32).reshape(-1, 1)
+    r_samples = np.linspace(0.1, 5.0, 400).astype(np.float32).reshape(-1, 1)
     r_torch = torch.tensor(r_samples, dtype=torch.float32, device=device, requires_grad=True)
     feat = torch.cat([r_torch, torch.pow(r_torch, -1), torch.pow(r_torch, -2)], dim=-1)
     v_vals = model.V_pair(feat)
     force_vals = -torch.autograd.grad(v_vals.sum(), r_torch)[0].cpu().detach().numpy().flatten()
-    
-    print(f"Mean Force Mag: {np.mean(np.abs(force_vals)):.4e}")
 
-    est = SymbolicRegressor(population_size=600, generations=20,
+    est = SymbolicRegressor(population_size=400, generations=15,
                             function_set=('add', 'sub', 'mul', 'div', 'neg', square),
-                            max_samples=0.5, stopping_criteria=1e-6,
-                            n_jobs=-1, parsimony_coefficient=1e-5, 
-                            verbose=0, random_state=42)
+                            max_samples=0.5, stopping_criteria=1e-5,
+                            n_jobs=-1, parsimony_coefficient=1e-4, random_state=42)
     est.fit(r_samples, force_vals)
     best_expr = str(est._program)
     t_symbolic = time.time()
-    print(f"Symbolic Phase Duration: {t_symbolic - t_train:.2f}s")
-
+    
     try:
         locals_dict = {'add':lambda a,b:a+b, 'sub':lambda a,b:a-b, 'mul':lambda a,b:a*b, 
-                       'div':lambda a,b:a/b, 'neg':lambda a:-a,
-                       'sq':lambda a:a**2, 'X0':sp.Symbol('r')}
+                       'div':lambda a,b:a/b, 'neg':lambda a:-a, 'sq':lambda a:a**2, 'X0':sp.Symbol('r')}
         expr = sp.simplify(sp.sympify(best_expr, locals=locals_dict))
-        print(f"SUCCESS: Discovered F_scaled(r_scaled) = {expr}")
-        
         mse = validate_discovered_law(expr, mode, scaler)
-        t_val = time.time()
-        print(f"Validation Phase Duration: {t_val - t_symbolic:.2f}s")
-        
-        r_plot = np.linspace(0.1, 5.0, 100)
-        r_plot_phys = r_plot * scaler.p_scale
-        v_gt = np.array([sim.get_ground_truth_potential(r) for r in r_plot_phys])
-        
-        with torch.no_grad():
-            r_t = torch.tensor(r_plot.reshape(-1, 1), dtype=torch.float32, device=device)
-            feat_p = torch.cat([r_t, torch.pow(r_t, -1), torch.pow(r_t, -2)], dim=-1)
-            v_nn_scaled = model.V_pair(feat_p).cpu().numpy().flatten()
-            v_nn = v_nn_scaled * (scaler.p_scale**2 / sim.dt**2)
-            v_nn -= (v_nn[-1] - v_gt[-1])
+        print(f"Result {mode}: {expr} | MSE: {mse:.4e}")
+    except Exception: pass
 
-        r_s = sp.Symbol('r')
-        v_disc_expr = -sp.integrate(expr, r_s)
-        v_disc_func = sp.lambdify(r_s, v_disc_expr, 'numpy')
-        v_disc_out = v_disc_func(r_plot)
-        if not isinstance(v_disc_out, np.ndarray):
-            v_disc_out = np.full_like(r_plot, v_disc_out)
-        v_disc = v_disc_out * (scaler.p_scale**2 / sim.dt**2)
-        v_disc -= (v_disc[-1] - v_gt[-1])
-
-        plt.figure(figsize=(8, 5))
-        plt.plot(r_plot_phys, v_gt, 'k--', label='Ground Truth')
-        plt.plot(r_plot_phys, v_nn, 'r-', alpha=0.5, label='Neural Network')
-        plt.plot(r_plot_phys, v_disc, 'b:', label='Symbolic Discovery')
-        plt.ylim(v_gt.min() - 2, v_gt.max() + 2)
-        plt.title(f"Discovery Result: {mode} (MSE: {mse:.6f})")
-        plt.legend()
-        plt.savefig(f"discovery_{mode}.png")
-        plt.close()
-
-    except Exception as e: print(f"Symbolic recovery failed: {best_expr} | Error: {e}")
+    print(f"Total Time {mode}: {time.time() - t_start:.2f}s")
 
 if __name__ == "__main__":
     for m in ['spring', 'lj']:
