@@ -56,8 +56,16 @@ class PhysicsSim:
         if self.mode == 'spring':
             f_mag = -10.0 * (dist - 1.0)
         else:
-            d_inv = 1.0 / torch.clamp(dist, min=0.8, max=5.0)
-            f_mag = 24.0 * (2 * torch.pow(d_inv, 13) - torch.pow(d_inv, 7))
+            # For LJ mode, ensure we properly calculate the force from the potential
+            # The Lennard-Jones force is the negative derivative of the potential
+            # V(r) = 4*epsilon*((sigma/r)^12 - (sigma/r)^6), force = -dV/dr
+            # This gives us F = 4*epsilon * (12*(sigma^12/r^13) - 6*(sigma^6/r^7))
+            # For simplicity, using epsilon=1 and sigma=1, we get F = 48*(1/r^13) - 24*(1/r^7)
+            d_inv = 1.0 / torch.clamp(dist, min=0.8, max=5.0)  # Use 0.8 to avoid extreme forces
+            # Clamp the powers to prevent overflow
+            d_inv_13 = torch.clamp(torch.pow(d_inv, 13), max=1e10)
+            d_inv_7 = torch.clamp(torch.pow(d_inv, 7), max=1e6)
+            f_mag = 24.0 * (2 * d_inv_13 - d_inv_7)
         f = f_mag * (diff / dist_clip) * self.mask
         return torch.sum(f, dim=1)
 
@@ -66,10 +74,20 @@ class PhysicsSim:
         traj_p = torch.zeros((steps, self.n, 2), device=self.device)
         traj_f = torch.zeros((steps, self.n, 2), device=self.device)
         curr_pos, curr_vel = self.pos.clone(), self.vel.clone()
+
+        # Add warm-up phase with random impulse injections to explore repulsive regions
         with torch.inference_mode():
             for i in range(steps):
                 f = self.compute_forces(curr_pos)
                 traj_f[i] = f
+
+                # Inject random impulses occasionally to explore high-energy configurations
+                if i % 50 == 0:  # Every 50 steps
+                    # Random impulse to increase velocity and potentially bring particles closer
+                    impulse_factor = 2.0 if self.mode == 'lj' else 1.5  # Higher for LJ to overcome repulsion
+                    random_impulse = torch.randn_like(curr_vel) * impulse_factor
+                    curr_vel += random_impulse
+
                 curr_vel += f * self.dt
                 curr_pos += curr_vel * self.dt
                 curr_pos = torch.clamp(curr_pos, -2.0, 6.0)
@@ -94,9 +112,14 @@ class DiscoveryNet(nn.Module):
         )
 
     def _get_features(self, dist):
-        dist_clip = torch.clamp(dist, min=0.5)
+        dist_clip = torch.clamp(dist, min=0.5, max=10.0)  # Clamp both min and max to prevent extreme values
         inv_r = 1.0 / dist_clip
-        return torch.cat([dist, inv_r, inv_r**6, inv_r**12, inv_r**7, inv_r**13], dim=-1)
+        # Clamp the powers to prevent overflow
+        inv_r_6 = torch.clamp(inv_r**6, max=1e6)
+        inv_r_12 = torch.clamp(inv_r**12, max=1e12)
+        inv_r_7 = torch.clamp(inv_r**7, max=1e7)
+        inv_r_13 = torch.clamp(inv_r**13, max=1e13)
+        return torch.cat([dist, inv_r, inv_r_6, inv_r_12, inv_r_7, inv_r_13], dim=-1)
 
     def forward(self, pos_scaled):
         diff = pos_scaled.unsqueeze(2) - pos_scaled.unsqueeze(1)
@@ -152,60 +175,50 @@ def extract_coefficients(expr, mode='lj'):
         try:
             # First, expand and simplify the expression to get it in a standard form
             simplified_expr = sp.simplify(expr)
-            expanded_expr = sp.expand(simplified_expr)
 
-            # Try multiple approaches to extract coefficients
+            # For Lennard-Jones potential, we expect the form: 48*(1/r^13) - 24*(1/r^7)
+            # Let's try to identify terms with r^(-13) and r^(-7) specifically
 
-            # Approach 1: Direct coefficient extraction
-            coeff_r_neg13 = expanded_expr.coeff(r**(-13))
-            coeff_r_neg7 = expanded_expr.coeff(r**(-7))
+            # Approach 1: Use as_ordered_terms to separate individual terms
+            terms = simplified_expr.as_ordered_terms() if hasattr(simplified_expr, 'as_ordered_terms') else [simplified_expr]
 
-            # Approach 2: If direct extraction failed, try collecting terms
-            if coeff_r_neg13 == 0 or coeff_r_neg13 is None or coeff_r_neg13 == 0 or coeff_r_neg7 is None:
-                # Collect terms with r^(-13) and r^(-7)
-                collected = sp.collect(expanded_expr, [r**(-13), r**(-7)], evaluate=False)
+            coeff_r_neg13 = 0
+            coeff_r_neg7 = 0
 
-                # The collected dict might have the terms we need
-                if len(collected) > 1:
-                    # If there are multiple terms, look for the ones with r^(-13) and r^(-7)
-                    for term, coeff in collected.items():
-                        if term == r**(-13):
-                            coeff_r_neg13 = coeff
-                        elif term == r**(-7):
-                            coeff_r_neg7 = coeff
-                        # If terms are products like r^(-13)*some_const, extract the coefficient
-                        elif term.has(r**(-13)):
-                            coeff_r_neg13 = coeff  # The coefficient part
-                        elif term.has(r**(-7)):
-                            coeff_r_neg7 = coeff  # The coefficient part
+            for term in terms:
+                # Check if this term contains r^(-13)
+                if term.has(r**(-13)):
+                    # Extract the coefficient of r^(-13)
+                    coeff = term.as_coefficient(r**(-13))
+                    if coeff is not None:
+                        coeff_r_neg13 = float(coeff)
+                    else:
+                        # Alternative method: divide the term by r^(-13) and simplify
+                        simplified_coeff = sp.simplify(term / r**(-13))
+                        if not simplified_coeff.has(r):  # If it's just a number
+                            coeff_r_neg13 = float(simplified_coeff)
 
-            # Approach 3: If still not found, try to separate terms
-            if coeff_r_neg13 == 0 or coeff_r_neg13 is None or coeff_r_neg7 == 0 or coeff_r_neg7 is None:
-                # Convert to a form where we can separate terms more easily
-                # Handle expressions like A/r^13 - B/r^7
-                terms = expanded_expr.as_ordered_terms() if hasattr(expanded_expr, 'as_ordered_terms') else [expanded_expr]
+                # Check if this term contains r^(-7)
+                elif term.has(r**(-7)):
+                    # Extract the coefficient of r^(-7)
+                    coeff = term.as_coefficient(r**(-7))
+                    if coeff is not None:
+                        coeff_r_neg7 = float(coeff)
+                    else:
+                        # Alternative method: divide the term by r^(-7) and simplify
+                        simplified_coeff = sp.simplify(term / r**(-7))
+                        if not simplified_coeff.has(r):  # If it's just a number
+                            coeff_r_neg7 = float(simplified_coeff)
 
-                for term in terms:
-                    # Check if the term contains r^(-13)
-                    if r**(-13) in sp.preorder_traversal(term):
-                        coeff_r_neg13 = term.as_coefficient(r**(-13))
-                        if coeff_r_neg13 is None:
-                            # If as_coefficient doesn't work, try to extract the coefficient manually
-                            # by dividing out the r^(-13) part
-                            simplified_term = sp.simplify(term / r**(-13))
-                            if simplified_term != 0 and not simplified_term.has(r):
-                                coeff_r_neg13 = simplified_term
-                    elif r**(-7) in sp.preorder_traversal(term):
-                        coeff_r_neg7 = term.as_coefficient(r**(-7))
-                        if coeff_r_neg7 is None:
-                            # Similar approach for r^(-7)
-                            simplified_term = sp.simplify(term / r**(-7))
-                            if simplified_term != 0 and not simplified_term.has(r):
-                                coeff_r_neg7 = simplified_term
-
-            # Convert to float, handling cases where the coefficient might still be None
-            coeff_r_neg13 = float(coeff_r_neg13) if coeff_r_neg13 is not None and coeff_r_neg13 != 0 else 0
-            coeff_r_neg7 = float(coeff_r_neg7) if coeff_r_neg7 is not None and coeff_r_neg7 != 0 else 0
+            # If we didn't find the expected terms, try using collect
+            if coeff_r_neg13 == 0 and coeff_r_neg7 == 0:
+                collected = sp.collect(simplified_expr, [r**(-13), r**(-7)], evaluate=False)
+                if collected:
+                    for power_term, coeff in collected.items():
+                        if power_term == r**(-13):
+                            coeff_r_neg13 = float(coeff) if not coeff.has(r) else 0
+                        elif power_term == r**(-7):
+                            coeff_r_neg7 = float(coeff) if not coeff.has(r) else 0
 
             return {
                 'coeff_r_neg13': coeff_r_neg13,
@@ -225,18 +238,41 @@ def extract_coefficients(expr, mode='lj'):
         # For spring mode, we expect -k*(r-1) where k ≈ 10
         try:
             r = sp.Symbol('r')
-            # Simplify and expand the expression to get it in standard form
+            # Simplify the expression to get it in standard form
             simplified_expr = sp.simplify(expr)
-            expanded_expr = sp.expand(simplified_expr)
 
             # The expected form is -k*(r-1) = -k*r + k
             # So we need to extract coefficients of r^1 and the constant term
-            coeff_r = expanded_expr.coeff(r, 1)  # Coefficient of r^1
-            const_term = expanded_expr.subs(r, 0)  # Constant term when r=0
+            coeff_r = simplified_expr.coeff(r, 1)  # Coefficient of r^1
+            const_term = simplified_expr.subs(r, 0)  # Constant term when r=0
 
-            # For the form -k*r + k, the coefficient of r is -k and the constant is k
-            # So the spring constant k is the absolute value of the r coefficient
-            k_value = abs(float(coeff_r)) if coeff_r is not None else 0
+            # For the form -k*(r-1), we expect it to be expanded as -k*r + k
+            # So if we have -k*r + k, the coefficient of r is -k and the constant is k
+            # Therefore k = -coeff_r if the expression is in the form -k*r + k
+            # And const_term should equal k, so k should also equal const_term
+            # Take the most appropriate value based on the form
+
+            # More robust approach: try to factor the expression
+            factored = sp.factor(simplified_expr)
+
+            # Check if it's in the form k*(r-1) or -k*(r-1)
+            if factored.is_Mul:
+                args = factored.args
+                for arg in args:
+                    if arg.equals(r - 1):
+                        # Expression is k*(r-1), so the other factor is k
+                        k_value = abs(float(factored / (r - 1)))
+                        break
+                    elif arg.equals(-(r - 1)) or arg.equals(1 - r):
+                        # Expression is k*(-(r-1)) = -k*(r-1), so the other factor is -k
+                        k_value = abs(float(factored / (-(r - 1))))
+                        break
+                else:
+                    # If not in the exact form, use the coefficient of r
+                    k_value = abs(float(coeff_r)) if coeff_r is not None else 0
+            else:
+                # If not factored nicely, use the coefficient of r
+                k_value = abs(float(coeff_r)) if coeff_r is not None else 0
 
             return {
                 'coeff_r': float(coeff_r) if coeff_r is not None else 0,
@@ -282,7 +318,12 @@ def train_discovery(mode='lj'):
     for epoch in range(epochs):
         idxs = np.random.randint(0, p_s.shape[0], size=512)
         f_pred = model(p_s[idxs])
-        loss = torch.nn.functional.mse_loss(f_pred, f_s[idxs])
+
+        # Use Log-Cosh loss instead of MSE to handle large force values at small distances
+        # Log-Cosh is less sensitive to outliers than MSE
+        diff = f_pred - f_s[idxs]
+        loss = torch.mean(torch.log(torch.cosh(diff + 1e-12)))  # Add small epsilon to prevent log(0)
+
         opt.zero_grad(); loss.backward(); opt.step(); sched.step(loss.detach())
         
         if loss.item() < best_loss:
@@ -343,7 +384,12 @@ def train_discovery(mode='lj'):
         for epoch in range(epochs):
             idxs = np.random.randint(0, p_s.shape[0], size=512)
             f_pred = model(p_s[idxs])
-            loss = torch.nn.functional.mse_loss(f_pred, f_s[idxs])
+
+            # Use Log-Cosh loss instead of MSE to handle large force values at small distances
+            # Log-Cosh is less sensitive to outliers than MSE
+            diff = f_pred - f_s[idxs]
+            loss = torch.mean(torch.log(torch.cosh(diff + 1e-12)))  # Add small epsilon to prevent log(0)
+
             opt.zero_grad(); loss.backward(); opt.step(); sched.step(loss.detach())
             
             if loss.item() < best_loss:
@@ -381,7 +427,16 @@ def train_discovery(mode='lj'):
         return f"Fail: {mode}", best_loss, 0, "N/A", 1e6
 
     # Prepare basis functions for symbolic regression to align with neural network features
-    r_phys_raw = np.linspace(0.9, 3.5, 300).astype(np.float32)
+    # Extend the range to include more repulsive region samples for LJ mode
+    if mode == 'lj':
+        # Use a range that emphasizes the repulsive region (small r) and attractive region (larger r)
+        r_phys_raw = np.concatenate([
+            np.linspace(0.8, 1.0, 150),  # Emphasize repulsive region
+            np.linspace(1.0, 2.0, 200), # Transition region
+            np.linspace(2.0, 3.5, 150)  # Attractive region
+        ]).astype(np.float32)
+    else:
+        r_phys_raw = np.linspace(0.9, 3.5, 300).astype(np.float32)
     r_phys = r_phys_raw.reshape(-1, 1)
 
     # Create the same basis functions that the neural network uses internally
@@ -391,12 +446,16 @@ def train_discovery(mode='lj'):
         features = model._get_features(dist_tensor)
         f_mag_phys = scaler.inverse_transform_f(model.predict_mag(torch.tensor(r_phys/scaler.p_scale, device=device))).cpu().numpy().ravel()
 
-        # Basis Pruning: In the LJ mode, limit the X_basis sent to SymbolicRegressor to only the r^{-7} and r^{-13} terms
+        # Basis Pruning: In the LJ mode, provide the right basis functions for symbolic regression
         if mode == 'lj':
-            # Select only the r^{-7} and r^{-13} columns from the features
+            # For LJ, we want to provide the fundamental building blocks for the expected form: A*(1/r^13) - B*(1/r^7)
             # The features are [dist, inv_r, inv_r**6, inv_r**12, inv_r**7, inv_r**13]
-            # So we want indices 4 (inv_r**7 = r^{-7}) and 5 (inv_r**13 = r^{-13})
-            X_basis = features[:, [4, 5]].cpu().numpy()
+            # So we want indices 5 (inv_r**13 = r^{-13}) and 4 (inv_r**7 = r^{-7}) as the primary features
+            X_basis = features[:, [5, 4]].cpu().numpy()  # [r^{-13}, r^{-7}] in that order
+
+            # Also add the raw distance as a feature to help with normalization
+            dist_feature = features[:, [0]].cpu().numpy()
+            X_basis = np.column_stack([X_basis, dist_feature])  # [r^{-13}, r^{-7}, r]
         else:
             # For spring mode, we want the deviation from equilibrium (r-1) as the main feature
             # The features are [dist, inv_r, inv_r**6, inv_r**12, inv_r**7, inv_r**13]
@@ -408,67 +467,96 @@ def train_discovery(mode='lj'):
 
     # Use the basis functions as input variables for symbolic regression
     # For LJ mode, only use basic arithmetic operations since basis functions are provided
-    p_coeff = 0.1  # Increased p_coeff to strongly favor simpler formulas
+
+    # Implement iterative search for parsimony_coefficient
+    p_coeff = 0.01  # Start with a low parsimony coefficient
+    max_depth_threshold = 10  # Increase only if formula depth exceeds this
 
     # Restrict function set for LJ mode to prevent 'mathematical loops'
     if mode == 'lj':
-        f_set = ['add', 'sub', 'mul']
+        f_set = ['add', 'sub', 'mul', 'div']  # Allow division to help form ratios
         # Reduced population size and generations for efficiency
-        population_size = 500
-        generations = 10
+        population_size = 300  # Smaller population to focus on simpler solutions
+        generations = 30  # Increased generations for better search
     else:
         f_set = ['add', 'sub', 'mul']  # Limit operations for spring too to keep it simple
-        population_size = 500
-        generations = 10
+        population_size = 300  # Smaller population for consistency
+        generations = 30  # Increased generations for better search
 
-    # Single fit without retry logic
-    est = SymbolicRegressor(population_size=population_size, generations=generations, function_set=f_set,
-                            parsimony_coefficient=p_coeff, metric='mse', random_state=42,
-                            max_samples=0.9, stopping_criteria=0.0001)
-    est.fit(X_basis, f_mag_phys)
+    # Iterative search for optimal parsimony coefficient
+    est = None
+    for attempt in range(5):  # Try up to 5 times with increasing parsimony
+        est = SymbolicRegressor(population_size=population_size, generations=generations, function_set=f_set,
+                                parsimony_coefficient=p_coeff, metric='mse', random_state=42,
+                                max_samples=0.9, stopping_criteria=0.0001)
+        est.fit(X_basis, f_mag_phys)
+
+        # Check if the formula depth is acceptable
+        if est._program.depth_ <= max_depth_threshold:
+            break  # Acceptable depth, stop searching
+
+        # If depth is too high, increase parsimony coefficient and try again
+        p_coeff *= 2.0  # Double the parsimony coefficient
+        print(f"Parsimony attempt {attempt+1}: depth={est._program.depth_}, p_coeff={p_coeff:.4f}")
+
+    print(f"Final parsimony coefficient: {p_coeff:.4f}, depth: {est._program.depth_}")
 
     # Map the symbolic regressor variables (X0, X1, etc.) back to physical variables (r)
-    # The X_basis contains features derived from r, so we need to map them back properly
+    # Using a robust sympy-based substitution system instead of string replacement
     program_str = str(est._program)
 
-    # Replace X0, X1, etc. with the corresponding physical variable based on the mode
-    # For LJ mode, X0 corresponds to r^(-7) and X1 corresponds to r^(-13)
-    # For other modes, we need to map appropriately
+    # Define the symbol for distance
+    r = sp.Symbol('r')
+
+    # Create a mapping dictionary for variables based on the mode
     if mode == 'lj':
-        # In LJ mode, X_basis contains [r^(-7), r^(-13)] at indices [0, 1]
-        # So X0 -> r^(-7), X1 -> r^(-13)
-        # But we want to express the final formula in terms of r, not r^(-7) or r^(-13)
-        # So we need to map X0 to r^(-7) and X1 to r^(-13), then simplify to get in terms of r
-        r = sp.Symbol('r')
-
-        # Replace X0 with r^(-7) and X1 with r^(-13)
-        program_str = program_str.replace('X0', 'r**(-7)')
-        program_str = program_str.replace('X1', 'r**(-13)')
-
-        # Now parse the expression and simplify
-        ld = {'inv': lambda x: 1/x, 'negpow': lambda x,n: x**(-abs(n)), 'add': lambda x,y: x+y, 'sub': lambda x,y: x-y, 'mul': lambda x,y: x*y, 'div': lambda x,y: x/y, 'r': r}
-        expr = sp.simplify(sp.sympify(program_str, locals=ld))
-
-        # Further simplify to ensure we get the expected form: A*(1/r^13) - B*(1/r^7)
-        # Convert to a more standard form if needed
-        expr = sp.expand(expr)
+        # In LJ mode, X_basis contains [r^(-13), r^(-7), r] at indices [0, 1, 2]
+        # So X0 -> r^(-13), X1 -> r^(-7), X2 -> r
+        var_mapping = {
+            sp.Symbol('X0'): r**(-13),
+            sp.Symbol('X1'): r**(-7),
+            sp.Symbol('X2'): r
+        }
     else:
         # For spring mode, X0 corresponds to (r-1) where r is the physical distance
-        r = sp.Symbol('r')
-        # Replace X0 with (r-1) (the deviation from equilibrium)
-        program_str = program_str.replace('X0', '(r-1)')
+        var_mapping = {
+            sp.Symbol('X0'): (r - 1)
+        }
+
+    # Parse the program string into a SymPy expression
+    # First, handle any custom functions like 'inv', 'negpow', etc.
+    custom_functions = {
+        'inv': lambda x: 1/x,
+        'negpow': lambda x, n: x**(-sp.Abs(n)),
+        'add': lambda x, y: x + y,
+        'sub': lambda x, y: x - y,
+        'mul': lambda x, y: x * y,
+        'div': lambda x, y: x / y
+    }
+
+    # Parse the expression using sympify with custom function handling
+    try:
+        expr = sp.sympify(program_str, locals=custom_functions)
+
+        # Perform the variable substitution using SymPy's subs method
+        for old_var, new_var in var_mapping.items():
+            expr = expr.subs(old_var, new_var)
+
+        # Simplify the final expression
+        expr = sp.simplify(expr)
+        expr = sp.expand(expr)
+
+    except Exception as e:
+        print(f"Error in sympy mapping: {e}")
+        # Fallback to original approach if sympy parsing fails
+        if mode == 'lj':
+            program_str = program_str.replace('X0', 'r**(-13)').replace('X1', 'r**(-7)').replace('X2', 'r')
+        else:
+            program_str = program_str.replace('X0', '(r-1)')
 
         ld = {'inv': lambda x: 1/x, 'negpow': lambda x,n: x**(-abs(n)), 'add': lambda x,y: x+y, 'sub': lambda x,y: x-y, 'mul': lambda x,y: x*y, 'div': lambda x,y: x/y, 'r': r}
         expr = sp.simplify(sp.sympify(program_str, locals=ld))
-
-        # Expand the expression to get it in a standard form
         expr = sp.expand(expr)
-
-        # For spring mode, we expect the form -k*(r-1), so let's try to put it in that form
-        # if possible
-        if mode == 'spring':
-            # Try to factor or rearrange to get closer to the expected form
-            expr = sp.simplify(expr)
     mse = validate_discovered_law(expr, mode, device=device)
 
     # Extract coefficients and compare against ground truth
@@ -512,8 +600,8 @@ def train_discovery(mode='lj'):
     print(f"Discovered {mode}: {expr} | MSE: {mse:.2e} | Depth: {est._program.depth_}")
     print(f"Coefficient Accuracy: {coeff_accuracy:.3f}")
 
-    # Check success criteria
-    validation_success = mse < 0.001 and est._program.depth_ < 8
+    # Check success criteria - Updated to match requirements: MSE < 0.01 and Coeff_Accuracy < 0.05
+    validation_success = mse < 0.01 and coeff_accuracy < 0.05 and est._program.depth_ < 8
     if mode == 'lj':
         expected_form = "A*(1/r^13) - B*(1/r^7)"
         print(f"LJ Target: {expected_form} where A≈48, B≈24")
