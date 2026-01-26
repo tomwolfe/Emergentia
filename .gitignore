@@ -134,6 +134,7 @@ Thumbs.db
 checkpoints/
 results/
 logs/
+*.csv
 *.png
 !discovery_*.png
 .pytest_cache/
