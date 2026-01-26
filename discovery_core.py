@@ -158,17 +158,16 @@ def train_discovery(mode='lj'):
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
     
     print(f"--- Training: {mode} on {device} ---")
-    for epoch in range(3001):
-        idxs = np.random.randint(0, p_s.shape[0], size=64)
+    for epoch in range(501):
+        idxs = np.random.randint(0, p_s.shape[0], size=512)
         f_pred = model(p_s[idxs])
         loss = torch.nn.functional.mse_loss(f_pred, f_s[idxs])
         
         opt.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         
-        if epoch % 1000 == 0: 
+        if epoch % 100 == 0: 
             print(f"[{mode}] Epoch {epoch} | Loss: {loss.item():.2e}")
 
     # Symbolic Extraction
@@ -184,7 +183,7 @@ def train_discovery(mode='lj'):
     p_coeff = 0.05 if mode == 'spring' else 0.005
     est = SymbolicRegressor(population_size=2000, generations=100,
                             function_set=('add', 'sub', 'mul', 'div', inv),
-                            metric='mse', max_samples=0.9, n_jobs=1, 
+                            metric='mse', max_samples=0.9, n_jobs=-1, 
                             parsimony_coefficient=p_coeff, random_state=42)
     est.fit(r_phys, f_mag_phys)
     
