@@ -181,9 +181,10 @@ def train_discovery(mode='lj'):
 
     # Spring should be simpler, LJ can be complex
     p_coeff = 0.05 if mode == 'spring' else 0.005
-    est = SymbolicRegressor(population_size=2000, generations=100,
+    est = SymbolicRegressor(population_size=2000, generations=40,
                             function_set=('add', 'sub', 'mul', 'div', inv),
                             metric='mse', max_samples=0.9, n_jobs=-1, 
+                            verbose=1,
                             parsimony_coefficient=p_coeff, random_state=42)
     est.fit(r_phys, f_mag_phys)
     
