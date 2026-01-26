@@ -5,6 +5,11 @@ import sympy as sp
 import matplotlib.pyplot as plt
 from gplearn.genetic import SymbolicRegressor
 from gplearn.functions import make_function
+import time
+
+# Device detection
+device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+print(f"Using device: {device}")
 
 # Custom functions for gplearn
 def _square(x):
@@ -48,7 +53,8 @@ class PhysicsSim:
             self.vel += f * self.dt
             self.pos += self.vel * self.dt
             traj_p.append(self.pos.copy()); traj_v.append(self.vel.copy())
-        return torch.tensor(np.array(traj_p), dtype=torch.float32), torch.tensor(np.array(traj_v), dtype=torch.float32)
+        return torch.tensor(np.array(traj_p), dtype=torch.float32, device=device), \
+               torch.tensor(np.array(traj_v), dtype=torch.float32, device=device)
 
 class TrajectoryScaler:
     def __init__(self, dt=0.01):
@@ -72,7 +78,7 @@ def validate_discovered_law(expr, mode, scaler, n_particles=16):
     print(f"\nValidating Discovered Law for {mode} (N={n_particles})...")
     r_sym = sp.Symbol('r')
     try:
-        f_scaled_func = sp.lambdify(r_sym, expr, 'numpy')
+        f_torch_func = sp.lambdify(r_sym, expr, 'torch')
     except Exception as e:
         print(f"Failed to create force function: {e}")
         return 1.0
@@ -80,36 +86,39 @@ def validate_discovered_law(expr, mode, scaler, n_particles=16):
     sim_gt = PhysicsSim(n=n_particles, mode=mode, seed=42)
     p_gt, _ = sim_gt.generate(steps=200)
     
-    sim_disc = PhysicsSim(n=n_particles, mode=mode, seed=42)
+    curr_pos = torch.tensor(sim_gt.pos, device=device, dtype=torch.float32)
+    curr_vel = torch.tensor(sim_gt.vel, device=device, dtype=torch.float32)
     p_disc = []
-    curr_pos = sim_disc.pos.copy()
-    curr_vel = sim_disc.vel.copy()
     
     a_factor = scaler.p_scale / (sim_gt.dt**2)
+    p_scale = scaler.p_scale
+    dt = sim_gt.dt
     
-    for _ in range(200):
-        diff = curr_pos[:, None, :] - curr_pos[None, :, :]
-        dist = np.linalg.norm(diff, axis=-1, keepdims=True)
-        dist_clip = np.clip(dist, 1e-8, None)
-        
-        try:
-            r_scaled = dist / scaler.p_scale
-            with np.errstate(all='ignore'):
-                mag_scaled = f_scaled_func(r_scaled)
-                mag_scaled = np.nan_to_num(mag_scaled, posinf=10.0, neginf=-10.0)
-            
-            f = (mag_scaled * a_factor) * (diff / dist_clip)
-            for i in range(n_particles): f[i, i, :] = 0
-            f = np.sum(f, axis=1)
-        except Exception:
-            f = np.zeros_like(curr_pos)
-            
-        curr_vel += f * sim_disc.dt
-        curr_pos += curr_vel * sim_disc.dt
-        p_disc.append(curr_pos.copy())
+    mask = ~torch.eye(n_particles, device=device).bool()
     
-    p_disc = np.array(p_disc)
-    mse = np.mean((p_gt.numpy() - p_disc)**2)
+    with torch.no_grad():
+        for _ in range(200):
+            diff = curr_pos.unsqueeze(1) - curr_pos.unsqueeze(0)
+            dist = torch.norm(diff, dim=-1, keepdim=True)
+            dist_clip = torch.clamp(dist, min=1e-8)
+            
+            r_scaled = dist / p_scale
+            try:
+                mag_scaled = f_torch_func(r_scaled)
+                mag_scaled = torch.nan_to_num(mag_scaled, nan=0.0, posinf=10.0, neginf=-10.0)
+                
+                f_pair = (mag_scaled * a_factor) * (diff / dist_clip)
+                f_pair = f_pair * mask.unsqueeze(-1)
+                f = torch.sum(f_pair, dim=1)
+            except Exception:
+                f = torch.zeros_like(curr_pos)
+                
+            curr_vel += f * dt
+            curr_pos += curr_vel * dt
+            p_disc.append(curr_pos.clone())
+    
+    p_disc = torch.stack(p_disc)
+    mse = torch.mean((p_gt - p_disc)**2).item()
     mse = np.nan_to_num(mse, nan=1.0)
     print(f"Validation MSE: {mse:.6f}")
     return mse
