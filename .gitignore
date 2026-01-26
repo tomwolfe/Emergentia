@@ -135,6 +135,5 @@ checkpoints/
 results/
 logs/
 *.png
-!discovery_result.png
-!training_history.png
+!discovery_*.png
 .pytest_cache/

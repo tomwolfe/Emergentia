@@ -229,9 +229,9 @@ def train_discovery(mode='lj'):
     v_vals = model.V_pair(feat)
     force_vals = -torch.autograd.grad(v_vals.sum(), r_torch)[0].cpu().detach().numpy().flatten()
 
-    est = SymbolicRegressor(population_size=500, generations=15,
+    est = SymbolicRegressor(population_size=600, generations=20,
                             function_set=('add', 'sub', 'mul', 'div', 'inv', 'neg', square),
-                            n_jobs=-1, parsimony_coefficient=0.005, 
+                            n_jobs=-1, parsimony_coefficient=0.002, 
                             verbose=0, random_state=42)
     est.fit(r_samples, force_vals)
     best_expr = str(est._program)
