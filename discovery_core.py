@@ -155,22 +155,66 @@ def extract_coefficients(expr, mode='lj'):
             # Look for terms with r^(-13) and r^(-7) (which appear as 1/r^13 and 1/r^7)
             # Since we expect the form A*(1/r^13) - B*(1/r^7), we need to extract these coefficients
 
-            # Extract coefficients for negative powers of r
+            # Extract coefficients for negative powers of r in multiple ways to handle equivalent forms
             coeff_r_neg13 = expanded.coeff(r**(-13))
+
+            # Also check for 1/r^13 form
+            if coeff_r_neg13 == 0 or coeff_r_neg13 is None:
+                # Convert expression to a form where we can extract coefficients of 1/r^13
+                # We need to collect terms that have r^(-13)
+                collected = sp.collect(expanded, r**(-13), evaluate=False)
+                if r**(-13) in collected:
+                    coeff_r_neg13 = collected[r**(-13)]
+                else:
+                    # Try to find coefficient of 1/r^13 by rewriting
+                    simplified_expr = sp.simplify(expanded)
+                    # Look for terms that contain r^(-13) or 1/r^13
+                    terms = simplified_expr.as_ordered_terms() if hasattr(simplified_expr, 'as_ordered_terms') else [simplified_expr]
+
+                    for term in terms:
+                        if r**(-13) in sp.preorder_traversal(term):
+                            coeff_r_neg13 = term.coeff(r**(-13))
+                            break
+                        elif sp.Mul(1, r**(-13)).has(r**(-13)) and term.has(r**(-13)):
+                            # Check if term is of the form coeff * r^(-13)
+                            if term.as_coeff_mul(r)[0] != 0:
+                                coeff_r_neg13 = term.as_coeff_mul(r)[0]
+                                break
+
+            # Similarly for r^(-7)
             coeff_r_neg7 = expanded.coeff(r**(-7))
+            if coeff_r_neg7 == 0 or coeff_r_neg7 is None:
+                collected = sp.collect(expanded, r**(-7), evaluate=False)
+                if r**(-7) in collected:
+                    coeff_r_neg7 = collected[r**(-7)]
+                else:
+                    # Try to find coefficient of 1/r^7 by rewriting
+                    simplified_expr = sp.simplify(expanded)
+                    terms = simplified_expr.as_ordered_terms() if hasattr(simplified_expr, 'as_ordered_terms') else [simplified_expr]
 
-            # Also check for positive powers that might represent equivalent forms
-            # The LJ potential is typically expressed as 4*epsilon*((sigma/r)^12 - (sigma/r)^6)
-            # which becomes 4*epsilon*(sigma^12*r^(-12) - sigma^6*r^(-6))
+                    for term in terms:
+                        if r**(-7) in sp.preorder_traversal(term):
+                            coeff_r_neg7 = term.coeff(r**(-7))
+                            break
+                        elif sp.Mul(1, r**(-7)).has(r**(-7)) and term.has(r**(-7)):
+                            # Check if term is of the form coeff * r^(-7)
+                            if term.as_coeff_mul(r)[0] != 0:
+                                coeff_r_neg7 = term.as_coeff_mul(r)[0]
+                                break
 
-            # For the force law, we expect terms like 24*(1/r^13) - 12*(1/r^7) based on derivative
-            # Actually, the force is derivative of potential: d/dr[4*epsilon*((sigma/r)^12 - (sigma/r)^6)]
-            # = 4*epsilon * (12*sigma^12*r^(-13) - 6*sigma^6*r^(-7))
-            # = 48*epsilon*sigma^12*r^(-13) - 24*epsilon*sigma^6*r^(-7)
+            # Alternative approach: convert to polynomial in r^-1
+            # This handles cases like 1/r^13 which is (r^-1)^13
+            r_inv = sp.Symbol('r_inv')
+            expr_substituted = expanded.subs(r**(-1), r_inv)
+            # Now extract coefficients of r_inv^13 and r_inv^7
+            if coeff_r_neg13 == 0 or coeff_r_neg13 is None:
+                coeff_r_neg13 = expr_substituted.coeff(r_inv**13)
+            if coeff_r_neg7 == 0 or coeff_r_neg7 is None:
+                coeff_r_neg7 = expr_substituted.coeff(r_inv**7)
 
             return {
-                'coeff_r_neg13': float(coeff_r_neg13) if coeff_r_neg13 else 0,
-                'coeff_r_neg7': float(coeff_r_neg7) if coeff_r_neg7 else 0,
+                'coeff_r_neg13': float(coeff_r_neg13) if coeff_r_neg13 and coeff_r_neg13 != 0 else 0,
+                'coeff_r_neg7': float(coeff_r_neg7) if coeff_r_neg7 and coeff_r_neg7 != 0 else 0,
                 'expected_A': 48,  # Expected coefficient for 1/r^13 term
                 'expected_B': 24,  # Expected coefficient for 1/r^7 term
             }
@@ -219,18 +263,31 @@ def train_discovery(mode='lj'):
     print(f"\n--- Training {mode} on {device} ---")
     best_loss = 1e6
     epochs = 400 if mode == 'spring' else 1200
+    patience_counter = 0
+    patience_limit = 100  # Number of epochs to wait before considering convergence
+
     for epoch in range(epochs):
         idxs = np.random.randint(0, p_s.shape[0], size=512)
         f_pred = model(p_s[idxs])
         loss = torch.nn.functional.mse_loss(f_pred, f_s[idxs])
         opt.zero_grad(); loss.backward(); opt.step(); sched.step(loss.detach())
-        if loss.item() < best_loss: best_loss = loss.item()
+        if loss.item() < best_loss:
+            best_loss = loss.item()
+            patience_counter = 0  # Reset patience counter when we find a better loss
+        else:
+            patience_counter += 1
+
         if epoch % 200 == 0: print(f"Epoch {epoch} | Loss: {loss.item():.2e}")
 
         # Early stopping: if loss is below threshold, break the loop
         threshold = 0.05 if mode == 'spring' else 0.5
         if loss.item() < threshold:
             print(f"Early stopping at epoch {epoch}, loss: {loss.item():.2e}")
+            break
+
+        # Additional early stopping based on patience
+        if patience_counter >= patience_limit:
+            print(f"No improvement for {patience_limit} epochs, stopping at epoch {epoch}")
             break
 
     threshold = 0.05 if mode == 'spring' else 0.5
@@ -240,22 +297,36 @@ def train_discovery(mode='lj'):
     if best_loss > threshold:
         print(f"Initial NN Loss {best_loss:.4f} > {threshold}, trying smaller hidden layer...")
         # Retrain with smaller hidden layer (32 neurons) to force smoother representation
+        # Use even smaller learning rate for fine-tuning
         model = DiscoveryNet(n_particles=sim.n, hidden_size=32).to(device)
-        opt = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-4)
+        opt = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)
         sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, 'min', patience=50, factor=0.5)
 
         best_loss = 1e6
+        patience_counter = 0
+        patience_limit = 100  # Number of epochs to wait before considering convergence
+
         for epoch in range(epochs):
             idxs = np.random.randint(0, p_s.shape[0], size=512)
             f_pred = model(p_s[idxs])
             loss = torch.nn.functional.mse_loss(f_pred, f_s[idxs])
             opt.zero_grad(); loss.backward(); opt.step(); sched.step(loss.detach())
-            if loss.item() < best_loss: best_loss = loss.item()
+            if loss.item() < best_loss:
+                best_loss = loss.item()
+                patience_counter = 0  # Reset patience counter when we find a better loss
+            else:
+                patience_counter += 1
+
             if epoch % 200 == 0: print(f"Epoch {epoch} (smaller net) | Loss: {loss.item():.2e}")
 
             # Early stopping: if loss is below threshold, break the loop
             if loss.item() < threshold:
                 print(f"Early stopping at epoch {epoch} (smaller net), loss: {loss.item():.2e}")
+                break
+
+            # Additional early stopping based on patience
+            if patience_counter >= patience_limit:
+                print(f"No improvement for {patience_limit} epochs, stopping at epoch {epoch} (smaller net)")
                 break
 
     if best_loss > threshold:
@@ -285,9 +356,13 @@ def train_discovery(mode='lj'):
 
     # Use the basis functions as input variables for symbolic regression
     # For LJ mode, only use basic arithmetic operations since basis functions are provided
-    p_coeff, f_set = 0.01, ['add', 'sub', 'mul']  # Changed initial p_coeff to 0.01 to favor simpler formulas
-    if mode != 'lj':  # Only add extra functions for non-LJ modes
-        f_set += ['div', inv, negpow]
+    p_coeff = 0.01  # Changed initial p_coeff to 0.01 to favor simpler formulas
+
+    # Restrict function set for LJ mode to prevent 'mathematical loops'
+    if mode == 'lj':
+        f_set = ['add', 'sub', 'mul']
+    else:
+        f_set = ['add', 'sub', 'mul', 'div', inv, negpow]
 
     # Single fit with one retry option instead of the attempt loop
     est = SymbolicRegressor(population_size=1000, generations=15, function_set=f_set,
@@ -304,8 +379,34 @@ def train_discovery(mode='lj'):
         est_retry.fit(X_basis, f_mag_phys)
         est = est_retry  # Use the retry result
 
-    ld = {'inv': lambda x: 1/x, 'negpow': lambda x,n: x**(-abs(n)), 'add': lambda x,y: x+y, 'sub': lambda x,y: x-y, 'mul': lambda x,y: x*y, 'div': lambda x,y: x/y}
-    expr = sp.simplify(sp.sympify(str(est._program), locals=ld))
+    # Map the symbolic regressor variables (X0, X1, etc.) back to physical variables (r)
+    # The X_basis contains features derived from r, so we need to map them back properly
+    program_str = str(est._program)
+
+    # Replace X0, X1, etc. with the corresponding physical variable based on the mode
+    # For LJ mode, X0 corresponds to r^(-7) and X1 corresponds to r^(-13)
+    # For other modes, we need to map appropriately
+    if mode == 'lj':
+        # In LJ mode, X_basis contains [r^(-7), r^(-13)] at indices [0, 1]
+        # So X0 -> r^(-7), X1 -> r^(-13)
+        # But we want to express the final formula in terms of r, not r^(-7) or r^(-13)
+        # So we need to map X0 to r^(-7) and X1 to r^(-13), then simplify to get in terms of r
+        r = sp.Symbol('r')
+
+        # Replace X0 with r^(-7) and X1 with r^(-13)
+        program_str = program_str.replace('X0', 'r**(-7)')
+        program_str = program_str.replace('X1', 'r**(-13)')
+
+        # Now parse the expression and simplify
+        ld = {'inv': lambda x: 1/x, 'negpow': lambda x,n: x**(-abs(n)), 'add': lambda x,y: x+y, 'sub': lambda x,y: x-y, 'mul': lambda x,y: x*y, 'div': lambda x,y: x/y, 'r': r}
+        expr = sp.simplify(sp.sympify(program_str, locals=ld))
+    else:
+        # For spring mode, X0 might correspond to r itself
+        r = sp.Symbol('r')
+        # Replace X0 with r (and any other X variables with r if needed)
+        program_str = program_str.replace('X0', 'r')
+        ld = {'inv': lambda x: 1/x, 'negpow': lambda x,n: x**(-abs(n)), 'add': lambda x,y: x+y, 'sub': lambda x,y: x-y, 'mul': lambda x,y: x*y, 'div': lambda x,y: x/y, 'r': r}
+        expr = sp.simplify(sp.sympify(program_str, locals=ld))
     mse = validate_discovered_law(expr, mode, device=device)
 
     # Extract coefficients and compare against ground truth
@@ -314,12 +415,22 @@ def train_discovery(mode='lj'):
     # Calculate coefficient accuracy metrics
     if mode == 'lj':
         # Calculate how close the discovered coefficients are to expected values
-        coeff_accuracy = min(
-            abs(coeffs.get('coeff_r_neg13', 0) - coeffs.get('expected_A', 48)) / coeffs.get('expected_A', 48),
-            abs(coeffs.get('coeff_r_neg7', 0) - coeffs.get('expected_B', 24)) / coeffs.get('expected_B', 24)
-        ) if coeffs.get('expected_A', 48) != 0 and coeffs.get('expected_B', 24) != 0 else float('inf')
+        coeff_r_neg13 = coeffs.get('coeff_r_neg13', 0)
+        coeff_r_neg7 = coeffs.get('coeff_r_neg7', 0)
+        expected_A = coeffs.get('expected_A', 48)
+        expected_B = coeffs.get('expected_B', 24)
+
+        # Calculate relative errors for both coefficients
+        rel_error_13 = abs(coeff_r_neg13 - expected_A) / abs(expected_A) if expected_A != 0 else float('inf')
+        rel_error_7 = abs(coeff_r_neg7 - expected_B) / abs(expected_B) if expected_B != 0 else float('inf')
+
+        # Use the average of both relative errors as the coefficient accuracy
+        # This gives a more comprehensive measure of how well both coefficients match
+        coeff_accuracy = (rel_error_13 + rel_error_7) / 2.0 if expected_A != 0 and expected_B != 0 else float('inf')
     elif mode == 'spring':
-        coeff_accuracy = abs(coeffs.get('coeff_r', 0) - coeffs.get('expected_k', 10)) / coeffs.get('expected_k', 10) if coeffs.get('expected_k', 10) != 0 else float('inf')
+        coeff_r = coeffs.get('coeff_r', 0)
+        expected_k = coeffs.get('expected_k', 10)
+        coeff_accuracy = abs(coeff_r - expected_k) / abs(expected_k) if expected_k != 0 else float('inf')
     else:
         coeff_accuracy = float('inf')
 
