@@ -27,7 +27,7 @@ class PhysicsSim:
         self.n, self.mode, self.dt = n, mode, 0.01
         self.pos = torch.rand((n, 2), device=device, dtype=torch.float32) * 2.0 
         self.vel = torch.randn((n, 2), device=device, dtype=torch.float32) * 0.05
-        self.mask = ~torch.eye(n, device=device).bool()
+        self.mask = (~torch.eye(n, device=device).bool()).unsqueeze(-1)
     
     def get_ground_truth_potential(self, r):
         if self.mode == 'spring':
@@ -45,10 +45,9 @@ class PhysicsSim:
             f = -10.0 * (dist - 1.0) * (diff / dist_clip)
         else:
             d_inv = 1.0 / torch.clamp(dist, min=0.4, max=5.0)
-            f = 24.0 * (2 * d_inv**13 - d_inv**7) * (diff / dist_clip)
+            f = 24.0 * (2 * torch.pow(d_inv, 13) - torch.pow(d_inv, 7)) * (diff / dist_clip)
         
-        f = f * self.mask.unsqueeze(-1)
-        return torch.sum(torch.nan_to_num(f), dim=1)
+        return torch.sum(f * self.mask, dim=1)
 
     def generate(self, steps=1500):
         traj_p = torch.zeros((steps, self.n, 2), device=device)
@@ -57,12 +56,13 @@ class PhysicsSim:
         curr_pos = self.pos.clone()
         curr_vel = self.vel.clone()
         
-        for i in range(steps):
-            f = self.compute_forces(curr_pos)
-            curr_vel += f * self.dt
-            curr_pos += curr_vel * self.dt
-            traj_p[i] = curr_pos
-            traj_v[i] = curr_vel
+        with torch.no_grad():
+            for i in range(steps):
+                f = self.compute_forces(curr_pos)
+                curr_vel += f * self.dt
+                curr_pos += curr_vel * self.dt
+                traj_p[i] = curr_pos
+                traj_v[i] = curr_vel
             
         return traj_p, traj_v
 
@@ -71,18 +71,13 @@ class TrajectoryScaler:
         self.dt = dt
         self.p_mid = 0
         self.p_scale = 1
-        self.v_scale = 1
 
     def fit(self, p, v):
         self.p_mid = p.mean(dim=(0, 1), keepdim=True)
         self.p_scale = p.std().item() + 1e-6
-        self.v_scale = self.p_scale / self.dt
 
     def transform(self, p, v):
-        return (p - self.p_mid) / self.p_scale, v / self.v_scale
-
-    def inverse_transform_p(self, p_s):
-        return p_s * self.p_scale + self.p_mid
+        return (p - self.p_mid) / self.p_scale, v * (self.dt / self.p_scale)
 
 def validate_discovered_law(expr, mode, scaler, n_particles=16):
     print(f"\nValidating Discovered Law for {mode} (N={n_particles})...")
@@ -103,7 +98,7 @@ def validate_discovered_law(expr, mode, scaler, n_particles=16):
     a_factor = scaler.p_scale / (sim_gt.dt**2)
     p_scale = scaler.p_scale
     dt = sim_gt.dt
-    mask = ~torch.eye(n_particles, device=device).bool()
+    mask = (~torch.eye(n_particles, device=device).bool()).unsqueeze(-1)
     
     with torch.inference_mode():
         for i in range(200):
@@ -117,8 +112,7 @@ def validate_discovered_law(expr, mode, scaler, n_particles=16):
                 mag_scaled = torch.nan_to_num(mag_scaled, nan=0.0, posinf=10.0, neginf=-10.0)
                 
                 f_pair = (mag_scaled * a_factor) * (diff / dist_clip)
-                f_pair = f_pair * mask.unsqueeze(-1)
-                f = torch.sum(f_pair, dim=1)
+                f = torch.sum(f_pair * mask, dim=1)
             except Exception:
                 f = torch.zeros_like(curr_pos)
                 
@@ -171,26 +165,24 @@ def train_discovery(mode='lj'):
     scaler = TrajectoryScaler(dt=sim.dt)
     scaler.fit(p_traj, v_traj)
     p_s, v_s = scaler.transform(p_traj, v_traj)
-    p_s, v_s = p_s.to(device), v_s.to(device)
     
     model = DiscoveryNet().to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+    opt = torch.optim.Adam(model.parameters(), lr=2e-3, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=1000)
     
-    # Pre-calculate consistency features
     r_large = torch.linspace(2.0, 5.0, 20, device=device).view(-1, 1)
     feat_large = torch.cat([r_large, torch.pow(r_large, -1), torch.pow(r_large, -2)], dim=-1)
     
     print(f"\n--- Training Discovery Pipeline: {mode} ---")
     
     for epoch in range(1001):
-        idxs = np.random.randint(0, len(p_s)-1, size=128)
+        idxs = np.random.randint(0, len(p_s)-1, size=64)
         
         p_batch = torch.cat([p_s[idxs], p_s[idxs+1]], dim=0)
         a_all, _ = model.get_forces(p_batch)
         
-        a = a_all[:128]
-        a_next = a_all[128:]
+        a = a_all[:64]
+        a_next = a_all[64:]
         
         q, p = p_s[idxs], v_s[idxs]
         q_next, p_next = p_s[idxs+1], v_s[idxs+1]
@@ -217,7 +209,6 @@ def train_discovery(mode='lj'):
             a_mag = a.abs().mean().item()
             print(f"Epoch {epoch:4d} | Loss: {loss.item():.4e} | Dyn: {l_dyn.item():.4e} | a_mag: {a_mag:.4e}")
 
-        # Early exit
         if l_dyn < 1e-8 and epoch > 600:
             print(f"Early exit at epoch {epoch}")
             break
@@ -228,10 +219,7 @@ def train_discovery(mode='lj'):
     print("\nDistilling Symbolic Force...")
     model.eval()
     
-    r_log = np.logspace(np.log10(0.05), np.log10(1.5), 400)
-    r_lin = np.linspace(1.5, 5.0, 400)
-    r_samples = np.concatenate([r_log, r_lin]).astype(np.float32).reshape(-1, 1)
-
+    r_samples = np.linspace(0.1, 5.0, 800).astype(np.float32).reshape(-1, 1)
     r_torch = torch.tensor(r_samples, dtype=torch.float32, device=device, requires_grad=True)
     feat = torch.cat([r_torch, torch.pow(r_torch, -1), torch.pow(r_torch, -2)], dim=-1)
     v_vals = model.V_pair(feat)
@@ -240,7 +228,7 @@ def train_discovery(mode='lj'):
     est = SymbolicRegressor(population_size=600, generations=20,
                             function_set=('add', 'sub', 'mul', 'div', 'neg', square),
                             max_samples=0.5, stopping_criteria=0.00001,
-                            n_jobs=-1, parsimony_coefficient=0.001, 
+                            n_jobs=-1, parsimony_coefficient=1e-5, 
                             verbose=0, random_state=42)
     est.fit(r_samples, force_vals)
     best_expr = str(est._program)
@@ -258,7 +246,7 @@ def train_discovery(mode='lj'):
         t_val = time.time()
         print(f"Validation Phase Duration: {t_val - t_symbolic:.2f}s")
         
-        r_plot = np.linspace(max(0.1, r_samples.min()), min(5.0, r_samples.max()), 100)
+        r_plot = np.linspace(0.1, 5.0, 100)
         r_plot_phys = r_plot * scaler.p_scale
         v_gt = np.array([sim.get_ground_truth_potential(r) for r in r_plot_phys])
         
