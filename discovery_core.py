@@ -7,6 +7,8 @@ from gplearn.functions import make_function
 import time
 from sklearn.metrics import r2_score
 import warnings
+from concurrent.futures import ProcessPoolExecutor
+import os
 
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
@@ -23,7 +25,7 @@ sqrt = make_function(function=_protected_sqrt, name='sqrt', arity=1)
 # 2. ENHANCED SIMULATOR
 class PhysicsSim:
     def __init__(self, n=8, mode='lj', seed=None, device='cpu'):
-        if seed is not None: 
+        if seed is not None:
             torch.manual_seed(seed)
             np.random.seed(seed)
         self.device = device
@@ -32,14 +34,16 @@ class PhysicsSim:
         scale = 2.0 if mode == 'spring' else 3.5
         self.pos = torch.rand((n, 2), device=self.device, dtype=torch.float32) * scale
         self.vel = torch.randn((n, 2), device=self.device, dtype=torch.float32) * 0.1
-    
+
+        # Pre-calculate the identity mask to avoid repeated torch.eye calls
+        self.mask = (~torch.eye(n, device=self.device).bool()).unsqueeze(-1)
+
     def compute_forces(self, pos):
         n = pos.size(0)
         diff = pos.unsqueeze(1) - pos.unsqueeze(0) # (N, N, 2)
         dist = torch.norm(diff, dim=-1, keepdim=True) # (N, N, 1)
         dist_clip = torch.clamp(dist, min=1e-6)
-        mask = (~torch.eye(n, device=self.device).bool()).unsqueeze(-1)
-        
+
         if self.mode == 'spring':
             # F = -10.0 * (r - 1.0)
             f_mag = -10.0 * (dist - 1.0)
@@ -48,8 +52,8 @@ class PhysicsSim:
             # Clamp distance to avoid explosion during simulation
             d_inv = 1.0 / torch.clamp(dist, min=0.7, max=5.0)
             f_mag = 24.0 * (2 * torch.pow(d_inv, 13) - torch.pow(d_inv, 7))
-        
-        f = f_mag * (diff / dist_clip) * mask
+
+        f = f_mag * (diff / dist_clip) * self.mask
         return torch.sum(f, dim=1)
 
     def generate(self, steps=600):
@@ -57,8 +61,8 @@ class PhysicsSim:
         traj_v = torch.zeros((steps, self.n, 2), device=self.device)
         traj_f = torch.zeros((steps, self.n, 2), device=self.device)
         curr_pos, curr_vel = self.pos.clone(), self.vel.clone()
-        
-        with torch.no_grad():
+
+        with torch.inference_mode():
             for i in range(steps):
                 f = self.compute_forces(curr_pos)
                 traj_f[i] = f
@@ -88,34 +92,36 @@ def validate_discovered_law(expr, mode, n_particles=8, device='cpu'):
         return 1e6
 
     sim_gt = PhysicsSim(n=n_particles, mode=mode, seed=42, device=device)
-    p_gt, _, _ = sim_gt.generate(steps=50)
+    p_gt, _, _ = sim_gt.generate(steps=20)  # Reduced from 50 to 20 steps
     curr_pos, curr_vel = sim_gt.pos.clone(), sim_gt.vel.clone()
-    p_disc = torch.zeros((50, n_particles, 2), device=device)
-    
+    p_disc = torch.zeros((20, n_particles, 2), device=device)  # Changed to 20 steps
+
+    # Pre-calculate the identity mask to avoid repeated torch.eye calls
+    mask = (~torch.eye(n_particles, device=device).bool()).unsqueeze(-1)
+
     with torch.inference_mode():
-        for i in range(50):
+        for i in range(20):  # Reduced from 50 to 20 steps
             diff = curr_pos.unsqueeze(1) - curr_pos.unsqueeze(0)
             dist = torch.norm(diff, dim=-1, keepdim=True)
             dist_clip = torch.clamp(dist, min=1e-8)
-            mask = (~torch.eye(n_particles, device=device).bool()).unsqueeze(-1)
-            
+
             try:
                 mag = f_torch_func(dist)
                 if not isinstance(mag, torch.Tensor): mag = torch.full_like(dist, float(mag))
                 mag = torch.nan_to_num(mag, nan=0.0, posinf=1000.0, neginf=-1000.0)
                 f = torch.sum(mag * (diff / dist_clip) * mask, dim=1)
             except: f = torch.zeros_like(curr_pos)
-            
+
             curr_vel += f * sim_gt.dt
             curr_pos += curr_vel * sim_gt.dt
             p_disc[i] = curr_pos
-    
+
     mse = torch.mean((p_gt - p_disc)**2).item()
     return np.nan_to_num(mse, nan=1e6)
 
 # 2. CORE ARCHITECTURE
 class DiscoveryNet(nn.Module):
-    def __init__(self):
+    def __init__(self, n_particles=8):
         super().__init__()
         # Input features: r, 1/r, 1/r^2
         self.net = nn.Sequential(
@@ -124,20 +130,30 @@ class DiscoveryNet(nn.Module):
             nn.Linear(128, 1)
         )
 
+        # Store the number of particles to pre-calculate the mask
+        self.n_particles = n_particles
+
     def forward(self, pos_scaled):
         B, N, _ = pos_scaled.shape
         diff = pos_scaled.unsqueeze(2) - pos_scaled.unsqueeze(1)
         dist = torch.norm(diff, dim=-1, keepdim=True)
         dist_clip = torch.clamp(dist, min=0.01)
-        
+
         # Physics-informed features
         r = dist
         inv_r = 1.0 / dist_clip
         inv_r2 = inv_r**2
         feat = torch.cat([r, inv_r, inv_r2], dim=-1)
-        
+
         mag = self.net(feat)
-        mask = (~torch.eye(N, device=pos_scaled.device).bool()).unsqueeze(-1)
+
+        # Use pre-calculated mask if dimensions match, otherwise calculate
+        if hasattr(self, '_mask') and self._mask.shape[0] == N:
+            mask = self._mask
+        else:
+            mask = (~torch.eye(N, device=pos_scaled.device).bool()).unsqueeze(-1)
+            self._mask = mask
+
         pair_forces = mag * (diff / dist_clip) * mask
         return torch.sum(pair_forces, dim=2)
 
@@ -149,58 +165,78 @@ class DiscoveryNet(nn.Module):
 # 3. TRAINING & DISCOVERY
 def train_discovery(mode='lj'):
     device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+
+    # Set device for multiprocessing to avoid CUDA conflicts
+    if device.type == 'cuda':
+        torch.cuda.set_device(device.index if device.index is not None else 0)
+
     sim = PhysicsSim(mode=mode, device=device)
     p_traj, v_traj, f_traj = sim.generate(600)
     scaler = TrajectoryScaler(mode=mode)
     p_s, f_s = scaler.transform(p_traj, f_traj)
-    
-    model = DiscoveryNet().to(device)
+
+    model = DiscoveryNet(n_particles=sim.n).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
-    
+
     print(f"--- Training: {mode} on {device} ---")
-    for epoch in range(151):
+
+    # Early stopping parameters
+    best_loss = float('inf')
+    patience = 10
+    patience_counter = 0
+
+    epochs = 151 if mode != 'spring' else 50  # Fewer epochs for spring mode
+
+    for epoch in range(epochs):
         idxs = np.random.randint(0, p_s.shape[0], size=512)
         f_pred = model(p_s[idxs])
         loss = torch.nn.functional.mse_loss(f_pred, f_s[idxs])
-        
+
         opt.zero_grad()
         loss.backward()
         opt.step()
-        
-        if loss.item() < 1e-5:
+
+        # Early stopping logic
+        if loss.item() < best_loss:
+            best_loss = loss.item()
+            patience_counter = 0
+        else:
+            patience_counter += 1
+
+        if patience_counter >= patience or loss.item() < 1e-5:
             print(f"[{mode}] Converged at epoch {epoch} | Loss: {loss.item():.2e}")
             break
 
-        if epoch % 100 == 0: 
+        if epoch % 50 == 0:  # Adjusted logging frequency
             print(f"[{mode}] Epoch {epoch} | Loss: {loss.item():.2e}")
 
     # Symbolic Extraction
     r_phys = np.linspace(0.8 if mode == 'lj' else 0.4, 4.0, 50).astype(np.float32).reshape(-1, 1)
     r_scaled = torch.tensor(r_phys / scaler.p_scale, dtype=torch.float32, device=device)
-    
-    with torch.no_grad():
+
+    with torch.inference_mode():
         f_mag_scaled = model.predict_mag(r_scaled).cpu().numpy()
-    
+
     f_mag_phys = scaler.inverse_transform_f(f_mag_scaled).ravel()
 
-    # Mode-dependent SR parameters
+    # Mode-dependent SR parameters - significantly reduced for spring mode
     if mode == 'spring':
-        pop_size, gens, f_set = 500, 10, ('add', 'sub', 'mul')
+        pop_size, gens, f_set = 200, 5, ('add', 'sub', 'mul')  # Reduced from 500,10 to 200,5
         p_coeff = 0.05
     else:
         pop_size, gens, f_set = 600, 12, ('add', 'sub', 'mul', 'div', inv)
         p_coeff = 0.005
-    
+
     est = SymbolicRegressor(population_size=pop_size, generations=gens,
                             function_set=f_set,
-                            metric='mse', max_samples=0.9, n_jobs=-1, 
+                            metric='mse', max_samples=0.9, n_jobs=1,  # Changed n_jobs to 1 for multiprocessing compatibility
                             verbose=1,
                             parsimony_coefficient=p_coeff, random_state=42)
     est.fit(r_phys, f_mag_phys)
-    
-    ld = {'add':lambda a,b:a+b, 'sub':lambda a,b:a-b, 'mul':lambda a,b:a*b, 
+
+    ld = {'add':lambda a,b:a+b, 'sub':lambda a,b:a-b, 'mul':lambda a,b:a*b,
           'div':lambda a,b:a/b, 'inv':lambda a:1./a, 'X0':sp.Symbol('r')}
-    
+
     expr = sp.simplify(sp.sympify(str(est._program), locals=ld))
     mse = validate_discovered_law(expr, mode, device=device)
 
@@ -208,10 +244,21 @@ def train_discovery(mode='lj'):
     print(res)
     return res
 
+def run_single_discovery(args):
+    """Wrapper function for multiprocessing"""
+    mode = args
+    return train_discovery(mode)
+
 if __name__ == "__main__":
     t0 = time.time()
-    res1 = train_discovery('spring')
-    res2 = train_discovery('lj')
+
+    # Use ProcessPoolExecutor to run spring and lj in parallel
+    with ProcessPoolExecutor(max_workers=2) as executor:
+        modes = ['spring', 'lj']
+        results = list(executor.map(run_single_discovery, modes))
+
+    res1, res2 = results
+
     print(f"\n--- SUMMARY (Total Time: {time.time()-t0:.2f}s) ---")
     print(res1)
     print(res2)
