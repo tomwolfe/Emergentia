@@ -158,8 +158,7 @@ def train_discovery(mode='lj'):
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
     
     print(f"--- Training: {mode} on {device} ---")
-    epochs = 301 if mode == 'lj' else 151
-    for epoch in range(epochs):
+    for epoch in range(151):
         idxs = np.random.randint(0, p_s.shape[0], size=512)
         f_pred = model(p_s[idxs])
         loss = torch.nn.functional.mse_loss(f_pred, f_s[idxs])
