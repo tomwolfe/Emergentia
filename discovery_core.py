@@ -9,8 +9,14 @@ import pandas as pd
 import warnings
 import os
 import datetime
+import concurrent.futures
 
 warnings.filterwarnings('ignore', category=RuntimeWarning)
+
+def optional_compile(func, **kwargs):
+    # Disable torch.compile to avoid pickling issues with multiprocessing
+    # and known issues with inductor backend
+    return func
 
 # 1. PROTECTED CUSTOM FUNCTIONS
 def _protected_inv(x):
@@ -41,6 +47,7 @@ class PhysicsSim:
         self.vel = torch.randn((n, 2), device=self.device, dtype=torch.float32) * 0.1
         self.mask = (~torch.eye(n, device=self.device).bool()).unsqueeze(-1)
 
+    @optional_compile
     def compute_forces(self, pos):
         diff = pos.unsqueeze(1) - pos.unsqueeze(0)
         dist = torch.norm(diff, dim=-1, keepdim=True)
@@ -53,6 +60,7 @@ class PhysicsSim:
         f = f_mag * (diff / dist_clip) * self.mask
         return torch.sum(f, dim=1)
 
+    @optional_compile
     def generate(self, steps=1000):
         traj_p = torch.zeros((steps, self.n, 2), device=self.device)
         traj_f = torch.zeros((steps, self.n, 2), device=self.device)
@@ -103,7 +111,9 @@ class DiscoveryNet(nn.Module):
 
 def validate_discovered_law(expr, mode, device='cpu'):
     r_sym = sp.Symbol('r')
-    try: f_torch_func = sp.lambdify(r_sym, expr, 'torch')
+    try: 
+        f_torch_func = sp.lambdify(r_sym, expr, 'torch')
+        f_torch_func = optional_compile(f_torch_func)
     except: return 1e6
     sim_gt = PhysicsSim(n=8, mode=mode, seed=42, device=device)
     p_gt, _ = sim_gt.generate(steps=50)
@@ -177,14 +187,35 @@ def train_discovery(mode='lj'):
     print(f"Discovered {mode}: {expr} | MSE: {mse:.2e}")
     return f"Success: {mode}", best_loss, p_coeff, expr, mse
 
+def run_single_mode(mode):
+    """Wrapper function to run a single mode with proper error handling"""
+    try:
+        return train_discovery(mode)
+    except Exception as e:
+        # Return a safe error representation that can be pickled
+        return f"Error in {mode}: {str(e)}"
+
 if __name__ == "__main__":
-    results = [train_discovery('spring'), train_discovery('lj')]
+
+    modes = ['spring', 'lj']
+
+    print(f"Starting discovery on {len(modes)} modes in parallel...")
+
+    # Use ThreadPoolExecutor instead of ProcessPoolExecutor to avoid pickling issues
+    # with complex PyTorch objects and compiled functions
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+
+        futures = {executor.submit(run_single_mode, mode): mode for mode in modes}
+
+        results = []
+
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                results.append(future.result())
+            except Exception as e:
+                print(f"Exception in thread for mode {futures[future]}: {e}")
+
+
     print("\n--- Final Results ---")
-    for r in results: print(r)
 
-
-
-if __name__ == "__main__":
-    results = [train_discovery('spring'), train_discovery('lj')]
-    print("\n--- Final Results ---")
     for r in results: print(r)
