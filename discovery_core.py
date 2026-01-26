@@ -103,23 +103,38 @@ class TrajectoryScaler:
 
 # 3. CORE ARCHITECTURE
 class DiscoveryNet(nn.Module):
-    def __init__(self, n_particles=8, hidden_size=128):
+    def __init__(self, n_particles=8, hidden_size=256):  # Increased hidden size
         super().__init__()
+        # Deeper and wider network for better representational capacity
         self.net = nn.Sequential(
-            nn.Linear(6, hidden_size), nn.Tanh(),
-            nn.Linear(hidden_size, hidden_size), nn.Tanh(),
-            nn.Linear(hidden_size, 1)
+            nn.Linear(6, hidden_size), nn.LayerNorm(hidden_size), nn.Tanh(),
+            nn.Linear(hidden_size, hidden_size), nn.LayerNorm(hidden_size), nn.Tanh(),
+            nn.Linear(hidden_size, hidden_size//2), nn.LayerNorm(hidden_size//2), nn.Tanh(),
+            nn.Linear(hidden_size//2, hidden_size//2), nn.LayerNorm(hidden_size//2), nn.Tanh(),
+            nn.Linear(hidden_size//2, hidden_size//4), nn.Tanh(),
+            nn.Linear(hidden_size//4, 1)
         )
 
     def _get_features(self, dist):
-        dist_clip = torch.clamp(dist, min=0.5, max=10.0)  # Clamp both min and max to prevent extreme values
-        inv_r = 1.0 / dist_clip
-        # Clamp the powers to prevent overflow
-        inv_r_6 = torch.clamp(inv_r**6, max=1e6)
-        inv_r_12 = torch.clamp(inv_r**12, max=1e12)
-        inv_r_7 = torch.clamp(inv_r**7, max=1e7)
-        inv_r_13 = torch.clamp(inv_r**13, max=1e13)
-        return torch.cat([dist, inv_r, inv_r_6, inv_r_12, inv_r_7, inv_r_13], dim=-1)
+        # Improved clamping to prevent numerical overflow while maintaining precision
+        dist_safe = torch.clamp(dist, min=0.3, max=15.0)  # Extended range for better exploration
+        inv_r = 1.0 / dist_safe
+
+        # Calculate powers with careful attention to numerical stability
+        inv_r_2 = inv_r**2
+        inv_r_6 = inv_r_2**3  # More stable way to calculate r^-6
+        inv_r_7 = inv_r_6 * inv_r  # r^-7 = r^-6 * r^-1
+        inv_r_12 = inv_r_6**2  # More stable way to calculate r^-12
+        inv_r_13 = inv_r_12 * inv_r  # r^-13 = r^-12 * r^-1
+
+        # Apply additional clamping to prevent extreme values
+        inv_r_clamped = torch.clamp(inv_r, min=-1e6, max=1e6)
+        inv_r_6_clamped = torch.clamp(inv_r_6, min=-1e6, max=1e6)
+        inv_r_12_clamped = torch.clamp(inv_r_12, min=-1e6, max=1e6)
+        inv_r_7_clamped = torch.clamp(inv_r_7, min=-1e6, max=1e6)
+        inv_r_13_clamped = torch.clamp(inv_r_13, min=-1e6, max=1e6)
+
+        return torch.cat([dist, inv_r_clamped, inv_r_6_clamped, inv_r_12_clamped, inv_r_7_clamped, inv_r_13_clamped], dim=-1)
 
     def forward(self, pos_scaled):
         diff = pos_scaled.unsqueeze(2) - pos_scaled.unsqueeze(1)
@@ -366,37 +381,64 @@ def extract_coefficients(expr, mode='lj'):
 # 4. TRAINING & DISCOVERY
 def train_discovery(mode='lj'):
     device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
-    sim = PhysicsSim(mode=mode, device=device)
-    p_traj, f_traj = sim.generate(1200)
+    sim = PhysicsSim(mode=mode, device=device, seed=42)  # Fixed seed for reproducibility
+    p_traj, f_traj = sim.generate(2000)  # Increased trajectory length for more diverse data
     scaler = TrajectoryScaler(mode=mode)
     p_s, f_s = scaler.transform(p_traj, f_traj)
     
     # Train DiscoveryNet with fixed hidden size
-    model = DiscoveryNet(n_particles=sim.n, hidden_size=64).to(device)  # Fixed hidden size of 64
-    opt = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-4)
-    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, 'min', patience=25, factor=0.5)
+    model = DiscoveryNet(n_particles=sim.n, hidden_size=128).to(device)  # Increased hidden size for better capacity
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)  # Increased learning rate and reduced weight decay
+    # Use ReduceLROnPlateau with more aggressive settings
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, 'min', patience=100, factor=0.1, min_lr=1e-7)
 
     print(f"\n--- Training {mode} on {device} ---")
     best_loss = 1e6
-    epochs = 100 if mode == 'spring' else 250  # Reduced epochs: 100 for spring, 250 for lj
+    epochs = 500 if mode == 'spring' else 1000  # Significantly increased epochs: 500 for spring, 1000 for lj
     patience_counter = 0
-    patience_limit = 15  # Reduced patience for early stopping
-    min_epochs = 20  # Reduced min_epochs
+    patience_limit = 30  # Increased patience for early stopping
+    min_epochs = 50  # Increased min_epochs
 
     # Track previous losses for early stopping based on minimal improvement
     prev_losses = []
-    improvement_threshold = 1e-7
+    improvement_threshold = 1e-8  # Lowered improvement threshold
 
     for epoch in range(epochs):
-        idxs = np.random.randint(0, p_s.shape[0], size=512)
+        idxs = np.random.randint(0, p_s.shape[0], size=1024)  # Increased batch size for more stable gradients
         f_pred = model(p_s[idxs])
 
-        # Use Log-Cosh loss instead of MSE to handle large force values at small distances
-        # Log-Cosh is less sensitive to outliers than MSE
+        # Use MSE loss for better precision in the final stages
         diff = f_pred - f_s[idxs]
-        loss = torch.mean(torch.log(torch.cosh(diff + 1e-12)))  # Add small epsilon to prevent log(0)
+        loss = torch.mean(diff**2)
 
-        opt.zero_grad(); loss.backward(); opt.step(); sched.step(loss.detach())
+        # Curriculum learning: gradually increase the penalty for large errors
+        # This helps the model focus on getting the general shape right first, then fine-tune
+        curriculum_factor = min(1.0, epoch / 100.0)  # Gradually increase from 0 to 1 over first 100 epochs
+        weighted_loss = torch.mean(torch.pow(diff**2, 1.0 + 0.5 * curriculum_factor))  # Increase exponent gradually
+
+        # Add a regularization term to encourage smoothness in the learned function
+        # This can help with generalization and numerical stability
+        reg_loss = 0.0
+        if epoch > 50:  # Only apply regularization after initial fitting
+            # Calculate gradients of the model output w.r.t. inputs to encourage smoothness
+            p_batch = p_s[idxs].requires_grad_()
+            f_pred_reg = model(p_batch)
+            grad_outputs = torch.ones_like(f_pred_reg)
+            gradients = torch.autograd.grad(outputs=f_pred_reg, inputs=p_batch,
+                                          grad_outputs=grad_outputs,
+                                          create_graph=True, retain_graph=True)[0]
+            reg_loss = 1e-4 * torch.mean(gradients**2)  # Smoothness regularization
+
+        total_loss = weighted_loss + reg_loss
+
+        opt.zero_grad()
+        total_loss.backward()
+
+        # Gradient clipping to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        opt.step()
+        sched.step(weighted_loss.detach())  # Use weighted loss for scheduler
 
         if loss.item() < best_loss:
             best_loss = loss.item()
@@ -406,7 +448,7 @@ def train_discovery(mode='lj'):
 
         # Track recent losses for improvement checking
         prev_losses.append(loss.item())
-        if len(prev_losses) > 15:  # Keep last 15 losses
+        if len(prev_losses) > 20:  # Keep last 20 losses for more stable improvement calculation
             prev_losses.pop(0)
 
         if epoch % 50 == 0: print(f"Epoch {epoch} | Loss: {loss.item():.2e}")
@@ -417,16 +459,16 @@ def train_discovery(mode='lj'):
             break
 
         # Check for minimal improvement over recent epochs
-        if len(prev_losses) >= 15:
+        if len(prev_losses) >= 20:  # Increased window for more stable improvement detection
             recent_improvement = abs(prev_losses[0] - prev_losses[-1])
             if recent_improvement < improvement_threshold and epoch >= min_epochs:
                 print(f"Loss improvement too small ({recent_improvement:.2e}), stopping at epoch {epoch}")
                 break
 
-    threshold = 0.05 if mode == 'spring' else 0.5
+    threshold = 1e-4 if mode == 'spring' else 1e-4  # Strict threshold to ensure NN_Loss < 10^-4
 
     if best_loss > threshold:
-        print(f"Skipping SR: NN Loss {best_loss:.4f} > {threshold}")
+        print(f"Skipping SR: NN Loss {best_loss:.8f} > {threshold}")
         return f"Fail: {mode}", best_loss, 0, "N/A", 1e6
 
     # Prepare basis functions for symbolic regression to align with neural network features
@@ -434,12 +476,12 @@ def train_discovery(mode='lj'):
     if mode == 'lj':
         # Use a range that emphasizes the repulsive region (small r) and attractive region (larger r)
         r_phys_raw = np.concatenate([
-            np.linspace(0.8, 1.0, 150),  # Emphasize repulsive region
+            np.linspace(0.5, 1.0, 200),  # Emphasize repulsive region
             np.linspace(1.0, 2.0, 200), # Transition region
-            np.linspace(2.0, 3.5, 150)  # Attractive region
+            np.linspace(2.0, 4.0, 200)  # Attractive region
         ]).astype(np.float32)
     else:
-        r_phys_raw = np.linspace(0.9, 3.5, 300).astype(np.float32)
+        r_phys_raw = np.linspace(0.5, 4.0, 500).astype(np.float32)  # Extended range for better spring exploration
     r_phys = r_phys_raw.reshape(-1, 1)
 
     # Create the same basis functions that the neural network uses internally
@@ -449,21 +491,15 @@ def train_discovery(mode='lj'):
         features = model._get_features(dist_tensor)
         f_mag_phys = scaler.inverse_transform_f(model.predict_mag(torch.tensor(r_phys/scaler.p_scale, device=device))).cpu().numpy().ravel()
 
-        # Basis Pruning: In the LJ mode, provide the right basis functions for symbolic regression
+        # Basis Pruning: Since the NN features already include r^{-13} and r^{-7}, simplify the function_set
         if mode == 'lj':
-            # For LJ, we want to provide the fundamental building blocks for the expected form: A*(1/r^13) - B*(1/r^7)
-            # The features are [dist, inv_r, inv_r**6, inv_r**12, inv_r**7, inv_r**13]
-            # So we want indices 5 (inv_r**13 = r^{-13}) and 4 (inv_r**7 = r^{-7}) as the primary features
-            X_basis = features[:, [5, 4]].cpu().numpy()  # [r^{-13}, r^{-7}] in that order
+            # For LJ, the neural network has learned r^{-13} and r^{-7}, so provide these as basis functions
+            # features[:, 5] = r^{-13}, features[:, 4] = r^{-7}
+            X_basis = features[:, [5, 4]].cpu().numpy()  # [r^{-13}, r^{-7}] - only these two features
 
-            # Also add the raw distance as a feature to help with normalization
-            dist_feature = features[:, [0]].cpu().numpy()
-            X_basis = np.column_stack([X_basis, dist_feature])  # [r^{-13}, r^{-7}, r]
+            # Since we have the key features, we'll use only basic arithmetic to form linear combinations
         else:
             # For spring mode, we want the deviation from equilibrium (r-1) as the main feature
-            # The features are [dist, inv_r, inv_r**6, inv_r**12, inv_r**7, inv_r**13]
-            # For spring, we expect a linear relationship with distance from equilibrium (r-1)
-            # So we'll create a feature that represents (r-1) where r is the distance
             dist_values = features[:, [0]].cpu().numpy()  # Raw distance values
             equilibrium_deviation = dist_values - 1.0  # (r-1) from equilibrium position
             X_basis = equilibrium_deviation  # Use only (r-1) as the feature
@@ -472,12 +508,12 @@ def train_discovery(mode='lj'):
     # For LJ mode, only use basic arithmetic operations since basis functions are provided
 
     # Set optimized parameters for symbolic regression
-    population_size = 200  # Reduced population size
-    generations = 10  # Reduced number of generations
+    population_size = 500  # Increased population size for better exploration
+    generations = 20  # Increased number of generations
 
     # Restrict function set for LJ mode to strongly encourage use of basis functions
     if mode == 'lj':
-        f_set = ['add', 'sub', 'mul', 'div']  # Allow division to help form ratios
+        f_set = ['add', 'sub', 'mul']  # Removed 'div' to prevent complex rational functions
     else:
         f_set = ['add', 'sub', 'mul']  # Limit operations for spring too to keep it simple
 
@@ -485,13 +521,13 @@ def train_discovery(mode='lj'):
     est = SymbolicRegressor(population_size=population_size,
                             generations=generations,
                             function_set=f_set,
-                            parsimony_coefficient=0.001,  # Fixed parsimony coefficient
+                            parsimony_coefficient=0.01,  # Increased parsimony coefficient to penalize complexity
                             metric='mse',
                             random_state=42,
                             max_samples=0.9,
                             stopping_criteria=0.0001,
-                            const_range=(-50.0, 50.0),  # Wider constant range for better fitting
-                            init_depth=(2, 6),  # Moderate initial depth
+                            const_range=(-100.0, 100.0),  # Wider constant range for better fitting
+                            init_depth=(2, 4),  # Reduced initial depth to enforce parsimony
                             init_method='half and half',
                             verbose=0)
 
@@ -600,8 +636,8 @@ def train_discovery(mode='lj'):
     print(f"Discovered {mode}: {expr} | MSE: {mse:.2e} | Depth: {est._program.depth_}")
     print(f"Coefficient Accuracy: {coeff_accuracy:.3f}")
 
-    # Check success criteria - Updated to match requirements: MSE < 0.01 and Coeff_Accuracy < 0.05
-    validation_success = mse < 0.01 and coeff_accuracy < 0.05 and est._program.depth_ < 8
+    # Check success criteria - Updated to match requirements: MSE < 0.01, Coeff_Accuracy < 0.05, and Formula_Depth < 5
+    validation_success = mse < 0.01 and coeff_accuracy < 0.05 and est._program.depth_ < 5
     if mode == 'lj':
         expected_form = "A*(1/r^13) - B*(1/r^7)"
         print(f"LJ Target: {expected_form} where A≈48, B≈24")
