@@ -11,7 +11,7 @@ from gplearn.functions import make_function
 class PhysicsSim:
     def __init__(self, n=8, mode='lj'):
         self.n, self.mode, self.dt = n, mode, 0.01
-        self.pos = np.random.rand(n, 2) * 3.0
+        self.pos = np.random.rand(n, 2) * 4.0
         self.vel = np.random.randn(n, 2) * 0.1
     
     def compute_forces(self, pos):
@@ -20,8 +20,7 @@ class PhysicsSim:
         if self.mode == 'spring':
             f = -10.0 * (dist - 1.0) * (diff / dist)
         else: # Lennard-Jones
-            # Capped LJ to avoid numerical explosion during data gen
-            d_inv = 1.0 / np.clip(dist, 0.5, 10.0)
+            d_inv = 1.0 / np.clip(dist, 0.6, 10.0)
             f = 24 * 1.0 * (2 * d_inv**13 - d_inv**7) * (diff / dist)
         return np.sum(np.nan_to_num(f), axis=1)
 
@@ -67,8 +66,7 @@ class DiscoveryNet(nn.Module):
         self.enc = EquiLayer(input_dim=4, output_dim=32)
         self.pool = nn.Linear(32, k)
         self.to_z = nn.Linear(32, particle_latent_dim) 
-        # Potential MLP with robust Tanh activations
-        self.V_pair = nn.Sequential(nn.Linear(1, 64), nn.Tanh(), nn.Linear(64, 64), nn.Tanh(), nn.Linear(64, 1))
+        self.V_pair = nn.Sequential(nn.Linear(1, 64), nn.SiLU(), nn.Linear(64, 64), nn.SiLU(), nn.Linear(64, 1))
         self.dec = nn.Sequential(nn.Linear(particle_latent_dim, 32), nn.SiLU(), nn.Linear(32, 4))
 
     def encode(self, x, pos, edge_index, batch):
@@ -84,9 +82,8 @@ class DiscoveryNet(nn.Module):
     def get_potential(self, q):
         k = q.size(1)
         q_i, q_j = q.unsqueeze(2), q.unsqueeze(1)
-        dist = torch.norm(q_i - q_j, dim=-1, keepdim=True)
-        # Clamping to avoid singularity in 1/r terms if they emerge
-        dist = torch.clamp(dist, min=0.1)
+        # Differentiable dist with eps
+        dist = torch.sqrt(torch.sum((q_i - q_j)**2, dim=-1, keepdim=True) + 1e-5)
         mask = torch.triu(torch.ones(k, k, device=q.device), diagonal=1).bool()
         dist_flat = dist[:, mask]
         return self.V_pair(dist_flat).sum(dim=1)
@@ -106,7 +103,7 @@ def train_discovery(mode='lj'):
     
     num_particles = p_traj.size(1)
     model = DiscoveryNet(k=num_particles, particle_latent_dim=4)
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-4) # Stable LR
     
     edge_index = torch.combinations(torch.arange(num_particles)).t()
     edge_index = torch.cat([edge_index, edge_index.flip(0)], dim=1)
@@ -128,11 +125,9 @@ def train_discovery(mode='lj'):
         a_next, _ = model.get_forces(q_next)
         p_next_pred = p + 0.5 * (a + a_next) * dt
         l_dyn = torch.nn.functional.mse_loss(q_next_pred, q_next) + torch.nn.functional.mse_loss(p_next_pred, p_next)
-        
-        # Centroid Alignment (Anchor latent space to physical space)
         l_cent = torch.nn.functional.mse_loss(q.squeeze(0), p_traj[idx])
 
-        w_dyn = min(100.0, epoch / 5.0)
+        w_dyn = min(50.0, epoch / 10.0)
         loss = l_rec * 1.0 + l_dyn * w_dyn + l_cent * 1.0
         
         opt.zero_grad(); loss.backward()
@@ -146,8 +141,7 @@ def train_discovery(mode='lj'):
     model.eval()
     dist_list, V_list = [], []
     with torch.no_grad():
-        # Test across a range of distances in the normalized space
-        test_d = torch.linspace(0.1, 5.0, 200).unsqueeze(-1)
+        test_d = torch.linspace(0.1, 5.0, 300).unsqueeze(-1)
         v_vals = model.V_pair(test_d).squeeze(-1)
         for d, v in zip(test_d, v_vals):
             dist_list.append([d.item()]); V_list.append(v.item())
@@ -155,9 +149,9 @@ def train_discovery(mode='lj'):
     X_train, y_train = np.array(dist_list), np.array(V_list)
     inv2 = make_function(function=lambda x: 1.0/(x**2 + 1e-4), name='inv2', arity=1)
     inv6 = make_function(function=lambda x: 1.0/(x**6 + 1e-4), name='inv6', arity=1)
-    est = SymbolicRegressor(population_size=2000, generations=50,
+    est = SymbolicRegressor(population_size=2000, generations=40,
                             function_set=('add', 'sub', 'mul', 'div', inv2, inv6),
-                            parsimony_coefficient=0.001, verbose=0)
+                            parsimony_coefficient=0.005, verbose=0)
     est.fit(X_train, y_train)
 
     try:
