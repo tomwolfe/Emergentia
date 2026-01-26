@@ -105,18 +105,18 @@ class TrajectoryScaler:
         self.mode = mode
         self.p_scale = None
         self.f_scale = None
-
+        
     def fit(self, p, f):
         """Fit the scaler to the data to determine appropriate scaling factors"""
         self.p_scale = torch.max(torch.abs(p)).item() if torch.max(torch.abs(p)).item() > 0 else 1.0
         self.f_scale = torch.max(torch.abs(f)).item() if torch.max(torch.abs(f)).item() > 0 else 1.0
-
-    def transform(self, p, f):
+        
+    def transform(self, p, f): 
         if self.p_scale is None or self.f_scale is None:
             self.fit(p, f)
         return p / self.p_scale, f / self.f_scale
-
-    def inverse_transform_f(self, f_scaled):
+    
+    def inverse_transform_f(self, f_scaled): 
         return f_scaled * self.f_scale
 
 # 3. CORE ARCHITECTURE
@@ -534,7 +534,6 @@ def train_discovery(mode='lj'):
     # For LJ mode, only use basic arithmetic operations since basis functions are provided
 
     # Set optimized parameters for symbolic regression
-    population_size = 500  # Increased population size for better exploration
     generations = 20  # Increased number of generations
 
     # Restrict function set for LJ mode to strongly encourage use of basis functions
@@ -675,31 +674,8 @@ def train_discovery(mode='lj'):
     result_status = f"Success: {mode}" if validation_success else f"Partial: {mode}"
     return result_status, best_loss, p_coeff, expr, mse
 
-def run_single_mode(mode):
-    """Wrapper function to run a single mode with proper error handling"""
-    try:
-        return train_discovery(mode)
-    except Exception as e:
-        # Return a safe error representation that can be pickled
-        return f"Error in {mode}: {str(e)}"
-
 if __name__ == "__main__":
-    modes = ['spring', 'lj']
-
-    print(f"Starting discovery on {len(modes)} modes in parallel...")
-
-    # Use ProcessPoolExecutor instead of ThreadPoolExecutor to bypass GIL
-    with ProcessPoolExecutor() as executor:
-        futures = {executor.submit(run_single_mode, mode): mode for mode in modes}
-
-        results = []
-
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                results.append(future.result())
-            except Exception as e:
-                print(f"Exception in process for mode {futures[future]}: {e}")
-
+    # Test only LJ mode first to see if it works
+    result = train_discovery('lj')
     print("\n--- Final Results ---")
-    for r in results: 
-        print(r)
+    print(result)
