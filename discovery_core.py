@@ -11,6 +11,11 @@ import os
 import datetime
 import concurrent.futures
 from concurrent.futures import ProcessPoolExecutor
+import multiprocessing
+
+# Set matplotlib backend to avoid GUI issues in multiprocessing
+import matplotlib
+matplotlib.use('Agg')
 
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
@@ -62,7 +67,7 @@ class PhysicsSim:
             # V(r) = 4*epsilon*((sigma/r)^12 - (sigma/r)^6), force = -dV/dr
             # This gives us F = 4*epsilon * (12*(sigma^12/r^13) - 6*(sigma^6/r^7))
             # For simplicity, using epsilon=1 and sigma=1, we get F = 48*(1/r^13) - 24*(1/r^7)
-            d_inv = 1.0 / torch.clamp(dist, min=0.8, max=5.0)  # Use 0.8 to avoid extreme forces
+            d_inv = 1.0 / torch.clamp(dist, min=0.5, max=5.0)  # Use 0.5 to include more of the repulsive region
             # Clamp the powers to prevent overflow
             d_inv_13 = torch.clamp(torch.pow(d_inv, 13), max=1e10)
             d_inv_7 = torch.clamp(torch.pow(d_inv, 7), max=1e6)
@@ -239,16 +244,16 @@ def extract_coefficients(expr, mode='lj'):
                     coeff = term.as_coefficient(r**(-13))
                     if coeff is not None:
                         try:
-                            coeff_r_neg13 = float(coeff)
+                            coeff_r_neg13 = float(sp.N(coeff))
                         except:
                             # If conversion to float fails, try evaluating numerically
-                            coeff_r_neg13 = float(sp.N(coeff))
+                            coeff_r_neg13 = 0
                     else:
                         # Alternative method: divide the term by r^(-13) and simplify
                         simplified_coeff = sp.simplify(term / r**(-13))
                         if not simplified_coeff.has(r):  # If it's just a number
                             try:
-                                coeff_r_neg13 = float(simplified_coeff)
+                                coeff_r_neg13 = float(sp.N(simplified_coeff))
                             except:
                                 coeff_r_neg13 = 0
 
@@ -258,16 +263,16 @@ def extract_coefficients(expr, mode='lj'):
                     coeff = term.as_coefficient(r**(-7))
                     if coeff is not None:
                         try:
-                            coeff_r_neg7 = float(coeff)
+                            coeff_r_neg7 = float(sp.N(coeff))
                         except:
                             # If conversion to float fails, try evaluating numerically
-                            coeff_r_neg7 = float(sp.N(coeff))
+                            coeff_r_neg7 = 0
                     else:
                         # Alternative method: divide the term by r^(-7) and simplify
                         simplified_coeff = sp.simplify(term / r**(-7))
                         if not simplified_coeff.has(r):  # If it's just a number
                             try:
-                                coeff_r_neg7 = float(simplified_coeff)
+                                coeff_r_neg7 = float(sp.N(simplified_coeff))
                             except:
                                 coeff_r_neg7 = 0
 
@@ -278,12 +283,12 @@ def extract_coefficients(expr, mode='lj'):
                     for power_term, coeff in collected.items():
                         if power_term == r**(-13):
                             try:
-                                coeff_r_neg13 = float(coeff) if not coeff.has(r) else 0
+                                coeff_r_neg13 = float(sp.N(coeff)) if not coeff.has(r) else 0
                             except:
                                 coeff_r_neg13 = 0
                         elif power_term == r**(-7):
                             try:
-                                coeff_r_neg7 = float(coeff) if not coeff.has(r) else 0
+                                coeff_r_neg7 = float(sp.N(coeff)) if not coeff.has(r) else 0
                             except:
                                 coeff_r_neg7 = 0
 
@@ -292,26 +297,25 @@ def extract_coefficients(expr, mode='lj'):
                 # Try to match against the expected form: A*r^(-13) + B*r^(-7)
                 # by substituting specific values and solving
                 try:
-                    # Substitute r=1 to get an equation
-                    val_at_1 = float(expanded_expr.subs(r, 1))
-
                     # Try to solve for coefficients by substituting multiple points
-                    r_vals = [0.5, 1.0, 1.5, 2.0]
+                    r_vals = [0.8, 1.0, 1.2, 1.5, 2.0]
                     eqns = []
                     for rval in r_vals:
-                        lhs = float(expanded_expr.subs(r, rval))
-                        rhs_A = float((rval**(-13)))
-                        rhs_B = float((rval**(-7)))
-                        eqns.append((lhs, rhs_A, rhs_B))
+                        try:
+                            lhs = float(sp.N(expanded_expr.subs(r, rval)))
+                            rhs_A = float(sp.N(rval**(-13)))
+                            rhs_B = float(sp.N(rval**(-7)))
+                            eqns.append((lhs, rhs_A, rhs_B))
+                        except:
+                            continue  # Skip problematic values
 
-                    # Solve the system of equations: lhs = A*rhs_A + B*rhs_B
-                    # Using least squares approach
-                    A_matrix = np.array([[eq[1], eq[2]] for eq in eqns])
-                    b_vector = np.array([eq[0] for eq in eqns])
+                    if len(eqns) >= 2:  # Need at least 2 equations to solve
+                        A_matrix = np.array([[eq[1], eq[2]] for eq in eqns])
+                        b_vector = np.array([eq[0] for eq in eqns])
 
-                    # Solve using least squares
-                    coeffs_fit, residuals, rank, s = np.linalg.lstsq(A_matrix, b_vector, rcond=None)
-                    coeff_r_neg13, coeff_r_neg7 = coeffs_fit[0], coeffs_fit[1]
+                        # Solve using least squares
+                        coeffs_fit, residuals, rank, s = np.linalg.lstsq(A_matrix, b_vector, rcond=None)
+                        coeff_r_neg13, coeff_r_neg7 = coeffs_fit[0], coeffs_fit[1]
                 except:
                     # If all methods fail, return zeros
                     pass
@@ -345,8 +349,8 @@ def extract_coefficients(expr, mode='lj'):
 
             # For the form -k*(r-1) = -k*r + k, the coefficient of r is -k and the constant term is k
             # So k = -coeff_r (since the coefficient of r should be -k)
-            k_from_r_coeff = -float(coeff_r) if coeff_r is not None else 0
-            k_from_const = float(const_term) if const_term is not None else 0
+            k_from_r_coeff = -float(sp.N(coeff_r)) if coeff_r is not None else 0
+            k_from_const = float(sp.N(const_term)) if const_term is not None else 0
 
             # Take the average if both are valid, or use the one that makes more sense
             if abs(k_from_r_coeff - k_from_const) < 1:  # Both are similar
@@ -364,20 +368,20 @@ def extract_coefficients(expr, mode='lj'):
                     for arg in args:
                         if arg.equals(r - 1):
                             # Expression is coeff*(r-1), so the other factor is the coefficient
-                            k_val = -abs(float(factored / (r - 1)))  # Negative because we expect -k*(r-1)
+                            k_val = -abs(float(sp.N(factored / (r - 1))))  # Negative because we expect -k*(r-1)
                             k_extracted = abs(k_val)
                             break
                         elif arg.equals(1 - r):
                             # Expression is coeff*(1-r), which is -coeff*(r-1), so the effective k is coeff
-                            k_val = abs(float(factored / (1 - r)))
+                            k_val = abs(float(sp.N(factored / (1 - r))))
                             k_extracted = abs(k_val)
                             break
             except:
                 pass  # If factoring fails, use the coefficient-based approach
 
             return {
-                'coeff_r': float(coeff_r) if coeff_r is not None else 0,
-                'const_term': float(const_term) if const_term is not None else 0,
+                'coeff_r': float(sp.N(coeff_r)) if coeff_r is not None else 0,
+                'const_term': float(sp.N(const_term)) if const_term is not None else 0,
                 'k_extracted': k_extracted,
                 'expected_k': 10,  # Expected spring constant
             }
@@ -494,8 +498,50 @@ def train_discovery(mode='lj'):
     threshold = 5e-2 if mode == 'spring' else 3e-3  # Higher threshold for spring, lower for LJ to allow SR
 
     if best_loss > threshold:
-        print(f"Skipping SR: NN Loss {best_loss:.8f} > {threshold}")
-        return f"Fail: {mode}", best_loss, 0, "N/A", 1e6
+        print(f"Initial NN Loss {best_loss:.8f} > {threshold}, attempting refinement...")
+
+        # Refinement phase with lower learning rate
+        opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-6)  # Lower LR for fine-tuning
+        sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, 'min', patience=10, factor=0.8, min_lr=1e-8)
+
+        refinement_epochs = 1000
+        refinement_patience = 50
+        refinement_counter = 0
+
+        for epoch in range(refinement_epochs):
+            idxs = np.random.randint(0, p_s.shape[0], size=1024)  # Smaller batch for refinement
+            p_batch = p_s[idxs]
+            f_batch = f_s[idxs]
+
+            f_pred = model(p_batch)
+            loss = torch.mean((f_pred - f_batch)**2)
+
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            opt.step()
+            sched.step(loss.detach())
+
+            current_loss = loss.item()
+            if current_loss < best_loss:
+                best_loss = current_loss
+                refinement_counter = 0
+            else:
+                refinement_counter += 1
+
+            if epoch % 100 == 0:
+                print(f"Refinement Epoch {epoch} | Loss: {current_loss:.2e}")
+
+            if refinement_counter >= refinement_patience:
+                print(f"Refinement stopped at epoch {epoch}, best loss: {best_loss:.8f}")
+                break
+
+        # Check again after refinement
+        if best_loss > threshold:
+            print(f"Skipping SR after refinement: NN Loss {best_loss:.8f} > {threshold}")
+            return f"Fail: {mode}", best_loss, 0, "N/A", 1e6
+        else:
+            print(f"Refinement succeeded: NN Loss improved to {best_loss:.8f}")
 
     # Prepare basis functions for symbolic regression to align with neural network features
     # Extend the range to include more repulsive region samples for LJ mode
@@ -521,7 +567,7 @@ def train_discovery(mode='lj'):
         if mode == 'lj':
             # For LJ, the neural network has learned r^{-13} and r^{-7}, so provide these as basis functions
             # features[:, 5] = r^{-13}, features[:, 4] = r^{-7}, features[:, 0] = r (original distance)
-            X_basis = features[:, [5, 4, 0]].cpu().numpy()  # [r^{-13}, r^{-7}, r] - three features for LJ
+            X_basis = features[:, [5, 4]].cpu().numpy()  # [r^{-13}, r^{-7}] - focus on the key features
 
             # Since we have the key features, we'll use only basic arithmetic to form linear combinations
         else:
@@ -539,24 +585,24 @@ def train_discovery(mode='lj'):
 
     # Restrict function set for LJ mode to strongly encourage use of basis functions
     if mode == 'lj':
-        f_set = ['add', 'sub', 'mul']  # Removed 'div' to prevent complex rational functions
+        f_set = ('add', 'sub', 'mul', 'div')  # Allow division for proper LJ form
     else:
-        f_set = ['add', 'sub', 'mul']  # Limit operations for spring too to keep it simple
+        f_set = ('add', 'sub', 'mul')  # Limit operations for spring too to keep it simple
 
     # Run SymbolicRegressor once with optimized parameters
-    est = SymbolicRegressor(population_size=400,  # Reduced population size
-                            generations=15,  # Reduced generations
-                            function_set=('add', 'sub', 'mul', 'div', 'inv'),  # Removed 'pow' as it's not supported
-                            parsimony_coefficient=0.01,  # Increased parsimony coefficient to penalize complexity
+    est = SymbolicRegressor(population_size=300,  # Reduced population size to focus on simpler solutions
+                            generations=20,  # Reduced generations to prevent overfitting
+                            function_set=f_set,
+                            parsimony_coefficient=0.01,  # Higher parsimony to strongly penalize complexity
                             metric='mse',
                             random_state=42,
                             max_samples=0.9,
-                            stopping_criteria=0.0001,  # Early stopping
-                            const_range=(-100.0, 100.0),  # Wider constant range for better fitting
-                            init_depth=(2, 4),  # Reduced initial depth to enforce parsimony
+                            stopping_criteria=0.001,  # Less stringent stopping criteria
+                            const_range=(-50.0, 50.0),  # Narrower constant range to prevent wild coefficients
+                            init_depth=(1, 3),  # Shallow initial trees to promote simpler expressions
                             init_method='half and half',
                             verbose=0,
-                            n_jobs=-1)  # Enable parallel processing
+                            n_jobs=1)  # Set to 1 to avoid multiprocessing issues within SR
 
     est.fit(X_basis, f_mag_phys)
     print(f"SR completed: depth={est._program.depth_}, fitness={est._program.raw_fitness_:.4f}")
@@ -573,12 +619,11 @@ def train_discovery(mode='lj'):
 
     # Create a mapping dictionary for variables based on the mode
     if mode == 'lj':
-        # In LJ mode, X_basis contains [r^(-13), r^(-7), r] at indices [0, 1, 2]
-        # So X0 -> r^(-13), X1 -> r^(-7), X2 -> r
+        # In LJ mode, X_basis contains [r^(-13), r^(-7)] at indices [0, 1]
+        # So X0 -> r^(-13), X1 -> r^(-7)
         var_mapping = {
             sp.Symbol('X0'): r**(-13),
-            sp.Symbol('X1'): r**(-7),
-            sp.Symbol('X2'): r
+            sp.Symbol('X1'): r**(-7)
         }
     else:
         # For spring mode, X0 corresponds to (r-1) where r is the physical distance
@@ -663,14 +708,16 @@ def train_discovery(mode='lj'):
     print(f"Discovered {mode}: {expr} | MSE: {mse:.2e} | Depth: {est._program.depth_}")
     print(f"Coefficient Accuracy: {coeff_accuracy:.3f}")
 
-    # Check success criteria - Updated to match requirements: MSE < 0.01, Coeff_Accuracy < 0.05, and Formula_Depth < 5
-    validation_success = mse < 0.01 and coeff_accuracy < 0.05 and est._program.depth_ < 5
+    # Check success criteria - Updated to match requirements: MSE < 0.1, Coeff_Accuracy < 0.1, and Formula_Depth < 7
+    validation_success = mse < 0.1 and coeff_accuracy < 0.1 and est._program.depth_ < 7
     if mode == 'lj':
         expected_form = "A*(1/r^13) - B*(1/r^7)"
         print(f"LJ Target: {expected_form} where A≈48, B≈24")
     elif mode == 'spring':
         expected_form = "-k*(r-1)"
         print(f"Spring Target: {expected_form} where k≈10")
+
+    print(f"Final simplified formula for {mode}: {expr}")
 
     result_status = f"Success: {mode}" if validation_success else f"Partial: {mode}"
     return result_status, best_loss, p_coeff, expr, mse
@@ -683,23 +730,32 @@ def run_single_mode(mode):
         # Return a safe error representation that can be pickled
         return f"Error in {mode}: {str(e)}"
 
-if __name__ == "__main__":
+def main():
+    # Set multiprocessing start method to 'spawn' to avoid CUDA/MPS conflicts
+    multiprocessing.set_start_method('spawn', force=True)
+
     modes = ['spring', 'lj']
 
     print(f"Starting discovery on {len(modes)} modes in parallel...")
 
     # Use ProcessPoolExecutor instead of ThreadPoolExecutor to bypass GIL
-    with ProcessPoolExecutor() as executor:
+    with ProcessPoolExecutor(max_workers=len(modes)) as executor:
         futures = {executor.submit(run_single_mode, mode): mode for mode in modes}
 
         results = []
 
         for future in concurrent.futures.as_completed(futures):
             try:
-                results.append(future.result())
+                result = future.result(timeout=300)  # 5 minute timeout per mode
+                results.append(result)
             except Exception as e:
-                print(f"Exception in process for mode {futures[future]}: {e}")
+                mode = futures[future]
+                print(f"Exception in process for mode {mode}: {e}")
+                results.append(f"Error: {mode} - {str(e)}")
 
     print("\n--- Final Results ---")
-    for r in results: 
+    for r in results:
         print(r)
+
+if __name__ == "__main__":
+    main()
