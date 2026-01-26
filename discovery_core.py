@@ -9,19 +9,16 @@ from concurrent.futures import ProcessPoolExecutor
 from sklearn.metrics import r2_score
 import warnings
 
-# Suppress annoying numpy warnings during symbolic search
-warnings.filterwarnings('ignore', '.*overflow encountered.*')
-warnings.filterwarnings('ignore', '.*invalid value encountered.*')
+warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 # 1. PROTECTED CUSTOM FUNCTIONS
 def _protected_sq(x):
-    return np.square(np.clip(x, -1e5, 1e5))
+    return np.square(np.clip(x, -1e3, 1e3))
 square = make_function(function=_protected_sq, name='sq', arity=1)
 
 def _protected_inv(x):
     with np.errstate(divide='ignore', invalid='ignore'):
-        # Smoother protected inverse
-        return np.where(np.abs(x) > 0.01, 1.0/x, 0.0)
+        return np.where(np.abs(x) > 0.05, 1.0/x, 0.0)
 inv = make_function(function=_protected_inv, name='inv', arity=1)
 
 # 2. ENHANCED SIMULATOR
@@ -35,21 +32,21 @@ class PhysicsSim:
         scale = 2.0 if mode == 'spring' else 4.0
         self.pos = torch.rand((n, 2), device=self.device, dtype=torch.float32) * scale
         self.vel = torch.randn((n, 2), device=self.device, dtype=torch.float32) * 0.05
-        self.mask = (~torch.eye(n, device=self.device).bool()).unsqueeze(-1)
     
     def compute_forces(self, pos):
+        n = pos.size(0)
         diff = pos.unsqueeze(1) - pos.unsqueeze(0)
         dist = torch.norm(diff, dim=-1, keepdim=True)
         dist_clip = torch.clamp(dist, min=1e-8)
+        mask = (~torch.eye(n, device=self.device).bool()).unsqueeze(-1)
         
         if self.mode == 'spring':
             f = -10.0 * (dist - 1.0) * (diff / dist_clip)
         else:
-            # LJ force: 24 * (2*r^-13 - r^-7)
-            d_inv = 1.0 / torch.clamp(dist, min=0.5, max=5.0) # Increased min dist for stability
+            d_inv = 1.0 / torch.clamp(dist, min=0.5, max=5.0)
             f = 24.0 * (2 * torch.pow(d_inv, 13) - torch.pow(d_inv, 7)) * (diff / dist_clip)
         
-        return torch.sum(f * self.mask, dim=1)
+        return torch.sum(f * mask, dim=1)
 
     def generate(self, steps=1000):
         traj_p = torch.zeros((steps, self.n, 2), device=self.device)
@@ -76,46 +73,42 @@ class TrajectoryScaler:
     def transform(self, p, v):
         return (p - self.p_mid) / self.p_scale, v * (self.dt / self.p_scale)
 
-def validate_discovered_law(expr, mode, r_samples=None, f_targets=None, n_particles=16, device='cpu'):
+def validate_discovered_law(expr, mode, n_particles=12, device='cpu'):
     r_sym = sp.Symbol('r')
-    if r_samples is not None and f_targets is not None:
-        try:
-            f_func_np = sp.lambdify(r_sym, expr, 'numpy')
-            f_pred = np.nan_to_num(f_func_np(r_samples.flatten()), nan=0.0, posinf=1e4, neginf=-1e4)
-            if r2_score(f_targets, f_pred) < 0.6: return 1e6 # More permissive initial filter
-        except: return 1e6
-
-    try: f_torch_func = sp.lambdify(r_sym, expr, 'torch')
-    except: return 1e6
+    try:
+        f_torch_func = sp.lambdify(r_sym, expr, 'torch')
+    except:
+        return 1e6
 
     sim_gt = PhysicsSim(n=n_particles, mode=mode, seed=42, device=device)
-    p_gt, _ = sim_gt.generate(steps=40)
+    p_gt, _ = sim_gt.generate(steps=50)
     curr_pos, curr_vel = sim_gt.pos.clone(), sim_gt.vel.clone()
-    p_disc = torch.zeros((40, n_particles, 2), device=device)
-    mask = (~torch.eye(n_particles, device=device).bool()).unsqueeze(-1)
+    p_disc = torch.zeros((50, n_particles, 2), device=device)
     
     with torch.inference_mode():
-        for i in range(40):
+        for i in range(50):
             diff = curr_pos.unsqueeze(1) - curr_pos.unsqueeze(0)
             dist = torch.norm(diff, dim=-1, keepdim=True)
             dist_clip = torch.clamp(dist, min=1e-8)
+            mask = (~torch.eye(n_particles, device=device).bool()).unsqueeze(-1)
+            
             try:
                 mag = f_torch_func(dist)
                 if not isinstance(mag, torch.Tensor): mag = torch.full_like(dist, float(mag))
-                mag = torch.nan_to_num(mag, nan=0.0, posinf=1000.0, neginf=-1000.0)
+                mag = torch.nan_to_num(mag, nan=0.0, posinf=500.0, neginf=-500.0)
                 f = torch.sum(mag * (diff / dist_clip) * mask, dim=1)
             except: f = torch.zeros_like(curr_pos)
+            
             curr_vel += f * sim_gt.dt
             curr_pos += curr_vel * sim_gt.dt
             p_disc[i] = curr_pos
     
     return np.nan_to_num(torch.mean((p_gt - p_disc)**2).item(), nan=1e6)
 
+# 2. CORE ARCHITECTURE
 class DiscoveryNet(nn.Module):
-    def __init__(self, n=12):
+    def __init__(self):
         super().__init__()
-        self.n = n
-        self.register_buffer('mask', ~torch.eye(n).bool())
         self.V_pair = nn.Sequential(
             nn.Linear(3, 64), nn.Tanh(), 
             nn.Linear(64, 64), nn.Tanh(), 
@@ -124,15 +117,19 @@ class DiscoveryNet(nn.Module):
 
     def get_forces(self, pos_scaled):
         pos_scaled = pos_scaled.requires_grad_(True)
+        B, N, D = pos_scaled.shape
         diff = pos_scaled.unsqueeze(2) - pos_scaled.unsqueeze(1)
         dist = torch.clamp(torch.norm(diff, dim=-1, keepdim=True), min=0.05)
-        dist_flat = dist[:, self.mask].view(pos_scaled.size(0), -1, 1)
-        # Expanded physics-informed features for LJ stability
+        
+        mask = ~torch.eye(N, device=pos_scaled.device).bool()
+        dist_flat = dist[:, mask].view(B, -1, 1)
+        
         feat = torch.cat([dist_flat, 1.0/dist_flat, 1.0/(dist_flat**2)], dim=-1)
         V = self.V_pair(feat).sum(dim=1) * 0.5
         grad = torch.autograd.grad(V.sum(), pos_scaled, create_graph=True)[0]
         return -grad
 
+# 3. TRAINING & DISCOVERY
 def train_discovery(mode='lj'):
     device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
     t_start = time.time()
@@ -144,8 +141,8 @@ def train_discovery(mode='lj'):
     
     model = DiscoveryNet().to(device)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
-    print(f"--- Training: {mode} on {device} ---")
     
+    print(f"--- Training: {mode} on {device} ---")
     best_loss, patience = float('inf'), 0
     for epoch in range(1001):
         idxs = np.random.randint(0, len(p_s)-1, size=64)
@@ -153,54 +150,50 @@ def train_discovery(mode='lj'):
         a_all = model.get_forces(p_batch)
         a, a_next = a_all[:64], a_all[64:]
         
-        # Reduced scale factor for numerical stability
-        scale_f = 1e4 if mode == 'spring' else 1e5 
+        scale_f = 1e4 if mode == 'spring' else 1e5
         loss = scale_f * (torch.nn.functional.mse_loss(p_s[idxs] + v_s[idxs] + 0.5*a, p_s[idxs+1]) + 
                           torch.nn.functional.mse_loss(v_s[idxs] + 0.5*(a + a_next), v_s[idxs+1]))
         
         opt.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         
         if loss.item() < best_loss * 0.999:
             best_loss, patience = loss.item(), 0
         else: patience += 1
-        if patience >= 150: # Increased patience
+        
+        if patience >= 150:
             print(f"[{mode}] Early stopping at {epoch}")
             break
         if epoch % 500 == 0: print(f"[{mode}] Epoch {epoch} | Loss: {loss.item():.2e}")
 
-    # SYMBOLIC DISCOVERY
-    r_phys = np.linspace(0.6 if mode == 'lj' else 0.2, 4.0, 500).astype(np.float32).reshape(-1, 1)
+    # Vectorized Symbolic Extraction
+    r_phys = np.linspace(0.6 if mode == 'lj' else 0.2, 4.0, 300).astype(np.float32).reshape(-1, 1)
     r_scaled = torch.tensor(r_phys / scaler.p_scale, dtype=torch.float32, device=device, requires_grad=True)
     
-    # Extract force curve from NN
-    pos_dummy = torch.zeros((1, 2, 2), device=device)
-    pos_dummy[0, 1, 0] = r_scaled[0] # Just need the gradient for one pair
+    # Create a batch of pairs to extract the force curve in one pass
+    # Shape: (300, 2, 2) -> 300 samples, 2 particles each
+    p_pairs = torch.zeros((len(r_scaled), 2, 2), device=device)
+    p_pairs[:, 1, 0] = r_scaled.squeeze()
     
-    f_nn_phys = []
-    for r_val in r_scaled:
-        p_pair = torch.tensor([[[0,0], [r_val.item(), 0]]], device=device, requires_grad=True, dtype=torch.float32)
-        f = model.get_forces(p_pair)
-        # F_phys = F_scaled * (p_scale / dt^2)
-        f_val = -f[0, 1, 0].item() * (scaler.p_scale / (sim.dt**2))
-        f_nn_phys.append(f_val)
-    
-    f_nn_phys = np.clip(np.array(f_nn_phys), -1000, 1000)
-    
+    f_nn_scaled = model.get_forces(p_pairs)
+    # The force on particle 1 along x-axis is our radial force
+    f_nn_phys = -f_nn_scaled[:, 1, 0].detach().cpu().numpy() * (scaler.p_scale / (sim.dt**2))
+    f_nn_phys = np.clip(f_nn_phys, -1000, 1000)
+
     best_expr, best_mse = None, float('inf')
     for p_coeff in [1e-3, 1e-4]:
-        est = SymbolicRegressor(population_size=600, generations=30,
+        est = SymbolicRegressor(population_size=600, generations=40,
                                 function_set=('add', 'sub', 'mul', 'div', square, inv),
                                 metric='mse', max_samples=0.8, n_jobs=1, 
                                 parsimony_coefficient=p_coeff, random_state=42)
-        est.fit(r_phys[::3], f_nn_phys[::3])
+        est.fit(r_phys, f_nn_phys)
         try:
-            ld = {'add':lambda a,b:a+b, 'sub':lambda a,b:a-b, 'mul':lambda a,b:a*b,
+            ld = {'add':lambda a,b:a+b, 'sub':lambda a,b:a-b, 'mul':lambda a,b:a*b, 
                   'div':lambda a,b:a/b, 'sq':lambda a:a**2, 'inv':lambda a:1./a, 'X0':sp.Symbol('r')}
             expr = sp.simplify(sp.sympify(str(est._program), locals=ld))
-            mse = validate_discovered_law(expr, mode, r_phys, f_nn_phys, device=device)
+            mse = validate_discovered_law(expr, mode, device=device)
             if mse < best_mse:
                 best_mse, best_expr = mse, expr
         except: continue
@@ -210,6 +203,7 @@ def train_discovery(mode='lj'):
     return res
 
 if __name__ == "__main__":
+    t0 = time.time()
     with ProcessPoolExecutor(max_workers=2) as ex:
         results = list(ex.map(train_discovery, ['spring', 'lj']))
-    print("\n--- SUMMARY ---\n" + "\n".join(results))
+    print(f"\n--- SUMMARY (Total Time: {time.time()-t0:.2f}s) ---\\n" + "\n".join(results))
