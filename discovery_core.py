@@ -216,12 +216,12 @@ def train_discovery(mode='lj'):
         r_samples = np.random.choice(r_samples, 2000, replace=False)
     r_samples = np.sort(r_samples).reshape(-1, 1)
 
-    with torch.no_grad():
-        r_torch = torch.tensor(r_samples, dtype=torch.float32, requires_grad=True)
-        # To get force F(r) = -dV/dr, we pass [r, 1/r, 1/r^2] to V_pair
-        feat = torch.cat([r_torch, 1.0/r_torch, 1.0/(r_torch**2)], dim=-1)
-        v_vals = model.V_pair(feat)
-        force_vals = -torch.autograd.grad(v_vals.sum(), r_torch)[0].numpy().flatten()
+    # Calculate force F(r) = -dV/dr from the model
+    r_torch = torch.tensor(r_samples, dtype=torch.float32, requires_grad=True)
+    # To get force F(r) = -dV/dr, we pass [r, 1/r, 1/r^2] to V_pair
+    feat = torch.cat([r_torch, 1.0/r_torch, 1.0/(r_torch**2)], dim=-1)
+    v_vals = model.V_pair(feat)
+    force_vals = -torch.autograd.grad(v_vals.sum(), r_torch)[0].detach().numpy().flatten()
 
     # Symbolic Regression on Force
     est = SymbolicRegressor(population_size=2000, generations=50,
