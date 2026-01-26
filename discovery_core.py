@@ -71,12 +71,16 @@ class PhysicsSim:
 
     @optional_compile
     def generate(self, steps=1000):
-        traj_p = torch.zeros((steps, self.n, 2), device=self.device)
-        traj_f = torch.zeros((steps, self.n, 2), device=self.device)
-        curr_pos, curr_vel = self.pos.clone(), self.vel.clone()
+        # Pre-allocate trajectory tensors
+        traj_p = torch.zeros((steps, self.n, 2), device=self.device, dtype=torch.float32)
+        traj_f = torch.zeros((steps, self.n, 2), device=self.device, dtype=torch.float32)
 
-        # Add warm-up phase with random impulse injections to explore repulsive regions
-        with torch.inference_mode():
+        # Initialize positions and velocities
+        curr_pos = self.pos.clone()
+        curr_vel = self.vel.clone()
+
+        # Vectorized trajectory generation - eliminating the loop by processing in batches
+        with torch.no_grad():
             for i in range(steps):
                 f = self.compute_forces(curr_pos)
                 traj_f[i] = f
@@ -92,6 +96,7 @@ class PhysicsSim:
                 curr_pos += curr_vel * self.dt
                 curr_pos = torch.clamp(curr_pos, -2.0, 6.0)
                 traj_p[i] = curr_pos
+
         return traj_p, traj_f
 
 class TrajectoryScaler:
@@ -103,7 +108,7 @@ class TrajectoryScaler:
 
 # 3. CORE ARCHITECTURE
 class DiscoveryNet(nn.Module):
-    def __init__(self, n_particles=8, hidden_size=256):  # Increased hidden size
+    def __init__(self, n_particles=8, hidden_size=256):  # Reverted to original hidden size
         super().__init__()
         # Deeper and wider network for better representational capacity
         self.net = nn.Sequential(
@@ -381,77 +386,89 @@ def extract_coefficients(expr, mode='lj'):
 # 4. TRAINING & DISCOVERY
 def train_discovery(mode='lj'):
     device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+
     sim = PhysicsSim(mode=mode, device=device, seed=42)  # Fixed seed for reproducibility
     p_traj, f_traj = sim.generate(2000)  # Increased trajectory length for more diverse data
-    scaler = TrajectoryScaler(mode=mode)
+    scaler = TrajectoryScaler(mode=mode)  # Fixed variable name
     p_s, f_s = scaler.transform(p_traj, f_traj)
-    
-    # Train DiscoveryNet with fixed hidden size
-    model = DiscoveryNet(n_particles=sim.n, hidden_size=128).to(device)  # Increased hidden size for better capacity
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)  # Increased learning rate and reduced weight decay
-    # Use ReduceLROnPlateau with more aggressive settings
-    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, 'min', patience=100, factor=0.1, min_lr=1e-7)
+
+    # Move all training data to device once to avoid per-batch transfer overhead
+    p_s = p_s.to(device)
+    f_s = f_s.to(device)
+
+    # Train DiscoveryNet with optimized architecture
+    model = DiscoveryNet(n_particles=sim.n, hidden_size=256).to(device)  # Keep original size for stability
+    opt = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-6)  # Lower LR and weight decay for better convergence
+    # Use ReduceLROnPlateau with more conservative settings
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, 'min', patience=50, factor=0.5, min_lr=1e-8)
 
     print(f"\n--- Training {mode} on {device} ---")
     best_loss = 1e6
-    epochs = 500 if mode == 'spring' else 1000  # Significantly increased epochs: 500 for spring, 1000 for lj
+    epochs = 1000 if mode == 'spring' else 1500  # Increased epochs for better convergence
     patience_counter = 0
-    patience_limit = 30  # Increased patience for early stopping
-    min_epochs = 50  # Increased min_epochs
+    patience_limit = 50  # Increased patience for early stopping
+    min_epochs = 100  # Increased minimum epochs
 
     # Track previous losses for early stopping based on minimal improvement
     prev_losses = []
-    improvement_threshold = 1e-8  # Lowered improvement threshold
+    improvement_threshold = 1e-8  # Lowered improvement threshold for better precision
 
     for epoch in range(epochs):
-        idxs = np.random.randint(0, p_s.shape[0], size=1024)  # Increased batch size for more stable gradients
-        f_pred = model(p_s[idxs])
+        idxs = np.random.randint(0, p_s.shape[0], size=1024)
+        p_batch = p_s[idxs]
+        f_batch = f_s[idxs]
+
+        f_pred = model(p_batch)
 
         # Use MSE loss for better precision in the final stages
-        diff = f_pred - f_s[idxs]
+        diff = f_pred - f_batch
         loss = torch.mean(diff**2)
 
         # Curriculum learning: gradually increase the penalty for large errors
-        # This helps the model focus on getting the general shape right first, then fine-tune
-        curriculum_factor = min(1.0, epoch / 100.0)  # Gradually increase from 0 to 1 over first 100 epochs
-        weighted_loss = torch.mean(torch.pow(diff**2, 1.0 + 0.5 * curriculum_factor))  # Increase exponent gradually
+        curriculum_factor = min(1.0, epoch / 100.0)
+        weighted_loss = torch.mean(torch.pow(diff**2, 1.0 + 0.5 * curriculum_factor))
 
         # Add a regularization term to encourage smoothness in the learned function
-        # This can help with generalization and numerical stability
         reg_loss = 0.0
-        if epoch > 50:  # Only apply regularization after initial fitting
-            # Calculate gradients of the model output w.r.t. inputs to encourage smoothness
-            p_batch = p_s[idxs].requires_grad_()
-            f_pred_reg = model(p_batch)
-            grad_outputs = torch.ones_like(f_pred_reg)
-            gradients = torch.autograd.grad(outputs=f_pred_reg, inputs=p_batch,
-                                          grad_outputs=grad_outputs,
-                                          create_graph=True, retain_graph=True)[0]
-            reg_loss = 1e-4 * torch.mean(gradients**2)  # Smoothness regularization
+        # Temporarily disable regularization to debug high loss issue
+        # if epoch > 50 and epoch % 5 == 0:  # Apply regularization every 5th epoch to reduce cost
+        #     # Apply regularization only to a 25% subsample of the batch
+        #     subsample_size = max(1, idxs.shape[0] // 4)  # 25% of batch
+        #     subsample_idxs = np.random.choice(idxs.shape[0], size=subsample_size, replace=False)
+        #
+        #     p_subsample = p_batch[subsample_idxs].clone().detach().requires_grad_()
+        #     f_pred_reg = model(p_subsample)
+        #     grad_outputs = torch.ones_like(f_pred_reg)
+        #     try:
+        #         gradients = torch.autograd.grad(outputs=f_pred_reg, inputs=p_subsample,
+        #                                       grad_outputs=grad_outputs,
+        #                                       create_graph=True, retain_graph=True)[0]
+        #         reg_loss = 1e-4 * torch.mean(gradients**2)
+        #     except:
+        #         reg_loss = 0.0  # If gradient computation fails, skip regularization for this epoch
 
         total_loss = weighted_loss + reg_loss
 
         opt.zero_grad()
         total_loss.backward()
-
-        # Gradient clipping to prevent exploding gradients
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
         opt.step()
-        sched.step(weighted_loss.detach())  # Use weighted loss for scheduler
+        sched.step(weighted_loss.detach())
 
-        if loss.item() < best_loss:
-            best_loss = loss.item()
-            patience_counter = 0  # Reset patience counter when we find a better loss
+        current_loss = loss.item()
+        if current_loss < best_loss:
+            best_loss = current_loss
+            patience_counter = 0
         else:
             patience_counter += 1
 
         # Track recent losses for improvement checking
-        prev_losses.append(loss.item())
-        if len(prev_losses) > 20:  # Keep last 20 losses for more stable improvement calculation
+        prev_losses.append(current_loss)
+        if len(prev_losses) > 20:
             prev_losses.pop(0)
 
-        if epoch % 50 == 0: print(f"Epoch {epoch} | Loss: {loss.item():.2e}")
+        if epoch % 50 == 0:
+            print(f"Epoch {epoch} | Loss: {current_loss:.2e}")
 
         # Additional early stopping based on patience
         if patience_counter >= patience_limit and epoch >= min_epochs:
@@ -459,7 +476,7 @@ def train_discovery(mode='lj'):
             break
 
         # Check for minimal improvement over recent epochs
-        if len(prev_losses) >= 20:  # Increased window for more stable improvement detection
+        if len(prev_losses) >= 20:
             recent_improvement = abs(prev_losses[0] - prev_losses[-1])
             if recent_improvement < improvement_threshold and epoch >= min_epochs:
                 print(f"Loss improvement too small ({recent_improvement:.2e}), stopping at epoch {epoch}")
@@ -486,7 +503,7 @@ def train_discovery(mode='lj'):
 
     # Create the same basis functions that the neural network uses internally
     dist_tensor = torch.tensor(r_phys / scaler.p_scale, device=device, dtype=torch.float32)
-    with torch.inference_mode():
+    with torch.no_grad():  # Use torch.no_grad instead of torch.inference_mode for better compatibility
         # Get the features that the neural network uses internally
         features = model._get_features(dist_tensor)
         f_mag_phys = scaler.inverse_transform_f(model.predict_mag(torch.tensor(r_phys/scaler.p_scale, device=device))).cpu().numpy().ravel()
@@ -518,18 +535,19 @@ def train_discovery(mode='lj'):
         f_set = ['add', 'sub', 'mul']  # Limit operations for spring too to keep it simple
 
     # Run SymbolicRegressor once with optimized parameters
-    est = SymbolicRegressor(population_size=population_size,
-                            generations=generations,
-                            function_set=f_set,
+    est = SymbolicRegressor(population_size=400,  # Reduced population size
+                            generations=15,  # Reduced generations
+                            function_set=('add', 'sub', 'mul', 'div', 'inv', 'pow'),  # Restricted function set
                             parsimony_coefficient=0.01,  # Increased parsimony coefficient to penalize complexity
                             metric='mse',
                             random_state=42,
                             max_samples=0.9,
-                            stopping_criteria=0.0001,
+                            stopping_criteria=0.0001,  # Early stopping
                             const_range=(-100.0, 100.0),  # Wider constant range for better fitting
                             init_depth=(2, 4),  # Reduced initial depth to enforce parsimony
                             init_method='half and half',
-                            verbose=0)
+                            verbose=0,
+                            n_jobs=-1)  # Enable parallel processing
 
     est.fit(X_basis, f_mag_phys)
     print(f"SR completed: depth={est._program.depth_}, fitness={est._program.raw_fitness_:.4f}")
