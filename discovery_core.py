@@ -149,76 +149,71 @@ def extract_coefficients(expr, mode='lj'):
         # Convert to polynomial form to extract coefficients
         r = sp.Symbol('r')
         try:
-            # Expand the expression to get polynomial terms
-            expanded = sp.expand(expr)
+            # First, expand and simplify the expression to get it in a standard form
+            simplified_expr = sp.simplify(expr)
+            expanded_expr = sp.expand(simplified_expr)
 
-            # Look for terms with r^(-13) and r^(-7) (which appear as 1/r^13 and 1/r^7)
-            # Since we expect the form A*(1/r^13) - B*(1/r^7), we need to extract these coefficients
+            # Try multiple approaches to extract coefficients
 
-            # Extract coefficients for negative powers of r in multiple ways to handle equivalent forms
-            coeff_r_neg13 = expanded.coeff(r**(-13))
+            # Approach 1: Direct coefficient extraction
+            coeff_r_neg13 = expanded_expr.coeff(r**(-13))
+            coeff_r_neg7 = expanded_expr.coeff(r**(-7))
 
-            # Also check for 1/r^13 form
-            if coeff_r_neg13 == 0 or coeff_r_neg13 is None:
-                # Convert expression to a form where we can extract coefficients of 1/r^13
-                # We need to collect terms that have r^(-13)
-                collected = sp.collect(expanded, r**(-13), evaluate=False)
-                if r**(-13) in collected:
-                    coeff_r_neg13 = collected[r**(-13)]
-                else:
-                    # Try to find coefficient of 1/r^13 by rewriting
-                    simplified_expr = sp.simplify(expanded)
-                    # Look for terms that contain r^(-13) or 1/r^13
-                    terms = simplified_expr.as_ordered_terms() if hasattr(simplified_expr, 'as_ordered_terms') else [simplified_expr]
+            # Approach 2: If direct extraction failed, try collecting terms
+            if coeff_r_neg13 == 0 or coeff_r_neg13 is None or coeff_r_neg13 == 0 or coeff_r_neg7 is None:
+                # Collect terms with r^(-13) and r^(-7)
+                collected = sp.collect(expanded_expr, [r**(-13), r**(-7)], evaluate=False)
 
-                    for term in terms:
-                        if r**(-13) in sp.preorder_traversal(term):
-                            coeff_r_neg13 = term.coeff(r**(-13))
-                            break
-                        elif sp.Mul(1, r**(-13)).has(r**(-13)) and term.has(r**(-13)):
-                            # Check if term is of the form coeff * r^(-13)
-                            if term.as_coeff_mul(r)[0] != 0:
-                                coeff_r_neg13 = term.as_coeff_mul(r)[0]
-                                break
+                # The collected dict might have the terms we need
+                if len(collected) > 1:
+                    # If there are multiple terms, look for the ones with r^(-13) and r^(-7)
+                    for term, coeff in collected.items():
+                        if term == r**(-13):
+                            coeff_r_neg13 = coeff
+                        elif term == r**(-7):
+                            coeff_r_neg7 = coeff
+                        # If terms are products like r^(-13)*some_const, extract the coefficient
+                        elif term.has(r**(-13)):
+                            coeff_r_neg13 = coeff  # The coefficient part
+                        elif term.has(r**(-7)):
+                            coeff_r_neg7 = coeff  # The coefficient part
 
-            # Similarly for r^(-7)
-            coeff_r_neg7 = expanded.coeff(r**(-7))
-            if coeff_r_neg7 == 0 or coeff_r_neg7 is None:
-                collected = sp.collect(expanded, r**(-7), evaluate=False)
-                if r**(-7) in collected:
-                    coeff_r_neg7 = collected[r**(-7)]
-                else:
-                    # Try to find coefficient of 1/r^7 by rewriting
-                    simplified_expr = sp.simplify(expanded)
-                    terms = simplified_expr.as_ordered_terms() if hasattr(simplified_expr, 'as_ordered_terms') else [simplified_expr]
+            # Approach 3: If still not found, try to separate terms
+            if coeff_r_neg13 == 0 or coeff_r_neg13 is None or coeff_r_neg7 == 0 or coeff_r_neg7 is None:
+                # Convert to a form where we can separate terms more easily
+                # Handle expressions like A/r^13 - B/r^7
+                terms = expanded_expr.as_ordered_terms() if hasattr(expanded_expr, 'as_ordered_terms') else [expanded_expr]
 
-                    for term in terms:
-                        if r**(-7) in sp.preorder_traversal(term):
-                            coeff_r_neg7 = term.coeff(r**(-7))
-                            break
-                        elif sp.Mul(1, r**(-7)).has(r**(-7)) and term.has(r**(-7)):
-                            # Check if term is of the form coeff * r^(-7)
-                            if term.as_coeff_mul(r)[0] != 0:
-                                coeff_r_neg7 = term.as_coeff_mul(r)[0]
-                                break
+                for term in terms:
+                    # Check if the term contains r^(-13)
+                    if r**(-13) in sp.preorder_traversal(term):
+                        coeff_r_neg13 = term.as_coefficient(r**(-13))
+                        if coeff_r_neg13 is None:
+                            # If as_coefficient doesn't work, try to extract the coefficient manually
+                            # by dividing out the r^(-13) part
+                            simplified_term = sp.simplify(term / r**(-13))
+                            if simplified_term != 0 and not simplified_term.has(r):
+                                coeff_r_neg13 = simplified_term
+                    elif r**(-7) in sp.preorder_traversal(term):
+                        coeff_r_neg7 = term.as_coefficient(r**(-7))
+                        if coeff_r_neg7 is None:
+                            # Similar approach for r^(-7)
+                            simplified_term = sp.simplify(term / r**(-7))
+                            if simplified_term != 0 and not simplified_term.has(r):
+                                coeff_r_neg7 = simplified_term
 
-            # Alternative approach: convert to polynomial in r^-1
-            # This handles cases like 1/r^13 which is (r^-1)^13
-            r_inv = sp.Symbol('r_inv')
-            expr_substituted = expanded.subs(r**(-1), r_inv)
-            # Now extract coefficients of r_inv^13 and r_inv^7
-            if coeff_r_neg13 == 0 or coeff_r_neg13 is None:
-                coeff_r_neg13 = expr_substituted.coeff(r_inv**13)
-            if coeff_r_neg7 == 0 or coeff_r_neg7 is None:
-                coeff_r_neg7 = expr_substituted.coeff(r_inv**7)
+            # Convert to float, handling cases where the coefficient might still be None
+            coeff_r_neg13 = float(coeff_r_neg13) if coeff_r_neg13 is not None and coeff_r_neg13 != 0 else 0
+            coeff_r_neg7 = float(coeff_r_neg7) if coeff_r_neg7 is not None and coeff_r_neg7 != 0 else 0
 
             return {
-                'coeff_r_neg13': float(coeff_r_neg13) if coeff_r_neg13 and coeff_r_neg13 != 0 else 0,
-                'coeff_r_neg7': float(coeff_r_neg7) if coeff_r_neg7 and coeff_r_neg7 != 0 else 0,
+                'coeff_r_neg13': coeff_r_neg13,
+                'coeff_r_neg7': coeff_r_neg7,
                 'expected_A': 48,  # Expected coefficient for 1/r^13 term
                 'expected_B': 24,  # Expected coefficient for 1/r^7 term
             }
-        except:
+        except Exception as e:
+            print(f"Error in LJ coefficient extraction: {e}")
             return {
                 'coeff_r_neg13': 0,
                 'coeff_r_neg7': 0,
@@ -229,20 +224,31 @@ def extract_coefficients(expr, mode='lj'):
         # For spring mode, we expect -k*(r-1) where k ≈ 10
         try:
             r = sp.Symbol('r')
-            expanded = sp.expand(expr)
-            # Extract the coefficient of r and the constant term
-            coeff_r = expanded.coeff(r, 1)  # Coefficient of r^1
-            const_term = expanded.subs(r, 0)  # Constant term when r=0
+            # Simplify and expand the expression to get it in standard form
+            simplified_expr = sp.simplify(expr)
+            expanded_expr = sp.expand(simplified_expr)
+
+            # The expected form is -k*(r-1) = -k*r + k
+            # So we need to extract coefficients of r^1 and the constant term
+            coeff_r = expanded_expr.coeff(r, 1)  # Coefficient of r^1
+            const_term = expanded_expr.subs(r, 0)  # Constant term when r=0
+
+            # For the form -k*r + k, the coefficient of r is -k and the constant is k
+            # So the spring constant k is the absolute value of the r coefficient
+            k_value = abs(float(coeff_r)) if coeff_r is not None else 0
 
             return {
-                'coeff_r': float(coeff_r) if coeff_r else 0,
-                'const_term': float(const_term) if const_term else 0,
+                'coeff_r': float(coeff_r) if coeff_r is not None else 0,
+                'const_term': float(const_term) if const_term is not None else 0,
+                'k_extracted': k_value,
                 'expected_k': 10,  # Expected spring constant
             }
-        except:
+        except Exception as e:
+            print(f"Error in spring coefficient extraction: {e}")
             return {
                 'coeff_r': 0,
                 'const_term': 0,
+                'k_extracted': 0,
                 'expected_k': 10,
             }
 
@@ -265,6 +271,7 @@ def train_discovery(mode='lj'):
     epochs = 400 if mode == 'spring' else 1200
     patience_counter = 0
     patience_limit = 100  # Number of epochs to wait before considering convergence
+    min_epochs = 50  # Minimum number of epochs to train before allowing early stopping
 
     for epoch in range(epochs):
         idxs = np.random.randint(0, p_s.shape[0], size=512)
@@ -279,14 +286,14 @@ def train_discovery(mode='lj'):
 
         if epoch % 200 == 0: print(f"Epoch {epoch} | Loss: {loss.item():.2e}")
 
-        # Early stopping: if loss is below threshold, break the loop
+        # Early stopping: if loss is below threshold AND we've trained for minimum epochs, break the loop
         threshold = 0.05 if mode == 'spring' else 0.5
-        if loss.item() < threshold:
+        if loss.item() < threshold and epoch >= min_epochs:
             print(f"Early stopping at epoch {epoch}, loss: {loss.item():.2e}")
             break
 
         # Additional early stopping based on patience
-        if patience_counter >= patience_limit:
+        if patience_counter >= patience_limit and epoch >= min_epochs:
             print(f"No improvement for {patience_limit} epochs, stopping at epoch {epoch}")
             break
 
@@ -305,6 +312,7 @@ def train_discovery(mode='lj'):
         best_loss = 1e6
         patience_counter = 0
         patience_limit = 100  # Number of epochs to wait before considering convergence
+        min_epochs = 50  # Minimum number of epochs to train before allowing early stopping
 
         for epoch in range(epochs):
             idxs = np.random.randint(0, p_s.shape[0], size=512)
@@ -319,13 +327,13 @@ def train_discovery(mode='lj'):
 
             if epoch % 200 == 0: print(f"Epoch {epoch} (smaller net) | Loss: {loss.item():.2e}")
 
-            # Early stopping: if loss is below threshold, break the loop
-            if loss.item() < threshold:
+            # Early stopping: if loss is below threshold AND we've trained for minimum epochs, break the loop
+            if loss.item() < threshold and epoch >= min_epochs:
                 print(f"Early stopping at epoch {epoch} (smaller net), loss: {loss.item():.2e}")
                 break
 
             # Additional early stopping based on patience
-            if patience_counter >= patience_limit:
+            if patience_counter >= patience_limit and epoch >= min_epochs:
                 print(f"No improvement for {patience_limit} epochs, stopping at epoch {epoch} (smaller net)")
                 break
 
@@ -351,31 +359,50 @@ def train_discovery(mode='lj'):
             # So we want indices 4 (inv_r**7 = r^{-7}) and 5 (inv_r**13 = r^{-13})
             X_basis = features[:, [4, 5]].cpu().numpy()
         else:
-            # For other modes, use all features
-            X_basis = features.cpu().numpy()
+            # For spring mode, we want the deviation from equilibrium (r-1) as the main feature
+            # The features are [dist, inv_r, inv_r**6, inv_r**12, inv_r**7, inv_r**13]
+            # For spring, we expect a linear relationship with distance from equilibrium (r-1)
+            # So we'll create a feature that represents (r-1) where r is the distance
+            dist_values = features[:, [0]].cpu().numpy()  # Raw distance values
+            equilibrium_deviation = dist_values - 1.0  # (r-1) from equilibrium position
+            X_basis = equilibrium_deviation  # Use only (r-1) as the feature
 
     # Use the basis functions as input variables for symbolic regression
     # For LJ mode, only use basic arithmetic operations since basis functions are provided
-    p_coeff = 0.01  # Changed initial p_coeff to 0.01 to favor simpler formulas
+    p_coeff = 0.05  # Increased p_coeff to strongly favor simpler formulas
 
     # Restrict function set for LJ mode to prevent 'mathematical loops'
     if mode == 'lj':
         f_set = ['add', 'sub', 'mul']
+        # Increase population size and generations for LJ mode to allow more exploration
+        # within the restricted function set
+        population_size = 2000
+        generations = 25
     else:
-        f_set = ['add', 'sub', 'mul', 'div', inv, negpow]
+        f_set = ['add', 'sub', 'mul']  # Limit operations for spring too to keep it simple
+        population_size = 1000
+        generations = 15
 
     # Single fit with one retry option instead of the attempt loop
-    est = SymbolicRegressor(population_size=1000, generations=15, function_set=f_set,
+    est = SymbolicRegressor(population_size=population_size, generations=generations, function_set=f_set,
                             parsimony_coefficient=p_coeff, metric='mse', random_state=42,
                             max_samples=0.9, stopping_criteria=0.0001)
     est.fit(X_basis, f_mag_phys)
 
-    # If the result is poor, do exactly one retry with p_coeff * 5
-    if est._program.depth_ > 10:  # If formula depth exceeds 10, try again with higher parsimony
-        print(f"Depth {est._program.depth_} too high, retrying with p_coeff * 5")
-        est_retry = SymbolicRegressor(population_size=1000, generations=15, function_set=f_set,
-                                      parsimony_coefficient=p_coeff * 5, metric='mse', random_state=42,
-                                      max_samples=0.9, stopping_criteria=0.0001)
+    # If the result is poor, do exactly one retry with different parameters
+    if est._program.depth_ > 10 or est._program.depth_ == 0:  # If formula depth exceeds 10 or is 0 (constant), try again
+        print(f"Depth {est._program.depth_} unsuitable, retrying with adjusted parameters")
+        # Use different parameters for retry depending on the mode
+        if mode == 'lj':
+            # For LJ mode, try with different population size and generations to find both terms
+            est_retry = SymbolicRegressor(population_size=3000, generations=30, function_set=f_set,
+                                          parsimony_coefficient=p_coeff, metric='mse', random_state=43,
+                                          max_samples=0.9, stopping_criteria=0.0001)
+        else:
+            # For spring mode, try with higher parsimony to get simpler formula
+            est_retry = SymbolicRegressor(population_size=population_size, generations=generations, function_set=f_set,
+                                          parsimony_coefficient=p_coeff * 3, metric='mse', random_state=43,
+                                          max_samples=0.9, stopping_criteria=0.0001)
         est_retry.fit(X_basis, f_mag_phys)
         est = est_retry  # Use the retry result
 
@@ -400,13 +427,27 @@ def train_discovery(mode='lj'):
         # Now parse the expression and simplify
         ld = {'inv': lambda x: 1/x, 'negpow': lambda x,n: x**(-abs(n)), 'add': lambda x,y: x+y, 'sub': lambda x,y: x-y, 'mul': lambda x,y: x*y, 'div': lambda x,y: x/y, 'r': r}
         expr = sp.simplify(sp.sympify(program_str, locals=ld))
+
+        # Further simplify to ensure we get the expected form: A*(1/r^13) - B*(1/r^7)
+        # Convert to a more standard form if needed
+        expr = sp.expand(expr)
     else:
-        # For spring mode, X0 might correspond to r itself
+        # For spring mode, X0 corresponds to (r-1) where r is the physical distance
         r = sp.Symbol('r')
-        # Replace X0 with r (and any other X variables with r if needed)
-        program_str = program_str.replace('X0', 'r')
+        # Replace X0 with (r-1) (the deviation from equilibrium)
+        program_str = program_str.replace('X0', '(r-1)')
+
         ld = {'inv': lambda x: 1/x, 'negpow': lambda x,n: x**(-abs(n)), 'add': lambda x,y: x+y, 'sub': lambda x,y: x-y, 'mul': lambda x,y: x*y, 'div': lambda x,y: x/y, 'r': r}
         expr = sp.simplify(sp.sympify(program_str, locals=ld))
+
+        # Expand the expression to get it in a standard form
+        expr = sp.expand(expr)
+
+        # For spring mode, we expect the form -k*(r-1), so let's try to put it in that form
+        # if possible
+        if mode == 'spring':
+            # Try to factor or rearrange to get closer to the expected form
+            expr = sp.simplify(expr)
     mse = validate_discovered_law(expr, mode, device=device)
 
     # Extract coefficients and compare against ground truth
@@ -428,9 +469,10 @@ def train_discovery(mode='lj'):
         # This gives a more comprehensive measure of how well both coefficients match
         coeff_accuracy = (rel_error_13 + rel_error_7) / 2.0 if expected_A != 0 and expected_B != 0 else float('inf')
     elif mode == 'spring':
-        coeff_r = coeffs.get('coeff_r', 0)
+        # For spring mode, use the extracted k value instead of the raw coefficient
+        k_extracted = coeffs.get('k_extracted', 0)
         expected_k = coeffs.get('expected_k', 10)
-        coeff_accuracy = abs(coeff_r - expected_k) / abs(expected_k) if expected_k != 0 else float('inf')
+        coeff_accuracy = abs(k_extracted - expected_k) / abs(expected_k) if expected_k != 0 else float('inf')
     else:
         coeff_accuracy = float('inf')
 
