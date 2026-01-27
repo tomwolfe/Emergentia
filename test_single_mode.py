@@ -30,6 +30,17 @@ def _protected_inv(x):
         return np.where(np.abs(x) > 0.01, 1.0/x, 0.0)
 inv = make_function(function=_protected_inv, name='inv', arity=1)
 
+def _protected_power(x, y):
+    with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+        # Restrict exponent to reasonable range for physical discovery
+        y_clamped = np.clip(y, -14, 14)
+        abs_x = np.abs(x)
+        abs_x = np.where(abs_x < 1e-6, 1e-6, abs_x)
+        result = np.power(abs_x, y_clamped)
+        result = np.where(np.isfinite(result), result, 0.0)
+        return np.clip(result, -1e10, 1e10)
+power = make_function(function=_protected_power, name='power', arity=2)
+
 def _protected_negpow(x, n):
     with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
         abs_x = np.abs(x)
@@ -76,7 +87,7 @@ class PhysicsSim:
         return torch.sum(f, dim=1)
 
     @optional_compile
-    def generate(self, steps=1000):
+    def generate(self, steps=1000, noise_std=0.0):
         # Pre-allocate trajectory tensors
         traj_p = torch.zeros((steps, self.n, 2), device=self.device, dtype=torch.float32)
         traj_f = torch.zeros((steps, self.n, 2), device=self.device, dtype=torch.float32)
@@ -103,6 +114,10 @@ class PhysicsSim:
                 curr_pos += curr_vel * self.dt
                 traj_p[i] = curr_pos
 
+        # Apply noise after trajectory generation to simulate observational noise
+        if noise_std > 0:
+            traj_p += torch.randn_like(traj_p) * noise_std
+
         return traj_p, traj_f
 
 class TrajectoryScaler:
@@ -128,32 +143,22 @@ class TrajectoryScaler:
 class DiscoveryNet(nn.Module):
     def __init__(self, n_particles=8, hidden_size=16):  # Even smaller network for better convergence
         super().__init__()
-        # Very simple network since we're providing the exact features that should be used linearly
+        self.feature_names = ['r', '1/r']
         self.net = nn.Sequential(
-            nn.Linear(6, hidden_size), nn.ReLU(),
+            nn.Linear(len(self.feature_names), hidden_size), nn.ReLU(),
             nn.Linear(hidden_size, 1)
         )
 
     def _get_features(self, dist):
-        # Improved clamping to prevent numerical overflow while maintaining precision
-        dist_safe = torch.clamp(dist, min=0.8, max=15.0)  # Increase min to prevent extreme values
+        # Generalized features: [r, 1/r]
+        dist_safe = torch.clamp(dist, min=0.1, max=15.0)
         inv_r = 1.0 / dist_safe
-
-        # Calculate powers with careful attention to numerical stability
-        inv_r_2 = inv_r**2
-        inv_r_6 = inv_r_2**3  # More stable way to calculate r^-6
-        inv_r_7 = inv_r_6 * inv_r  # r^-7 = r^-6 * r^-1
-        inv_r_12 = inv_r_6**2  # More stable way to calculate r^-12
-        inv_r_13 = inv_r_12 * inv_r  # r^-13 = r^-12 * r^-1
 
         # Apply additional clamping to prevent extreme values
         inv_r_clamped = torch.clamp(inv_r, min=-1e3, max=1e3)
-        inv_r_6_clamped = torch.clamp(inv_r_6, min=-1e3, max=1e3)
-        inv_r_12_clamped = torch.clamp(inv_r_12, min=-1e3, max=1e3)
-        inv_r_7_clamped = torch.clamp(inv_r_7, min=-1e3, max=1e3)
-        inv_r_13_clamped = torch.clamp(inv_r_13, min=-1e3, max=1e3)
+        dist_clamped = torch.clamp(dist_safe, min=-1e3, max=1e3)
 
-        return torch.cat([dist, inv_r_clamped, inv_r_6_clamped, inv_r_12_clamped, inv_r_7_clamped, inv_r_13_clamped], dim=-1)
+        return torch.cat([dist_clamped, inv_r_clamped], dim=-1)
 
     def forward(self, pos_scaled):
         diff = pos_scaled.unsqueeze(2) - pos_scaled.unsqueeze(1)
@@ -397,11 +402,11 @@ def extract_coefficients(expr, mode='lj'):
     return {}
 
 # 4. TRAINING & DISCOVERY
-def train_discovery(mode='lj'):
+def train_discovery(mode='lj', noise_std=0.0, seed=42):
     device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
 
-    sim = PhysicsSim(mode=mode, device=device, seed=42)  # Fixed seed for reproducibility
-    p_traj, f_traj = sim.generate(2000)  # Increased trajectory length for more diverse data
+    sim = PhysicsSim(mode=mode, device=device, seed=seed)  # Use trial seed
+    p_traj, f_traj = sim.generate(2000, noise_std=noise_std)
     scaler = TrajectoryScaler(mode=mode)  # Fixed variable name
     p_s, f_s = scaler.transform(p_traj, f_traj)
 
@@ -548,7 +553,7 @@ def train_discovery(mode='lj'):
     if mode == 'lj':
         # Use a range that emphasizes the repulsive region (small r) and attractive region (larger r)
         r_phys_raw = np.concatenate([
-            np.linspace(0.5, 1.0, 200),  # Emphasize repulsive region
+            np.linspace(0.4, 1.0, 200),  # Emphasize repulsive region
             np.linspace(1.0, 2.0, 200), # Transition region
             np.linspace(2.0, 4.0, 200)  # Attractive region
         ]).astype(np.float32)
@@ -558,113 +563,66 @@ def train_discovery(mode='lj'):
 
     # Create the same basis functions that the neural network uses internally
     dist_tensor = torch.tensor(r_phys / scaler.p_scale, device=device, dtype=torch.float32)
-    with torch.no_grad():  # Use torch.no_grad instead of torch.inference_mode for better compatibility
+    with torch.no_grad():
         # Get the features that the neural network uses internally
         features = model._get_features(dist_tensor)
         f_mag_phys = scaler.inverse_transform_f(model.predict_mag(torch.tensor(r_phys/scaler.p_scale, device=device))).cpu().numpy().ravel()
 
-        # Basis Pruning: Since the NN features already include r^{-13} and r^{-7}, simplify the function_set
-        if mode == 'lj':
-            # For LJ, the neural network has learned r^{-13} and r^{-7}, so provide these as basis functions
-            # features[:, 5] = r^{-13}, features[:, 4] = r^{-7}, features[:, 0] = r (original distance)
-            X_basis = features[:, [5, 4]].cpu().numpy()  # [r^{-13}, r^{-7}] - focus on the key features
-
-            # Since we have the key features, we'll use only basic arithmetic to form linear combinations
-        else:
-            # For spring mode, we want the deviation from equilibrium (r-1) as the main feature
-            dist_values = features[:, [0]].cpu().numpy()  # Raw distance values
-            equilibrium_deviation = dist_values - 1.0  # (r-1) from equilibrium position
-            X_basis = equilibrium_deviation  # Use only (r-1) as the feature
-
-    # Use the basis functions as input variables for symbolic regression
-    # For LJ mode, only use basic arithmetic operations since basis functions are provided
+        # Generalized Basis: Use the features [r, 1/r] provided to the NN
+        X_basis = features.cpu().numpy()
 
     # Set optimized parameters for symbolic regression
-    population_size = 500  # Increased population size for better exploration
-    generations = 20  # Increased number of generations
+    population_size = 5000  # Even larger population
+    generations = 100
 
-    # Restrict function set for LJ mode to strongly encourage use of basis functions
-    if mode == 'lj':
-        f_set = ('add', 'sub', 'mul', 'div')  # Allow division for proper LJ form
-    else:
-        f_set = ('add', 'sub', 'mul')  # Limit operations for spring too to keep it simple
+    # Include power and inv operators as requested
+    f_set = ['add', 'sub', 'mul', 'div', inv, power]
 
-    # Run SymbolicRegressor once with optimized parameters
-    est = SymbolicRegressor(population_size=300,  # Reduced population size to focus on simpler solutions
-                            generations=20,  # Reduced generations to prevent overfitting
+    # Run SymbolicRegressor with broader function set to discover exponents
+    est = SymbolicRegressor(population_size=population_size,
+                            generations=generations,
                             function_set=f_set,
-                            parsimony_coefficient=0.01,  # Higher parsimony to strongly penalize complexity
+                            parsimony_coefficient=0.05,  # High parsimony
                             metric='mse',
-                            random_state=42,
-                            max_samples=0.9,
-                            stopping_criteria=0.001,  # Less stringent stopping criteria
-                            const_range=(-50.0, 50.0),  # Narrower constant range to prevent wild coefficients
-                            init_depth=(1, 3),  # Shallow initial trees to promote simpler expressions
-                            init_method='half and half',
-                            verbose=0,
-                            n_jobs=1)  # Set to 1 to avoid multiprocessing issues within SR
+                            random_state=seed, # Use trial seed
+                            stopping_criteria=0.00001,
+                            const_range=(-15.0, 15.0),
+                            init_depth=(1, 3),  # Very shallow trees initially
+                            verbose=1)
 
     est.fit(X_basis, f_mag_phys)
     print(f"SR completed: depth={est._program.depth_}, fitness={est._program.raw_fitness_:.4f}")
 
-    # Define the parsimony coefficient that was used
-    p_coeff = 0.001
-
     # Map the symbolic regressor variables (X0, X1, etc.) back to physical variables (r)
-    # Using a robust sympy-based substitution system instead of string replacement
+    # Automatically map based on DiscoveryNet feature definition
+    r_sym = sp.Symbol('r')
+    feature_exprs = [r_sym, 1/r_sym]
+    var_mapping = {sp.Symbol(f'X{i}'): expr for i, expr in enumerate(feature_exprs)}
+
     program_str = str(est._program)
 
-    # Define the symbol for distance
-    r = sp.Symbol('r')
-
-    # Create a mapping dictionary for variables based on the mode
-    if mode == 'lj':
-        # In LJ mode, X_basis contains [r^(-13), r^(-7)] at indices [0, 1]
-        # So X0 -> r^(-13), X1 -> r^(-7)
-        var_mapping = {
-            sp.Symbol('X0'): r**(-13),
-            sp.Symbol('X1'): r**(-7)
-        }
-    else:
-        # For spring mode, X0 corresponds to (r-1) where r is the physical distance
-        var_mapping = {
-            sp.Symbol('X0'): (r - 1)
-        }
-
     # Parse the program string into a SymPy expression
-    # First, handle any custom functions like 'inv', 'negpow', etc.
     custom_functions = {
         'inv': lambda x: 1/x,
-        'negpow': lambda x, n: x**(-sp.Abs(n)),
+        'power': lambda x, y: sp.Pow(sp.Abs(x), y), # Use Abs to match protected_power logic
         'add': lambda x, y: x + y,
         'sub': lambda x, y: x - y,
         'mul': lambda x, y: x * y,
         'div': lambda x, y: x / y
     }
 
-    # Parse the expression using sympify with custom function handling
     try:
         expr = sp.sympify(program_str, locals=custom_functions)
-
-        # Perform the variable substitution using SymPy's subs method
         for old_var, new_var in var_mapping.items():
             expr = expr.subs(old_var, new_var)
-
-        # Simplify the final expression
         expr = sp.simplify(expr)
         expr = sp.expand(expr)
-
     except Exception as e:
         print(f"Error in sympy mapping: {e}")
-        # Fallback to original approach if sympy parsing fails
-        if mode == 'lj':
-            program_str = program_str.replace('X0', 'r**(-13)').replace('X1', 'r**(-7)').replace('X2', 'r')
-        else:
-            program_str = program_str.replace('X0', '(r-1)')
-
-        ld = {'inv': lambda x: 1/x, 'negpow': lambda x,n: x**(-abs(n)), 'add': lambda x,y: x+y, 'sub': lambda x,y: x-y, 'mul': lambda x,y: x*y, 'div': lambda x,y: x/y, 'r': r}
-        expr = sp.simplify(sp.sympify(program_str, locals=ld))
-        expr = sp.expand(expr)
+        # Fallback
+        expr = sp.sympify(0)
+    
+    p_coeff = 0.005
     mse = validate_discovered_law(expr, mode, device=device)
 
     # Extract coefficients and compare against ground truth
@@ -723,8 +681,8 @@ def train_discovery(mode='lj'):
     return result_status, best_loss, p_coeff, expr, mse
 
 def main():
-    # Test only LJ mode first to see if it works
-    result = train_discovery('lj')
+    # Test only LJ mode first with noise to see if it works
+    result = train_discovery('lj', noise_std=0.01, seed=42)
     print("\n--- Final Results ---")
     print(result)
 
