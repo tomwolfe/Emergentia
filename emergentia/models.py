@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 class TrajectoryScaler:
-    def __init__(self, mode='spring'):
+    def __init__(self, mode='lj'):
         self.mode = mode
         self.p_scale = 1.0
         self.f_scale = 1.0
@@ -20,25 +20,26 @@ class TrajectoryScaler:
 class DiscoveryNet(nn.Module):
     def __init__(self, hidden_size=128):
         super().__init__()
-        # Input features: [r, 1/r] - Zero Hinting
+        # Input features: [r, 1/r, exp(-r)] - Expanded Zero Hinting
         self.net = nn.Sequential(
-            nn.Linear(2, hidden_size), nn.SiLU(),
+            nn.Linear(3, hidden_size), nn.SiLU(),
             nn.Linear(hidden_size, hidden_size), nn.SiLU(),
             nn.Linear(hidden_size, 1)
         )
 
     def _get_features(self, dist):
-        # Only distance and its inverse. No high-power exponents.
+        # Basis set: [r, 1/r, exp(-r)]
         dist_safe = torch.clamp(dist, min=1e-4, max=50.0)
         inv_r = 1.0 / dist_safe
-        return torch.cat([dist_safe, inv_r], dim=-1)
+        exp_r = torch.exp(-dist_safe)
+        return torch.cat([dist_safe, inv_r, exp_r], dim=-1)
 
     def forward(self, pos_scaled):
         # pos_scaled: (batch, n_particles, 2)
         diff = pos_scaled.unsqueeze(2) - pos_scaled.unsqueeze(1) # (batch, n, n, 2)
         dist = torch.norm(diff, dim=-1, keepdim=True) # (batch, n, n, 1)
         
-        feat = self._get_features(dist) # (batch, n, n, 2)
+        feat = self._get_features(dist) # (batch, n, n, 3)
         mag = self.net(feat) # (batch, n, n, 1)
         
         # Mask out self-interaction

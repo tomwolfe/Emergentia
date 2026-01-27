@@ -21,15 +21,22 @@ def _protected_power(x, y):
         return np.where(np.isfinite(result), np.clip(result, -1e10, 1e10), 0.0)
 power = make_function(function=_protected_power, name='power', arity=2)
 
+def _protected_exp(x):
+    with np.errstate(over='ignore', invalid='ignore'):
+        result = np.exp(np.clip(x, -20, 20))
+        return result
+exp = make_function(function=_protected_exp, name='exp', arity=1)
+
 class DiscoveryPipeline:
-    def __init__(self, mode='lj', device='cpu', seed=42):
+    def __init__(self, mode='lj', potential=None, device='cpu', seed=42):
         self.mode = mode
+        self.potential = potential # Store the actual potential object
         self.device = device
         self.seed = seed
         self.model = DiscoveryNet().to(device)
         self.scaler = TrajectoryScaler(mode=mode)
         
-    def train_nn(self, p_traj, f_traj, epochs=5000):
+    def train_nn(self, p_traj, f_traj, epochs=5000, noise_std=0.0):
         self.scaler.fit(p_traj, f_traj)
         p_s, f_s = self.scaler.transform(p_traj, f_traj)
         
@@ -40,10 +47,12 @@ class DiscoveryPipeline:
         f_target = f_target.to(self.device)
         
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=2e-3, weight_decay=1e-4)
-        criterion = nn.HuberLoss(delta=0.1)
+        # Increase delta for noise resilience if needed, or keep it robust
+        delta = 0.5 if noise_std > 0 else 0.1
+        criterion = nn.HuberLoss(delta=delta)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=200, factor=0.5)
         
-        print(f"Training NN for {self.mode}...")
+        print(f"Training NN for {self.mode} (noise_std={noise_std})...")
         for epoch in range(epochs):
             idxs = torch.randint(0, p_s.shape[0], (1024,))
             p_batch = p_s[idxs]
@@ -64,8 +73,13 @@ class DiscoveryPipeline:
 
     def distill_symbolic(self, population_size=2000, generations=40):
         # Sample the NN across a physical range
-        r_min = 0.6 if self.mode == 'lj' else 0.5
-        r_max = 3.5 if self.mode == 'lj' else 2.5
+        if self.mode == 'lj':
+            r_min, r_max = 0.6, 3.5
+        elif self.mode == 'morse':
+            r_min, r_max = 0.5, 4.0
+        else: # spring
+            r_min, r_max = 0.5, 2.5
+            
         r_phys = np.linspace(r_min, r_max, 500).reshape(-1, 1).astype(np.float32)
         r_scaled = torch.tensor(r_phys / self.scaler.p_scale, device=self.device)
         
@@ -75,14 +89,14 @@ class DiscoveryPipeline:
             mag_s = torch.sign(mag_scaled) * (torch.exp(torch.abs(mag_scaled)) - 1)
             mag_phys = (mag_s * self.scaler.f_scale).cpu().numpy().ravel()
 
-        # Input features for SR: [r, 1/r]
-        X_sr = np.hstack([r_phys, 1.0/r_phys])
+        # Input features for SR: [r, 1/r, exp(-r)]
+        X_sr = np.hstack([r_phys, 1.0/r_phys, np.exp(-r_phys)])
         
         print(f"Running Symbolic Regression for {self.mode}...")
         est = SymbolicRegressor(
             population_size=population_size,
             generations=generations,
-            function_set=('add', 'sub', 'mul', 'div', inv, power),
+            function_set=('add', 'sub', 'mul', 'div', inv, power, exp),
             const_range=(-100.0, 100.0),
             parsimony_coefficient=0.01, 
             stopping_criteria=0.001,
@@ -102,26 +116,30 @@ class DiscoveryPipeline:
         locals_dict = {
             'add': lambda x,y: x+y, 'sub': lambda x,y: x-y, 
             'mul': lambda x,y: x*y, 'div': lambda x,y: x/y,
-            'inv': lambda x: 1/x, 'power': lambda x,y: sp.Pow(sp.Abs(x), y)
+            'inv': lambda x: 1/x, 'power': lambda x,y: sp.Pow(sp.Abs(x), y),
+            'exp': lambda x: sp.exp(x)
         }
         
         expr = sp.sympify(str(est._program), locals=locals_dict)
-        expr = expr.subs(sp.Symbol('X0'), r).subs(sp.Symbol('X1'), 1/r)
+        expr = expr.subs(sp.Symbol('X0'), r).subs(sp.Symbol('X1'), 1/r).subs(sp.Symbol('X2'), sp.exp(-r))
         expr = sp.simplify(expr)
         
         return expr
 
-    def run(self, sim, nn_epochs=5000):
-        p_traj, f_traj = sim.generate(steps=2000)
-        final_nn_loss = self.train_nn(p_traj, f_traj, epochs=nn_epochs)
+    def run(self, sim, nn_epochs=5000, noise_std=0.0):
+        p_traj, f_traj = sim.generate(steps=2000, noise_std=noise_std)
+        final_nn_loss = self.train_nn(p_traj, f_traj, epochs=nn_epochs, noise_std=noise_std)
         discovered_expr = self.distill_symbolic()
         
-        success, mse = verify_equivalence(discovered_expr, self.mode)
+        # Use the potential object for verification if available
+        success, metrics = verify_equivalence(discovered_expr, self.mode, potential=self.potential)
         
         return {
             "mode": self.mode,
             "nn_loss": final_nn_loss,
             "formula": str(discovered_expr),
-            "mse": mse,
+            "mse": metrics.get("mse", 1e6),
+            "r2": metrics.get("r2", 0.0),
+            "bic": metrics.get("bic", 1e6),
             "success": success
         }
