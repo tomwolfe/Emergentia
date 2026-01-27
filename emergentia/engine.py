@@ -33,13 +33,13 @@ class DiscoveryPipeline:
         self.scaler.fit(p_traj, f_traj)
         p_s, f_s = self.scaler.transform(p_traj, f_traj)
         
-        # We use linear force but with a robust loss
-        f_target = f_s
+        # Symmetric Log Transform for high dynamic range
+        f_target = torch.sign(f_s) * torch.log1p(torch.abs(f_s))
             
         p_s = p_s.to(self.device)
         f_target = f_target.to(self.device)
         
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-3, weight_decay=1e-4)
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=2e-3, weight_decay=1e-4)
         criterion = nn.HuberLoss(delta=0.1)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=200, factor=0.5)
         
@@ -57,37 +57,39 @@ class DiscoveryPipeline:
             optimizer.step()
             scheduler.step(loss)
             
-            if epoch % 500 == 0:
+            if epoch % 1000 == 0:
                 print(f"Epoch {epoch} | Loss: {loss.item():.2e}")
                 
         return loss.item()
 
-    def distill_symbolic(self, population_size=10000, generations=40):
+    def distill_symbolic(self, population_size=2000, generations=40):
         # Sample the NN across a physical range
-        r_phys = np.linspace(0.6, 4.0, 1000).reshape(-1, 1).astype(np.float32)
+        r_min = 0.6 if self.mode == 'lj' else 0.5
+        r_max = 3.5 if self.mode == 'lj' else 2.5
+        r_phys = np.linspace(r_min, r_max, 500).reshape(-1, 1).astype(np.float32)
         r_scaled = torch.tensor(r_phys / self.scaler.p_scale, device=self.device)
         
         with torch.no_grad():
             mag_scaled = self.model.predict_mag(r_scaled)
-            # Magnitude is now linear
-            mag_s = mag_scaled
-            
+            # Inverse Symmetric Log Transform
+            mag_s = torch.sign(mag_scaled) * (torch.exp(torch.abs(mag_scaled)) - 1)
             mag_phys = (mag_s * self.scaler.f_scale).cpu().numpy().ravel()
 
-        # Input features for SR: [r, 1/r] to match NN
+        # Input features for SR: [r, 1/r]
         X_sr = np.hstack([r_phys, 1.0/r_phys])
         
         print(f"Running Symbolic Regression for {self.mode}...")
-        # To find exponents like 13, we need to allow gplearn to explore more
-        # and maybe use a smaller parsimony to allow complex exponentiation initially
         est = SymbolicRegressor(
-            population_size=5000,
-            generations=100,
+            population_size=population_size,
+            generations=generations,
             function_set=('add', 'sub', 'mul', 'div', inv, power),
-            parsimony_coefficient=0.0005, 
-            stopping_criteria=1e-6,
+            const_range=(-100.0, 100.0),
+            parsimony_coefficient=0.01, 
+            stopping_criteria=0.001,
             init_depth=(2, 6),
-            max_samples=1.0,
+            max_samples=0.9,
+            n_jobs=-1,
+            metric='mse',
             random_state=self.seed,
             verbose=1
         )
@@ -104,7 +106,6 @@ class DiscoveryPipeline:
         }
         
         expr = sp.sympify(str(est._program), locals=locals_dict)
-        # Map X0 -> r, X1 -> 1/r
         expr = expr.subs(sp.Symbol('X0'), r).subs(sp.Symbol('X1'), 1/r)
         expr = sp.simplify(expr)
         

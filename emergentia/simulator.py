@@ -1,15 +1,25 @@
 import torch
 import numpy as np
+import time
 
 class PhysicsSim:
-    def __init__(self, n=4, mode='lj', seed=None, device='cpu'):
+    def __init__(self, n=4, mode='lj', seed=None, device=None):
         if seed is not None:
             torch.manual_seed(seed)
             np.random.seed(seed)
-        self.device = device
+        
+        if device is None:
+            if torch.backends.mps.is_available():
+                self.device = torch.device("mps")
+            elif torch.cuda.is_available():
+                self.device = torch.device("cuda")
+            else:
+                self.device = torch.device("cpu")
+        else:
+            self.device = device
+            
         self.n = n
         self.mode = mode
-        # LJ needs smaller dt for stability
         self.dt = 0.001 if mode == 'lj' else 0.01
         
         scale = 2.0 if mode == 'spring' else 3.5
@@ -17,47 +27,56 @@ class PhysicsSim:
         self.vel = torch.randn((n, 2), device=self.device, dtype=torch.float32) * 0.1
         self.mask = (~torch.eye(n, device=self.device).bool()).unsqueeze(-1)
 
-    def compute_forces(self, pos):
+        # Force computation is the bottleneck
+        self._compute_forces_compiled = torch.compile(self._compute_forces_raw) if hasattr(torch, 'compile') and self.device.type != 'mps' else self._compute_forces_raw
+
+    def _compute_forces_raw(self, pos):
         diff = pos.unsqueeze(1) - pos.unsqueeze(0)
         dist = torch.norm(diff, dim=-1, keepdim=True)
         dist_clip = torch.clamp(dist, min=1e-6)
         
         if self.mode == 'spring':
-            # F = -k * (r - r0)
             f_mag = -10.0 * (dist - 1.0)
         else:
-            # LJ: F = 48*(1/r^13) - 24*(1/r^7)
             d_inv = 1.0 / torch.clamp(dist, min=0.5, max=5.0)
-            d_inv_13 = torch.clamp(torch.pow(d_inv, 13), max=1e10)
-            d_inv_7 = torch.clamp(torch.pow(d_inv, 7), max=1e6)
+            d_inv_13 = torch.pow(d_inv, 13)
+            d_inv_7 = torch.pow(d_inv, 7)
             f_mag = 48.0 * d_inv_13 - 24.0 * d_inv_7
             
         f = f_mag * (diff / dist_clip) * self.mask
         return torch.sum(f, dim=1)
 
     def generate(self, steps=2000, noise_std=0.0):
-        traj_p = torch.zeros((steps, self.n, 2), device=self.device, dtype=torch.float32)
-        traj_f = torch.zeros((steps, self.n, 2), device=self.device, dtype=torch.float32)
+        start = time.perf_counter()
+        
+        # Pre-allocate on device
+        traj_p = torch.zeros((steps, self.n, 2), device=self.device)
+        traj_f = torch.zeros((steps, self.n, 2), device=self.device)
 
         curr_pos = self.pos.clone()
         curr_vel = self.vel.clone()
 
-        with torch.no_grad():
-            for i in range(steps):
-                f = self.compute_forces(curr_pos)
-                traj_f[i] = f
+        # Optimize: Move some logic outside the loop if possible
+        dt = self.dt
+        
+        for i in range(steps):
+            # Impulse check
+            if i % 500 == 0:
+                impulse_factor = 0.5 if self.mode == 'lj' else 0.3
+                curr_vel += torch.randn_like(curr_vel) * impulse_factor
 
-                # Occasional random impulses to explore state space
-                if i % 500 == 0:
-                    impulse_factor = 0.5 if self.mode == 'lj' else 0.3
-                    curr_vel += torch.randn_like(curr_vel) * impulse_factor
-
-                curr_vel += f * self.dt
-                curr_vel *= 0.99 # Damping for stability
-                curr_pos += curr_vel * self.dt
-                traj_p[i] = curr_pos
+            f = self._compute_forces_compiled(curr_pos)
+            traj_f[i] = f
+            
+            curr_vel += f * dt
+            curr_vel *= 0.99 
+            curr_pos += curr_vel * dt
+            traj_p[i] = curr_pos
 
         if noise_std > 0:
             traj_p += torch.randn_like(traj_p) * noise_std
+            
+        sim_time = (time.perf_counter() - start) * 1000
+        print(f"Simulation of {steps} steps took {sim_time:.2f}ms")
 
         return traj_p, traj_f
