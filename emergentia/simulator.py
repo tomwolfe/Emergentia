@@ -8,6 +8,10 @@ class Potential(ABC):
     def compute_force_magnitude(self, dist):
         pass
 
+    @abstractmethod
+    def compute_potential(self, dist):
+        pass
+
     @property
     @abstractmethod
     def default_scale(self):
@@ -26,6 +30,9 @@ class HarmonicPotential(Potential):
     def compute_force_magnitude(self, dist):
         return -self.k * (dist - self.r0)
 
+    def compute_potential(self, dist):
+        return 0.5 * self.k * torch.pow(dist - self.r0, 2)
+
     @property
     def default_scale(self):
         return 2.0
@@ -36,6 +43,8 @@ class HarmonicPotential(Potential):
 
 class LennardJonesPotential(Potential):
     def __init__(self, epsilon=1.0, sigma=1.0):
+        self.eps = epsilon
+        self.sig = sigma
         # 48 * eps * (sigma^12 / r^13) - 24 * eps * (sigma^6 / r^7)
         self.a = 48.0 * epsilon * (sigma**12)
         self.b = 24.0 * epsilon * (sigma**6)
@@ -43,6 +52,11 @@ class LennardJonesPotential(Potential):
     def compute_force_magnitude(self, dist):
         d_inv = 1.0 / torch.clamp(dist, min=0.5, max=5.0)
         return self.a * torch.pow(d_inv, 13) - self.b * torch.pow(d_inv, 7)
+
+    def compute_potential(self, dist):
+        # V(r) = 4 * eps * ((sigma/r)^12 - (sigma/r)^6)
+        s_r = self.sig / torch.clamp(dist, min=0.5, max=5.0)
+        return 4.0 * self.eps * (torch.pow(s_r, 12) - torch.pow(s_r, 6))
 
     @property
     def default_scale(self):
@@ -59,12 +73,16 @@ class MorsePotential(Potential):
         self.re = re
 
     def compute_force_magnitude(self, dist):
-        # F(r) = 2 * De * a * (exp(-a(r-re)) - exp(-2a(r-re)))
-        # Note: Using the formula provided in the prompt
         diff = dist - self.re
         exp_neg_a = torch.exp(-self.a * diff)
         exp_neg_2a = torch.exp(-2.0 * self.a * diff)
         return 2.0 * self.De * self.a * (exp_neg_a - exp_neg_2a)
+
+    def compute_potential(self, dist):
+        # V(r) = De * (1 - exp(-a(r-re)))^2
+        diff = dist - self.re
+        val = 1.0 - torch.exp(-self.a * diff)
+        return self.De * torch.pow(val, 2)
 
     @property
     def default_scale(self):
@@ -74,8 +92,28 @@ class MorsePotential(Potential):
     def dt(self):
         return 0.005
 
+class GravityPotential(Potential):
+    def __init__(self, G=1.0):
+        self.G = G
+
+    def compute_force_magnitude(self, dist):
+        # F = -G / r^2
+        return -self.G / torch.pow(torch.clamp(dist, min=0.1), 2)
+
+    def compute_potential(self, dist):
+        # V = -G / r
+        return -self.G / torch.clamp(dist, min=0.1)
+
+    @property
+    def default_scale(self):
+        return 5.0
+
+    @property
+    def dt(self):
+        return 0.01
+
 class PhysicsSim:
-    def __init__(self, n=4, potential=None, seed=None, device=None):
+    def __init__(self, n=4, dim=2, potential=None, seed=None, device=None):
         if seed is not None:
             torch.manual_seed(seed)
             np.random.seed(seed)
@@ -91,16 +129,35 @@ class PhysicsSim:
             self.device = device
             
         self.n = n
+        self.dim = dim
         self.potential = potential if potential is not None else LennardJonesPotential()
         self.dt = self.potential.dt
         
         scale = self.potential.default_scale
-        self.pos = torch.rand((n, 2), device=self.device, dtype=torch.float32) * scale
-        self.vel = torch.randn((n, 2), device=self.device, dtype=torch.float32) * 0.1
+        self.pos = torch.rand((n, self.dim), device=self.device, dtype=torch.float32) * scale
+        self.vel = torch.randn((n, self.dim), device=self.device, dtype=torch.float32) * 0.1
         self.mask = (~torch.eye(n, device=self.device).bool()).unsqueeze(-1)
 
         # Force computation is the bottleneck
         self._compute_forces_compiled = torch.compile(self._compute_forces_raw) if hasattr(torch, 'compile') and self.device.type != 'mps' else self._compute_forces_raw
+
+    def get_hamiltonian(self, pos=None, vel=None):
+        p = pos if pos is not None else self.pos
+        v = vel if vel is not None else self.vel
+        
+        # Kinetic Energy: 0.5 * sum(v^2)
+        ke = 0.5 * torch.sum(v**2)
+        
+        # Potential Energy: sum_{i<j} V(r_ij)
+        diff = p.unsqueeze(1) - p.unsqueeze(0)
+        dist = torch.norm(diff, dim=-1)
+        
+        n = self.n
+        indices = torch.triu_indices(n, n, offset=1, device=self.device)
+        dist_pairs = dist[indices[0], indices[1]]
+        
+        pe = torch.sum(self.potential.compute_potential(dist_pairs))
+        return ke + pe
 
     def _compute_forces_raw(self, pos):
         diff = pos.unsqueeze(1) - pos.unsqueeze(0)
@@ -116,8 +173,8 @@ class PhysicsSim:
         start = time.perf_counter()
         
         # Pre-allocate on device
-        traj_p = torch.zeros((steps, self.n, 2), device=self.device)
-        traj_f = torch.zeros((steps, self.n, 2), device=self.device)
+        traj_p = torch.zeros((steps, self.n, self.dim), device=self.device)
+        traj_f = torch.zeros((steps, self.n, self.dim), device=self.device)
 
         curr_pos = self.pos.clone()
         curr_vel = self.vel.clone()

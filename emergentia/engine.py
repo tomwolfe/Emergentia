@@ -28,26 +28,39 @@ def _protected_exp(x):
 exp = make_function(function=_protected_exp, name='exp', arity=1)
 
 class DiscoveryPipeline:
-    def __init__(self, mode='lj', potential=None, device='cpu', seed=42):
+    def __init__(self, mode='lj', potential=None, device='cpu', seed=42, basis_set=None):
         self.mode = mode
         self.potential = potential # Store the actual potential object
         self.device = device
         self.seed = seed
-        self.model = DiscoveryNet().to(device)
+        self.model = DiscoveryNet(basis_set=basis_set).to(device)
         self.scaler = TrajectoryScaler(mode=mode)
         
     def train_nn(self, p_traj, f_traj, epochs=5000, noise_std=0.0):
+        if torch.isnan(p_traj).any() or torch.isnan(f_traj).any():
+            print("Warning: NaNs detected in trajectories. Clipping and filling.")
+            p_traj = torch.nan_to_num(p_traj, nan=0.0)
+            f_traj = torch.nan_to_num(f_traj, nan=0.0)
+
+        if noise_std > 0:
+            from scipy.ndimage import gaussian_filter1d
+            p_np = p_traj.cpu().numpy()
+            p_np = gaussian_filter1d(p_np, sigma=1.0, axis=0)
+            p_traj = torch.from_numpy(p_np).to(self.device)
+
         self.scaler.fit(p_traj, f_traj)
         p_s, f_s = self.scaler.transform(p_traj, f_traj)
         
         # Symmetric Log Transform for high dynamic range
         f_target = torch.sign(f_s) * torch.log1p(torch.abs(f_s))
+        
+        if torch.isnan(f_target).any():
+            f_target = torch.nan_to_num(f_target, nan=0.0)
             
         p_s = p_s.to(self.device)
         f_target = f_target.to(self.device)
         
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=2e-3, weight_decay=1e-4)
-        # Increase delta for noise resilience if needed, or keep it robust
         delta = 0.5 if noise_std > 0 else 0.1
         criterion = nn.HuberLoss(delta=delta)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=200, factor=0.5)
@@ -61,12 +74,18 @@ class DiscoveryPipeline:
             f_pred = self.model(p_batch)
             loss = criterion(f_pred, f_batch)
             
+            if torch.isnan(loss):
+                print(f"NaN Loss at epoch {epoch}. Stopping.")
+                break
+                
             optimizer.zero_grad()
             loss.backward()
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             optimizer.step()
             scheduler.step(loss)
             
-            if epoch % 1000 == 0:
+            if epoch % 500 == 0:
                 print(f"Epoch {epoch} | Loss: {loss.item():.2e}")
                 
         return loss.item()
@@ -77,20 +96,38 @@ class DiscoveryPipeline:
             r_min, r_max = 0.6, 3.5
         elif self.mode == 'morse':
             r_min, r_max = 0.5, 4.0
-        else: # spring
-            r_min, r_max = 0.5, 2.5
+        else: # spring/gravity
+            r_min, r_max = 0.5, 5.0
             
         r_phys = np.linspace(r_min, r_max, 500).reshape(-1, 1).astype(np.float32)
         r_scaled = torch.tensor(r_phys / self.scaler.p_scale, device=self.device)
         
         with torch.no_grad():
             mag_scaled = self.model.predict_mag(r_scaled)
-            # Inverse Symmetric Log Transform
-            mag_s = torch.sign(mag_scaled) * (torch.exp(torch.abs(mag_scaled)) - 1)
+            # Inverse Symmetric Log Transform with clamping to prevent overflow
+            # exp(20) is ~4.8e8, which is safe for float32
+            mag_s = torch.sign(mag_scaled) * (torch.exp(torch.clamp(torch.abs(mag_scaled), max=20.0)) - 1)
             mag_phys = (mag_s * self.scaler.f_scale).cpu().numpy().ravel()
+            
+        # Clean up any remaining infinities or NaNs in mag_phys
+        mag_phys = np.nan_to_num(mag_phys, nan=0.0, posinf=1e10, neginf=-1e10)
 
-        # Input features for SR: [r, 1/r, exp(-r)]
-        X_sr = np.hstack([r_phys, 1.0/r_phys, np.exp(-r_phys)])
+        # Dynamic Input features for SR based on DiscoveryNet basis
+        X_feats = []
+        for name in self.model.basis_names:
+            if name == 'r': X_feats.append(r_phys)
+            elif name == '1/r': X_feats.append(1.0/r_phys)
+            elif name == '1/r^2': X_feats.append(1.0/np.power(r_phys, 2))
+            elif name == '1/r^6': X_feats.append(1.0/np.power(r_phys, 6))
+            elif name == '1/r^7': X_feats.append(1.0/np.power(r_phys, 7))
+            elif name == '1/r^12': X_feats.append(1.0/np.power(r_phys, 12))
+            elif name == '1/r^13': X_feats.append(1.0/np.power(r_phys, 13))
+            elif name == 'exp(-r)': X_feats.append(np.exp(-r_phys))
+            
+        X_sr = np.hstack(X_feats)
+        
+        # Parsimony adjustment based on noise: more noise -> more penalty for complexity
+        parsimony = 0.05 if self.scaler.f_scale > 10.0 else 0.01
         
         print(f"Running Symbolic Regression for {self.mode}...")
         est = SymbolicRegressor(
@@ -98,7 +135,7 @@ class DiscoveryPipeline:
             generations=generations,
             function_set=('add', 'sub', 'mul', 'div', inv, power, exp),
             const_range=(-100.0, 100.0),
-            parsimony_coefficient=0.01, 
+            parsimony_coefficient=parsimony, 
             stopping_criteria=0.001,
             init_depth=(2, 6),
             max_samples=0.9,
@@ -121,23 +158,87 @@ class DiscoveryPipeline:
         }
         
         expr = sp.sympify(str(est._program), locals=locals_dict)
-        expr = expr.subs(sp.Symbol('X0'), r).subs(sp.Symbol('X1'), 1/r).subs(sp.Symbol('X2'), sp.exp(-r))
-        expr = sp.simplify(expr)
         
+        # Mapping back X0, X1, ... to basis functions
+        for i, name in enumerate(self.model.basis_names):
+            if name == 'r': val = r
+            elif name == '1/r': val = 1/r
+            elif name == '1/r^2': val = 1/r**2
+            elif name == '1/r^6': val = 1/r**6
+            elif name == '1/r^7': val = 1/r**7
+            elif name == '1/r^12': val = 1/r**12
+            elif name == '1/r^13': val = 1/r**13
+            elif name == 'exp(-r)': val = sp.exp(-r)
+            expr = expr.subs(sp.Symbol(f'X{i}'), val)
+            
+        expr = sp.simplify(expr)
         return expr
+
+    def refine_constants(self, expr, p_traj, f_traj):
+        from scipy.optimize import minimize
+        
+        # Identify numerical constants (Floats and Integers) and replace with symbols for optimization
+        # Exclude small integers that are likely exponents (e.g., 1, 2, -1, -2) to keep the functional form
+        all_atoms = list(expr.atoms(sp.Number))
+        tune_atoms = [a for a in all_atoms if not (isinstance(a, sp.Integer) and abs(a) <= 2)]
+        
+        if not tune_atoms:
+            return expr
+            
+        symbols = [sp.Symbol(f'c{i}') for i in range(len(tune_atoms))]
+        param_map = {tune_atoms[i]: symbols[i] for i in range(len(tune_atoms))}
+        param_expr = expr.subs(param_map)
+        
+        r_sym = sp.Symbol('r')
+        func = sp.lambdify([r_sym] + symbols, param_expr, 'numpy')
+        
+        p_np = p_traj.cpu().numpy()
+        f_np = f_traj.cpu().numpy()
+        
+        def objective(params):
+            # Compute total force
+            diff = p_np[:, :, np.newaxis, :] - p_np[:, np.newaxis, :, :]
+            dist = np.linalg.norm(diff, axis=-1, keepdims=True)
+            
+            with np.errstate(all='ignore'):
+                mag = func(dist, *params)
+                if not isinstance(mag, np.ndarray):
+                    mag = np.full(dist.shape, mag)
+                # Handle possible infinities from bad params
+                mag = np.nan_to_num(mag, nan=0.0, posinf=1e6, neginf=-1e6)
+                    
+            n = p_np.shape[1]
+            mask = (~np.eye(n, dtype=bool))[np.newaxis, :, :, np.newaxis]
+            
+            pair_forces = mag * (diff / np.clip(dist, 1e-6, None)) * mask
+            f_pred = np.sum(pair_forces, axis=2)
+            
+            return np.mean((f_pred - f_np)**2)
+            
+        initial_guess = [float(v) for v in tune_atoms]
+        # Use a more robust optimizer
+        res = minimize(objective, initial_guess, method='Nelder-Mead', tol=1e-3)
+        
+        final_map = {symbols[i]: res.x[i] for i in range(len(symbols))}
+        return sp.simplify(param_expr.subs(final_map))
 
     def run(self, sim, nn_epochs=5000, noise_std=0.0):
         p_traj, f_traj = sim.generate(steps=2000, noise_std=noise_std)
         final_nn_loss = self.train_nn(p_traj, f_traj, epochs=nn_epochs, noise_std=noise_std)
         discovered_expr = self.distill_symbolic()
         
+        print(f"Raw discovered formula: {discovered_expr}")
+        refined_expr = self.refine_constants(discovered_expr, p_traj, f_traj)
+        print(f"Refined formula: {refined_expr}")
+        
         # Use the potential object for verification if available
-        success, metrics = verify_equivalence(discovered_expr, self.mode, potential=self.potential)
+        success, metrics = verify_equivalence(refined_expr, self.mode, potential=self.potential)
         
         return {
             "mode": self.mode,
             "nn_loss": final_nn_loss,
-            "formula": str(discovered_expr),
+            "formula": str(refined_expr),
+            "raw_formula": str(discovered_expr),
             "mse": metrics.get("mse", 1e6),
             "r2": metrics.get("r2", 0.0),
             "bic": metrics.get("bic", 1e6),

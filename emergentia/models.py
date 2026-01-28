@@ -18,28 +18,50 @@ class TrajectoryScaler:
         return f_scaled * self.f_scale
 
 class DiscoveryNet(nn.Module):
-    def __init__(self, hidden_size=128):
+    def __init__(self, hidden_size=128, basis_set=None):
         super().__init__()
-        # Input features: [r, 1/r, exp(-r)] - Expanded Zero Hinting
+        # Configurable basis set: Default to [r, 1/r, exp(-r)]
+        if basis_set is None:
+            self.basis_names = ['r', '1/r', 'exp(-r)']
+        else:
+            self.basis_names = basis_set
+            
         self.net = nn.Sequential(
-            nn.Linear(3, hidden_size), nn.SiLU(),
+            nn.Linear(len(self.basis_names), hidden_size), nn.SiLU(),
             nn.Linear(hidden_size, hidden_size), nn.SiLU(),
             nn.Linear(hidden_size, 1)
         )
 
     def _get_features(self, dist):
-        # Basis set: [r, 1/r, exp(-r)]
-        dist_safe = torch.clamp(dist, min=1e-4, max=50.0)
-        inv_r = 1.0 / dist_safe
-        exp_r = torch.exp(-dist_safe)
-        return torch.cat([dist_safe, inv_r, exp_r], dim=-1)
+        dist_safe = torch.clamp(dist, min=0.1, max=50.0)
+        feats = []
+        for name in self.basis_names:
+            if name == 'r':
+                feats.append(dist_safe)
+            elif name == '1/r':
+                feats.append(1.0 / dist_safe)
+            elif name == '1/r^2':
+                feats.append(1.0 / torch.pow(dist_safe, 2))
+            elif name == '1/r^6':
+                feats.append(1.0 / torch.pow(dist_safe, 6))
+            elif name == '1/r^7':
+                feats.append(1.0 / torch.pow(dist_safe, 7))
+            elif name == '1/r^12':
+                feats.append(1.0 / torch.pow(dist_safe, 12))
+            elif name == '1/r^13':
+                feats.append(1.0 / torch.pow(dist_safe, 13))
+            elif name == 'exp(-r)':
+                feats.append(torch.exp(-dist_safe))
+            else:
+                raise ValueError(f"Unknown basis function: {name}")
+        return torch.cat(feats, dim=-1)
 
     def forward(self, pos_scaled):
-        # pos_scaled: (batch, n_particles, 2)
-        diff = pos_scaled.unsqueeze(2) - pos_scaled.unsqueeze(1) # (batch, n, n, 2)
+        # pos_scaled: (batch, n_particles, dim)
+        diff = pos_scaled.unsqueeze(2) - pos_scaled.unsqueeze(1) # (batch, n, n, dim)
         dist = torch.norm(diff, dim=-1, keepdim=True) # (batch, n, n, 1)
         
-        feat = self._get_features(dist) # (batch, n, n, 3)
+        feat = self._get_features(dist) # (batch, n, n, len(basis_names))
         mag = self.net(feat) # (batch, n, n, 1)
         
         # Mask out self-interaction

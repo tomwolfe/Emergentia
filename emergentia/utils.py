@@ -14,6 +14,8 @@ def verify_equivalence(expr, mode, potential=None, domain=None, samples=100):
             domain = (0.6, 3.5)
         elif mode == 'morse':
             domain = (0.5, 4.0)
+        elif mode == 'gravity':
+            domain = (0.5, 5.0)
         else:
             domain = (0.5, 2.5)
 
@@ -34,6 +36,8 @@ def verify_equivalence(expr, mode, potential=None, domain=None, samples=100):
                 y_target = -10.0 * (r_vals - 1.0)
             elif mode == 'lj':
                 y_target = 48.0 * (r_vals**-13) - 24.0 * (r_vals**-7)
+            elif mode == 'gravity':
+                y_target = -1.0 / (r_vals**2)
             else:
                 return False, {"mse": 1e6, "r2": 0.0, "bic": 1e6}
 

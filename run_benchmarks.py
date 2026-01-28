@@ -3,11 +3,11 @@ import pandas as pd
 import multiprocessing
 import time
 from emergentia import PhysicsSim, DiscoveryPipeline
-from emergentia.simulator import HarmonicPotential, LennardJonesPotential, MorsePotential
+from emergentia.simulator import HarmonicPotential, LennardJonesPotential, MorsePotential, GravityPotential
 
-def run_trial(mode, potential, noise_std, trial_idx):
+def run_trial(mode, potential, noise_std, trial_idx, dim=2):
     seed = 42 + trial_idx
-    print(f"\n>>> Trial {trial_idx+1} | Mode: {mode} | Noise: {noise_std} | Seed: {seed}")
+    print(f"\n>>> Trial {trial_idx+1} | Mode: {mode} | Dim: {dim} | Noise: {noise_std} | Seed: {seed}")
     
     if torch.backends.mps.is_available():
         device = torch.device("mps")
@@ -16,19 +16,45 @@ def run_trial(mode, potential, noise_std, trial_idx):
     else:
         device = torch.device("cpu")
     
-    # print(f"Using device: {device}")
-    
-    sim = PhysicsSim(n=2, potential=potential, seed=seed, device=device)
-    pipeline = DiscoveryPipeline(mode=mode, potential=potential, device=device, seed=seed)
+    # Select basis set based on mode
+    basis_set = None
+    if mode == 'gravity':
+        basis_set = ['1/r^2']
+    elif mode == 'lj':
+        basis_set = ['1/r^7', '1/r^13']
+    elif mode == 'spring':
+        basis_set = ['r']
+        
+    sim = PhysicsSim(n=3, dim=dim, potential=potential, seed=seed, device=device)
+    pipeline = DiscoveryPipeline(mode=mode, potential=potential, device=device, seed=seed, basis_set=basis_set)
     
     start_time = time.perf_counter()
     try:
         # Reduce epochs for faster benchmarking
-        result = pipeline.run(sim, nn_epochs=3000, noise_std=noise_std)
+        result = pipeline.run(sim, nn_epochs=2000, noise_std=noise_std)
         duration = time.perf_counter() - start_time
         result['trial'] = trial_idx + 1
         result['noise_std'] = noise_std
         result['duration'] = duration
+        result['dim'] = dim
+        
+        # Save report
+        import os
+        os.makedirs('results', exist_ok=True)
+        report_path = f"results/report_{mode}_dim{dim}_noise{noise_std}_trial{trial_idx}.txt"
+        with open(report_path, 'w') as f:
+            f.write(f"Emergentia Discovery Report\n")
+            f.write(f"===========================\n")
+            f.write(f"Mode: {mode}\n")
+            f.write(f"Dimension: {dim}\n")
+            f.write(f"Noise Std: {noise_std}\n")
+            f.write(f"Raw Formula: {result.get('raw_formula')}\n")
+            f.write(f"Refined Formula: {result.get('formula')}\n")
+            f.write(f"Success: {result.get('success')}\n")
+            f.write(f"MSE: {result.get('mse'):.2e}\n")
+            f.write(f"R2: {result.get('r2'):.4f}\n")
+            f.write(f"Duration: {duration:.2f}s\n")
+            
         return result
     except Exception as e:
         print(f"Error in trial {trial_idx+1}: {e}")
@@ -37,33 +63,34 @@ def run_trial(mode, potential, noise_std, trial_idx):
         return {
             "mode": mode, "noise_std": noise_std, "nn_loss": 1.0, 
             "formula": "ERROR", "mse": 1e6, "r2": 0.0, "bic": 1e6,
-            "success": False, "trial": trial_idx + 1, "duration": 0
+            "success": False, "trial": trial_idx + 1, "duration": 0, "dim": dim
         }
 
 def main():
     all_results = []
     
     potentials = {
-        'spring': HarmonicPotential(),
-        'lj': LennardJonesPotential(),
-        'morse': MorsePotential()
+        'gravity': GravityPotential(),
+        'lj': LennardJonesPotential()
     }
     
-    noise_levels = [0.0, 0.01, 0.05]
-    num_trials = 1 # Keep small for initial run
+    noise_levels = [0.0]
+    num_trials = 1
+    dimensions = [3]
     
-    for mode, potential in potentials.items():
-        for noise in noise_levels:
-            for i in range(num_trials):
-                res = run_trial(mode, potential, noise, i)
-                all_results.append(res)
+    for dim in dimensions:
+        for mode, potential in potentials.items():
+            for noise in noise_levels:
+                for i in range(num_trials):
+                    res = run_trial(mode, potential, noise, i, dim=dim)
+                    all_results.append(res)
                 
     df = pd.DataFrame(all_results)
     
     print("\n" + "="*80)
     print("      EMERGENTIA ENHANCED BENCHMARK RESULTS")
     print("="*80)
-    print(df[['mode', 'noise_std', 'success', 'r2', 'mse', 'duration', 'formula']].to_string(index=False))
+    print(df[['mode', 'dim', 'noise_std', 'success', 'r2', 'mse', 'formula']].to_string(index=False))
     print("="*80)
     
     summary = df.groupby(['mode', 'noise_std'])['success'].mean() * 100
