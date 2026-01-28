@@ -17,6 +17,18 @@ class TrajectoryScaler:
     def inverse_transform_f(self, f_scaled): 
         return f_scaled * self.f_scale
 
+BASIS_REGISTRY = {
+    '1': lambda d: torch.ones_like(d),
+    'r': lambda d: d,
+    '1/r': lambda d: 1.0 / d,
+    '1/r^2': lambda d: 1.0 / torch.pow(d, 2),
+    '1/r^6': lambda d: 1.0 / torch.pow(d, 6),
+    '1/r^7': lambda d: 1.0 / torch.pow(d, 7),
+    '1/r^12': lambda d: 1.0 / torch.pow(d, 12),
+    '1/r^13': lambda d: 1.0 / torch.pow(d, 13),
+    'exp(-r)': lambda d: torch.exp(-d)
+}
+
 class DiscoveryNet(nn.Module):
     def __init__(self, hidden_size=128, basis_set=None):
         super().__init__()
@@ -36,22 +48,8 @@ class DiscoveryNet(nn.Module):
         dist_safe = torch.clamp(dist, min=0.1, max=50.0)
         feats = []
         for name in self.basis_names:
-            if name == 'r':
-                feats.append(dist_safe)
-            elif name == '1/r':
-                feats.append(1.0 / dist_safe)
-            elif name == '1/r^2':
-                feats.append(1.0 / torch.pow(dist_safe, 2))
-            elif name == '1/r^6':
-                feats.append(1.0 / torch.pow(dist_safe, 6))
-            elif name == '1/r^7':
-                feats.append(1.0 / torch.pow(dist_safe, 7))
-            elif name == '1/r^12':
-                feats.append(1.0 / torch.pow(dist_safe, 12))
-            elif name == '1/r^13':
-                feats.append(1.0 / torch.pow(dist_safe, 13))
-            elif name == 'exp(-r)':
-                feats.append(torch.exp(-dist_safe))
+            if name in BASIS_REGISTRY:
+                feats.append(BASIS_REGISTRY[name](dist_safe))
             else:
                 raise ValueError(f"Unknown basis function: {name}")
         return torch.cat(feats, dim=-1)

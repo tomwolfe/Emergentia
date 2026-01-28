@@ -112,6 +112,24 @@ class GravityPotential(Potential):
     def dt(self):
         return 0.01
 
+class CompositePotential(Potential):
+    def __init__(self, potentials):
+        self.potentials = potentials
+
+    def compute_force_magnitude(self, dist):
+        return sum(p.compute_force_magnitude(dist) for p in self.potentials)
+
+    def compute_potential(self, dist):
+        return sum(p.compute_potential(dist) for p in self.potentials)
+
+    @property
+    def default_scale(self):
+        return max(p.default_scale for p in self.potentials)
+
+    @property
+    def dt(self):
+        return min(p.dt for p in self.potentials)
+
 class PhysicsSim:
     def __init__(self, n=4, dim=2, potential=None, seed=None, device=None):
         if seed is not None:
@@ -169,7 +187,7 @@ class PhysicsSim:
         f = f_mag * (diff / dist_clip) * self.mask
         return torch.sum(f, dim=1)
 
-    def generate(self, steps=2000, noise_std=0.0):
+    def generate(self, steps=2000, noise_std=0.0, impulses=True):
         start = time.perf_counter()
         
         # Pre-allocate on device
@@ -179,22 +197,35 @@ class PhysicsSim:
         curr_pos = self.pos.clone()
         curr_vel = self.vel.clone()
 
-        # Optimize: Move some logic outside the loop if possible
         dt = self.dt
+        
+        # Initial force
+        f = self._compute_forces_compiled(curr_pos)
         
         for i in range(steps):
             # Impulse check
-            if i % 500 == 0:
+            if impulses and i % 500 == 0:
                 impulse_factor = 0.5 if isinstance(self.potential, LennardJonesPotential) else 0.3
                 curr_vel += torch.randn_like(curr_vel) * impulse_factor
 
+            # Velocity Verlet: 
+            # 1. v(t + dt/2) = v(t) + 0.5 * a(t) * dt
+            curr_vel += 0.5 * f * dt
+            
+            # 2. x(t + dt) = x(t) + v(t + dt/2) * dt
+            curr_pos += curr_vel * dt
+            
+            # 3. a(t + dt)
             f = self._compute_forces_compiled(curr_pos)
             traj_f[i] = f
             
-            curr_vel += f * dt
-            curr_vel *= 0.99 
-            curr_pos += curr_vel * dt
+            # 4. v(t + dt) = v(t + dt/2) + 0.5 * a(t + dt) * dt
+            curr_vel += 0.5 * f * dt
+            
             traj_p[i] = curr_pos
+
+        self.pos = curr_pos.clone()
+        self.vel = curr_vel.clone()
 
         if noise_std > 0:
             traj_p += torch.randn_like(traj_p) * noise_std

@@ -4,8 +4,33 @@ import numpy as np
 import sympy as sp
 from gplearn.genetic import SymbolicRegressor
 from gplearn.functions import make_function
-from .models import DiscoveryNet, TrajectoryScaler
+from .models import DiscoveryNet, TrajectoryScaler, BASIS_REGISTRY
 from .utils import verify_equivalence
+
+# Basis registries for symbolic distillation
+NP_BASIS_REGISTRY = {
+    '1': lambda d: np.ones_like(d),
+    'r': lambda d: d,
+    '1/r': lambda d: 1.0 / d,
+    '1/r^2': lambda d: 1.0 / np.power(d, 2),
+    '1/r^6': lambda d: 1.0 / np.power(d, 6),
+    '1/r^7': lambda d: 1.0 / np.power(d, 7),
+    '1/r^12': lambda d: 1.0 / np.power(d, 12),
+    '1/r^13': lambda d: 1.0 / np.power(d, 13),
+    'exp(-r)': lambda d: np.exp(-d)
+}
+
+SP_BASIS_REGISTRY = {
+    '1': lambda r: sp.Integer(1),
+    'r': lambda r: r,
+    '1/r': lambda r: 1/r,
+    '1/r^2': lambda r: 1/r**2,
+    '1/r^6': lambda r: 1/r**6,
+    '1/r^7': lambda r: 1/r**7,
+    '1/r^12': lambda r: 1/r**12,
+    '1/r^13': lambda r: 1/r**13,
+    'exp(-r)': lambda r: sp.exp(-r)
+}
 
 # Protected functions for gplearn
 def _protected_inv(x):
@@ -60,13 +85,22 @@ class DiscoveryPipeline:
         p_s = p_s.to(self.device)
         f_target = f_target.to(self.device)
         
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=2e-3, weight_decay=1e-4)
+        base_lr = 2e-3
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=base_lr, weight_decay=1e-4)
         delta = 0.5 if noise_std > 0 else 0.1
         criterion = nn.HuberLoss(delta=delta)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=200, factor=0.5)
         
+        warmup_epochs = 500
+        
         print(f"Training NN for {self.mode} (noise_std={noise_std})...")
         for epoch in range(epochs):
+            # LR Warm-up
+            if epoch < warmup_epochs:
+                lr = base_lr * (epoch + 1) / warmup_epochs
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = lr
+
             idxs = torch.randint(0, p_s.shape[0], (1024,))
             p_batch = p_s[idxs]
             f_batch = f_target[idxs]
@@ -83,10 +117,12 @@ class DiscoveryPipeline:
             # Gradient clipping
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             optimizer.step()
-            scheduler.step(loss)
+            
+            if epoch >= warmup_epochs:
+                scheduler.step(loss)
             
             if epoch % 500 == 0:
-                print(f"Epoch {epoch} | Loss: {loss.item():.2e}")
+                print(f"Epoch {epoch} | Loss: {loss.item():.2e} | LR: {optimizer.param_groups[0]['lr']:.2e}")
                 
         return loss.item()
 
@@ -115,25 +151,21 @@ class DiscoveryPipeline:
         # Dynamic Input features for SR based on DiscoveryNet basis
         X_feats = []
         for name in self.model.basis_names:
-            if name == 'r': X_feats.append(r_phys)
-            elif name == '1/r': X_feats.append(1.0/r_phys)
-            elif name == '1/r^2': X_feats.append(1.0/np.power(r_phys, 2))
-            elif name == '1/r^6': X_feats.append(1.0/np.power(r_phys, 6))
-            elif name == '1/r^7': X_feats.append(1.0/np.power(r_phys, 7))
-            elif name == '1/r^12': X_feats.append(1.0/np.power(r_phys, 12))
-            elif name == '1/r^13': X_feats.append(1.0/np.power(r_phys, 13))
-            elif name == 'exp(-r)': X_feats.append(np.exp(-r_phys))
+            if name in NP_BASIS_REGISTRY:
+                X_feats.append(NP_BASIS_REGISTRY[name](r_phys))
+            else:
+                raise ValueError(f"Unknown basis function: {name}")
             
         X_sr = np.hstack(X_feats)
         
-        # Parsimony adjustment based on noise: more noise -> more penalty for complexity
-        parsimony = 0.05 if self.scaler.f_scale > 10.0 else 0.01
+        # Parsimony adjustment: much higher to favor simple basis combinations
+        parsimony = 0.1
         
         print(f"Running Symbolic Regression for {self.mode}...")
         est = SymbolicRegressor(
             population_size=population_size,
             generations=generations,
-            function_set=('add', 'sub', 'mul', 'div', inv, power, exp),
+            function_set=('add', 'sub', 'mul', 'div', inv),
             const_range=(-100.0, 100.0),
             parsimony_coefficient=parsimony, 
             stopping_criteria=0.001,
@@ -161,14 +193,10 @@ class DiscoveryPipeline:
         
         # Mapping back X0, X1, ... to basis functions
         for i, name in enumerate(self.model.basis_names):
-            if name == 'r': val = r
-            elif name == '1/r': val = 1/r
-            elif name == '1/r^2': val = 1/r**2
-            elif name == '1/r^6': val = 1/r**6
-            elif name == '1/r^7': val = 1/r**7
-            elif name == '1/r^12': val = 1/r**12
-            elif name == '1/r^13': val = 1/r**13
-            elif name == 'exp(-r)': val = sp.exp(-r)
+            if name in SP_BASIS_REGISTRY:
+                val = SP_BASIS_REGISTRY[name](r)
+            else:
+                raise ValueError(f"Unknown basis function: {name}")
             expr = expr.subs(sp.Symbol(f'X{i}'), val)
             
         expr = sp.simplify(expr)

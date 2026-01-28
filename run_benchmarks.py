@@ -3,7 +3,7 @@ import pandas as pd
 import multiprocessing
 import time
 from emergentia import PhysicsSim, DiscoveryPipeline
-from emergentia.simulator import HarmonicPotential, LennardJonesPotential, MorsePotential, GravityPotential
+from emergentia.simulator import HarmonicPotential, LennardJonesPotential, MorsePotential, GravityPotential, CompositePotential
 
 def run_trial(mode, potential, noise_std, trial_idx, dim=2):
     seed = 42 + trial_idx
@@ -19,18 +19,20 @@ def run_trial(mode, potential, noise_std, trial_idx, dim=2):
     # Select basis set based on mode
     basis_set = None
     if mode == 'gravity':
-        basis_set = ['1/r^2']
+        basis_set = ['1', '1/r^2']
     elif mode == 'lj':
-        basis_set = ['1/r^7', '1/r^13']
+        basis_set = ['1', '1/r^7', '1/r^13']
     elif mode == 'spring':
-        basis_set = ['r']
+        basis_set = ['1', 'r']
+    elif mode == 'mixed':
+        basis_set = ['1', 'r', '1/r^2']
         
     sim = PhysicsSim(n=3, dim=dim, potential=potential, seed=seed, device=device)
     pipeline = DiscoveryPipeline(mode=mode, potential=potential, device=device, seed=seed, basis_set=basis_set)
     
     start_time = time.perf_counter()
     try:
-        # Reduce epochs for faster benchmarking
+        # Balanced epochs for speed and accuracy
         result = pipeline.run(sim, nn_epochs=2000, noise_std=noise_std)
         duration = time.perf_counter() - start_time
         result['trial'] = trial_idx + 1
@@ -71,7 +73,8 @@ def main():
     
     potentials = {
         'gravity': GravityPotential(),
-        'lj': LennardJonesPotential()
+        'lj': LennardJonesPotential(),
+        'mixed': CompositePotential([HarmonicPotential(k=10.0, r0=1.0), GravityPotential(G=1.0)])
     }
     
     noise_levels = [0.0]

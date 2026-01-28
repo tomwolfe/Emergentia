@@ -11,32 +11,20 @@ def test_hamiltonian_conservation():
     potential = LennardJonesPotential()
     sim = PhysicsSim(n=n, dim=dim, potential=potential, seed=42, device=torch.device("cpu"))
     
-    # Disable damping for conservation check
-    # Note: PhysicsSim has hardcoded 0.99 damping in generate. 
-    # I'll monkeypatch it or just check if it's reasonably stable for a few steps.
-    
-    steps = 1000
-    dt = potential.dt
-    
+    steps = 500 # Short run to check conservation
     h_start = sim.get_hamiltonian().item()
     
-    # Run manual loop without damping
-    curr_pos = sim.pos.clone()
-    curr_vel = sim.vel.clone()
+    # To test pure conservation, we need to avoid the random impulses in generate()
+    p_traj, f_traj = sim.generate(steps=400, noise_std=0.0, impulses=False)
     
-    h_history = []
-    for i in range(steps):
-        f = sim._compute_forces_raw(curr_pos)
-        curr_vel += f * dt
-        curr_pos += curr_vel * dt
-        h_history.append(sim.get_hamiltonian(curr_pos, curr_vel).item())
-        
-    h_end = h_history[-1]
+    h_end = sim.get_hamiltonian().item()
     drift = abs(h_end - h_start) / abs(h_start)
     
-    print(f"Energy drift over {steps} steps: {drift:.2e}")
-    # Euler integration has drift, but it should be small for dt=0.001
-    assert drift < 0.05 # 5% tolerance for simple Euler
+    print(f"Energy drift over {400} steps with Velocity Verlet: {drift:.2e}")
+    # Velocity Verlet should have MUCH better conservation than Euler
+    # Euler with dt=0.001 usually has drift ~1e-2 to 1e-3 over 400 steps.
+    # VV should be 1e-4 or better in float32.
+    assert drift < 1e-4 
 
 def test_symbolic_conservative():
     r = sp.Symbol('r')
