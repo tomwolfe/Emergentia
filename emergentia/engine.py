@@ -77,7 +77,7 @@ class DiscoveryPipeline:
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = lr
 
-            idxs = torch.randint(0, p_s.shape[0], (1024,))
+            idxs = torch.randint(0, p_s.shape[0], (1024,), device=self.device)
             p_batch = p_s[idxs]
             f_batch = f_target[idxs]
             
@@ -220,6 +220,18 @@ class DiscoveryPipeline:
         final_map = {symbols[i]: res.x[i] for i in range(len(symbols))}
         return sp.simplify(param_expr.subs(final_map))
 
+    def validate_conservativeness(self, expr):
+        r = sp.Symbol('r')
+        try:
+            potential = sp.integrate(expr, r)
+            if potential.is_constant():
+                return False
+            if potential.has(sp.I):
+                return False
+            return True
+        except Exception:
+            return False
+
     def run(self, sim, nn_epochs=5000, noise_std=0.0):
         p_traj, f_traj = sim.generate(steps=2000, noise_std=noise_std)
         final_nn_loss = self.train_nn(p_traj, f_traj, epochs=nn_epochs, noise_std=noise_std)
@@ -232,6 +244,8 @@ class DiscoveryPipeline:
         # Use the potential object for verification if available
         success, metrics = verify_equivalence(refined_expr, self.mode, potential=self.potential)
         
+        is_conservative = self.validate_conservativeness(refined_expr)
+        
         return {
             "mode": self.mode,
             "nn_loss": final_nn_loss,
@@ -240,5 +254,6 @@ class DiscoveryPipeline:
             "mse": metrics.get("mse", 1e6),
             "r2": metrics.get("r2", 0.0),
             "bic": metrics.get("bic", 1e6),
-            "success": success
+            "success": success,
+            "conservative": is_conservative
         }

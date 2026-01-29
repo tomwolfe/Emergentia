@@ -9,8 +9,8 @@ class TrajectoryScaler:
         self.f_scale = 1.0
         
     def fit(self, p, f):
-        self.p_scale = torch.max(torch.abs(p)).item() if torch.max(torch.abs(p)).item() > 0 else 1.0
-        self.f_scale = torch.max(torch.abs(f)).item() if torch.max(torch.abs(f)).item() > 0 else 1.0
+        self.p_scale = max(torch.max(torch.abs(p)).item(), 1e-8)
+        self.f_scale = max(torch.max(torch.abs(f)).item(), 1e-8)
         
     def transform(self, p, f): 
         return p / self.p_scale, f / self.f_scale

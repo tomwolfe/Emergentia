@@ -27,8 +27,8 @@ def test_scaling_zero_motion():
     
     assert torch.all(p_s == 0)
     assert torch.all(f_s == 0)
-    assert scaler.p_scale == 1.0
-    assert scaler.f_scale == 1.0
+    assert scaler.p_scale == 1e-8
+    assert scaler.f_scale == 1e-8
 
 def test_extreme_scales():
     scaler = TrajectoryScaler()
