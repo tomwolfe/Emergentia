@@ -24,6 +24,8 @@ def run_trial(mode, potential, noise_std, trial_idx, dim=2):
         basis_set = ['1', '1/r^7', '1/r^13']
     elif mode == 'spring':
         basis_set = ['1', 'r']
+    elif mode == 'morse':
+        basis_set = ['1', 'exp(-r)']
     elif mode == 'mixed':
         basis_set = ['1', 'r', '1/r^2']
         
@@ -74,6 +76,7 @@ def main():
     potentials = {
         'gravity': GravityPotential(),
         'lj': LennardJonesPotential(),
+        'morse': MorsePotential(),
         'mixed': CompositePotential([HarmonicPotential(k=10.0, r0=1.0), GravityPotential(G=1.0)])
     }
     

@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from .registry import PhysicalBasisRegistry
 
 class TrajectoryScaler:
     def __init__(self, mode='lj'):
@@ -16,18 +17,6 @@ class TrajectoryScaler:
     
     def inverse_transform_f(self, f_scaled): 
         return f_scaled * self.f_scale
-
-BASIS_REGISTRY = {
-    '1': lambda d: torch.ones_like(d),
-    'r': lambda d: d,
-    '1/r': lambda d: 1.0 / d,
-    '1/r^2': lambda d: 1.0 / torch.pow(d, 2),
-    '1/r^6': lambda d: 1.0 / torch.pow(d, 6),
-    '1/r^7': lambda d: 1.0 / torch.pow(d, 7),
-    '1/r^12': lambda d: 1.0 / torch.pow(d, 12),
-    '1/r^13': lambda d: 1.0 / torch.pow(d, 13),
-    'exp(-r)': lambda d: torch.exp(-d)
-}
 
 class DiscoveryNet(nn.Module):
     def __init__(self, hidden_size=128, basis_set=None):
@@ -48,10 +37,7 @@ class DiscoveryNet(nn.Module):
         dist_safe = torch.clamp(dist, min=0.1, max=50.0)
         feats = []
         for name in self.basis_names:
-            if name in BASIS_REGISTRY:
-                feats.append(BASIS_REGISTRY[name](dist_safe))
-            else:
-                raise ValueError(f"Unknown basis function: {name}")
+            feats.append(PhysicalBasisRegistry.get(name, backend='torch')(dist_safe))
         return torch.cat(feats, dim=-1)
 
     def forward(self, pos_scaled):

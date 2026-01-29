@@ -182,6 +182,11 @@ class PhysicsSim:
         dist = torch.norm(diff, dim=-1, keepdim=True)
         dist_clip = torch.clamp(dist, min=1e-6)
         
+        # Validation check for numerical instability
+        if torch.any(dist + torch.eye(self.n, device=self.device).unsqueeze(-1) * 10.0 < 0.1):
+            # We don't want to print every step in a compiled function, but this is a raw fallback
+            pass
+
         f_mag = self.potential.compute_force_magnitude(dist)
             
         f = f_mag * (diff / dist_clip) * self.mask
@@ -223,6 +228,14 @@ class PhysicsSim:
             curr_vel += 0.5 * f * dt
             
             traj_p[i] = curr_pos
+            
+            # Periodic distance check (sampling instead of every step to avoid sync overhead)
+            if i % 100 == 0:
+                with torch.no_grad():
+                    dist_check = torch.norm(curr_pos.unsqueeze(1) - curr_pos.unsqueeze(0), dim=-1)
+                    dist_check = dist_check + torch.eye(self.n, device=self.device) * 10.0
+                    if torch.any(dist_check < 0.1):
+                        print(f"Warning: Step {i} | Minimum distance {torch.min(dist_check):.4f} < 0.1. Numerical instability likely.")
 
         self.pos = curr_pos.clone()
         self.vel = curr_vel.clone()

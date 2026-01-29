@@ -4,33 +4,9 @@ import numpy as np
 import sympy as sp
 from gplearn.genetic import SymbolicRegressor
 from gplearn.functions import make_function
-from .models import DiscoveryNet, TrajectoryScaler, BASIS_REGISTRY
+from .models import DiscoveryNet, TrajectoryScaler
+from .registry import PhysicalBasisRegistry
 from .utils import verify_equivalence
-
-# Basis registries for symbolic distillation
-NP_BASIS_REGISTRY = {
-    '1': lambda d: np.ones_like(d),
-    'r': lambda d: d,
-    '1/r': lambda d: 1.0 / d,
-    '1/r^2': lambda d: 1.0 / np.power(d, 2),
-    '1/r^6': lambda d: 1.0 / np.power(d, 6),
-    '1/r^7': lambda d: 1.0 / np.power(d, 7),
-    '1/r^12': lambda d: 1.0 / np.power(d, 12),
-    '1/r^13': lambda d: 1.0 / np.power(d, 13),
-    'exp(-r)': lambda d: np.exp(-d)
-}
-
-SP_BASIS_REGISTRY = {
-    '1': lambda r: sp.Integer(1),
-    'r': lambda r: r,
-    '1/r': lambda r: 1/r,
-    '1/r^2': lambda r: 1/r**2,
-    '1/r^6': lambda r: 1/r**6,
-    '1/r^7': lambda r: 1/r**7,
-    '1/r^12': lambda r: 1/r**12,
-    '1/r^13': lambda r: 1/r**13,
-    'exp(-r)': lambda r: sp.exp(-r)
-}
 
 # Protected functions for gplearn
 def _protected_inv(x):
@@ -151,10 +127,7 @@ class DiscoveryPipeline:
         # Dynamic Input features for SR based on DiscoveryNet basis
         X_feats = []
         for name in self.model.basis_names:
-            if name in NP_BASIS_REGISTRY:
-                X_feats.append(NP_BASIS_REGISTRY[name](r_phys))
-            else:
-                raise ValueError(f"Unknown basis function: {name}")
+            X_feats.append(PhysicalBasisRegistry.get(name, backend='numpy')(r_phys))
             
         X_sr = np.hstack(X_feats)
         
@@ -193,10 +166,7 @@ class DiscoveryPipeline:
         
         # Mapping back X0, X1, ... to basis functions
         for i, name in enumerate(self.model.basis_names):
-            if name in SP_BASIS_REGISTRY:
-                val = SP_BASIS_REGISTRY[name](r)
-            else:
-                raise ValueError(f"Unknown basis function: {name}")
+            val = PhysicalBasisRegistry.get(name, backend='sympy')(r)
             expr = expr.subs(sp.Symbol(f'X{i}'), val)
             
         expr = sp.simplify(expr)
