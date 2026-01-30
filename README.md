@@ -1,63 +1,129 @@
-# Emergentia: Meso-scale Discovery Engine
+# 🌌 Emergentia: Meso-scale Discovery Engine
 
-Emergentia is a Neural-Symbolic discovery engine designed to extract parsimonious physical laws from meso-scale particle trajectories. By combining the flexible representation power of Neural Networks with the mathematical clarity of Symbolic Regression, Emergentia can "rediscover" the underlying equations of motion from raw simulation data, even in the presence of noise.
+**Emergentia** is a Neural-Symbolic discovery engine designed to extract parsimonious physical laws from meso-scale particle trajectories. By combining the flexible representation power of **Deep Learning** with the mathematical clarity of **Symbolic Regression**, Emergentia "rediscovers" the underlying equations of motion from raw simulation data, even in high-noise environments.
 
-## 🚀 Key Features
+---
 
-*   **Modular Physics Engine:** A plug-and-play architecture for physical potentials. Easily define new laws (e.g., Harmonic, Lennard-Jones, Morse) by extending the base `Potential` class.
-*   **Neural-Symbolic Pipeline:** 
-    1.  **Neural Mapping:** A `DiscoveryNet` (PyTorch) approximates force laws using an expanded basis set $[r, 1/r, \exp(-r)]$.
-    2.  **Symbolic Distillation:** A `SymbolicRegressor` (gplearn) extracts clean, human-readable mathematical formulas from the neural weights.
-*   **Noise Resilience:** Built-in support for discovery from noisy trajectories using robust `HuberLoss` training and automated Gaussian smoothing considerations.
-*   **Robust Statistical Validation:** Automated verification of discovered laws using curve-fitting, $R^2$ scores, and Bayesian Information Criterion (BIC) to ensure parsimony and accuracy.
-*   **Hardware Acceleration:** Full support for `CUDA` (NVIDIA) and `MPS` (Apple Silicon) backends.
-*   **Symmetric Log Transform:** Advanced training techniques to handle high-dynamic-range forces (e.g., $1/r^{13}$ walls) without numerical instability.
+## ✨ Key Features
+
+* 
+**🧩 Modular Physics Engine:** A plug-and-play architecture for physical potentials. Easily define new laws (e.g., Harmonic, Lennard-Jones, Morse, Gravity) by extending the base `Potential` class.
+
+
+* 
+**🧠 Neural-Symbolic Pipeline:** 1.  **Neural Mapping:** A `DiscoveryNet` (PyTorch) approximates force laws using an expanded basis set, such as .
+2.  **Symbolic Distillation:** A `SymbolicRegressor` (gplearn) extracts clean, human-readable mathematical formulas from the neural weights.
+
+
+* 
+**🛡️ Noise Resilience:** Built-in support for discovery from noisy trajectories using robust `HuberLoss` training and automated Gaussian smoothing.
+
+
+* 
+**📊 Robust Validation:** Automated verification of discovered laws using  scores, Mean Squared Error (MSE), and the Bayesian Information Criterion (BIC) to ensure both accuracy and parsimony.
+
+
+* 
+**⚡ Hardware Acceleration:** Full support for `CUDA` (NVIDIA) and `MPS` (Apple Silicon) backends.
+
+
+* 
+**📉 Symmetric Log Transform:** Advanced training techniques to handle high-dynamic-range forces (e.g.,  "walls") without numerical instability.
+
+
+
+---
+
+## 🚀 Performance Benchmarks
+
+Emergentia achieves high-fidelity results across multiple physical regimes:
+
+| Mode | Basis Functions | Target Law Example | Resilience |
+| --- | --- | --- | --- |
+| **Spring** |  |  | High |
+| **LJ** |  |  | Medium |
+| **Morse** |  |  | High |
+| **Gravity** |  |  | High |
+
+> 
+> **Note:** Performance data is based on standard validation trials.
+> 
+> 
+
+---
 
 ## 🛠 Installation
 
-Ensure you have Python 3.9+ and the following dependencies:
+Emergentia requires **Python 3.9+**. Install the core dependencies via pip:
 
 ```bash
 pip install torch numpy sympy gplearn pandas scipy pytest
+
 ```
 
-## 📈 Discovery Performance
-
-Emergentia achieves high-fidelity results across multiple physical regimes and noise levels:
-
-| Mode | Basis | Target Law | Discovery MSE | Noise Resilience |
-| :--- | :--- | :--- | :--- | :--- |
-| **Spring** | $r$ | $F = -k(r - r_0)$ | ~10⁻⁵ | High |
-| **LJ** | $r^{-7}, r^{-13}$ | $F = A/r^{13} - B/r^{7}$ | ~10⁻³ | Medium |
-| **Morse** | $\exp(-r)$ | $F = 2Da(e^{-a(r-r_e)} - e^{-2a(r-r_e)})$ | ~10⁻⁴ | High |
+---
 
 ## 💻 Usage
 
-### Run Benchmarks
-To evaluate the engine across all supported potentials and noise levels:
+### 🧪 Running Benchmarks
+
+To evaluate the engine across all supported potentials (Gravity, LJ, Morse, and Mixed):
 
 ```bash
 python run_benchmarks.py
+
 ```
 
-### Run Tests
-To verify the internal scaling and normalization logic:
+### 🔍 Running Tests
+
+Verify the internal scaling, physics integrity, and registry consistency:
 
 ```bash
+# Test trajectory scaling logic
 pytest tests/test_scaling.py
+
+# Verify Hamiltonian conservation and 3D discovery flow
+pytest tests/test_physics_integrity.py
+
 ```
+
+---
 
 ## 🏗 Project Structure
 
-*   `emergentia/`: Core package.
-    *   `simulator.py`: Modular physics simulation engine and potential definitions.
-    *   `models.py`: `DiscoveryNet` architecture and `TrajectoryScaler`.
-    *   `engine.py`: The `DiscoveryPipeline` linking neural training to symbolic regression.
-    *   `utils.py`: Statistical verification and symbolic utility functions.
-*   `run_benchmarks.py`: Main entry point for cross-regime validation.
-*   `tests/`: Unit test suite.
-*   `LICENSE`: Project licensing information.
+* 
+`emergentia/`: Core package containing the discovery logic.
+
+
+* 
+`simulator.py`: Modular physics simulation using Velocity Verlet integration.
+
+
+* 
+`models.py`: `DiscoveryNet` architecture and `TrajectoryScaler`.
+
+
+* 
+`engine.py`: The `DiscoveryPipeline` linking neural training to symbolic regression.
+
+
+* 
+`registry.py`: Centralized physical basis functions (Torch, NumPy, SymPy).
+
+
+* 
+`utils.py`: Statistical verification and symbolic utility functions.
+
+
+
+
+* 
+`run_benchmarks.py`: Main entry point for cross-regime validation.
+
+
+
+---
 
 ## 📜 License
 
-Distributed under the MIT License. See `LICENSE` for more information.
+Distributed under the **MIT License**. See `LICENSE` for more information.
