@@ -3,7 +3,7 @@ import pandas as pd
 import multiprocessing
 import time
 from emergentia import PhysicsSim, DiscoveryPipeline
-from emergentia.simulator import HarmonicPotential, LennardJonesPotential, MorsePotential, GravityPotential, CompositePotential
+from emergentia.simulator import HarmonicPotential, LennardJonesPotential, MorsePotential, GravityPotential, CompositePotential, BuckinghamPotential
 
 def run_trial(mode, potential, noise_std, trial_idx, dim=2):
     seed = 42 + trial_idx
@@ -26,6 +26,8 @@ def run_trial(mode, potential, noise_std, trial_idx, dim=2):
         basis_set = ['1', 'r']
     elif mode == 'morse':
         basis_set = ['1', 'exp(-r)']
+    elif mode == 'buckingham':
+        basis_set = ['1', '1/r^7', 'exp(-r)']
     elif mode == 'mixed':
         basis_set = ['1', 'r', '1/r^2']
         
@@ -77,6 +79,7 @@ def main():
         'gravity': GravityPotential(),
         'lj': LennardJonesPotential(),
         'morse': MorsePotential(),
+        'buckingham': BuckinghamPotential(),
         'mixed': CompositePotential([HarmonicPotential(k=10.0, r0=1.0), GravityPotential(G=1.0)])
     }
     

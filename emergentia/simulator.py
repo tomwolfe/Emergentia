@@ -112,6 +112,30 @@ class GravityPotential(Potential):
     def dt(self):
         return 0.01
 
+class BuckinghamPotential(Potential):
+    def __init__(self, A=10.0, B=1.0, C=1.0):
+        self.A = A
+        self.B = B
+        self.C = C
+
+    def compute_force_magnitude(self, dist):
+        # F(r) = A * B * exp(-B * r) - 6 * C * r^(-7)
+        dist_clamped = torch.clamp(dist, min=0.5)
+        return self.A * self.B * torch.exp(-self.B * dist_clamped) - 6.0 * self.C * torch.pow(dist_clamped, -7)
+
+    def compute_potential(self, dist):
+        # V(r) = A * exp(-B * r) - C * r^(-6)
+        dist_clamped = torch.clamp(dist, min=0.5)
+        return self.A * torch.exp(-self.B * dist_clamped) - self.C * torch.pow(dist_clamped, -6)
+
+    @property
+    def default_scale(self):
+        return 3.0
+
+    @property
+    def dt(self):
+        return 0.001
+
 class CompositePotential(Potential):
     def __init__(self, potentials):
         self.potentials = potentials
