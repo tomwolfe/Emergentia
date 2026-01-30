@@ -138,9 +138,9 @@ class DiscoveryPipeline:
         est = SymbolicRegressor(
             population_size=population_size,
             generations=generations,
-            function_set=('add', 'sub', 'mul', 'div', inv),
+            function_set=('add', 'sub', 'mul', 'div', inv, power, exp),
             const_range=(-100.0, 100.0),
-            parsimony_coefficient=parsimony, 
+            parsimony_coefficient=parsimony,
             stopping_criteria=0.001,
             init_depth=(2, 6),
             max_samples=0.9,

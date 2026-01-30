@@ -21,9 +21,9 @@ class TrajectoryScaler:
 class DiscoveryNet(nn.Module):
     def __init__(self, hidden_size=128, basis_set=None):
         super().__init__()
-        # Configurable basis set: Default to [r, 1/r, exp(-r)]
+        # Configurable basis set: Generalized to reduce mode-cheating
         if basis_set is None:
-            self.basis_names = ['r', '1/r', 'exp(-r)']
+            self.basis_names = ['1', 'r', '1/r^2', '1/r^7', '1/r^13', 'exp(-r)']
         else:
             self.basis_names = basis_set
             

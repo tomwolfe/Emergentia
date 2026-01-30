@@ -80,8 +80,8 @@ def main():
         'mixed': CompositePotential([HarmonicPotential(k=10.0, r0=1.0), GravityPotential(G=1.0)])
     }
     
-    noise_levels = [0.0]
-    num_trials = 1
+    noise_levels = [0.0, 0.01, 0.05]
+    num_trials = 3
     dimensions = [3]
     
     for dim in dimensions:
@@ -102,6 +102,21 @@ def main():
     summary = df.groupby(['mode', 'noise_std'])['success'].mean() * 100
     print("\nSummary Success Rates (%):")
     print(summary)
+
+    # Export benchmark summary to CSV
+    summary_df = df.groupby(['mode', 'noise_std']).agg({
+        'success': lambda x: (x.sum() / len(x)) * 100,  # Success rate percentage
+        'r2': 'mean',
+        'mse': 'mean'
+    }).round(4)
+    summary_df.columns = ['success_rate_pct', 'mean_r2', 'mean_mse']
+    summary_df.reset_index(inplace=True)
+
+    os.makedirs('results', exist_ok=True)
+    summary_df.to_csv('results/benchmark_summary.csv', index=False)
+    print(f"\nBenchmark summary saved to results/benchmark_summary.csv")
+    print("\nDetailed Summary:")
+    print(summary_df)
 
 if __name__ == "__main__":
     main()
