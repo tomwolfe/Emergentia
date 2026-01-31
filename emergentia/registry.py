@@ -53,6 +53,11 @@ class PhysicalBasisRegistry:
             'torch': lambda d: torch.exp(-d),
             'numpy': lambda d: np.exp(-d),
             'sympy': lambda r: sp.exp(-r)
+        },
+        'exp(-r)/r': {
+            'torch': lambda d: torch.exp(-d) / d,
+            'numpy': lambda d: np.exp(-d) / d,
+            'sympy': lambda r: sp.exp(-r) / r
         }
     }
 

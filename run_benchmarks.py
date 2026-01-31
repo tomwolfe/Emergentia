@@ -2,8 +2,9 @@ import torch
 import pandas as pd
 import multiprocessing
 import time
+import os
 from emergentia import PhysicsSim, DiscoveryPipeline
-from emergentia.simulator import HarmonicPotential, LennardJonesPotential, MorsePotential, GravityPotential, CompositePotential, BuckinghamPotential
+from emergentia.simulator import HarmonicPotential, LennardJonesPotential, MorsePotential, GravityPotential, CompositePotential, BuckinghamPotential, YukawaPotential
 
 def run_trial(mode, potential, noise_std, trial_idx, dim=2):
     seed = 42 + trial_idx
@@ -28,6 +29,8 @@ def run_trial(mode, potential, noise_std, trial_idx, dim=2):
         basis_set = ['1', 'exp(-r)']
     elif mode == 'buckingham':
         basis_set = ['1', '1/r^7', 'exp(-r)']
+    elif mode == 'yukawa':
+        basis_set = ['1/r', '1/r^2', 'exp(-r)/r']
     elif mode == 'mixed':
         basis_set = ['1', 'r', '1/r^2']
         
@@ -45,7 +48,6 @@ def run_trial(mode, potential, noise_std, trial_idx, dim=2):
         result['dim'] = dim
         
         # Save report
-        import os
         os.makedirs('results', exist_ok=True)
         report_path = f"results/report_{mode}_dim{dim}_noise{noise_std}_trial{trial_idx}.txt"
         with open(report_path, 'w') as f:
@@ -80,6 +82,7 @@ def main():
         'lj': LennardJonesPotential(),
         'morse': MorsePotential(),
         'buckingham': BuckinghamPotential(),
+        'yukawa': YukawaPotential(),
         'mixed': CompositePotential([HarmonicPotential(k=10.0, r0=1.0), GravityPotential(G=1.0)])
     }
     

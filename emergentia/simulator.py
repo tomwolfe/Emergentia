@@ -136,6 +136,31 @@ class BuckinghamPotential(Potential):
     def dt(self):
         return 0.001
 
+class YukawaPotential(Potential):
+    def __init__(self, A=1.0, B=1.0):
+        self.A = A
+        self.B = B
+
+    def compute_force_magnitude(self, dist):
+        # Formula: V(r) = A * exp(-B * r) / r
+        # Force Magnitude: F(r) = -dV/dr = A * exp(-B * r) * (B/r + 1/r^2)
+        dist_clamped = torch.clamp(dist, min=0.1)
+        exp_br = torch.exp(-self.B * dist_clamped)
+        return self.A * exp_br * (self.B / dist_clamped + 1.0 / torch.pow(dist_clamped, 2))
+
+    def compute_potential(self, dist):
+        # V(r) = A * exp(-B * r) / r
+        dist_clamped = torch.clamp(dist, min=0.1)
+        return self.A * torch.exp(-self.B * dist_clamped) / dist_clamped
+
+    @property
+    def default_scale(self):
+        return 4.0
+
+    @property
+    def dt(self):
+        return 0.005
+
 class CompositePotential(Potential):
     def __init__(self, potentials):
         self.potentials = potentials

@@ -108,6 +108,8 @@ class DiscoveryPipeline:
             r_min, r_max = 0.6, 3.5
         elif self.mode == 'morse':
             r_min, r_max = 0.5, 4.0
+        elif self.mode == 'yukawa':
+            r_min, r_max = 0.5, 4.0
         else: # spring/gravity
             r_min, r_max = 0.5, 5.0
             
