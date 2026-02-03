@@ -2,7 +2,7 @@
 
 **Emergentia** is a Neural-Symbolic discovery engine designed to extract parsimonious physical laws from meso-scale particle trajectories. By combining the flexible representation power of **Deep Learning** with the mathematical clarity of **Symbolic Regression**, Emergentia "rediscovers" the underlying equations of motion from raw simulation data, even in high-noise environments.
 
-> **Project Status:** As of February 3, 2026, Emergentia is an active research project under development. The core engine is functional and has been validated across multiple physical regimes. The `DifferentiableDiscoveryPipeline` and `ConservativeForceField` components represent ongoing enhancements to improve physical consistency and training stability.
+> **Project Status:** As of February 4, 2026, Emergentia is an active research project under development. The core engine is functional and has been validated across multiple physical regimes. The `DifferentiableDiscoveryPipeline` and `ConservativeForceField` components represent ongoing enhancements to improve physical consistency and training stability.
 
 ---
 
@@ -19,6 +19,9 @@
 * **🧪 Comprehensive Testing:** A full suite of unit and integration tests verify physics integrity, scaling logic, registry consistency, and discovery robustness.
 * **🔄 Differentiable Simulation (Experimental):** An experimental `DifferentiableDiscoveryPipeline` integrates `torchdiffeq` to train the neural network by matching simulated particle trajectories directly, enforcing energy conservation by design.
 * **🌐 Consistent Multi-Backend Registry:** A centralized `PhysicalBasisRegistry` ensures identical definitions for physical functions (`1/r`, `exp(-r)`, etc.) across NumPy, PyTorch, and SymPy backends.
+* **🎯 LLM-Powered Priors (Experimental):** Integrate domain knowledge from LLMs (via Z.AI's GLM-4.7-flash) to guide symbolic regression, improving discovery success rates and formula quality.
+* **⚖️ Unit-Checker Integration:** Validate discovered symbolic expressions for dimensional consistency using a lightweight unit system, ensuring physical plausibility.
+* **📈 Learnable Auto-Smoother:** A co-evolving, learnable Gaussian smoother that automatically adjusts its bandwidth to optimally denoise trajectories during training, balancing signal preservation and noise reduction.
 
 ---
 
@@ -43,31 +46,28 @@ Emergentia achieves high-fidelity results across multiple physical regimes. Benc
 ## 🛠 Installation
 
 Emergentia requires **Python 3.9+**. Install the core dependencies via pip:
-
 ```bash
 pip install torch numpy sympy gplearn pandas scipy pytest
 ```
 
-For optimal performance, ensure you have compatible hardware drivers for CUDA (NVIDIA GPUs) or MPS (Apple Silicon Macs).
+For optimal performance, ensure you have compatible hardware drivers for CUDA (NVIDIA GPUs) or MPS (Apple Silicon Macs). For LLM prior functionality, install the optional Z.AI SDK:
+```bash
+pip install zai-sdk==0.1.0
+```
 
 ---
 
 ## 💻 Usage
 
 ### 🧪 Running Benchmarks
-
 To evaluate the engine across all supported potentials (Gravity, LJ, Morse, Buckingham, Yukawa, Mixed) with varying noise levels:
-
 ```bash
 python run_benchmarks.py
 ```
-
 This will generate detailed reports and a summary CSV file (`results/benchmark_summary.csv`) in the `results/` directory.
 
 ### 🔍 Running Tests
-
 Verify the internal scaling, physics integrity, and registry consistency:
-
 ```bash
 # Test trajectory scaling logic
 pytest tests/test_scaling.py
@@ -77,12 +77,13 @@ pytest tests/test_physics_integrity.py
 pytest tests/test_registry_consistency.py
 # Test discovery robustness with mixed potentials and noise
 pytest tests/test_discovery_robustness.py
+# Test auto-smoothing functionality
+pytest tests/test_auto_smoother.py
 # Run all tests
 pytest tests/
 ```
 
 ### 📂 Project Structure
-
 * `emergentia/`: Core package containing the discovery logic.
 * `simulator.py`: Modular physics simulation using Velocity Verlet integration.
 * `models.py`: `DiscoveryNet` architecture and `TrajectoryScaler`. The `DiscoveryNet` now predicts a potential energy function, deriving forces via autodifferentiation.
@@ -90,7 +91,10 @@ pytest tests/
 * `registry.py`: Centralized physical basis functions (Torch, NumPy, SymPy).
 * `utils.py`: Statistical verification and symbolic utility functions.
 * `differentiable_solver.py`: Experimental components for trajectory-based training using `torchdiffeq`.
-* `physics_constraints.py`: Experimental modules for enforcing physical invariants.
+* `physics_constraints.py`: Experimental modules for enforcing physical invariants (e.g., `ConservativeForceField`).
+* `llm_priors.py`: Integration with LLMs for generating symbolic priors.
+* `preprocessing.py`: Advanced preprocessing tools, including `AutoSmoother` and `LearnableAutoSmoother`.
+* `unit_checker.py`: Dimensional analysis for validating physical consistency.
 * `run_benchmarks.py`: Main entry point for cross-regime validation.
 * `tests/`: Comprehensive test suite.
 * `results/`: Directory for benchmark reports and summaries (auto-generated).
@@ -100,5 +104,4 @@ pytest tests/
 ---
 
 ## 📜 License
-
 Distributed under the **MIT License**. See `LICENSE` for more information.
