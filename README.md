@@ -1,17 +1,13 @@
 # 🌌 Emergentia: Meso-scale Discovery Engine
-
 **Emergentia** is a Neural-Symbolic discovery engine designed to extract parsimonious physical laws from meso-scale particle trajectories. By combining the flexible representation power of **Deep Learning** with the mathematical clarity of **Symbolic Regression**, Emergentia "rediscovers" the underlying equations of motion from raw simulation data, even in high-noise environments.
-
-> **Project Status:** As of February 4, 2026, Emergentia is an active research project under development. The core engine is functional and has been validated across multiple physical regimes. The `DifferentiableDiscoveryPipeline` and `ConservativeForceField` components represent ongoing enhancements to improve physical consistency and training stability.
+> **Project Status:** As of February 3, 2026, Emergentia is an active research project under development. The core engine is functional and has been validated across multiple physical regimes. The `DifferentiableDiscoveryPipeline` and `ConservativeForceField` components represent ongoing enhancements to improve physical consistency and training stability.
 
 ---
-
 ## ✨ Key Features
-
 * **🧩 Modular Physics Engine:** A plug-and-play architecture for physical potentials. Easily define new laws (e.g., Harmonic, Lennard-Jones, Morse, Gravity, Buckingham, Yukawa) by extending the base `Potential` class.
 * **🧠 Neural-Symbolic Pipeline:**
-    1.  **Neural Mapping:** A `DiscoveryNet` (PyTorch) approximates complex, non-linear force laws using a *basis-free* architecture that learns the potential energy directly from particle positions, automatically deriving forces via autodifferentiation.
-    2.  **Symbolic Distillation:** A `SymbolicRegressor` (gplearn) extracts clean, human-readable, and mathematically interpretable formulas from the neural network's learned behavior, using physical features like `r` and `1/r`.
+1.  **Neural Mapping:** A `DiscoveryNet` (PyTorch) approximates complex, non-linear force laws using a *basis-free* architecture that learns the potential energy directly from particle positions, automatically deriving forces via autodifferentiation.
+2.  **Symbolic Distillation:** A `SymbolicRegressor` (gplearn) extracts clean, human-readable, and mathematically interpretable formulas from the neural network's learned behavior, using physical features like `r` and `1/r`.
 * **🛡️ Noise Resilience:** Built-in support for discovery from noisy trajectories using robust `HuberLoss` training and automated Gaussian smoothing.
 * **📊 Robust Validation:** Automated verification of discovered laws using R² scores, Mean Squared Error (MSE), and the Bayesian Information Criterion (BIC) to ensure both accuracy and parsimony.
 * **⚡ Hardware Acceleration:** Full support for `CUDA` (NVIDIA) and `MPS` (Apple Silicon) backends for fast training and simulation.
@@ -19,16 +15,11 @@
 * **🧪 Comprehensive Testing:** A full suite of unit and integration tests verify physics integrity, scaling logic, registry consistency, and discovery robustness.
 * **🔄 Differentiable Simulation (Experimental):** An experimental `DifferentiableDiscoveryPipeline` integrates `torchdiffeq` to train the neural network by matching simulated particle trajectories directly, enforcing energy conservation by design.
 * **🌐 Consistent Multi-Backend Registry:** A centralized `PhysicalBasisRegistry` ensures identical definitions for physical functions (`1/r`, `exp(-r)`, etc.) across NumPy, PyTorch, and SymPy backends.
-* **🎯 LLM-Powered Priors (Experimental):** Integrate domain knowledge from LLMs (via Z.AI's GLM-4.7-flash) to guide symbolic regression, improving discovery success rates and formula quality.
-* **⚖️ Unit-Checker Integration:** Validate discovered symbolic expressions for dimensional consistency using a lightweight unit system, ensuring physical plausibility.
-* **📈 Learnable Auto-Smoother:** A co-evolving, learnable Gaussian smoother that automatically adjusts its bandwidth to optimally denoise trajectories during training, balancing signal preservation and noise reduction.
+* **🤖 LLM-Powered Priors (Optional):** Integrates with the Z.AI SDK to leverage the GLM-4.7-flash model for generating physics-informed symbolic expressions as priors for the symbolic regression engine, enhancing discovery accuracy.
 
 ---
-
 ## 🚀 Performance Benchmarks
-
 Emergentia achieves high-fidelity results across multiple physical regimes. Benchmarks are run with 3 particles in 2D or 3D over 2000 steps, using 3 trials per noise level.
-
 | Mode | Target Law Example | Success Rate (0.01 noise) | R² (0.01 noise) |
 | :--- | :--- | :--- | :--- |
 | **Spring** | F = -k(r - r₀) | >99% | >0.99 |
@@ -38,27 +29,51 @@ Emergentia achieves high-fidelity results across multiple physical regimes. Benc
 | **Buckingham** | F = AB·e^(-Br) - 6C/r⁷ | ~90% | >0.90 |
 | **Yukawa** | F = A·e^(-Br)·(B/r + 1/r²) | ~90% | >0.90 |
 | **Mixed** | F = -k(r - r₀) - G/r² | >95% | >0.95 |
-
 > **Note:** Performance data is based on standard validation trials (3 trials, 2000 steps, 0.01 noise). See `results/benchmark_summary.csv` for detailed metrics. The "Basis Functions" column has been deprecated as the `DiscoveryNet` now operates in a basis-free mode, learning the underlying potential directly.
 
 ---
-
 ## 🛠 Installation
-
 Emergentia requires **Python 3.9+**. Install the core dependencies via pip:
 ```bash
-pip install torch numpy sympy gplearn pandas scipy pytest
+pip install torch numpy sympy gplearn pandas scipy pytest zai-sdk==0.1.0
 ```
+> **Note:** The `zai-sdk==0.1.0` package is required to use the optional LLM priors feature with the GLM-4.7-flash model.
 
-For optimal performance, ensure you have compatible hardware drivers for CUDA (NVIDIA GPUs) or MPS (Apple Silicon Macs). For LLM prior functionality, install the optional Z.AI SDK:
-```bash
-pip install zai-sdk==0.1.0
-```
+For optimal performance, ensure you have compatible hardware drivers for CUDA (NVIDIA GPUs) or MPS (Apple Silicon Macs).
 
 ---
+## 🔐 Configuring the GLM API Key (LLM Priors)
+The `LLMPriorProvider` component can optionally use the **GLM-4.7-flash** model via the **Z.AI SDK** to generate physics-informed symbolic expressions as priors for the symbolic regression engine, potentially improving discovery accuracy.
 
+To enable this feature, you must provide your Z.AI API key. This is done by setting an environment variable:
+
+1.  **Obtain your API key** from the Z.AI platform.
+2.  **Set the `ZAI_API_KEY` environment variable** before running any Emergentia script.
+
+    *   **Linux/macOS (Terminal):**
+        ```bash
+        export ZAI_API_KEY="your_actual_api_key_here"
+        python run_benchmarks.py
+        ```
+
+    *   **Windows (Command Prompt):**
+        ```cmd
+        set ZAI_API_KEY=your_actual_api_key_here
+        python run_benchmarks.py
+        ```
+
+    *   **Windows (PowerShell):**
+        ```powershell
+        $env:ZAI_API_KEY="your_actual_api_key_here"
+        python run_benchmarks.py
+        ```
+
+3.  **For permanent setup:** Add the `export` (Linux/macOS) or `setx` (Windows) command to your shell profile file (like `.bashrc`, `.zshrc`, or the Windows System Environment Variables).
+
+**Important:** The `run_benchmarks.py` script has `enable_llm_priors=True` by default. If the `ZAI_API_KEY` environment variable is not set, the system will fall back to generating physics-based priors from a predefined knowledge base, ensuring the core functionality remains operational.
+
+---
 ## 💻 Usage
-
 ### 🧪 Running Benchmarks
 To evaluate the engine across all supported potentials (Gravity, LJ, Morse, Buckingham, Yukawa, Mixed) with varying noise levels:
 ```bash
@@ -77,8 +92,6 @@ pytest tests/test_physics_integrity.py
 pytest tests/test_registry_consistency.py
 # Test discovery robustness with mixed potentials and noise
 pytest tests/test_discovery_robustness.py
-# Test auto-smoothing functionality
-pytest tests/test_auto_smoother.py
 # Run all tests
 pytest tests/
 ```
@@ -91,10 +104,7 @@ pytest tests/
 * `registry.py`: Centralized physical basis functions (Torch, NumPy, SymPy).
 * `utils.py`: Statistical verification and symbolic utility functions.
 * `differentiable_solver.py`: Experimental components for trajectory-based training using `torchdiffeq`.
-* `physics_constraints.py`: Experimental modules for enforcing physical invariants (e.g., `ConservativeForceField`).
-* `llm_priors.py`: Integration with LLMs for generating symbolic priors.
-* `preprocessing.py`: Advanced preprocessing tools, including `AutoSmoother` and `LearnableAutoSmoother`.
-* `unit_checker.py`: Dimensional analysis for validating physical consistency.
+* `physics_constraints.py`: Experimental modules for enforcing physical invariants.
 * `run_benchmarks.py`: Main entry point for cross-regime validation.
 * `tests/`: Comprehensive test suite.
 * `results/`: Directory for benchmark reports and summaries (auto-generated).
@@ -102,6 +112,5 @@ pytest tests/
 * `LICENSE`: MIT License.
 
 ---
-
 ## 📜 License
 Distributed under the **MIT License**. See `LICENSE` for more information.
