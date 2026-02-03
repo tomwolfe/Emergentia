@@ -7,6 +7,7 @@ from gplearn.functions import make_function
 from .models import DiscoveryNet, TrajectoryScaler
 from .registry import PhysicalBasisRegistry
 from .utils import verify_equivalence
+from .differentiable_solver import DifferentiableSimulator
 
 # Protected functions for gplearn
 def _protected_inv(x):
@@ -29,12 +30,12 @@ def _protected_exp(x):
 exp = make_function(function=_protected_exp, name='exp', arity=1)
 
 class DiscoveryPipeline:
-    def __init__(self, mode='lj', potential=None, device='cpu', seed=42, basis_set=None):
+    def __init__(self, mode='lj', potential=None, device='cpu', seed=42):
         self.mode = mode
         self.potential = potential # Store the actual potential object
         self.device = device
         self.seed = seed
-        self.model = DiscoveryNet(basis_set=basis_set).to(device)
+        self.model = DiscoveryNet().to(device)
         self.scaler = TrajectoryScaler(mode=mode)
         
     def train_nn(self, p_traj, f_traj, epochs=5000, noise_std=0.0):
@@ -119,32 +120,27 @@ class DiscoveryPipeline:
         with torch.no_grad():
             mag_scaled = self.model.predict_mag(r_scaled)
             # Inverse Symmetric Log Transform with clamping to prevent overflow
-            # exp(20) is ~4.8e8, which is safe for float32
             mag_s = torch.sign(mag_scaled) * (torch.exp(torch.clamp(torch.abs(mag_scaled), max=20.0)) - 1)
             mag_phys = (mag_s * self.scaler.f_scale).cpu().numpy().ravel()
             
         # Clean up any remaining infinities or NaNs in mag_phys
         mag_phys = np.nan_to_num(mag_phys, nan=0.0, posinf=1e10, neginf=-1e10)
 
-        # Dynamic Input features for SR based on DiscoveryNet basis
-        X_feats = []
-        for name in self.model.basis_names:
-            X_feats.append(PhysicalBasisRegistry.get(name, backend='numpy')(r_phys))
-            
-        X_sr = np.hstack(X_feats)
+        # Basis-Free: Use r and 1/r as the input features
+        X_sr = np.hstack([r_phys, 1.0/np.clip(r_phys, 1e-3, None)])
         
-        # Parsimony adjustment: much higher to favor simple basis combinations
-        parsimony = 0.1
+        # Parsimony adjustment: higher to favor simple basis combinations
+        parsimony = 0.08
         
         print(f"Running Symbolic Regression for {self.mode}...")
         est = SymbolicRegressor(
             population_size=population_size,
             generations=generations,
             function_set=('add', 'sub', 'mul', 'div', inv, power, exp),
-            const_range=(-100.0, 100.0),
+            const_range=(-20.0, 20.0), # Narrower range for stability
             parsimony_coefficient=parsimony,
             stopping_criteria=0.001,
-            init_depth=(2, 6),
+            init_depth=(2, 4), # Shallower trees
             max_samples=0.9,
             n_jobs=-1,
             metric='mse',
@@ -166,10 +162,9 @@ class DiscoveryPipeline:
         
         expr = sp.sympify(str(est._program), locals=locals_dict)
         
-        # Mapping back X0, X1, ... to basis functions
-        for i, name in enumerate(self.model.basis_names):
-            val = PhysicalBasisRegistry.get(name, backend='sympy')(r)
-            expr = expr.subs(sp.Symbol(f'X{i}'), val)
+        # Mapping back X0=r, X1=1/r
+        expr = expr.subs(sp.Symbol('X0'), r)
+        expr = expr.subs(sp.Symbol('X1'), 1/r)
             
         expr = sp.simplify(expr)
         return expr
@@ -178,7 +173,6 @@ class DiscoveryPipeline:
         from scipy.optimize import minimize
         
         # Identify numerical constants (Floats and Integers) and replace with symbols for optimization
-        # Exclude small integers that are likely exponents (e.g., 1, 2, -1, -2) to keep the functional form
         all_atoms = list(expr.atoms(sp.Number))
         tune_atoms = [a for a in all_atoms if not (isinstance(a, sp.Integer) and abs(a) <= 2)]
         
@@ -192,32 +186,69 @@ class DiscoveryPipeline:
         r_sym = sp.Symbol('r')
         func = sp.lambdify([r_sym] + symbols, param_expr, 'numpy')
         
+        # Derivatives for Jacobian
+        grad_funcs = []
+        for s in symbols:
+            try:
+                # Try to simplify and evaluate derivative
+                ge = sp.diff(param_expr, s).doit()
+                gf = sp.lambdify([r_sym] + symbols, ge, 'numpy')
+                grad_funcs.append(gf)
+            except Exception:
+                grad_funcs.append(None)
+        
         p_np = p_traj.cpu().numpy()
         f_np = f_traj.cpu().numpy()
         
+        # Precompute distances and directions
+        diff = p_np[:, :, np.newaxis, :] - p_np[:, np.newaxis, :, :] # (T, N, N, D)
+        dist = np.linalg.norm(diff, axis=-1, keepdims=True) # (T, N, N, 1)
+        dir_vec = diff / np.clip(dist, 1e-6, None) # (T, N, N, D)
+        
+        n_particles = p_np.shape[1]
+        mask = (~np.eye(n_particles, dtype=bool))[np.newaxis, :, :, np.newaxis]
+        
         def objective(params):
-            # Compute total force
-            diff = p_np[:, :, np.newaxis, :] - p_np[:, np.newaxis, :, :]
-            dist = np.linalg.norm(diff, axis=-1, keepdims=True)
-            
             with np.errstate(all='ignore'):
                 mag = func(dist, *params)
                 if not isinstance(mag, np.ndarray):
                     mag = np.full(dist.shape, mag)
-                # Handle possible infinities from bad params
                 mag = np.nan_to_num(mag, nan=0.0, posinf=1e6, neginf=-1e6)
                     
-            n = p_np.shape[1]
-            mask = (~np.eye(n, dtype=bool))[np.newaxis, :, :, np.newaxis]
-            
-            pair_forces = mag * (diff / np.clip(dist, 1e-6, None)) * mask
+            pair_forces = mag * dir_vec * mask
             f_pred = np.sum(pair_forces, axis=2)
-            
             return np.mean((f_pred - f_np)**2)
             
+        def jacobian(params):
+            with np.errstate(all='ignore'):
+                mag = func(dist, *params)
+                if not isinstance(mag, np.ndarray):
+                    mag = np.full(dist.shape, mag)
+                mag = np.nan_to_num(mag, nan=0.0, posinf=1e6, neginf=-1e6)
+                
+                f_pred = np.sum(mag * dir_vec * mask, axis=2)
+                err = f_pred - f_np # (T, N, D)
+                
+                jac = []
+                for gf in grad_funcs:
+                    if gf is None:
+                        jac.append(0.0)
+                        continue
+                        
+                    d_mag = gf(dist, *params)
+                    if not isinstance(d_mag, np.ndarray):
+                        d_mag = np.full(dist.shape, d_mag)
+                    d_mag = np.nan_to_num(d_mag, nan=0.0, posinf=1e6, neginf=-1e6)
+                    
+                    # dF_i/dc_k = sum_j (d_mag * dir_vec)
+                    df_dc = np.sum(d_mag * dir_vec * mask, axis=2) # (T, N, D)
+                    # dJ/dc_k = 2/N * mean(err * df_dc)
+                    jac.append(2.0 * np.mean(err * df_dc))
+                    
+                return np.array(jac, dtype=np.float64)
+
         initial_guess = [float(v) for v in tune_atoms]
-        # Use a more robust optimizer
-        res = minimize(objective, initial_guess, method='Nelder-Mead', tol=1e-3)
+        res = minimize(objective, initial_guess, jac=jacobian, method='L-BFGS-B', tol=1e-4)
         
         final_map = {symbols[i]: res.x[i] for i in range(len(symbols))}
         return sp.simplify(param_expr.subs(final_map))
@@ -234,10 +265,10 @@ class DiscoveryPipeline:
         except Exception:
             return False
 
-    def run(self, sim, nn_epochs=5000, noise_std=0.0):
+    def run(self, sim, nn_epochs=5000, noise_std=0.0, sr_generations=40, sr_population=2000):
         p_traj, f_traj = sim.generate(steps=2000, noise_std=noise_std)
         final_nn_loss = self.train_nn(p_traj, f_traj, epochs=nn_epochs, noise_std=noise_std)
-        discovered_expr = self.distill_symbolic()
+        discovered_expr = self.distill_symbolic(population_size=sr_population, generations=sr_generations)
         
         print(f"Raw discovered formula: {discovered_expr}")
         refined_expr = self.refine_constants(discovered_expr, p_traj, f_traj)
@@ -259,3 +290,59 @@ class DiscoveryPipeline:
             "success": success,
             "conservative": is_conservative
         }
+
+class DifferentiableDiscoveryPipeline(DiscoveryPipeline):
+    def train_nn(self, p_traj, f_traj, epochs=2000, noise_std=0.0):
+        # In differentiable mode, we want to match trajectories
+        # p_traj: (T, N, D)
+        
+        self.scaler.fit(p_traj, f_traj)
+        p_s, f_s = self.scaler.transform(p_traj, f_traj)
+        
+        # Assume a small dt for stability in the ODE solver
+        dt = 0.001 
+        
+        # Estimate velocities (scaled)
+        vel_s = (p_s[1:] - p_s[:-1])
+        vel_s = torch.cat([vel_s, vel_s[-1:]], dim=0)
+        
+        # Use float64 for ODE stability
+        states = torch.cat([p_s.view(p_s.shape[0], -1), vel_s.view(vel_s.shape[0], -1)], dim=-1).to(torch.float64)
+        
+        # Model must also be float64 during ODE integration
+        self.model.to(torch.float64)
+        simulator = DifferentiableSimulator(self.model).to(self.device)
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=5e-4)
+        
+        print(f"Training Differentiable NN for {self.mode}...")
+        
+        t = torch.tensor([0.0, dt], dtype=torch.float64).to(self.device)
+        
+        for epoch in range(epochs):
+            idx = torch.randint(0, states.shape[0] - 1, (32,))
+            x0 = states[idx].to(self.device)
+            target_pos = p_s[idx + 1].to(self.device).to(torch.float64)
+            
+            try:
+                pred_states = simulator(x0, t)
+                # x_t+1 is at index 1 of the time dimension
+                pred_pos = pred_states[1, :, :target_pos.view(32, -1).shape[1]].view(32, *p_s.shape[1:])
+                
+                loss = torch.mean((pred_pos - target_pos)**2)
+                
+                if torch.isnan(loss):
+                    break
+                    
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+                optimizer.step()
+            except Exception as e:
+                print(f"Error during ODE integration at epoch {epoch}: {e}")
+                break
+            
+            if epoch % 200 == 0:
+                print(f"Epoch {epoch} | Trajectory Loss: {loss.item():.2e}")
+                
+        self.model.to(torch.float32) # Convert back
+        return loss.item()

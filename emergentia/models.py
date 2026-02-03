@@ -19,44 +19,52 @@ class TrajectoryScaler:
         return f_scaled * self.f_scale
 
 class DiscoveryNet(nn.Module):
-    def __init__(self, hidden_size=128, basis_set=None):
+    def __init__(self, hidden_size=128):
         super().__init__()
-        # Configurable basis set: Generalized to reduce mode-cheating
-        if basis_set is None:
-            self.basis_names = ['1', 'r', '1/r^2', '1/r^7', '1/r^13', 'exp(-r)']
-        else:
-            self.basis_names = basis_set
-            
+        # The network now predicts the Potential V(r)
         self.net = nn.Sequential(
-            nn.Linear(len(self.basis_names), hidden_size), nn.SiLU(),
+            nn.Linear(2, hidden_size), nn.SiLU(),
             nn.Linear(hidden_size, hidden_size), nn.SiLU(),
             nn.Linear(hidden_size, 1)
         )
 
     def _get_features(self, dist):
+        # Generic atomic-like features: r and 1/r
         dist_safe = torch.clamp(dist, min=0.1, max=50.0)
-        feats = []
-        for name in self.basis_names:
-            feats.append(PhysicalBasisRegistry.get(name, backend='torch')(dist_safe))
-        return torch.cat(feats, dim=-1)
+        return torch.cat([dist_safe, 1.0 / dist_safe], dim=-1)
 
     def forward(self, pos_scaled):
         # pos_scaled: (batch, n_particles, dim)
+        if not pos_scaled.requires_grad:
+            pos_scaled = pos_scaled.clone().requires_grad_(True)
+        
         diff = pos_scaled.unsqueeze(2) - pos_scaled.unsqueeze(1) # (batch, n, n, dim)
         dist = torch.norm(diff, dim=-1, keepdim=True) # (batch, n, n, 1)
         
-        feat = self._get_features(dist) # (batch, n, n, len(basis_names))
-        mag = self.net(feat) # (batch, n, n, 1)
+        feat = self._get_features(dist) # (batch, n, n, 2)
+        v_pair = self.net(feat) # (batch, n, n, 1)
         
         # Mask out self-interaction
         mask = (~torch.eye(pos_scaled.shape[1], device=pos_scaled.device).bool()).unsqueeze(0).unsqueeze(-1)
         
-        # F_ij = mag_ij * (r_i - r_j) / |r_i - r_j|
-        pair_forces = mag * (diff / torch.clamp(dist, min=1e-6)) * mask
+        # Total potential energy (sum of pairs / 2)
+        v_total = torch.sum(v_pair * mask) * 0.5
         
-        # Net force on each particle: F_i = sum_j F_ij
-        return torch.sum(pair_forces, dim=2)
+        # Force is negative gradient of potential energy
+        # Use allow_unused=True just in case, though it shouldn't be needed here
+        forces = -torch.autograd.grad(v_total, pos_scaled, create_graph=True, retain_graph=True, allow_unused=True)[0]
+        if forces is None:
+            forces = torch.zeros_like(pos_scaled)
+        return forces
 
     def predict_mag(self, r_scaled):
         # r_scaled: (num_points, 1)
-        return self.net(self._get_features(r_scaled))
+        with torch.enable_grad():
+            r_scaled = r_scaled.clone().requires_grad_(True)
+            feat = self._get_features(r_scaled)
+            v = self.net(feat)
+            # Force magnitude F(r) = -dV/dr
+            dv_dr = torch.autograd.grad(v.sum(), r_scaled, create_graph=True)[0]
+        return -dv_dr
+
+
