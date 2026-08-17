@@ -20,26 +20,38 @@ class ConservativeForceField(nn.Module):
         self.potential_net = potential_net
 
     def forward(self, pos):
-        # Enable gradient tracking for pos to compute forces
         pos = pos.requires_grad_(True)
         dist, diff = self.projection(pos)
         
-        # Mask out self-interaction for potential
         mask = (~torch.eye(pos.shape[1], device=pos.device).bool()).unsqueeze(0).unsqueeze(-1)
         
-        # Predict pairwise potentials
-        # We only need upper triangle for total energy, or we can just sum all and divide by 2
         v_pair = self.potential_net(dist) * mask
         total_energy = torch.sum(v_pair) * 0.5
         
-        # Force is -grad(Energy)
         forces = -torch.autograd.grad(total_energy, pos, create_graph=True)[0]
         return forces
 
     def predict_mag(self, r):
-        # For symbolic distillation, we need the magnitude of the force
-        # F(r) = -dV/dr
+        """Predict force magnitude F(r) = -dV/dr for 1D symbolic distillation.
+        
+        Args:
+            r: Tensor of shape (num_points, 1) or (num_points, n, n, 1)
+        """
         r = r.requires_grad_(True)
         v = self.potential_net(r)
         dv_dr = torch.autograd.grad(v.sum(), r, create_graph=True)[0]
         return -dv_dr
+
+    def get_potential_energy(self, pos):
+        """Compute scalar total potential energy for logging/conservation checks.
+        
+        Args:
+            pos: Tensor of shape (batch, n_particles, dim)
+        Returns:
+            Scalar total potential energy
+        """
+        pos = pos.requires_grad_(True)
+        dist, diff = self.projection(pos)
+        mask = (~torch.eye(pos.shape[1], device=pos.device).bool()).unsqueeze(0).unsqueeze(-1)
+        v_pair = self.potential_net(dist) * mask
+        return torch.sum(v_pair) * 0.5

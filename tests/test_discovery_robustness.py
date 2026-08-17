@@ -105,7 +105,25 @@ def test_refine_constants_logic():
     assert isinstance(refined_expr, sp.Basic), "Refined expression should be a SymPy expression"
 
 
+def test_train_test_split():
+    """Verify that the pipeline performs train/test split and reports test metrics."""
+    from emergentia.simulator import HarmonicPotential
+    torch.manual_seed(42)
+    np.random.seed(42)
+
+    sim = PhysicsSim(n=3, dim=2, potential=HarmonicPotential(), seed=42)
+    pipeline = DiscoveryPipeline(mode='spring', potential=sim.potential, seed=42)
+
+    result = pipeline.run(sim, nn_epochs=500, noise_std=0.0)
+
+    # Check that test metrics are reported
+    assert 'test_r2' in result, "Result should contain test_r2"
+    assert 'test_mse' in result, "Result should contain test_mse"
+    print(f"Train R2: {result['r2']:.4f}, Test R2: {result.get('test_r2', 'N/A')}")
+
+
 if __name__ == "__main__":
     test_mixed_potential_discovery_with_noise()
     test_refine_constants_logic()
+    test_train_test_split()
     print("All robustness tests passed!")

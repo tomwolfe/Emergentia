@@ -3,6 +3,11 @@ from typing import Dict, List, Tuple
 import numpy as np
 
 
+class DimensionalInconsistencyError(Exception):
+    """Raised when an expression has dimensionally inconsistent terms in an Add node."""
+    pass
+
+
 class DimensionalSignature:
     """
     Simple dimensional signature for Length (L), Time (T), Mass (M), Charge (Q).
@@ -172,15 +177,18 @@ class UnitChecker:
                 Q += dim[3]
 
             elif node.is_Function:
-                dim = self.OPERATOR_DIMENSIONS.get("exp", (0, 0, 0, 0))
-                L += dim[0]
-                T += dim[1]
-                M += dim[2]
-                Q += dim[3]
-
-                # Recurse into arguments
-                for arg in node.args:
-                    _traverse(arg)
+                func_name = str(node.func).lower()
+                # Validate that arguments to exp, log, sin, cos are dimensionless
+                trig_exp_funcs = {"exp", "log", "sin", "cos", "tan", "asin", "acos", "atan"}
+                if func_name in trig_exp_funcs:
+                    for arg in node.args:
+                        arg_dim = self._get_dimensional_signature(arg)
+                        if arg_dim != (0, 0, 0, 0):
+                            L = float("nan")
+                            T = float("nan")
+                            M = float("nan")
+                            Q = float("nan")
+                            return
 
             elif node.is_Pow:
                 if len(node.args) == 2:
@@ -190,41 +198,37 @@ class UnitChecker:
                         try:
                             exp_val = float(exponent.evalf())
                             if abs(exp_val - round(exp_val, 6)) < 1e-6:
-                                L += base_dim[0] * round(exp_val, 6)
-                                T += base_dim[1] * round(exp_val, 6)
-                                M += base_dim[2] * round(exp_val, 6)
-                                Q += base_dim[3] * round(exp_val, 6)
+                                rounded = round(exp_val, 6)
+                                L += base_dim[0] * rounded
+                                T += base_dim[1] * rounded
+                                M += base_dim[2] * rounded
+                                Q += base_dim[3] * rounded
                         except Exception:
                             pass
-
-                    # Don't recurse into base - we already added its dimensions above
+                    # Do NOT recurse into base - dimensions already accounted for above
 
             elif node.is_Add:
-                if len(node.args) == 2:
-                    # For addition of two expressions, check if dimensions are consistent
-                    arg1_dim = self._get_dimensional_signature(node.args[0])
-                    arg2_dim = self._get_dimensional_signature(node.args[1])
-                    # Check if all dimensions are approximately equal
-                    dim_match = (
-                        abs(arg1_dim[0] - arg2_dim[0]) < 1e-6
-                        and abs(arg1_dim[1] - arg2_dim[1]) < 1e-6
-                        and abs(arg1_dim[2] - arg2_dim[2]) < 1e-6
-                        and abs(arg1_dim[3] - arg2_dim[3]) < 1e-6
-                    )
-                    # If dimensions don't match, the expression is not dimensionally consistent
-                    if not dim_match:
-                        # Mark this as invalid by returning early
-                        L = float("nan")
-                        T = float("nan")
-                        M = float("nan")
-                        Q = float("nan")
-                        return
+                if len(node.args) >= 2:
+                    arg_dims = [self._get_dimensional_signature(a) for a in node.args]
+                    first_dim = arg_dims[0]
+                    for d in arg_dims[1:]:
+                        dim_match = (
+                            abs(first_dim[0] - d[0]) < 1e-6
+                            and abs(first_dim[1] - d[1]) < 1e-6
+                            and abs(first_dim[2] - d[2]) < 1e-6
+                            and abs(first_dim[3] - d[3]) < 1e-6
+                        )
+                        if not dim_match:
+                            L = float("nan")
+                            T = float("nan")
+                            M = float("nan")
+                            Q = float("nan")
+                            return
                 for arg in node.args:
                     _traverse(arg)
 
             elif node.is_Mul:
                 if len(node.args) == 2:
-                    # For multiplication of two expressions, add their dimensions
                     arg1_dim = self._get_dimensional_signature(node.args[0])
                     arg2_dim = self._get_dimensional_signature(node.args[1])
                     L += arg1_dim[0] + arg2_dim[0]
@@ -340,10 +344,15 @@ class UnitChecker:
         invalid_count = 0
 
         for i, expr in enumerate(candidates):
-            is_valid, metric, signature, message = checker.check_consistency(expr)
-            if is_valid and metric > 0.8:
-                valid_candidates.append(expr)
-            else:
+            try:
+                is_valid, metric, signature, message = checker.check_consistency(expr)
+                if is_valid and not any(
+                    isinstance(d, float) and d != d for d in signature
+                ):
+                    valid_candidates.append(expr)
+                else:
+                    invalid_count += 1
+            except Exception:
                 invalid_count += 1
 
         print(

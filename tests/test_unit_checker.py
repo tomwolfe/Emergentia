@@ -132,15 +132,16 @@ class TestUnitChecker:
         assert metric < 0.5
 
     def test_unit_checker_consistency_with_morse(self):
-        """Test Unit-Checker with Morse potential."""
+        """Test Unit-Checker with Morse potential - exp(-r) has dimensional arg, should be inconsistent."""
         checker = UnitChecker(mode="morse")
 
-        # Morse potential: derivative
+        # Morse potential derivative: exp(-r) * r
+        # exp(-r) requires dimensionless argument, but r has dimension L^1
         expr = sp.sympify("exp(-r) * r")
         is_consistent, metric, signature, message = checker.check_consistency(expr)
 
-        # Should be consistent
-        assert is_consistent
+        # Should be inconsistent: exp argument is not dimensionless
+        assert not is_consistent
 
     def test_unit_checker_consistency_with_gravity(self):
         """Test Unit-Checker with gravity."""
@@ -194,10 +195,26 @@ class TestUnitChecker:
         checker = UnitChecker(mode="yukawa")
 
         # Yukawa potential: exp(-r)/r
+        # exp(-r) requires dimensionless argument, r has L^1 - should be inconsistent
         expr = sp.sympify("exp(-r) / r")
         is_consistent, metric, signature, message = checker.check_consistency(expr)
 
-        assert is_consistent
+        # Should be inconsistent: exp argument is not dimensionless
+        assert not is_consistent
+
+    def test_exp_r_flagged_inconsistent(self):
+        """Test that exp(r) is flagged as dimensionally inconsistent (r has L^1, exp requires dimensionless)."""
+        checker = UnitChecker()
+        expr = sp.exp(sp.Symbol("r"))
+        is_consistent, metric, signature, message = checker.check_consistency(expr)
+        assert not is_consistent
+
+    def test_r_plus_inv_r_flagged_inconsistent(self):
+        """Test that r + 1/r is flagged as inconsistent (L^1 + L^-1)."""
+        checker = UnitChecker()
+        expr = sp.Symbol("r") + 1 / sp.Symbol("r")
+        is_consistent, metric, signature, message = checker.check_consistency(expr)
+        assert not is_consistent
 
     def test_unit_checker_multiple_atoms(self):
         """Test Unit-Checker with multiple variable atoms."""

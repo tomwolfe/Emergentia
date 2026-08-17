@@ -24,139 +24,13 @@ class TrajectoryScaler:
         return f_scaled * self.f_scale
 
 
-class LearnableAutoSmoother(nn.Module):
-    """
-    Learnable auto-smoother that co-evolves with the neural network.
-    Uses learnable bandwidth parameter optimized via backpropagation.
-    """
-
-    def __init__(
-        self,
-        init_bandwidth: float = 1.0,
-        min_bandwidth: float = 0.1,
-        max_bandwidth: float = 5.0,
-    ):
-        """
-        Initialize the learnable auto-smoother.
-
-        Args:
-            init_bandwidth: Initial smoothing bandwidth
-            min_bandwidth: Minimum bandwidth
-            max_bandwidth: Maximum bandwidth
-        """
-        super().__init__()
-        self.min_bandwidth = min_bandwidth
-        self.max_bandwidth = max_bandwidth
-
-        # Learnable bandwidth (log space for stability)
-        self.log_bandwidth = nn.Parameter(
-            torch.tensor(np.log(init_bandwidth), dtype=torch.float32)
-        )
-
-        self.current_bandwidth = init_bandwidth
-        self.training_step = 0
-
-    def forward(self, trajectory: torch.Tensor) -> torch.Tensor:
-        """
-        Apply learnable smoothing to trajectory.
-
-        Args:
-            trajectory: Input trajectory (T, N, D) or (T, D) or (T,)
-
-        Returns:
-            Smoothed trajectory
-        """
-        # Get current bandwidth
-        bandwidth = torch.clamp(
-            torch.exp(self.log_bandwidth),
-            min=self.min_bandwidth,
-            max=self.max_bandwidth,
-        ).item()
-
-        self.current_bandwidth = bandwidth
-
-        # Convert to numpy
-        if isinstance(trajectory, torch.Tensor):
-            trajectory_np = trajectory.detach().cpu().numpy()
-            is_tensor = True
-        else:
-            trajectory_np = np.array(trajectory)
-            is_tensor = False
-
-        # Apply smoothing
-        if trajectory_np.ndim == 1:
-            smoothed = gaussian_filter1d(trajectory_np, sigma=bandwidth, axis=0)
-        elif trajectory_np.ndim == 2:
-            smoothed = gaussian_filter1d(trajectory_np, sigma=bandwidth, axis=0)
-        elif trajectory_np.ndim == 3:
-            smoothed = np.array(
-                [
-                    gaussian_filter1d(trajectory_np[t], sigma=bandwidth, axis=0)
-                    for t in range(trajectory_np.shape[0])
-                ]
-            )
-        else:
-            if is_tensor:
-                return trajectory
-            else:
-                return trajectory_np
-
-        # Return as tensor
-        if is_tensor:
-            return torch.from_numpy(smoothed).to(trajectory.device)
-        else:
-            return smoothed
-
-    def update_from_loss(self, prev_loss: float, current_loss: float):
-        """
-        Update bandwidth based on loss improvement.
-
-        Args:
-            prev_loss: Previous loss value
-            current_loss: Current loss value
-        """
-        self.training_step += 1
-
-        if self.training_step > 0 and (prev_loss - current_loss) > 0:
-            # Loss improving - slightly reduce smoothing
-            self.log_bandwidth.data = torch.clamp(
-                self.log_bandwidth * 0.95,
-                min=np.log(self.min_bandwidth),
-                max=np.log(self.max_bandwidth),
-            )
-        elif self.training_step > 0 and (prev_loss - current_loss) < 0:
-            # Loss worsening - increase smoothing
-            self.log_bandwidth.data = torch.clamp(
-                self.log_bandwidth * 1.05,
-                min=np.log(self.min_bandwidth),
-                max=np.log(self.max_bandwidth),
-            )
-
-    def get_bandwidth(self) -> float:
-        """Get current bandwidth."""
-        return torch.clamp(
-            torch.exp(self.log_bandwidth),
-            min=self.min_bandwidth,
-            max=self.max_bandwidth,
-        ).item()
-
-    def get_info(self) -> Dict[str, Any]:
-        """Get bandwidth information."""
-        return {
-            "bandwidth": float(self.get_bandwidth()),
-            "log_bandwidth": float(self.log_bandwidth.item()),
-            "training_step": self.training_step,
-            "min_bandwidth": self.min_bandwidth,
-            "max_bandwidth": self.max_bandwidth,
-        }
-
-
 class DiscoveryNet(nn.Module):
-    def __init__(self, hidden_size=128):
+    def __init__(self, hidden_size=128, n_features=6):
         super().__init__()
-        # The network now predicts the Potential V(r)
+        self.n_features = n_features
+        # The network predicts the Potential V(r)
         self.net = nn.Sequential(
-            nn.Linear(2, hidden_size),
+            nn.Linear(n_features, hidden_size),
             nn.SiLU(),
             nn.Linear(hidden_size, hidden_size),
             nn.SiLU(),
@@ -164,9 +38,18 @@ class DiscoveryNet(nn.Module):
         )
 
     def _get_features(self, dist):
-        # Generic atomic-like features: r and 1/r
         dist_safe = torch.clamp(dist, min=0.1, max=50.0)
-        return torch.cat([dist_safe, 1.0 / dist_safe], dim=-1)
+        return torch.cat(
+            [
+                dist_safe,                  # r
+                1.0 / dist_safe,            # 1/r
+                dist_safe ** 2,             # r^2
+                1.0 / (dist_safe ** 2),     # 1/r^2
+                torch.exp(-dist_safe),      # exp(-r)
+                torch.log(dist_safe + 1.0), # log(r+1)
+            ],
+            dim=-1,
+        )
 
     def forward(self, pos_scaled):
         # pos_scaled: (batch, n_particles, dim)

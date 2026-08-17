@@ -31,9 +31,11 @@ def test_basis_free_lj():
     assert results['r2'] > 0.8 or results['success'], f"Discovery failed: R2={results['r2']}"
     
     formula = results['formula']
-    # Check that it's not using X1, X2... which were basis indices (except X0, X1 we defined)
-    assert 'X2' not in formula
-    assert 'X3' not in formula
+    # Check that feature indices X2-X5 are mapped to SymPy expressions (not raw variable names)
+    assert 'X2' not in formula, f"Formula contains unmapped feature X2: {formula}"
+    assert 'X3' not in formula, f"Formula contains unmapped feature X3: {formula}"
+    assert 'X4' not in formula, f"Formula contains unmapped feature X4: {formula}"
+    assert 'X5' not in formula, f"Formula contains unmapped feature X5: {formula}"
     
     # 5. Check for L-BFGS in engine.py (as per mission contract)
     with open('emergentia/engine.py', 'r') as f:

@@ -3,7 +3,8 @@ import numpy as np
 import sympy as sp
 from scipy.optimize import curve_fit
 
-def verify_equivalence(expr, mode, potential=None, domain=None, samples=100):
+def verify_equivalence(expr, mode, potential=None, domain=None, samples=100,
+                       test_r_vals=None, test_y_target=None):
     """
     Numerically verify if a discovered expression matches the ground truth using curve fitting and statistics.
     """
@@ -51,14 +52,26 @@ def verify_equivalence(expr, mode, potential=None, domain=None, samples=100):
         r2 = 1 - (mse / var_y) if var_y > 1e-9 else 0.0
         
         # BIC: n * ln(MSE) + k * ln(n)
-        # k is the number of symbols in the expression as a proxy for complexity
         k = len(expr.free_symbols) + len(list(expr.atoms(sp.Number)))
         n = samples
         bic = n * np.log(mse + 1e-12) + k * np.log(n)
         
+        result = {"mse": mse, "r2": r2, "bic": bic}
+
+        # Compute test metrics if test data provided
+        if test_r_vals is not None and test_y_target is not None:
+            y_test_discovered = f_discovered(test_r_vals)
+            if np.isscalar(y_test_discovered):
+                y_test_discovered = np.full_like(test_r_vals, y_test_discovered)
+            test_mse = np.mean((y_test_discovered - test_y_target)**2)
+            test_var = np.var(test_y_target)
+            test_r2 = 1 - (test_mse / test_var) if test_var > 1e-9 else 0.0
+            result["test_mse"] = test_mse
+            result["test_r2"] = test_r2
+
         success = (r2 > 0.995) and (mse < 1e-2)
         
-        return success, {"mse": mse, "r2": r2, "bic": bic}
+        return success, result
         
     except Exception as e:
         print(f"Verification error: {e}")

@@ -28,23 +28,6 @@ def run_trial(mode, potential, noise_std, trial_idx, dim=2):
     else:
         device = torch.device("cpu")
 
-    # Select basis set based on mode
-    basis_set = None
-    if mode == "gravity":
-        basis_set = ["1", "1/r^2"]
-    elif mode == "lj":
-        basis_set = ["1", "1/r^7", "1/r^13"]
-    elif mode == "spring":
-        basis_set = ["1", "r"]
-    elif mode == "morse":
-        basis_set = ["1", "exp(-r)"]
-    elif mode == "buckingham":
-        basis_set = ["1", "1/r^7", "exp(-r)"]
-    elif mode == "yukawa":
-        basis_set = ["1/r", "1/r^2", "exp(-r)/r"]
-    elif mode == "mixed":
-        basis_set = ["1", "r", "1/r^2"]
-
     sim = PhysicsSim(n=3, dim=dim, potential=potential, seed=seed, device=device)
     pipeline = DiscoveryPipeline(
         mode=mode, potential=potential, device=device, seed=seed,
