@@ -51,11 +51,10 @@ def test_buckingham_integration_with_discovery_pipeline():
     
     # Create a DiscoveryPipeline with Buckingham-specific basis set
     pipeline = DiscoveryPipeline(
-        mode='buckingham', 
-        potential=potential, 
-        device=sim.device, 
-        seed=42, 
-        basis_set=['1', '1/r^7', 'exp(-r)']
+        mode='buckingham',
+        potential=potential,
+        device=sim.device,
+        seed=42,
     )
     
     # Run a short discovery process (500 epochs as specified)

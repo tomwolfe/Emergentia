@@ -113,134 +113,100 @@ class UnitChecker:
             self.VARIABLE_DIMENSIONS["k_e"] = (1, 3, -2, -2)
             self.VARIABLE_DIMENSIONS["inv_k_e"] = (-1, -3, 2, 2)
 
-    def _get_atom_dimensions(self, atom: sp.Atom) -> Tuple[float, float, float, float]:
-        """
-        Get dimensions for an atom in the expression tree.
-
-        Args:
-            atom: A SymPy atom (constant, symbol, etc.)
-
-        Returns:
-            A tuple (L, T, M, Q) representing the dimensional signature
-        """
-        if atom.is_Number or atom.is_NumberSymbol:
-            return (0, 0, 0, 0)
-
-        elif atom.is_Symbol:
-            name = str(atom).lower()
-            if name in self.VARIABLE_DIMENSIONS:
-                dim = self.VARIABLE_DIMENSIONS[name]
-                if isinstance(dim, tuple) and len(dim) >= 4:
-                    return (dim[0], dim[1], dim[2], dim[3])
-            return (0, 0, 0, 0)
-
-        elif hasattr(atom, "func") and hasattr(atom.func, "name"):
-            name = atom.func.name.lower()
-            if name in self.OPERATOR_DIMENSIONS:
-                return self.OPERATOR_DIMENSIONS[name]
-
-        return (0, 0, 0, 0)
-
     def _get_dimensional_signature(
         self, expr: sp.Expr
     ) -> Tuple[float, float, float, float]:
         """
-        Compute the dimensional signature of a symbolic expression.
+        Compute the dimensional signature of a symbolic expression using
+        bottom-up type inference: every node returns exactly ONE signature
+        that is the function of its children's signatures.
 
         Args:
             expr: A SymPy expression
 
         Returns:
-            A tuple (L, T, M, Q) representing the dimensional signature
+            A tuple (L, T, M, Q) representing the dimensional signature.
+            Returns (nan, nan, nan, nan) if the expression is dimensionally
+            inconsistent (e.g., r + t, exp(r)) or if an exponent is non-rational.
         """
+        nan_sig = (float("nan"), float("nan"), float("nan"), float("nan"))
+
         if not isinstance(expr, sp.Expr):
-            return (0, 0, 0, 0)
+            return (0.0, 0.0, 0.0, 0.0)
 
-        total_atoms = sum(1 for _ in expr.atoms())
+        if expr.is_Number or expr.is_NumberSymbol:
+            return (0.0, 0.0, 0.0, 0.0)
 
-        if total_atoms == 0:
-            return (0, 0, 0, 0)
+        if expr.is_Symbol:
+            name = str(expr)
+            if name in self.VARIABLE_DIMENSIONS:
+                dim = self.VARIABLE_DIMENSIONS[name]
+                if isinstance(dim, tuple) and len(dim) >= 4:
+                    return (float(dim[0]), float(dim[1]), float(dim[2]), float(dim[3]))
+            return (0.0, 0.0, 0.0, 0.0)
 
-        L, T, M, Q = 0.0, 0.0, 0.0, 0.0
+        if expr.is_Pow:
+            base_sig = self._get_dimensional_signature(expr.args[0])
+            if any(isinstance(d, float) and d != d for d in base_sig):
+                return nan_sig
+            exponent = expr.args[1]
+            if exponent.is_number:
+                try:
+                    exp_val = float(exponent.evalf())
+                    if abs(exp_val - round(exp_val, 6)) < 1e-6:
+                        rounded = round(exp_val, 6)
+                        return tuple(d * rounded for d in base_sig)
+                    else:
+                        return nan_sig
+                except Exception:
+                    return nan_sig
+            else:
+                return nan_sig
 
-        def _traverse(node):
-            nonlocal L, T, M, Q
+        if expr.is_Mul:
+            result = (0.0, 0.0, 0.0, 0.0)
+            for arg in expr.args:
+                arg_sig = self._get_dimensional_signature(arg)
+                if any(isinstance(d, float) and d != d for d in arg_sig):
+                    return nan_sig
+                result = tuple(r + a for r, a in zip(result, arg_sig))
+            return result
 
-            if node.is_Number or node.is_NumberSymbol:
-                return
+        if expr.is_Add:
+            arg_sigs = [self._get_dimensional_signature(arg) for arg in expr.args]
+            for sig in arg_sigs:
+                if any(isinstance(d, float) and d != d for d in sig):
+                    return nan_sig
+            first = arg_sigs[0]
+            for sig in arg_sigs[1:]:
+                if any(abs(f - s) > 1e-6 for f, s in zip(first, sig)):
+                    return nan_sig
+            return first
 
-            elif node.is_Symbol:
-                dim = self._get_atom_dimensions(node)
-                L += dim[0]
-                T += dim[1]
-                M += dim[2]
-                Q += dim[3]
+        if expr.is_Function:
+            func_name = str(expr.func).lower()
+            trig_exp_funcs = {
+                "exp", "log", "sin", "cos", "tan",
+                "asin", "acos", "atan", "sinh", "cosh", "tanh",
+            }
+            if func_name in trig_exp_funcs:
+                for arg in expr.args:
+                    arg_sig = self._get_dimensional_signature(arg)
+                    if any(isinstance(d, float) and d != d for d in arg_sig):
+                        return nan_sig
+                    if any(abs(d) > 1e-6 for d in arg_sig):
+                        return nan_sig
+                return (0.0, 0.0, 0.0, 0.0)
+            else:
+                import warnings
+                warnings.warn(
+                    f"Unknown function '{func_name}' in expression. "
+                    f"Assuming dimensionless output.",
+                    RuntimeWarning,
+                )
+                return (0.0, 0.0, 0.0, 0.0)
 
-            elif node.is_Function:
-                func_name = str(node.func).lower()
-                # Validate that arguments to exp, log, sin, cos are dimensionless
-                trig_exp_funcs = {"exp", "log", "sin", "cos", "tan", "asin", "acos", "atan"}
-                if func_name in trig_exp_funcs:
-                    for arg in node.args:
-                        arg_dim = self._get_dimensional_signature(arg)
-                        if arg_dim != (0, 0, 0, 0):
-                            L = float("nan")
-                            T = float("nan")
-                            M = float("nan")
-                            Q = float("nan")
-                            return
-
-            elif node.is_Pow:
-                if len(node.args) == 2:
-                    base, exponent = node.args
-                    base_dim = self._get_dimensional_signature(base)
-                    if hasattr(exponent, "evalf") and hasattr(exponent, "is_Number"):
-                        try:
-                            exp_val = float(exponent.evalf())
-                            if abs(exp_val - round(exp_val, 6)) < 1e-6:
-                                rounded = round(exp_val, 6)
-                                L += base_dim[0] * rounded
-                                T += base_dim[1] * rounded
-                                M += base_dim[2] * rounded
-                                Q += base_dim[3] * rounded
-                        except Exception:
-                            pass
-                    # Do NOT recurse into base - dimensions already accounted for above
-
-            elif node.is_Add:
-                if len(node.args) >= 2:
-                    arg_dims = [self._get_dimensional_signature(a) for a in node.args]
-                    first_dim = arg_dims[0]
-                    for d in arg_dims[1:]:
-                        dim_match = (
-                            abs(first_dim[0] - d[0]) < 1e-6
-                            and abs(first_dim[1] - d[1]) < 1e-6
-                            and abs(first_dim[2] - d[2]) < 1e-6
-                            and abs(first_dim[3] - d[3]) < 1e-6
-                        )
-                        if not dim_match:
-                            L = float("nan")
-                            T = float("nan")
-                            M = float("nan")
-                            Q = float("nan")
-                            return
-                for arg in node.args:
-                    _traverse(arg)
-
-            elif node.is_Mul:
-                if len(node.args) == 2:
-                    arg1_dim = self._get_dimensional_signature(node.args[0])
-                    arg2_dim = self._get_dimensional_signature(node.args[1])
-                    L += arg1_dim[0] + arg2_dim[0]
-                    T += arg1_dim[1] + arg2_dim[1]
-                    M += arg1_dim[2] + arg2_dim[2]
-                    Q += arg1_dim[3] + arg2_dim[3]
-                else:
-                    for arg in node.args:
-                        _traverse(arg)
-
-        _traverse(expr)
-        return (L, T, M, Q)
+        return (0.0, 0.0, 0.0, 0.0)
 
     def check_consistency(
         self, expr: sp.Expr
@@ -260,32 +226,25 @@ class UnitChecker:
         """
         try:
             signature = self._get_dimensional_signature(expr)
+
+            has_nan = any(isinstance(d, float) and d != d for d in signature)
+
+            if has_nan:
+                return (
+                    False,
+                    0.0,
+                    signature,
+                    "Dimensionally inconsistent (Add terms have mismatched "
+                    "dimensions or transcendentals have dimensional arguments)",
+                )
+
             L, T, M, Q = signature
-
-            # Check that all dimensions are well-behaved
-            dimensions_ok = True
-            for dim in signature:
-                if not (isinstance(dim, (int, float)) and dim == round(dim, 6)):
-                    dimensions_ok = False
-
-            # Compute a consistency score
-            # Score is higher when dimensions are well-defined
-            metric = 0.0
-
-            if dimensions_ok:
-                metric = 1.0
-                message = f"Dimensionally consistent (L={L:.2f}, T={T:.2f}, M={M:.2f}, Q={Q:.2f})"
-            else:
-                message = "Dimensional signature contains non-numeric values"
-
-            is_consistent = dimensions_ok and (
-                L == round(L, 6)
-                and T == round(T, 6)
-                and M == round(M, 6)
-                and Q == round(Q, 6)
+            return (
+                True,
+                1.0,
+                signature,
+                f"Dimensionally consistent (L={L:.2f}, T={T:.2f}, M={M:.2f}, Q={Q:.2f})",
             )
-
-            return (is_consistent, metric, signature, message)
 
         except Exception as e:
             return (False, 0.0, (0, 0, 0, 0), f"Error during validation: {str(e)}")

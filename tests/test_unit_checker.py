@@ -226,6 +226,21 @@ class TestUnitChecker:
         # r has L^1, so r * r * r = L^3
         assert abs(L - 3.0) < 0.01
 
+    def test_add_mismatch_returns_nan(self):
+        """Test that r + 1/r is flagged as inconsistent (L^1 + L^-1)."""
+        checker = UnitChecker()
+        expr = sp.Symbol("r") + 1 / sp.Symbol("r")
+        is_consistent, metric, signature, message = checker.check_consistency(expr)
+        assert not is_consistent
+        assert metric == 0.0
+
+    def test_mul_accumulates(self):
+        """Test that r * r * r accumulates dimensions (L^3)."""
+        checker = UnitChecker()
+        expr = sp.Symbol("r") * sp.Symbol("r") * sp.Symbol("r")
+        L, T, M, Q = checker._get_dimensional_signature(expr)
+        assert abs(L - 3.0) < 0.01
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -58,6 +58,21 @@ class PhysicalBasisRegistry:
             'torch': lambda d: torch.exp(-d) / d,
             'numpy': lambda d: np.exp(-d) / d,
             'sympy': lambda r: sp.exp(-r) / r
+        },
+        'r^2': {
+            'torch': lambda d: d**2,
+            'numpy': lambda d: d**2,
+            'sympy': lambda r: r**2
+        },
+        'log(r+1)': {
+            'torch': lambda d: torch.log(d + 1),
+            'numpy': lambda d: np.log(d + 1),
+            'sympy': lambda r: sp.log(r + 1)
+        },
+        'exp(-r)/r^2': {
+            'torch': lambda d: torch.exp(-d) / d**2,
+            'numpy': lambda d: np.exp(-d) / d**2,
+            'sympy': lambda r: sp.exp(-r) / r**2
         }
     }
 

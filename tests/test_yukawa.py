@@ -44,11 +44,10 @@ def test_yukawa_integration():
     
     # Create a DiscoveryPipeline with Yukawa-specific basis set
     pipeline = DiscoveryPipeline(
-        mode='yukawa', 
-        potential=potential, 
-        device=sim.device, 
-        seed=42, 
-        basis_set=['1/r', '1/r^2', 'exp(-r)/r']
+        mode='yukawa',
+        potential=potential,
+        device=sim.device,
+        seed=42,
     )
     
     # Run a short discovery process (100 epochs as specified in mission)

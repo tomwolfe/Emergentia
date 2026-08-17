@@ -357,6 +357,18 @@ class TestR2ScoreSimulation:
         assert smoother.min_bandwidth <= bandwidth <= smoother.max_bandwidth
         assert bandwidth > 0
 
+    def test_smoother_gradient(self):
+        """Test that gradient flows through the differentiable smoother."""
+        smoother = AutoSmoother(init_bandwidth=1.0)
+
+        traj = torch.randn(100, 3, 2, requires_grad=True)
+        smoothed = smoother(traj)
+        loss = smoothed.sum()
+        loss.backward()
+
+        assert traj.grad is not None
+        assert not torch.isnan(traj.grad).any()
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -29,11 +29,10 @@ def test_mixed_potential_discovery_with_noise():
 
     # Initialize pipeline with mixed mode and a general basis set
     pipeline = DiscoveryPipeline(
-        mode='mixed', 
-        potential=mixed_potential, 
-        device=device_name, 
+        mode='mixed',
+        potential=mixed_potential,
+        device=device_name,
         seed=42,
-        basis_set=['1', 'r', '1/r', '1/r^2', 'exp(-r)']
     )
 
     # Generate trajectory with noise

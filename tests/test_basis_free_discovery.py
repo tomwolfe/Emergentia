@@ -54,8 +54,9 @@ def test_differentiable_pipeline():
     p_traj, f_traj = sim.generate(steps=100)
     try:
         loss = pipeline.train_nn(p_traj, f_traj, epochs=5)
-        # Even if it's NaN, the fact that it ran through odeint means it's integrated
-        assert True
+        # Loss must be finite (not NaN or Inf)
+        assert loss is not None, "train_nn should return a loss value"
+        assert np.isfinite(loss), f"Loss is not finite: {loss}"
     except Exception as e:
         pytest.fail(f"Differentiable pipeline failed to run: {e}")
 

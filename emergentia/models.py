@@ -23,6 +23,12 @@ class TrajectoryScaler:
     def inverse_transform_f(self, f_scaled):
         return f_scaled * self.f_scale
 
+    def fit_for_potential(self, p, f, potential):
+        """Set scale using potential's default_scale for potential-based training."""
+        self.p_scale = max(potential.default_scale, 1e-8)
+        self.f_scale = max(torch.max(torch.abs(f)).item(), 1e-8)
+        self.v_scale = max(abs(torch.max(potential.compute_potential(torch.tensor([self.p_scale]))).item()), 1e-8)
+
 
 class DiscoveryNet(nn.Module):
     def __init__(self, hidden_size=128, n_features=6):
@@ -90,3 +96,9 @@ class DiscoveryNet(nn.Module):
             # Force magnitude F(r) = -dV/dr
             dv_dr = torch.autograd.grad(v.sum(), r_scaled, create_graph=True)[0]
         return -dv_dr
+    
+    def forward_potential(self, r_scaled):
+        # r_scaled: (num_points, 1)
+        # Compute potential energy for scalar distances
+        feat = self._get_features(r_scaled)
+        return self.net(feat)

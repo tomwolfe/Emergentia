@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
 from typing import Optional, Dict, Any
@@ -43,6 +44,61 @@ class AutoSmoother(nn.Module):
         self.noise_level = 0.0
         self.optimization_step = 0
 
+    def _differentiable_smooth(
+        self, trajectory: torch.Tensor, bandwidth: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Apply differentiable Gaussian smoothing via conv1d, preserving the
+        autograd graph for both the trajectory and the bandwidth parameter.
+
+        Args:
+            trajectory: Input tensor of shape (T,), (T, D), or (T, N, D)
+            bandwidth: Scalar tensor (the smoothing sigma)
+
+        Returns:
+            Smoothed trajectory with same shape as input
+        """
+        sigma = torch.clamp(bandwidth, min=0.01, max=20.0)
+
+        # Fixed kernel size based on max_bandwidth so the integer
+        # doesn't break differentiability
+        kernel_size = max(3, int(np.ceil(6 * self.max_bandwidth)) + 1)
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        center = kernel_size // 2
+
+        x = torch.arange(kernel_size, dtype=torch.float32, device=trajectory.device)
+        kernel = torch.exp(-0.5 * ((x - center) / sigma) ** 2)
+        kernel = kernel / kernel.sum()
+
+        ndim = trajectory.dim()
+
+        if ndim == 1:
+            # (T,) → conv1d
+            x_t = trajectory.unsqueeze(0).unsqueeze(0)  # (1, 1, T)
+            weight = kernel.view(1, 1, -1)  # (1, 1, k)
+            smoothed = F.conv1d(x_t, weight, padding=center)
+            return smoothed.squeeze(0).squeeze(0)
+
+        elif ndim == 2:
+            T, D = trajectory.shape
+            # (T, D) → (1, D, T) for depthwise conv1d
+            x_t = trajectory.t().unsqueeze(0)  # (1, D, T)
+            weight = kernel.view(1, 1, -1).expand(D, 1, -1)  # (D, 1, k)
+            smoothed = F.conv1d(x_t, weight, groups=D, padding=center)  # (1, D, T)
+            return smoothed.squeeze(0).t()  # (T, D)
+
+        elif ndim == 3:
+            T, N, D = trajectory.shape
+            # (T, N, D) → (1, N*D, T) for depthwise conv1d
+            x_t = trajectory.permute(1, 2, 0).reshape(1, N * D, T)  # (1, N*D, T)
+            weight = kernel.view(1, 1, -1).expand(N * D, 1, -1)  # (N*D, 1, k)
+            smoothed = F.conv1d(x_t, weight, groups=N * D, padding=center)  # (1, N*D, T)
+            return smoothed.reshape(N, D, T).permute(2, 0, 1)  # (T, N, D)
+
+        else:
+            return trajectory
+
     def forward(
         self,
         trajectory: torch.Tensor,
@@ -51,8 +107,13 @@ class AutoSmoother(nn.Module):
         """
         Apply learned Gaussian smoothing to a trajectory.
 
+        When *trajectory* requires grad (i.e. it is part of a differentiable
+        computation graph) the smoothing is performed with ``torch.nn.functional.conv1d``
+        so that gradients flow through both the data and the learnable bandwidth.
+        Otherwise, the faster SciPy implementation is used.
+
         Args:
-            trajectory: Input trajectory tensor of shape (T, N, D) or (T, D)
+            trajectory: Input trajectory tensor of shape (T, N, D) or (T, D) or (T,)
             optimizer: Optional optimizer for bandwidth optimization
 
         Returns:
@@ -62,11 +123,17 @@ class AutoSmoother(nn.Module):
             return trajectory
 
         # Get current bandwidth from log parameter
-        bandwidth = torch.clamp(
+        bandwidth_tensor = torch.clamp(
             torch.exp(self.log_bandwidth),
             min=self.min_bandwidth,
             max=self.max_bandwidth,
-        ).item()
+        )
+
+        # Use differentiable smoothing when the input requires grad
+        if isinstance(trajectory, torch.Tensor) and trajectory.requires_grad:
+            return self._differentiable_smooth(trajectory, bandwidth_tensor)
+
+        bandwidth = bandwidth_tensor.item()
 
         # Convert to numpy if it's a tensor
         if isinstance(trajectory, torch.Tensor):

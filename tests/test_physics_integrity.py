@@ -64,7 +64,7 @@ def test_3d_discovery_flow():
     
     sim = PhysicsSim(n=n, dim=dim, potential=potential, seed=42, device=device)
     
-    pipeline = DiscoveryPipeline(mode='lj', potential=potential, device=device_name, basis_set=['1/r^7', '1/r^13'])
+    pipeline = DiscoveryPipeline(mode='lj', potential=potential, device=device_name)
     
     # Short run for testing
     p_traj, f_traj = sim.generate(steps=500)
