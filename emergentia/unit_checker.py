@@ -76,9 +76,23 @@ class UnitChecker:
         "charge_inv": (0, 0, 0, -1),
         "inv_q": (0, 0, 0, -1),
         "k": (1, 3, -2, 0),  # Spring constant has dimension of energy per length cubed
-        "G": (-1, 3, -2, 0),  # Gravitational constant
+        "G": (3, -2, -1, 0),  # Gravitational constant - dimensions M^-1 L^3 T^-2
         "epsilon0": (-1, -3, 2, 2),  # Vacuum permittivity
         "mu0": (1, 1, -2, -2),  # Vacuum permeability
+        # Lennard-Jones constants
+        "epsilon": (1, -2, -2, 0),  # Energy: M·L²·T⁻²
+        "sigma": (0, 0, 0, 0),  # Distance, effectively dimensionless in LJ when paired with epsilon
+        # Morse constants
+        "De": (1, -2, -2, 0),  # Dissociation energy
+        "a": (0, 0, 0, 0),  # Width parameter
+        "re": (1, 0, 0, 0),  # Equilibrium position (length)
+        # Buckingham constants
+        "A": (1, -1, -2, 0),  # Repulsive coefficient
+        "B": (0, 0, 0, 0),  # Exponential width parameter
+        "C": (1, -5, -2, 0),  # Attractive coefficient (r⁻⁷ term)
+        # Spring constants
+        "k_spring": (1, -2, -2, 0),  # Spring constant dimension
+        "r0": (1, 0, 0, 0),  # Equilibrium length
     }
 
     OPERATOR_DIMENSIONS = {
@@ -100,6 +114,19 @@ class UnitChecker:
         "exp(1)": (0, 0, 0, 0),
     }
 
+    # Expected output dimensions (force = M·L·T⁻²) per physics mode
+    EXPECTED_OUTPUT_DIMENSIONS = {
+        "spring": (1, -2, 1, 0),
+        "gravity": (1, -2, 1, 0),
+        "lj": (1, -2, 1, 0),
+        "morse": (1, -2, 1, 0),
+        "buckingham": (1, -2, 1, 0),
+        "yukawa": (1, -2, 1, 0),
+        "mixed": (1, -2, 1, 0),
+        "electric": (1, -2, 1, 0),
+        "generic": None,  # skip output check
+    }
+
     def __init__(self, mode: str = "generic"):
         self.mode = mode
         self._setup_mode_specific_dimensions()
@@ -107,8 +134,8 @@ class UnitChecker:
     def _setup_mode_specific_dimensions(self):
         """Set up dimensions specific to different physics modes."""
         if self.mode == "gravity":
-            self.VARIABLE_DIMENSIONS["G"] = (-1, 3, -2, 0)
-            self.VARIABLE_DIMENSIONS["inv_G"] = (1, -3, 2, 0)
+            self.VARIABLE_DIMENSIONS["G"] = (3, -2, -1, 0)
+            self.VARIABLE_DIMENSIONS["inv_G"] = (-3, 2, 1, 0)
 
         elif self.mode == "electric":
             self.VARIABLE_DIMENSIONS["k_e"] = (1, 3, -2, -2)
@@ -129,10 +156,12 @@ class UnitChecker:
 
         elif atom.is_Symbol:
             name = str(atom).lower()
-            if name in self.VARIABLE_DIMENSIONS:
-                dim = self.VARIABLE_DIMENSIONS[name]
-                if isinstance(dim, tuple) and len(dim) >= 4:
-                    return (dim[0], dim[1], dim[2], dim[3])
+            # Try lowercase first, then original case
+            dim = self.VARIABLE_DIMENSIONS.get(name)
+            if dim is None:
+                dim = self.VARIABLE_DIMENSIONS.get(str(atom))
+            if isinstance(dim, tuple) and len(dim) >= 4:
+                return (dim[0], dim[1], dim[2], dim[3])
             return (0, 0, 0, 0)
 
         elif hasattr(atom, "func") and hasattr(atom.func, "name"):
@@ -266,22 +295,32 @@ class UnitChecker:
                 if not (isinstance(dim, (int, float)) and dim == round(dim, 6)):
                     dimensions_ok = False
 
+            # Check against expected output dimensions for the mode
+            expected_dims = self.EXPECTED_OUTPUT_DIMENSIONS.get(self.mode)
+            mode_ok = True
+            if expected_dims is not None:
+                exp_L, exp_T, exp_M, exp_Q = expected_dims
+                mode_ok = (
+                    abs(L - exp_L) < 1e-6
+                    and abs(T - exp_T) < 1e-6
+                    and abs(M - exp_M) < 1e-6
+                    and abs(Q - exp_Q) < 1e-6
+                )
+
             # Compute a consistency score
-            # Score is higher when dimensions are well-defined
+            # Score is higher when dimensions are well-defined and match expected output
             metric = 0.0
 
-            if dimensions_ok:
+            if dimensions_ok and mode_ok:
                 metric = 1.0
                 message = f"Dimensionally consistent (L={L:.2f}, T={T:.2f}, M={M:.2f}, Q={Q:.2f})"
+            elif dimensions_ok and not mode_ok:
+                metric = 0.3
+                message = f"Dimensionally valid but output dimension mismatch: expected {expected_dims}, got {signature}"
             else:
                 message = "Dimensional signature contains non-numeric values"
 
-            is_consistent = dimensions_ok and (
-                L == round(L, 6)
-                and T == round(T, 6)
-                and M == round(M, 6)
-                and Q == round(Q, 6)
-            )
+            is_consistent = dimensions_ok and mode_ok
 
             return (is_consistent, metric, signature, message)
 
@@ -327,7 +366,7 @@ class UnitChecker:
         Filter a list of symbolic candidates, removing physically inconsistent ones.
 
         Args:
-            candidates: List of SymPy expressions
+            candidates: List of symbolic expressions
             mode: Optional mode to validate against
 
         Returns:

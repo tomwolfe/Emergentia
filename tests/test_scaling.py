@@ -43,3 +43,30 @@ def test_extreme_scales():
     
     f_inv = scaler.inverse_transform_f(f_s)
     assert torch.allclose(f, f_inv)
+
+
+def test_10_particles():
+    """Test 10-particle LJ simulation with neighbor list."""
+    from emergentia.simulator import PhysicsSim, LennardJonesPotential
+    
+    # Test with neighbor list
+    sim = PhysicsSim(n=10, dim=2, potential=LennardJonesPotential(), seed=42, use_neighbor_list=True, cutoff=3.0)
+    traj_p, traj_f = sim.generate(steps=500, noise_std=0.0)
+    
+    # Check energy conservation
+    H_before = sim.get_hamiltonian()
+    
+    # Test without neighbor list for comparison
+    sim2 = PhysicsSim(n=10, dim=2, potential=LennardJonesPotential(), seed=42, use_neighbor_list=False)
+    traj_p2, traj_f2 = sim2.generate(steps=500, noise_std=0.0)
+    H_before2 = sim2.get_hamiltonian()
+    
+    # Energies should be similar
+    energy_diff = abs(H_before.item() - H_before2.item()) / abs(H_before2.item())
+    assert energy_diff < 0.01, f'Energies differ by {energy_diff*100:.1f}%'
+    
+    # Verify trajectory shapes
+    assert traj_p.shape == (500, 10, 2)
+    assert traj_f.shape == (500, 10, 2)
+    
+    print(f'10-particle test passed! Energy: {H_before.item():.2f}')

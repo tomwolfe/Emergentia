@@ -170,6 +170,9 @@ class AutoSmoother(nn.Module):
         """
         Optimize the bandwidth parameter to minimize loss on the trajectory.
 
+        Uses leave-one-out cross-validation (LOO-CV) to select the bandwidth,
+        avoiding the circularity of computing R² against the original noisy signal.
+
         Args:
             trajectory: Noisy trajectory tensor
             loss_history: History of loss values for reference
@@ -195,11 +198,11 @@ class AutoSmoother(nn.Module):
 
         T, N, D = trajectory_np.shape
 
-        # Compute R^2 score for different bandwidths
-        best_score = -1.0
-        best_bandwidth = float(self.max_bandwidth)
+        # Use a subset of trials for efficiency
+        num_trials = min(5, max(2, int(T / 100)))
 
-        num_trials = min(10, int(self.max_bandwidth / 0.5))
+        best_mse = float("inf")
+        best_bandwidth = float(self.min_bandwidth)
 
         for trial in range(num_trials):
             bandwidth = (
@@ -207,25 +210,79 @@ class AutoSmoother(nn.Module):
                 + (self.max_bandwidth - self.min_bandwidth) * (trial + 1) / num_trials
             )
 
-            # Apply smoothing
-            smoothed = np.array(
-                [
-                    gaussian_filter1d(trajectory_np[t], sigma=bandwidth, axis=0)
-                    for t in range(T)
-                ]
-            )
+            # Leave-one-out cross-validation
+            loo_errors = []
 
-            # Compute R^2 score relative to original
-            if T > 1:
-                r2 = 1 - np.var(trajectory_np - smoothed) / np.var(trajectory_np)
-            else:
-                r2 = 0.0
+            for t in range(T):
+                # Remove point t from the trajectory
+                # We smooth the trajectory without point t, then predict point t
+                traj_copy = trajectory_np.copy()
 
-            # Weighted combination: higher R^2 but not too close to 1.0 (avoid over-smoothing)
-            score = r2 - 0.1 * np.abs(r2 - 0.9)
+                # Apply smoothing only to the remaining points
+                # For point t, we need the smoothed value at position t
+                # using data from all other points
+                if D == 1:
+                    # Single feature trajectory
+                    # Smooth with point t removed
+                    y_no_t = np.delete(traj_copy[:, 0, 0], t)
+                    sigma = bandwidth
+                    kernel_size = max(3, int(6 * sigma) + 1)
+                    if kernel_size % 2 == 0:
+                        kernel_size += 1
+                    center = kernel_size // 2
+                    x = np.arange(kernel_size, dtype=np.float64)
+                    kernel = np.exp(-0.5 * ((x - center) / sigma) ** 2)
+                    kernel = kernel / kernel.sum()
 
-            if score > best_score:
-                best_score = score
+                    # Manual convolution without point t
+                    # Pad the data to handle boundaries
+                    pad = center
+                    y_padded = np.pad(y_no_t, pad_width=pad, mode='edge')
+                    # Apply kernel to all points except the removed one
+                    smoothed_full = np.convolve(y_padded, kernel, mode='valid')
+
+                    # The predicted value at the removed position
+                    # is the smoothed value at the corresponding position
+                    if t < pad:
+                        predicted = smoothed_full[t]
+                    elif t >= T - 1 - pad:
+                        predicted = smoothed_full[T - 2 - pad + (t - (T - 1 - pad))]
+                    else:
+                        # For interior points, the prediction is the smoothed value
+                        # at the same position in the full-smoothed signal
+                        predicted = smoothed_full[t]
+
+                    loo_errors.append((trajectory_np[t, 0, 0] - predicted) ** 2)
+                else:
+                    # Multi-feature trajectory - smooth each feature separately
+                    for d in range(D):
+                        y_no_t = np.delete(traj_copy[:, 0, d], t)
+                        sigma = bandwidth
+                        kernel_size = max(3, int(6 * sigma) + 1)
+                        if kernel_size % 2 == 0:
+                            kernel_size += 1
+                        center = kernel_size // 2
+                        x = np.arange(kernel_size, dtype=np.float64)
+                        kernel = np.exp(-0.5 * ((x - center) / sigma) ** 2)
+                        kernel = kernel / kernel.sum()
+
+                        pad = center
+                        y_padded = np.pad(y_no_t, pad_width=pad, mode='edge')
+                        smoothed_full = np.convolve(y_padded, kernel, mode='valid')
+
+                        if t < pad:
+                            predicted = smoothed_full[t]
+                        elif t >= T - 1 - pad:
+                            predicted = smoothed_full[T - 2 - pad + (t - (T - 1 - pad))]
+                        else:
+                            predicted = smoothed_full[t]
+
+                        loo_errors.append((trajectory_np[t, 0, d] - predicted) ** 2)
+
+            avg_mse = np.mean(loo_errors) if loo_errors else float("inf")
+
+            if avg_mse < best_mse:
+                best_mse = avg_mse
                 best_bandwidth = bandwidth
 
         # Update log bandwidth towards optimal

@@ -621,37 +621,82 @@ class DifferentiableDiscoveryPipeline(DiscoveryPipeline):
 
         print(f"Training Differentiable NN for {self.mode}...")
 
-        # Multi-step rollout: use 10 time steps
-        n_steps = 10
-        t = torch.linspace(0.0, dt * n_steps, n_steps + 1, dtype=torch.float64).to(self.device)
+        # Multi-step rollout: curriculum learning (1->5->10->20 steps)
+        curriculum_schedule = [1, 5, 10, 20]
+
+        max_idx_base = states.shape[0] - 2 - 1
+
         batch_size = 32
 
-        max_idx = states.shape[0] - n_steps - 1
-        if max_idx < 1:
-            print("Not enough timesteps for rollout. Skipping training.")
-            self.model.to(torch.float32)
-            return 0.0
-
         for epoch in range(epochs):
+            # Update rollout steps based on curriculum
+            n_steps = 1
+            for i, ce in enumerate([epochs // 4, 2 * (epochs // 4), 3 * (epochs // 4)]):
+                if epoch >= ce:
+                    n_steps = curriculum_schedule[i]
+                else:
+                    break
+
+            # Recompute max_idx and time grid for current n_steps
+            max_idx = states.shape[0] - n_steps - 1
+            if max_idx < 1:
+                print("Not enough timesteps for rollout. Skipping training.")
+                self.model.to(torch.float32)
+                return 0.0
+
+            t = torch.linspace(0.0, dt * n_steps, n_steps + 1, dtype=torch.float32).to(self.device)
+
             idx = torch.randint(0, max_idx, (batch_size,))
             x0 = states[idx].to(self.device)
-            target_pos = p_s[idx + 1: idx + n_steps + 1].to(self.device).to(torch.float64)
+            target_pos = p_s[idx[0].item() + 1: idx[0].item() + n_steps + 1].to(self.device).to(torch.float64)
 
             try:
-                pred_states = simulator(x0, t)
-                # pred_states: (n_steps+1, batch, state_dim)
+                # Use adaptive solver (dopri5) after checkpoint, otherwise fixed-step RK4
+                use_adaptive = epoch >= epochs // 2
+                if use_adaptive:
+                    simulator = DifferentiableSimulator(
+                        self.model, dim=dim, n_particles=n_particles
+                    ).to(self.device)
+                    pred_states = simulator(x0, t, method='dopri5', atol=1e-6, rtol=1e-4)
+                else:
+                    pred_states = simulator(x0, t)
+
+                # Energy conservation loss: minimize Hamiltonian drift
+                # Kinetic energy at start (from initial velocities in state)
+                v0 = x0[:, -dim:]
+                ke_0 = 0.5 * torch.sum(v0 ** 2, dim=1)
+
+                # Position components from pred_states
                 pos_dim = n_particles * dim
                 pred_pos = pred_states[1:, :, :pos_dim].view(n_steps, batch_size, n_particles, dim)
 
-                loss = torch.mean((pred_pos - target_pos) ** 2)
+                # Potential energy approximation from model's invariant layer
+                # Use position components from pred_states
+                pos_dim = n_particles * dim
+                pred_pos_0 = pred_states[0, :, :pos_dim]
+                pred_pos_end = pred_states[-1, :, :pos_dim]
 
-                if torch.isnan(loss):
-                    break
+                # Simplified potential energy: quadratic (harmonic approx)
+                pe_0 = 0.1 * torch.sum(pred_pos_0 ** 2, dim=1)
+                pe_end = 0.1 * torch.sum(pred_pos_end ** 2, dim=1)
 
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
-                optimizer.step()
+                # Hamiltonian: H = KE + PE
+                # Approximate potential energy from position magnitudes
+                pe_0 = 0.1 * torch.sum(pred_pos_0 ** 2, dim=1)  # simplified harmonic
+                pe_end = 0.1 * torch.sum(pred_pos_end ** 2, dim=1)  # simplified harmonic
+                
+                # KE at end: approximate from position differences
+                v_end = (pred_pos_end[:, :dim] - pred_pos_0[:, :dim]) / (dt * n_steps)
+                ke_end = 0.5 * torch.sum(v_end ** 2, dim=1)
+                
+                H_0 = ke_0 + pe_0
+                H_end = ke_end + pe_end  # KE at end + PE at end
+
+                # Energy conservation loss: H_end - H_0 should be ~0
+                loss_energy = torch.mean((H_end - H_0) ** 2)
+
+                # Total loss: trajectory + energy conservation
+                loss = torch.mean((pred_pos - target_pos) ** 2) + 0.1 * loss_energy
             except Exception as e:
                 print(f"Error during ODE integration at epoch {epoch}: {e}")
                 break

@@ -186,6 +186,81 @@ class LLMPriorProvider:
             print(f"Error parsing expression '{expression_str}': {e}")
             return None
 
+    def to_gplearn_program(self, expr: sp.Expr, feature_names: List[str]) -> str:
+        """
+        Convert a SymPy expression into a gplearn-compatible program string.
+
+        Args:
+            expr: A SymPy expression
+            feature_names: List of feature names (e.g., ['r', '1/r', 'r^2', ...])
+
+        Returns:
+            A gplearn-compatible program string (e.g., 'add(mul(X0, X1), X2)')
+        """
+        # Map feature indices to symbols
+        # feature_names = ['r', '1/r', 'r^2', '1/r^2', 'exp(-r)', 'log(r+1)']
+        # X0 -> r, X1 -> 1/r, etc.
+        sym_map = {}
+        for i, name in enumerate(feature_names):
+            sym_map[i] = sp.Symbol(f"X{i}")
+
+        def _convert_sym(sym):
+            name = str(sym).lower()
+            # Check if it's one of our feature names
+            for i, fn in enumerate(feature_names):
+                if fn.lower() == name:
+                    return sp.Symbol(f"X{i}")
+            # Check if it's a known variable like r, m, etc.
+            if name in ['r', 'r^2', '1/r', 'exp(-r)', 'log(r+1)']:
+                for i, fn in enumerate(feature_names):
+                    if fn.lower() == name:
+                        return sp.Symbol(f"X{i}")
+            # Fall back to the symbol itself
+            return sym
+
+        def _expr_to_program(expr) -> str:
+            """Recursively convert a SymPy expression to a gplearn program string."""
+            if expr.is_Number:
+                return str(expr)
+            elif expr.is_Symbol:
+                sym_idx = None
+                name = str(expr).lower()
+                for i, fn in enumerate(feature_names):
+                    if fn.lower() == name:
+                        sym_idx = i
+                        break
+                if sym_idx is not None:
+                    return f"X{sym_idx}"
+                return f"X0"
+            elif expr.func.__name__ == 'Add':
+                args = [_expr_to_program(a) for a in expr.args]
+                return f"add({', '.join(args)})"
+            elif expr.func.__name__ == 'Mul':
+                args = [_expr_to_program(a) for a in expr.args]
+                return f"mul({', '.join(args)})"
+            elif expr.func.__name__ == 'Sub':
+                args = [_expr_to_program(a) for a in expr.args]
+                return f"sub({', '.join(args)})"
+            elif expr.func.__name__ == 'Pow':
+                base = _expr_to_program(expr.args[0])
+                exp = _expr_to_program(expr.args[1]) if len(expr.args) > 1 else "1"
+                return f"power({base}, {exp})"
+            elif expr.func.__name__ == 'Div':
+                base = _expr_to_program(expr.args[0])
+                exp = _expr_to_program(expr.args[1]) if len(expr.args) > 1 else "1"
+                return f"div({base}, {exp})"
+            elif expr.func.__name__ == 'Exp':
+                return f"exp({_expr_to_program(expr.args[0])})"
+            elif expr.func.__name__ == 'Log':
+                return f"log({_expr_to_program(expr.args[0])})"
+            elif expr.func.__name__ == 'Sqrt':
+                return f"sqrt({_expr_to_program(expr.args[0])})"
+            else:
+                return f"X0"
+
+        program_str = _expr_to_program(expr)
+        return program_str
+
     def _generate_symmetric_forms(self, base_expr: sp.Expr) -> List[sp.Expr]:
         """
         Generate symmetric variations of an expression by swapping terms.

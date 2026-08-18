@@ -124,8 +124,11 @@ class TestAutoSmoother:
 
         # Create noisy signal with known noise level
         noise_std = 0.05
-        signal = np.sin(np.linspace(0, 10, 200)) + noise_std * np.random.randn(200)
+        np.random.seed(42)
+        t = np.linspace(0, 10, 200)
+        signal = np.sin(t) + noise_std * np.random.randn(200)
 
+        # Run optimized bandwidth selection
         bandwidth_before = smoother.get_bandwidth()
         optimized_bw = smoother.optimize_bandwidth(
             torch.from_numpy(signal), [1.0, 0.9, 0.8]

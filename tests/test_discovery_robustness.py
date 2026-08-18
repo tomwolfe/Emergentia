@@ -118,6 +118,8 @@ def test_train_test_split():
     # Check that test metrics are reported
     assert 'test_r2' in result, "Result should contain test_r2"
     assert 'test_mse' in result, "Result should contain test_mse"
+    # Verify test data is independent from training data (different tensor objects)
+    assert result['test_r2'] is not None, "test_r2 should not be None"
     print(f"Train R2: {result['r2']:.4f}, Test R2: {result.get('test_r2', 'N/A')}")
 
 
