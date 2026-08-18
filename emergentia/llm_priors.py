@@ -131,9 +131,11 @@ class LLMPriorProvider:
 
         if zai_client is None:
             try:
+                from zai import ZaiClient
+
                 self.zai_client = ZaiClient()
                 print(f"Initialized Z.AI client with model: {model}")
-            except (ImportError, Exception) as e:
+            except ImportError:
                 print(
                     "Warning: zai-sdk not installed. LLM priors will use default physics-based suggestions."
                 )
@@ -298,15 +300,10 @@ class LLMPriorProvider:
             for expr_str in expr_strings[: self.max_candidates]:
                 expr = self._parse_sym_expression(expr_str)
                 if expr is not None:
-                    is_consistent, metric, sig, msg = (
-                        self.unit_checker.check_consistency(expr)
-                    )
-                    if is_consistent and not any(
-                        isinstance(d, float) and d != d for d in sig
-                    ):
-                        if not expr.has(sp.nan) and not expr.has(sp.zoo):
-                            expressions.append(expr)
-                            valid_count += 1
+                    is_valid, metric, signature, message = self.unit_checker.check_consistency(expr)
+                    if is_valid:
+                        expressions.append(expr)
+                        valid_count += 1
 
             if valid_count == 0:
                 # If no valid expressions, return empty list
@@ -398,7 +395,7 @@ Focus on physically plausible forms that match the expected behavior for force f
 
             print("Calling GLM-4.7-flash with prompt...")
 
-            response = self.zai_client.client.chat.completions.create(
+            response = self.zai_client.chat.completions.create(
                 model=self.model,
                 messages=[
                     {

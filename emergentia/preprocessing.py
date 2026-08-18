@@ -151,13 +151,8 @@ class AutoSmoother(nn.Module):
             # Multiple trajectories (T, D)
             smoothed = gaussian_filter1d(trajectory_np, sigma=bandwidth, axis=0)
         elif trajectory_np.ndim == 3:
-            # Batch of trajectories (T, N, D)
-            smoothed = np.array(
-                [
-                    gaussian_filter1d(trajectory_np[t], sigma=bandwidth, axis=0)
-                    for t in range(trajectory_np.shape[0])
-                ]
-            )
+            # Batch of trajectories (T, N, D) - smooth along time axis
+            smoothed = gaussian_filter1d(trajectory_np, sigma=bandwidth, axis=0)
         else:
             # Unknown dimension - return original
             if is_tensor:
@@ -418,12 +413,7 @@ class LearnableAutoSmoother(nn.Module):
         elif trajectory_np.ndim == 2:
             smoothed = gaussian_filter1d(trajectory_np, sigma=bandwidth, axis=0)
         elif trajectory_np.ndim == 3:
-            smoothed = np.array(
-                [
-                    gaussian_filter1d(trajectory_np[t], sigma=bandwidth, axis=0)
-                    for t in range(trajectory_np.shape[0])
-                ]
-            )
+            smoothed = gaussian_filter1d(trajectory_np, sigma=bandwidth, axis=0)
         else:
             if is_tensor:
                 return trajectory
@@ -585,12 +575,7 @@ class GaussianSmoother(nn.Module):
         elif trajectory_np.ndim == 2:
             smoothed = gaussian_filter1d(trajectory_np, sigma=self.sigma, axis=0)
         elif trajectory_np.ndim == 3:
-            smoothed = np.array(
-                [
-                    gaussian_filter1d(trajectory_np[t], sigma=self.sigma, axis=0)
-                    for t in range(trajectory_np.shape[0])
-                ]
-            )
+            smoothed = gaussian_filter1d(trajectory_np, sigma=self.sigma, axis=0)
         else:
             if is_tensor:
                 return trajectory

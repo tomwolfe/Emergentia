@@ -19,13 +19,19 @@ class ConservativeForceField(nn.Module):
         self.projection = InvariantLayer()
         self.potential_net = potential_net
 
+    def _pairwise_potential(self, dist):
+        """Compute pairwise potentials from distances using the inner network."""
+        feat = self.potential_net._get_features(dist)
+        return self.potential_net.net(feat)
+
     def forward(self, pos):
-        pos = pos.requires_grad_(True)
+        if not pos.requires_grad:
+            pos = pos.clone().requires_grad_(True)
         dist, diff = self.projection(pos)
         
         mask = (~torch.eye(pos.shape[1], device=pos.device).bool()).unsqueeze(0).unsqueeze(-1)
         
-        v_pair = self.potential_net(dist) * mask
+        v_pair = self._pairwise_potential(dist) * mask
         total_energy = torch.sum(v_pair) * 0.5
         
         forces = -torch.autograd.grad(total_energy, pos, create_graph=True)[0]
@@ -35,10 +41,12 @@ class ConservativeForceField(nn.Module):
         """Predict force magnitude F(r) = -dV/dr for 1D symbolic distillation.
         
         Args:
-            r: Tensor of shape (num_points, 1) or (num_points, n, n, 1)
+            r: Tensor of shape (num_points, 1)
         """
-        r = r.requires_grad_(True)
-        v = self.potential_net(r)
+        r = r.view(-1, 1)
+        if not r.requires_grad:
+            r = r.clone().requires_grad_(True)
+        v = self._pairwise_potential(r)
         dv_dr = torch.autograd.grad(v.sum(), r, create_graph=True)[0]
         return -dv_dr
 
@@ -50,8 +58,9 @@ class ConservativeForceField(nn.Module):
         Returns:
             Scalar total potential energy
         """
-        pos = pos.requires_grad_(True)
+        if not pos.requires_grad:
+            pos = pos.clone().requires_grad_(True)
         dist, diff = self.projection(pos)
         mask = (~torch.eye(pos.shape[1], device=pos.device).bool()).unsqueeze(0).unsqueeze(-1)
-        v_pair = self.potential_net(dist) * mask
+        v_pair = self._pairwise_potential(dist) * mask
         return torch.sum(v_pair) * 0.5

@@ -3,7 +3,7 @@ import torch.nn as nn
 import numpy as np
 import sympy as sp
 from gplearn.genetic import SymbolicRegressor
-from gplearn.functions import make_function, _Function
+from gplearn.functions import make_function
 from .models import DiscoveryNet, TrajectoryScaler
 from .registry import PhysicalBasisRegistry
 from .utils import verify_equivalence
@@ -12,84 +12,6 @@ from .unit_checker import UnitChecker, is_dimensionally_consistent
 from .llm_priors import LLMPriorProvider, ZaiClient
 from .preprocessing import AutoSmoother, TrajectorySmoother
 from .physics_constraints import ConservativeForceField, InvariantLayer
-
-
-def _gplearn_to_sympy(program, feature_subs):
-    """
-    Recursively convert a gplearn Program tree to a SymPy expression.
-
-    Args:
-        program: Either a gplearn _Program object or its internal ``program``
-            list (flat pre-order traversal of the expression tree).
-        feature_subs: Dict mapping integer feature index -> SymPy expression.
-
-    Returns:
-        SymPy expression
-    """
-    from gplearn.functions import _Function
-
-    if hasattr(program, "program"):
-        prog = program.program
-    else:
-        prog = program
-
-    idx = [0]  # mutable cursor
-
-    _SYM_FUNCS = {
-        "add": lambda x, y: x + y,
-        "sub": lambda x, y: x - y,
-        "mul": lambda x, y: x * y,
-        "div": lambda x, y: x / y,
-        "inv": lambda x: 1 / x,
-        "power": lambda x, y: sp.Pow(sp.Abs(x), y),
-        "exp": lambda x: sp.exp(x),
-        "log": lambda x: sp.log(x),
-        "sqrt": lambda x: sp.sqrt(x),
-        "sin": lambda x: sp.sin(x),
-        "cos": lambda x: sp.cos(x),
-        "tan": lambda x: sp.tan(x),
-        "abs": lambda x: sp.Abs(x),
-    }
-
-    def walk():
-        i = idx[0]
-        if i >= len(prog):
-            return sp.Integer(0)
-
-        node = prog[i]
-
-        if isinstance(node, _Function):
-            idx[0] = i + 1
-            args = []
-            for _ in range(node.arity):
-                args.append(walk())
-
-            name = node.name
-            if name in _SYM_FUNCS:
-                return _SYM_FUNCS[name](*args)
-            else:
-                func = getattr(sp, name, None)
-                if func is not None and callable(func):
-                    return func(*args)
-                # Unknown function — just return first arg as fallback
-                return args[0] if args else sp.Integer(0)
-
-        elif isinstance(node, (int, np.integer)):
-            idx[0] = i + 1
-            return feature_subs.get(int(node), sp.Symbol(f"X{int(node)}"))
-
-        elif isinstance(node, (float, np.floating)):
-            idx[0] = i + 1
-            return sp.Float(float(node))
-
-        else:
-            idx[0] = i + 1
-            try:
-                return sp.Float(float(node))
-            except (TypeError, ValueError):
-                return sp.Symbol(str(node))
-
-    return walk()
 
 
 # Protected functions for gplearn
@@ -119,6 +41,21 @@ def _protected_exp(x):
 
 
 exp = make_function(function=_protected_exp, name="exp", arity=1)
+
+
+def _protected_sqrt(x):
+    return np.sqrt(np.abs(x))
+
+
+sqrt = make_function(function=_protected_sqrt, name="sqrt", arity=1)
+
+
+def _protected_log(x):
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(np.abs(x) > 1e-6, np.log(np.abs(x)), 0.0)
+
+
+log = make_function(function=_protected_log, name="log", arity=1)
 
 
 class DiscoveryPipeline:
@@ -209,7 +146,7 @@ class DiscoveryPipeline:
             valid_dists = dists[:, mask].ravel()
             valid_dists = valid_dists[valid_dists > 0.1]
             if len(valid_dists) > 0:
-                r_min = max(0.5, float(np.percentile(valid_dists, 5)))
+                r_min = max(0.3, float(np.percentile(valid_dists, 5)))
                 r_max = min(10.0, float(np.percentile(valid_dists, 95)))
             else:
                 r_min, r_max = 0.5, 5.0
@@ -219,139 +156,89 @@ class DiscoveryPipeline:
         self.scaler.fit(p_traj, f_traj)
         p_s, f_s = self.scaler.transform(p_traj, f_traj)
 
-        # Train on potential energy V(r) directly instead of force vectors.
-        # This avoids double-autograd (grad-of-grad) through the force computation
-        # in DiscoveryNet.forward, which causes vanishing gradients and prevents
-        # the model from learning the correct pairwise potential.
-        # Forces are recovered analytically at inference via predict_mag.
-        use_potential_training = (
-            self.potential is not None
-            and self.conservative_field is None
+        # Symmetric Log Transform for high dynamic range
+        f_target = torch.sign(f_s) * torch.log1p(torch.abs(f_s))
+
+        if torch.isnan(f_target).any():
+            f_target = torch.nan_to_num(f_target, nan=0.0)
+
+        p_s = p_s.to(self.device)
+        f_target = f_target.to(self.device)
+
+        # Train/val split for early stopping (last 20% as validation)
+        split_idx = int(p_s.shape[0] * 0.8)
+        p_train, f_train = p_s[:split_idx], f_target[:split_idx]
+        p_val, f_val = p_s[split_idx:], f_target[split_idx:]
+
+        base_lr = 2e-3
+        optimizer = torch.optim.AdamW(
+            self.model.parameters(), lr=base_lr, weight_decay=1e-4
+        )
+        delta = 0.5 if noise_std > 0 else 0.1
+        criterion = nn.HuberLoss(delta=delta)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, "min", patience=200, factor=0.5
         )
 
-        if use_potential_training:
-            # Use potential's default_scale for better feature coverage
-            self.scaler.fit_for_potential(p_traj, f_traj, self.potential)
-            p_np = p_traj[:p_s.shape[0]].cpu().numpy()
-            n_particles = p_np.shape[1]
-            tri_idx = np.triu_indices(n_particles, k=1)
+        warmup_epochs = 500
+        best_val_loss = float("inf")
+        best_state = None
+        patience_counter = 0
+        es_patience = 200
 
-            r_samples = []
-            v_samples = []
-            for frame_idx in range(0, p_np.shape[0], 32):
-                frame = p_np[frame_idx:frame_idx+32]
-                diff = frame[:, :, np.newaxis, :] - frame[:, np.newaxis, :, :]
-                dists = np.linalg.norm(diff, axis=-1)
-                for i, j in zip(*tri_idx):
-                    d = dists[:, i, j]
-                    valid = d[d > 0.1]
-                    if len(valid) > 0:
-                        r_phys = valid
-                        v_true = self.potential.compute_potential(
-                            torch.tensor(r_phys, dtype=torch.float32)
-                        ).numpy()
-                        r_samples.extend(r_phys / self.scaler.p_scale)
-                        v_samples.extend(v_true)
+        print(f"Training NN for {self.mode} (noise_std={noise_std})...")
+        for epoch in range(epochs):
+            # LR Warm-up
+            if epoch < warmup_epochs:
+                lr = base_lr * (epoch + 1) / warmup_epochs
+                for param_group in optimizer.param_groups:
+                    param_group["lr"] = lr
 
-            r_train = torch.tensor(np.array(r_samples), dtype=torch.float32, device=self.device)
-            v_train = torch.tensor(np.array(v_samples), dtype=torch.float32, device=self.device)
+            idxs = torch.randint(0, p_train.shape[0], (1024,), device=self.device)
+            p_batch = p_train[idxs]
+            f_batch = f_train[idxs]
 
-            # Normalize potential targets to O(1) for stable training
-            self.v_scale = max(abs(v_train).max().item(), 1e-8)
-            v_train = v_train / self.v_scale
+            f_pred = self.conservative_field(p_batch) if self.conservative_field else self.model(p_batch)
+            loss = criterion(f_pred, f_batch)
 
-            base_lr = 1e-3
-            optimizer = torch.optim.AdamW(
-                self.model.parameters(), lr=base_lr, weight_decay=0
-            )
-            criterion = nn.MSELoss()
-            warmup_epochs = min(100, max(20, epochs // 10))
+            if torch.isnan(loss):
+                print(f"NaN Loss at epoch {epoch}. Stopping.")
+                break
 
-            print(f"Training NN on potential energy for {self.mode}...")
-            final_loss = None
-            for epoch in range(epochs):
-                if epoch < warmup_epochs:
-                    lr = base_lr * (epoch + 1) / warmup_epochs
-                    for pg in optimizer.param_groups:
-                        pg["lr"] = lr
+            optimizer.zero_grad()
+            loss.backward()
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            optimizer.step()
 
-                idxs = torch.randint(0, r_train.shape[0], (1024,), device=self.device)
-                r_batch = r_train[idxs].view(-1, 1)
-                v_batch = v_train[idxs].view(-1, 1)
+            if epoch >= warmup_epochs:
+                scheduler.step(loss)
 
-                v_pred = self.model.forward_potential(r_batch)
-                loss = criterion(v_pred, v_batch)
-
-                if torch.isnan(loss):
-                    print(f"NaN Loss at epoch {epoch}. Stopping.")
+            # Early stopping: check validation loss every 50 epochs
+            if epoch % 50 == 0:
+                with torch.no_grad():
+                    val_pred = self.conservative_field(p_val) if self.conservative_field else self.model(p_val)
+                    val_loss = criterion(val_pred, f_val).item()
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_state = {k: v.clone() for k, v in self.model.state_dict().items()}
+                    patience_counter = 0
+                else:
+                    patience_counter += 50
+                if patience_counter >= es_patience:
+                    print(f"Early stopping at epoch {epoch} (best val loss: {best_val_loss:.2e})")
                     break
 
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                optimizer.step()
+            if epoch % 500 == 0:
+                print(
+                    f"Epoch {epoch} | Loss: {loss.item():.2e} | LR: {optimizer.param_groups[0]['lr']:.2e}"
+                )
 
-                final_loss = loss.item()
-                if epoch % 500 == 0:
-                    print(
-                        f"Epoch {epoch} | Loss: {final_loss:.2e}"
-                    )
+        # Restore best model weights
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
 
-            return final_loss
-        else:
-            # Fallback: train on force vectors (for conservative field or no potential)
-            f_target = f_s
-
-            if torch.isnan(f_target).any():
-                f_target = torch.nan_to_num(f_target, nan=0.0)
-
-            p_s = p_s.to(self.device)
-            f_target = f_target.to(self.device)
-
-            base_lr = 2e-3
-            optimizer = torch.optim.AdamW(
-                self.model.parameters(), lr=base_lr, weight_decay=1e-4
-            )
-            delta = 0.5 if noise_std > 0 else 0.1
-            criterion = nn.HuberLoss(delta=delta)
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer, "min", patience=200, factor=0.5
-            )
-
-            warmup_epochs = min(200, max(50, epochs // 5))
-
-            print(f"Training NN for {self.mode} (noise_std={noise_std})...")
-            for epoch in range(epochs):
-                if epoch < warmup_epochs:
-                    lr = base_lr * (epoch + 1) / warmup_epochs
-                    for param_group in optimizer.param_groups:
-                        param_group["lr"] = lr
-
-                idxs = torch.randint(0, p_s.shape[0], (1024,), device=self.device)
-                p_batch = p_s[idxs]
-                f_batch = f_target[idxs]
-
-                f_pred = self.conservative_field(p_batch) if self.conservative_field else self.model(p_batch)
-                loss = criterion(f_pred, f_batch)
-
-                if torch.isnan(loss):
-                    print(f"NaN Loss at epoch {epoch}. Stopping.")
-                    break
-
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                optimizer.step()
-
-                if epoch >= warmup_epochs:
-                    scheduler.step(loss)
-
-                if epoch % 500 == 0:
-                    print(
-                        f"Epoch {epoch} | Loss: {loss.item():.2e} | LR: {optimizer.param_groups[0]['lr']:.2e}"
-                    )
-
-            return loss.item()
+        return loss.item()
 
     def distill_symbolic(
         self,
@@ -360,6 +247,7 @@ class DiscoveryPipeline:
         use_llm_priors=False,
         llm_priors=None,
     ):
+        # Use data-driven range from train_nn, or fallback
         if self.pairwise_dist_range is not None:
             r_min, r_max = self.pairwise_dist_range
         else:
@@ -370,14 +258,17 @@ class DiscoveryPipeline:
 
         with torch.no_grad():
             mag_scaled = self.model.predict_mag(r_scaled)
-            # Model trained on V(r)/v_scale; force = -dV/dr = predict_mag * v_scale / p_scale
-            mag_phys = (mag_scaled * getattr(self, 'v_scale', 1.0) / self.scaler.p_scale).cpu().numpy().ravel()
+            # Inverse Symmetric Log Transform with clamping to prevent overflow
+            mag_s = torch.sign(mag_scaled) * (
+                torch.exp(torch.clamp(torch.abs(mag_scaled), max=20.0)) - 1
+            )
+            mag_phys = (mag_s * self.scaler.f_scale).cpu().numpy().ravel()
 
         # Clean up any remaining infinities or NaNs in mag_phys
         mag_phys = np.nan_to_num(mag_phys, nan=0.0, posinf=1e10, neginf=-1e10)
 
         # Build 6-feature matrix matching DiscoveryNet._get_features
-        r_safe = np.clip(r_phys, 1e-3, None)
+        r_safe = np.clip(r_phys, 0.1, 50.0)
         X_sr = np.hstack(
             [
                 r_safe,                  # X0 = r
@@ -389,48 +280,62 @@ class DiscoveryPipeline:
             ]
         )
 
-        parsimony = 0.001
+        parsimony = 0.08
 
         print(f"Running Symbolic Regression for {self.mode}...")
 
         # Apply LLM priors by adjusting GP parameters (never as data points)
         if use_llm_priors and llm_priors is not None and len(llm_priors) > 0:
             print(f"Using {len(llm_priors)} LLM priors to guide search")
-            priors_str = [str(p) for p in llm_priors]
+            priors_str = [str(expr) for expr in llm_priors]
             print(f"LLM Priors: {priors_str}")
             # Lower parsimony and widen init_depth to let GP explore prior-like structures
-            parsimony = 0.001
+            parsimony = 0.01
 
         est = SymbolicRegressor(
             population_size=population_size,
             generations=generations,
-            function_set=("add", "sub", "mul", "div", inv, power, exp),
+            function_set=("add", "sub", "mul", "div", inv, power, exp, sqrt, log),
             const_range=(-20.0, 20.0),
             parsimony_coefficient=parsimony,
             stopping_criteria=0.001,
-            init_depth=(2, 6) if (use_llm_priors and llm_priors) else (2, 6),
-            max_samples=1.0,
-            n_jobs=1,
+            init_depth=(2, 6) if (use_llm_priors and llm_priors) else (2, 4),
+            max_samples=0.9,
+            n_jobs=-1,
             metric="mse",
             random_state=self.seed,
-            verbose=0,
+            verbose=1,
         )
         est.fit(X_sr, mag_phys)
 
         print(f"Best program: {est._program}")
 
-        # Convert gplearn program tree to SymPy using robust recursive walker
+        # Convert to SymPy - map all 6 features
         r = sp.Symbol("r")
-        feature_subs = {
-            0: r,               # X0 = r
-            1: 1 / r,           # X1 = 1/r
-            2: r ** 2,          # X2 = r^2
-            3: 1 / r ** 2,     # X3 = 1/r^2
-            4: sp.exp(-r),     # X4 = exp(-r)
-            5: sp.log(r + 1),  # X5 = log(r+1)
+        locals_dict = {
+            "add": lambda x, y: x + y,
+            "sub": lambda x, y: x - y,
+            "mul": lambda x, y: x * y,
+            "div": lambda x, y: x / y,
+            "inv": lambda x: 1 / x,
+            "power": lambda x, y: sp.Pow(sp.Abs(x), y),
+            "exp": lambda x: sp.exp(x),
         }
 
-        expr = _gplearn_to_sympy(est._program, feature_subs)
+        expr = sp.sympify(str(est._program), locals=locals_dict)
+
+        # Map feature indices back to symbolic expressions
+        feature_subs = {
+            "X0": r,
+            "X1": 1 / r,
+            "X2": r ** 2,
+            "X3": 1 / r ** 2,
+            "X4": sp.exp(-r),
+            "X5": sp.log(r + 1),
+        }
+        for name, sym_expr in feature_subs.items():
+            expr = expr.subs(sp.Symbol(name), sym_expr)
+
         expr = sp.simplify(expr)
 
         # Apply Unit-Checker if enabled
@@ -485,15 +390,20 @@ class DiscoveryPipeline:
         dist = np.linalg.norm(diff, axis=-1, keepdims=True)  # (T, N, N, 1)
         dir_vec = diff / np.clip(dist, 1e-6, None)  # (T, N, N, D)
 
+        # Expression was discovered in scaled space, so evaluate on scaled distances
+        # and multiply the result by f_scale to get physical force magnitudes
+        dist_scaled = dist / self.scaler.p_scale
+
         n_particles = p_np.shape[1]
         mask = (~np.eye(n_particles, dtype=bool))[np.newaxis, :, :, np.newaxis]
 
         def objective(params):
             with np.errstate(all="ignore"):
-                mag = func(dist, *params)
+                mag = func(dist_scaled, *params)
                 if not isinstance(mag, np.ndarray):
-                    mag = np.full(dist.shape, mag)
+                    mag = np.full(dist_scaled.shape, mag)
                 mag = np.nan_to_num(mag, nan=0.0, posinf=1e6, neginf=-1e6)
+                mag = mag * self.scaler.f_scale
 
             pair_forces = mag * dir_vec * mask
             f_pred = np.sum(pair_forces, axis=2)
@@ -501,10 +411,11 @@ class DiscoveryPipeline:
 
         def jacobian(params):
             with np.errstate(all="ignore"):
-                mag = func(dist, *params)
+                mag = func(dist_scaled, *params)
                 if not isinstance(mag, np.ndarray):
-                    mag = np.full(dist.shape, mag)
+                    mag = np.full(dist_scaled.shape, mag)
                 mag = np.nan_to_num(mag, nan=0.0, posinf=1e6, neginf=-1e6)
+                mag = mag * self.scaler.f_scale
 
                 f_pred = np.sum(mag * dir_vec * mask, axis=2)
                 err = f_pred - f_np  # (T, N, D)
@@ -515,10 +426,11 @@ class DiscoveryPipeline:
                         jac.append(0.0)
                         continue
 
-                    d_mag = gf(dist, *params)
+                    d_mag = gf(dist_scaled, *params)
                     if not isinstance(d_mag, np.ndarray):
-                        d_mag = np.full(dist.shape, d_mag)
+                        d_mag = np.full(dist_scaled.shape, d_mag)
                     d_mag = np.nan_to_num(d_mag, nan=0.0, posinf=1e6, neginf=-1e6)
+                    d_mag = d_mag * self.scaler.f_scale
 
                     # dF_i/dc_k = sum_j (d_mag * dir_vec)
                     df_dc = np.sum(d_mag * dir_vec * mask, axis=2)  # (T, N, D)
@@ -528,25 +440,9 @@ class DiscoveryPipeline:
                 return np.array(jac, dtype=np.float64)
 
         initial_guess = [float(v) for v in tune_atoms]
-
-        # Multi-start optimization to avoid local minima
-        best_result = None
-        for trial in range(3):
-            x0 = initial_guess if trial == 0 else np.random.uniform(
-                0.1, 5.0, len(initial_guess)
-            )
-            try:
-                res = minimize(
-                    objective, x0, jac=jacobian, method="L-BFGS-B", tol=1e-4
-                )
-            except Exception:
-                # Fallback to Nelder-Mead (no Jacobian) when analytical path fails
-                res = minimize(objective, x0, method="Nelder-Mead", tol=1e-4)
-
-            if best_result is None or res.fun < best_result.fun:
-                best_result = res
-
-        res = best_result
+        res = minimize(
+            objective, initial_guess, jac=jacobian, method="L-BFGS-B", tol=1e-4
+        )
 
         final_map = {symbols[i]: res.x[i] for i in range(len(symbols))}
         return sp.simplify(param_expr.subs(final_map))
@@ -730,13 +626,16 @@ class DifferentiableDiscoveryPipeline(DiscoveryPipeline):
         t = torch.linspace(0.0, dt * n_steps, n_steps + 1, dtype=torch.float64).to(self.device)
         batch_size = 32
 
-        for epoch in range(epochs):
-            idx = torch.randint(0, states.shape[0] - n_steps, (batch_size,))
-            x0 = states[idx].to(self.device)
+        max_idx = states.shape[0] - n_steps - 1
+        if max_idx < 1:
+            print("Not enough timesteps for rollout. Skipping training.")
+            self.model.to(torch.float32)
+            return 0.0
 
-            target_indices = idx.unsqueeze(1) + torch.arange(1, n_steps + 1).unsqueeze(0)
-            target_pos = p_s[target_indices]  # (batch, n_steps, n, dim)
-            target_pos = target_pos.permute(1, 0, 2, 3).to(self.device).to(torch.float64)  # (n_steps, batch, n, dim)
+        for epoch in range(epochs):
+            idx = torch.randint(0, max_idx, (batch_size,))
+            x0 = states[idx].to(self.device)
+            target_pos = p_s[idx + 1: idx + n_steps + 1].to(self.device).to(torch.float64)
 
             try:
                 pred_states = simulator(x0, t)
@@ -751,19 +650,6 @@ class DifferentiableDiscoveryPipeline(DiscoveryPipeline):
 
                 optimizer.zero_grad()
                 loss.backward()
-
-                # Check for NaN gradients and skip step if detected
-                has_nan_grad = False
-                for param in self.model.parameters():
-                    if param.grad is not None and torch.isnan(param.grad).any():
-                        has_nan_grad = True
-                        break
-
-                if has_nan_grad:
-                    print(f"NaN gradients at epoch {epoch}, skipping optimizer step")
-                    optimizer.zero_grad()
-                    continue
-
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
                 optimizer.step()
             except Exception as e:

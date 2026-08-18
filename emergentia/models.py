@@ -59,36 +59,36 @@ class DiscoveryNet(nn.Module):
 
     def forward(self, pos_scaled):
         # pos_scaled: (batch, n_particles, dim)
-        if not pos_scaled.requires_grad:
-            pos_scaled = pos_scaled.clone().requires_grad_(True)
+        pos_scaled = pos_scaled.detach().requires_grad_(True)
 
-        diff = pos_scaled.unsqueeze(2) - pos_scaled.unsqueeze(1)  # (batch, n, n, dim)
-        dist = torch.norm(diff, dim=-1, keepdim=True)  # (batch, n, n, 1)
+        with torch.enable_grad():
+            diff = pos_scaled.unsqueeze(2) - pos_scaled.unsqueeze(1)  # (batch, n, n, dim)
+            dist = torch.norm(diff, dim=-1, keepdim=True)  # (batch, n, n, 1)
 
-        feat = self._get_features(dist)  # (batch, n, n, 2)
-        v_pair = self.net(feat)  # (batch, n, n, 1)
+            feat = self._get_features(dist)  # (batch, n, n, 6)
+            v_pair = self.net(feat)  # (batch, n, n, 1)
 
-        # Mask out self-interaction
-        mask = (
-            (~torch.eye(pos_scaled.shape[1], device=pos_scaled.device).bool())
-            .unsqueeze(0)
-            .unsqueeze(-1)
-        )
+            # Mask out self-interaction
+            mask = (
+                (~torch.eye(pos_scaled.shape[1], device=pos_scaled.device).bool())
+                .unsqueeze(0)
+                .unsqueeze(-1)
+            )
 
-        # Total potential energy (sum of pairs / 2)
-        v_total = torch.sum(v_pair * mask) * 0.5
+            # Total potential energy (sum of pairs / 2)
+            v_total = torch.sum(v_pair * mask) * 0.5
 
-        # Force is negative gradient of potential energy
-        # Use allow_unused=True just in case, though it shouldn't be needed here
-        forces = -torch.autograd.grad(
-            v_total, pos_scaled, create_graph=True, retain_graph=True, allow_unused=True
-        )[0]
+            # Force is negative gradient of potential energy
+            forces = -torch.autograd.grad(
+                v_total, pos_scaled, create_graph=True, retain_graph=True, allow_unused=True
+            )[0]
         if forces is None:
             forces = torch.zeros_like(pos_scaled)
         return forces
 
     def predict_mag(self, r_scaled):
         # r_scaled: (num_points, 1)
+        r_scaled = r_scaled.view(-1, 1)
         with torch.enable_grad():
             r_scaled = r_scaled.clone().requires_grad_(True)
             feat = self._get_features(r_scaled)
