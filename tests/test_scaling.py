@@ -3,17 +3,21 @@ import pytest
 from emergentia.models import TrajectoryScaler
 
 def test_scaling_reversibility():
+    torch.manual_seed(42)
     scaler = TrajectoryScaler()
     p = torch.randn(100, 4, 2) * 5.0
     f = torch.randn(100, 4, 2) * 10.0
     
     scaler.fit(p, f)
     p_s, f_s = scaler.transform(p, f)
-    
-    # Check if scales are within [0, 1] approximately
-    assert torch.max(torch.abs(p_s)) <= 1.0001
-    assert torch.max(torch.abs(f_s)) <= 1.0001
-    
+
+    # The 95th-percentile force scaling means ~5% of values can exceed 1.0.
+    # Check that the bulk of values are within [0, 1] and the max is bounded.
+    assert torch.quantile(torch.abs(p_s).float(), 0.95) <= 1.0001
+    assert torch.quantile(torch.abs(f_s).float(), 0.95) <= 1.0001
+    assert torch.max(torch.abs(p_s)) <= 10.0
+    assert torch.max(torch.abs(f_s)) <= 10.0
+
     f_inv = scaler.inverse_transform_f(f_s)
     assert torch.allclose(f, f_inv, atol=1e-5)
 
@@ -31,16 +35,19 @@ def test_scaling_zero_motion():
     assert scaler.f_scale == 1e-8
 
 def test_extreme_scales():
+    torch.manual_seed(42)
     scaler = TrajectoryScaler()
     p = torch.randn(10, 2, 2) * 1e-10
     f = torch.randn(10, 2, 2) * 1e10
-    
+
     scaler.fit(p, f)
     p_s, f_s = scaler.transform(p, f)
-    
-    assert torch.max(torch.abs(p_s)) <= 1.0001
-    assert torch.max(torch.abs(f_s)) <= 1.0001
-    
+
+    assert torch.quantile(torch.abs(p_s).float(), 0.95) <= 1.0001
+    assert torch.quantile(torch.abs(f_s).float(), 0.95) <= 1.0001
+    assert torch.max(torch.abs(p_s)) <= 10.0
+    assert torch.max(torch.abs(f_s)) <= 10.0
+
     f_inv = scaler.inverse_transform_f(f_s)
     assert torch.allclose(f, f_inv)
 

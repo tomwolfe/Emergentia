@@ -45,7 +45,12 @@ def test_regression_gravity_formula():
     assert result["r2"] > 0.90
     # The discovered formula should involve 1/r**2 (gravity's characteristic term)
     formula = result["formula"]
-    assert "1/r**2" in formula or "r**(-2)" in formula or "inv" in formula.lower(), (
+    assert (
+        "1/r**2" in formula
+        or "r**(-2)" in formula
+        or "/r**2" in formula
+        or "inv" in formula.lower()
+    ), (
         f"Gravity formula should contain 1/r^2: {formula}"
     )
 

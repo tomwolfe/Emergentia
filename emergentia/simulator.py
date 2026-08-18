@@ -195,6 +195,7 @@ class PhysicsSim:
         else:
             self.device = device
         
+        self.seed = seed
         self.n = n
         self.dim = dim
         self.potential = potential if potential is not None else LennardJonesPotential()
@@ -208,7 +209,10 @@ class PhysicsSim:
         self.mask = (~torch.eye(n, device=self.device).bool()).unsqueeze(-1)
         
         # Force computation is the bottleneck
-        self._compute_forces_compiled = torch.compile(self._compute_forces_raw) if hasattr(torch, 'compile') and self.device.type != 'mps' else self._compute_forces_raw
+        if self.use_neighbor_list:
+            self._compute_forces_compiled = self._compute_forces_neighbor_list
+        else:
+            self._compute_forces_compiled = torch.compile(self._compute_forces_raw) if hasattr(torch, 'compile') and self.device.type != 'mps' else self._compute_forces_raw
 
     def get_hamiltonian(self, pos=None, vel=None):
         p = pos if pos is not None else self.pos
@@ -303,22 +307,22 @@ class PhysicsSim:
         # Cell-list algorithm for O(n*k) force computation
         # Divide simulation box into cells of size cutoff
         # For each particle, only compute forces on particles in neighboring cells
-        
+
         n = self.n
         cutoff = self.cutoff
-        
+
         # Get position bounds
         pos_min = pos.min(0)[0]
         pos_max = pos.max(0)[0]
-        
+
         # Number of cells per dimension
         n_cells = torch.ceil((pos_max - pos_min) / cutoff).long()
         n_cells = torch.max(n_cells, torch.tensor(1, device=self.device))
-        
+
         # Compute cell index for each particle
         # Shift by -pos_min to make cells start from 0
         cell_pos = ((pos - pos_min) / cutoff).long()
-        
+
         # Build cell to particle mapping
         cell_to_particles = {}
         for i in range(n):
@@ -329,52 +333,52 @@ class PhysicsSim:
                 flat_cell = c0 * n_cells[1] + c1
             else:
                 flat_cell = cell_pos[i, 0]
-            
+
             if flat_cell not in cell_to_particles:
                 cell_to_particles[flat_cell] = []
             cell_to_particles[flat_cell].append(i)
-        
-        # For each particle, find particles in neighboring cells and within cutoff
+
+        # Pairwise geometry
         diff = pos.unsqueeze(1) - pos.unsqueeze(0)  # (n, n, dim)
         dist = torch.norm(diff, dim=-1, keepdim=True)  # (n, n, 1)
         dist_clip = torch.clamp(dist, min=1e-6)
-        
+
         # Self-interaction mask
         mask = (~torch.eye(n, device=self.device).bool()).unsqueeze(-1)
-        
-        # Initialize result mask (1 = compute force, 0 = skip)
+
+        # Initialize result mask (True = compute force, False = skip)
         force_mask = mask.clone()
-        
+
         # For each particle, determine which other particles are within cutoff
         # by checking both distance and cell adjacency
         for i in range(n):
             # Get particle i's cell
             cell_i = cell_pos[i]
-            
+
             # Check all other particles j
             for j in range(n):
                 if i == j:
                     continue
                 # Check distance first (cheap)
-                if dist[i, j] > cutoff:
+                if dist[i, j, 0] > cutoff:
                     force_mask[i, j] = False
                 else:
                     # Also verify cell adjacency (optional but good for correctness)
                     cell_j = cell_pos[j]
                     if self.dim == 2:
-                        c0_i, c1_i = cell_i
-                        c0_j, c1_j = cell_j
+                        c0_i, c1_i = cell_i[0].item(), cell_i[1].item()
+                        c0_j, c1_j = cell_j[0].item(), cell_j[1].item()
                         # Cells are adjacent if they differ by at most 1 in each dimension
                         cell_adj = (abs(c0_i - c0_j) <= 1 and abs(c1_i - c1_j) <= 1)
                     else:
                         cell_adj = True  # 1D: any distance within cutoff is fine
-                    
+
                     if not cell_adj:
                         force_mask[i, j] = False
-        
+
         # Compute force magnitude
         f_mag = self.potential.compute_force_magnitude(dist)
-            
+
         # Apply sparsity mask
         f = f_mag * (diff / dist_clip) * force_mask
         return torch.sum(f, dim=1)

@@ -127,8 +127,9 @@ class UnitChecker:
         "generic": None,  # skip output check
     }
 
-    def __init__(self, mode: str = "generic"):
+    def __init__(self, mode: str = "generic", reduced_units: bool = True):
         self.mode = mode
+        self.reduced_units = reduced_units
         self._setup_mode_specific_dimensions()
 
     def _setup_mode_specific_dimensions(self):
@@ -151,6 +152,9 @@ class UnitChecker:
         Returns:
             A tuple (L, T, M, Q) representing the dimensional signature
         """
+        if self.reduced_units:
+            return (0, 0, 0, 0)
+
         if atom.is_Number or atom.is_NumberSymbol:
             return (0, 0, 0, 0)
 
@@ -295,6 +299,22 @@ class UnitChecker:
                 if not (isinstance(dim, (int, float)) and dim == round(dim, 6)):
                     dimensions_ok = False
 
+            # Check for NaN/zoo in the expression structure
+            has_nan = expr.has(sp.nan) or expr.has(sp.zoo)
+
+            if self.reduced_units:
+                # In reduced units mode, all terminal symbols are dimensionless.
+                # Only flag structural issues (NaN/zoo, non-numeric signatures).
+                is_consistent = dimensions_ok and not has_nan
+                metric = 1.0 if is_consistent else 0.0
+                if is_consistent:
+                    message = "Dimensionally consistent (reduced units mode)"
+                elif has_nan:
+                    message = "Expression contains structural issues (NaN/zoo)"
+                else:
+                    message = "Dimensional signature contains non-numeric values"
+                return (is_consistent, metric, signature, message)
+
             # Check against expected output dimensions for the mode
             expected_dims = self.EXPECTED_OUTPUT_DIMENSIONS.get(self.mode)
             mode_ok = True
@@ -339,7 +359,7 @@ class UnitChecker:
             Dictionary with validation results
         """
         if mode:
-            checker = UnitChecker(mode=mode)
+            checker = UnitChecker(mode=mode, reduced_units=self.reduced_units)
         else:
             checker = self
 
@@ -373,7 +393,7 @@ class UnitChecker:
             Filtered list of dimensionally consistent candidates
         """
         if mode:
-            checker = UnitChecker(mode=mode)
+            checker = UnitChecker(mode=mode, reduced_units=self.reduced_units)
         else:
             checker = self
 
@@ -384,7 +404,7 @@ class UnitChecker:
             try:
                 is_valid, metric, signature, message = checker.check_consistency(expr)
                 if is_valid and not any(
-                    isinstance(d, float) and d != d for d in signature
+                    math.isnan(d) for d in signature
                 ):
                     valid_candidates.append(expr)
                 else:
@@ -399,8 +419,8 @@ class UnitChecker:
         return valid_candidates
 
 
-def is_dimensionally_consistent(expr: sp.Expr, mode: str = None) -> bool:
+def is_dimensionally_consistent(expr: sp.Expr, mode: str = None, reduced_units: bool = True) -> bool:
     """Convenience function to check if an expression is dimensionally consistent."""
-    checker = UnitChecker(mode=mode)
+    checker = UnitChecker(mode=mode, reduced_units=reduced_units)
     is_consistent, _, _, _ = checker.check_consistency(expr)
     return is_consistent

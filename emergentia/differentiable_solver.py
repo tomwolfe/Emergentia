@@ -54,15 +54,18 @@ class ODEFunc(nn.Module):
         # This avoids the nested (second-order) autograd.grad inside DiscoveryNet.forward
         # that destabilises gradients through the ODE solver.
         dist_flat = dist_safe.detach().view(-1, 1)  # (B*n*n, 1)
-        dist_flat = dist_flat.clone().requires_grad_(True)
+        model_dtype = next(self.model.parameters()).dtype
+        dist_model = dist_flat.to(model_dtype)
+        dist_model = dist_model.clone().requires_grad_(True)
 
-        feat = self.model._get_features(dist_flat)
-        v = self.model.net(feat)  # potential values (B*n*n, 1)
+        v = self.model.net(dist_model)  # potential values (B*n*n, 1)
 
         dv_dr = torch.autograd.grad(
-            v.sum(), dist_flat, create_graph=True, retain_graph=True
+            v.sum(), dist_model, create_graph=True, retain_graph=True
         )[0]
         f_mag = -dv_dr  # (|B*n*n|, 1)
+        # Cast back to state dtype so the ODE solver gets consistent dtypes
+        f_mag = f_mag.to(dist_flat.dtype)
 
         f_mag = torch.nan_to_num(f_mag, nan=0.0, posinf=1e3, neginf=-1e3)
         f_mag = f_mag.view(batch_size, self.n_particles, self.n_particles, 1)
@@ -87,5 +90,14 @@ class DifferentiableSimulator(nn.Module):
         self.odefunc = ODEFunc(model, mass, dim, n_particles)
         self.method = method
 
-    def forward(self, x0, t):
-        return odeint(self.odefunc, x0, t, method=self.method)
+    def forward(self, x0, t, method=None, atol=None, rtol=None):
+        kwargs = {}
+        if method is not None:
+            kwargs["method"] = method
+        else:
+            kwargs["method"] = self.method
+        if atol is not None:
+            kwargs["atol"] = atol
+        if rtol is not None:
+            kwargs["rtol"] = rtol
+        return odeint(self.odefunc, x0, t, **kwargs)

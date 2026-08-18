@@ -197,31 +197,10 @@ class LLMPriorProvider:
         Returns:
             A gplearn-compatible program string (e.g., 'add(mul(X0, X1), X2)')
         """
-        # Map feature indices to symbols
-        # feature_names = ['r', '1/r', 'r^2', '1/r^2', 'exp(-r)', 'log(r+1)']
-        # X0 -> r, X1 -> 1/r, etc.
-        sym_map = {}
-        for i, name in enumerate(feature_names):
-            sym_map[i] = sp.Symbol(f"X{i}")
-
-        def _convert_sym(sym):
-            name = str(sym).lower()
-            # Check if it's one of our feature names
-            for i, fn in enumerate(feature_names):
-                if fn.lower() == name:
-                    return sp.Symbol(f"X{i}")
-            # Check if it's a known variable like r, m, etc.
-            if name in ['r', 'r^2', '1/r', 'exp(-r)', 'log(r+1)']:
-                for i, fn in enumerate(feature_names):
-                    if fn.lower() == name:
-                        return sp.Symbol(f"X{i}")
-            # Fall back to the symbol itself
-            return sym
-
         def _expr_to_program(expr) -> str:
             """Recursively convert a SymPy expression to a gplearn program string."""
             if expr.is_Number:
-                return str(expr)
+                return str(float(expr))
             elif expr.is_Symbol:
                 sym_idx = None
                 name = str(expr).lower()
@@ -231,32 +210,35 @@ class LLMPriorProvider:
                         break
                 if sym_idx is not None:
                     return f"X{sym_idx}"
-                return f"X0"
+                # r is the first feature (X0)
+                if name == 'r':
+                    return "X0"
+                return "X0"
             elif expr.func.__name__ == 'Add':
                 args = [_expr_to_program(a) for a in expr.args]
-                return f"add({', '.join(args)})"
+                # Handle subtraction as Add with negative terms
+                result = args[0]
+                for a in args[1:]:
+                    result = f"add({result}, {a})"
+                return result
             elif expr.func.__name__ == 'Mul':
                 args = [_expr_to_program(a) for a in expr.args]
-                return f"mul({', '.join(args)})"
-            elif expr.func.__name__ == 'Sub':
-                args = [_expr_to_program(a) for a in expr.args]
-                return f"sub({', '.join(args)})"
+                result = args[0]
+                for a in args[1:]:
+                    result = f"mul({result}, {a})"
+                return result
             elif expr.func.__name__ == 'Pow':
                 base = _expr_to_program(expr.args[0])
                 exp = _expr_to_program(expr.args[1]) if len(expr.args) > 1 else "1"
                 return f"power({base}, {exp})"
-            elif expr.func.__name__ == 'Div':
-                base = _expr_to_program(expr.args[0])
-                exp = _expr_to_program(expr.args[1]) if len(expr.args) > 1 else "1"
-                return f"div({base}, {exp})"
-            elif expr.func.__name__ == 'Exp':
+            elif expr.func.__name__.lower() == 'exp':
                 return f"exp({_expr_to_program(expr.args[0])})"
-            elif expr.func.__name__ == 'Log':
+            elif expr.func.__name__.lower() == 'log':
                 return f"log({_expr_to_program(expr.args[0])})"
-            elif expr.func.__name__ == 'Sqrt':
+            elif expr.func.__name__.lower() == 'sqrt':
                 return f"sqrt({_expr_to_program(expr.args[0])})"
             else:
-                return f"X0"
+                return "X0"
 
         program_str = _expr_to_program(expr)
         return program_str
@@ -411,6 +393,75 @@ class LLMPriorProvider:
                 expressions.append(expr)
 
         return expressions
+
+    def _expr_to_program_list(self, expr, feature_names, function_map):
+        """
+        Convert a SymPy expression into a gplearn program list
+        (list of _Function objects, ints for feature indices, and floats for constants).
+
+        Args:
+            expr: A SymPy expression
+            feature_names: List of feature name strings (e.g. ['r', '1/r', ...])
+            function_map: Dict mapping function names to _Function objects
+
+        Returns:
+            A list representing the gplearn program
+        """
+        import sympy as sp
+
+        if expr.is_Number:
+            return [float(expr)]
+
+        elif expr.is_Symbol:
+            name = str(expr).lower()
+            sym_idx = None
+            for i, fn in enumerate(feature_names):
+                if fn.lower() == name:
+                    sym_idx = i
+                    break
+            if sym_idx is not None:
+                return [sym_idx]
+            # r is the first feature (X0)
+            if name == 'r':
+                return [0]
+            return [0]
+
+        elif expr.is_Pow:
+            base_prog = self._expr_to_program_list(expr.args[0], feature_names, function_map)
+            exp_val = float(expr.args[1]) if len(expr.args) == 2 else 1.0
+            # Convert x**y to power(x, y)
+            return [function_map['power']] + base_prog + [exp_val]
+
+        elif expr.is_Mul:
+            # Handle Mul by splitting into factors
+            terms = [self._expr_to_program_list(a, feature_names, function_map) for a in expr.args]
+            # Build multiplication tree
+            program = terms[0]
+            for t in terms[1:]:
+                program = [function_map['mul']] + program + t
+            return program
+
+        elif expr.is_Add:
+            terms = [self._expr_to_program_list(t, feature_names, function_map) for t in expr.args]
+            program = terms[0]
+            for t in terms[1:]:
+                program = [function_map['add']] + program + t
+            return program
+
+        elif expr.func.__name__.lower() == 'exp':
+            arg_prog = self._expr_to_program_list(expr.args[0], feature_names, function_map)
+            return [function_map['exp']] + arg_prog
+
+        elif expr.func.__name__.lower() == 'log':
+            arg_prog = self._expr_to_program_list(expr.args[0], feature_names, function_map)
+            return [function_map['log']] + arg_prog
+
+        elif expr.func.__name__.lower() == 'sqrt':
+            arg_prog = self._expr_to_program_list(expr.args[0], feature_names, function_map)
+            return [function_map['sqrt']] + arg_prog
+
+        else:
+            return [0]
 
     def generate_priors_from_llm(
         self, dataset_summary: Dict[str, Any], mode: str = None

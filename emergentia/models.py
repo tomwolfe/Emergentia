@@ -13,9 +13,16 @@ class TrajectoryScaler:
         self.p_scale = 1.0
         self.f_scale = 1.0
 
-    def fit(self, p, f):
-        self.p_scale = max(torch.max(torch.abs(p)).item(), 1e-8)
-        self.f_scale = max(torch.max(torch.abs(f)).item(), 1e-8)
+    def fit(self, p, f, potential=None):
+        # Use potential's default_scale if available, else max position
+        if potential is not None and hasattr(potential, 'default_scale'):
+            self.p_scale = max(potential.default_scale, 1e-8)
+        else:
+            self.p_scale = max(torch.max(torch.abs(p)).item(), 1e-8)
+        # Use 95th percentile of |f| for robust scaling (avoids extreme outliers)
+        f_abs = torch.abs(f).flatten()
+        f_95 = torch.quantile(f_abs.float(), 0.95).item()
+        self.f_scale = max(f_95, 1e-8)
 
     def transform(self, p, f):
         return p / self.p_scale, f / self.f_scale
@@ -26,36 +33,36 @@ class TrajectoryScaler:
     def fit_for_potential(self, p, f, potential):
         """Set scale using potential's default_scale for potential-based training."""
         self.p_scale = max(potential.default_scale, 1e-8)
-        self.f_scale = max(torch.max(torch.abs(f)).item(), 1e-8)
+        f_abs = torch.abs(f).flatten()
+        f_95 = torch.quantile(f_abs.float(), 0.95).item()
+        self.f_scale = max(f_95, 1e-8)
         self.v_scale = max(abs(torch.max(potential.compute_potential(torch.tensor([self.p_scale]))).item()), 1e-8)
 
 
 class DiscoveryNet(nn.Module):
-    def __init__(self, hidden_size=128, n_features=6):
+    def __init__(self, hidden_size=64):
         super().__init__()
-        self.n_features = n_features
-        # The network predicts the Potential V(r)
+        # Basis-free: the network takes the raw pairwise distance r as its only
+        # input and learns the potential V(r) directly. No feature dictionary.
         self.net = nn.Sequential(
-            nn.Linear(n_features, hidden_size),
+            nn.Linear(1, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
             nn.SiLU(),
             nn.Linear(hidden_size, hidden_size),
             nn.SiLU(),
             nn.Linear(hidden_size, 1),
         )
+        # Numerical floor only (prevents 1/r singularities at coincident
+        # particles). No upper bound: clamping to the training-data range would
+        # flatten the learned force outside that range and corrupt distillation.
+        self._dist_min = 1e-4
 
-    def _get_features(self, dist):
-        dist_safe = torch.clamp(dist, min=0.1, max=50.0)
-        return torch.cat(
-            [
-                dist_safe,                  # r
-                1.0 / dist_safe,            # 1/r
-                dist_safe ** 2,             # r^2
-                1.0 / (dist_safe ** 2),     # 1/r^2
-                torch.exp(-dist_safe),      # exp(-r)
-                torch.log(dist_safe + 1.0), # log(r+1)
-            ],
-            dim=-1,
-        )
+    def set_dist_range(self, r_min, r_max):
+        """Retained for API compatibility. Only the lower floor is used."""
+        self._dist_min = max(r_min * 0.1, 1e-6)
 
     def forward(self, pos_scaled):
         # pos_scaled: (batch, n_particles, dim)
@@ -64,9 +71,9 @@ class DiscoveryNet(nn.Module):
         with torch.enable_grad():
             diff = pos_scaled.unsqueeze(2) - pos_scaled.unsqueeze(1)  # (batch, n, n, dim)
             dist = torch.norm(diff, dim=-1, keepdim=True)  # (batch, n, n, 1)
+            dist_safe = torch.clamp(dist, min=self._dist_min)
 
-            feat = self._get_features(dist)  # (batch, n, n, 6)
-            v_pair = self.net(feat)  # (batch, n, n, 1)
+            v_pair = self.net(dist_safe)  # (batch, n, n, 1)
 
             # Mask out self-interaction
             mask = (
@@ -88,20 +95,19 @@ class DiscoveryNet(nn.Module):
 
     def predict_mag(self, r_scaled):
         # r_scaled: (num_points, 1)
-        r_scaled = r_scaled.view(-1, 1)
+        # Force magnitude F(r) = -dV/dr via autograd on the learned potential.
+        r_safe = torch.clamp(r_scaled, min=self._dist_min)
         with torch.enable_grad():
-            r_scaled = r_scaled.clone().requires_grad_(True)
-            feat = self._get_features(r_scaled)
-            v = self.net(feat)
-            # Force magnitude F(r) = -dV/dr
-            dv_dr = torch.autograd.grad(v.sum(), r_scaled, create_graph=True)[0]
+            r_safe = r_safe.clone().requires_grad_(True)
+            v = self.net(r_safe)  # potential values (num_points, 1)
+            dv_dr = torch.autograd.grad(v.sum(), r_safe, create_graph=True)[0]
         return -dv_dr
-    
+
     def forward_potential(self, r_scaled):
         # r_scaled: (num_points, 1)
         # Compute potential energy for scalar distances
-        feat = self._get_features(r_scaled)
-        return self.net(feat)
+        r_safe = torch.clamp(r_scaled, min=self._dist_min)
+        return self.net(r_safe.view(-1, 1))
 
 
 class EnsembleDiscoveryNet(nn.Module):
@@ -110,12 +116,11 @@ class EnsembleDiscoveryNet(nn.Module):
     on force predictions by computing mean and std across members.
     """
     
-    def __init__(self, n_members=5, hidden_size=128, n_features=6):
+    def __init__(self, n_members=3, hidden_size=128):
         super().__init__()
         self.n_members = n_members
-        self.n_features = n_features
         self.members = nn.ModuleList([
-            DiscoveryNet(hidden_size=hidden_size, n_features=n_features)
+            DiscoveryNet(hidden_size=hidden_size)
             for _ in range(n_members)
         ])
     

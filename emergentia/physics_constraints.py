@@ -21,8 +21,9 @@ class ConservativeForceField(nn.Module):
 
     def _pairwise_potential(self, dist):
         """Compute pairwise potentials from distances using the inner network."""
-        feat = self.potential_net._get_features(dist)
-        return self.potential_net.net(feat)
+        dmin = getattr(self.potential_net, '_dist_min', 1e-4)
+        dist_safe = torch.clamp(dist, min=dmin)
+        return self.potential_net.net(dist_safe)
 
     def forward(self, pos):
         if not pos.requires_grad:

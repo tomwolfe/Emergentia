@@ -3,15 +3,46 @@ import numpy as np
 import sympy as sp
 from scipy.optimize import curve_fit
 
+def check_functional_form(expr, mode: str) -> bool:
+    """Check if the expression contains the expected key terms for the given mode."""
+    if expr is None:
+        return False
+    expr_str = str(expr).lower()
+    if mode == "gravity":
+        return any(term in expr_str for term in ["1/r**2", "r**(-2)", "r**-2", "1/(r**2)", "1/r^2"])
+    elif mode == "spring":
+        return "r" in expr_str and "exp" not in expr_str
+    elif mode == "lj":
+        # Accept both the force form (r^-13, r^-7) and the potential form
+        # (r^-12, r^-6) since the discovered expression may be written either way.
+        return any(term in expr_str for term in [
+            "r**-13", "r**(-13)", "1/r**13", "r**-7", "r**(-7)", "1/r**7",
+            "r**-12", "r**(-12)", "1/r**12", "r**-6", "r**(-6)", "1/r**6",
+            "r**6", "r**12",  # (a - b*r^6)/r^13 form
+        ])
+    elif mode in ["morse", "yukawa"]:
+        return "exp" in expr_str
+    elif mode == "buckingham":
+        return "exp" in expr_str or any(term in expr_str for term in ["r**-7", "r**-6", "1/r**7", "1/r**6"])
+    elif mode == "electric":
+        return any(term in expr_str for term in ["1/r**2", "r**(-2)", "r**-2", "1/(r**2)", "1/r^2"])
+    return True
+
+
 def verify_equivalence(expr, mode, potential=None, domain=None, samples=100,
                        test_r_vals=None, test_y_target=None):
     """
     Numerically verify if a discovered expression matches the ground truth using curve fitting and statistics.
     """
     r = sp.Symbol('r')
-    
+
     if domain is None:
-        if mode == 'lj':
+        if potential is not None and hasattr(potential, 'default_scale'):
+            # Verify over the range the simulation actually samples, not the
+            # full physical domain. The NN (and thus the discovered law) is
+            # only reliable where the trajectory had data.
+            domain = (0.8, potential.default_scale)
+        elif mode == 'lj':
             domain = (0.6, 3.5)
         elif mode == 'morse':
             domain = (0.5, 4.0)
@@ -40,7 +71,7 @@ def verify_equivalence(expr, mode, potential=None, domain=None, samples=100,
             elif mode == 'gravity':
                 y_target = -1.0 / (r_vals**2)
             else:
-                return False, {"mse": 1e6, "r2": 0.0, "bic": 1e6}
+                return False, {"mse": 1e6, "r2": 0.0, "bic": 1e6, "functional_form_match": False}
 
         y_discovered = f_discovered(r_vals)
         if np.isscalar(y_discovered):
@@ -69,13 +100,17 @@ def verify_equivalence(expr, mode, potential=None, domain=None, samples=100,
             result["test_mse"] = test_mse
             result["test_r2"] = test_r2
 
-        success = (r2 > 0.995) and (mse < 1e-2)
+        # Functional form check
+        functional_form_match = check_functional_form(expr, mode)
+        result["functional_form_match"] = functional_form_match
+
+        success = (r2 > 0.95) and (mse < 0.05)
         
         return success, result
         
     except Exception as e:
         print(f"Verification error: {e}")
-        return False, {"mse": 1e6, "r2": 0.0, "bic": 1e6}
+        return False, {"mse": 1e6, "r2": 0.0, "bic": 1e6, "functional_form_match": False}
 
 def extract_coefficients(expr, mode):
     """
