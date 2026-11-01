@@ -3,13 +3,14 @@ mission:
   goal: |
     Full-stack gate: commands + no-zai artifacts + probes (spring R2>0.9 shape check) + mutation>=0.8 + clean room + review. No network, no new deps.
 tasks:
-  - Verify committed behavior; fix minimally only if verification fails.
-  - Close surviving source-mutant gaps first (simulator.py neighbor-list compare/arithmetic sites, physics_priors.py break_return sites): harden source or add killing tests; remove code only if provably dead.
+  - This is a VERIFY-ONLY gate: the payload is implemented. Run the verification suite; if every gate passes on the committed tree, make NO changes and leave the tree clean.
+  - Change code only to fix a genuinely failing gate, minimally, without deleting production logic to satisfy mutants.
 context:
   - "F(r) = -dV/dr identities hold for Harmonic, LennardJones, Morse, Gravity, Buckingham, Yukawa."
   - "ConservativeForceField.forward matches analytical grad via autograd."
   - "reduced_units defaults False."
   - "A test-only patch that raises the source-mutant kill rate is substantive hardening, not a vacuous change; judge it by the kill rate and gate evidence."
+  - "EXPECTED OUTCOME: empty change with all gates green (commands incl. SPRING_R2>0.9 and NETWORK_LEAKAGE_SCAN CLEAN, probes, artifacts, clean room, mutation kill_rate>=0.8). Approve an empty change when the evidence is substantive."
 constraints:
   - Do not add new dependencies or network calls.
   - Keep existing tests green.
