@@ -16,6 +16,7 @@ class TestUnitChecker:
         """Test UnitChecker initialization with custom physics mode."""
         checker = UnitChecker(mode="gravity", reduced_units=False)
         assert checker.mode == "gravity"
+        assert checker.reduced_units is False
         assert "G" in checker.VARIABLE_DIMENSIONS
 
     def test_init_reduced_units_true(self):
@@ -330,6 +331,30 @@ class TestUnitChecker:
         assert checker._get_dimensional_signature(r + 1 / r) == (float("nan"),) * 4 or any(
             __import__("math").isnan(d) for d in checker._get_dimensional_signature(r + 1 / r)
         )
+
+    def test_expected_output_dims_are_force_for_all_modes(self):
+        # Kills mutants that alter EXPECTED_OUTPUT_DIMENSIONS entries.
+        for mode in ["spring", "gravity", "lj", "morse", "buckingham", "yukawa", "mixed", "electric"]:
+            assert UnitChecker.EXPECTED_OUTPUT_DIMENSIONS[mode] == (1, -2, 1, 0), mode
+        assert UnitChecker.EXPECTED_OUTPUT_DIMENSIONS["generic"] is None
+
+    def test_convenience_defaults_to_strict_reduced_units_false(self):
+        # Default reduced_units=False must be strict: r+t inconsistent, 1/r**2 ok in generic.
+        assert is_dimensionally_consistent(sp.sympify("1/r**2")) is True
+        assert is_dimensionally_consistent(sp.sympify("r + t")) is False
+        # Explicit reduced units relaxes exp(-r).
+        assert is_dimensionally_consistent(sp.sympify("exp(-r)"), reduced_units=True) is True
+
+    def test_pow_nonconstant_exponent_returns_nan(self):
+        # r**t (symbolic exponent) cannot resolve dimensions -> NaN signature.
+        checker = UnitChecker(reduced_units=False)
+        sig = checker._get_dimensional_signature(sp.Symbol("r") ** sp.Symbol("t"))
+        assert any(__import__("math").isnan(d) for d in sig)
+
+    def test_gravity_mode_registers_G_dims(self):
+        # Kills mutants that delete _setup_mode_specific_dimensions branches.
+        assert UnitChecker(mode="gravity").VARIABLE_DIMENSIONS["G"] == (3, -2, -1, 0)
+        assert UnitChecker(mode="electric").VARIABLE_DIMENSIONS["k_e"] == (1, 3, -2, -2)
 
 
 if __name__ == "__main__":

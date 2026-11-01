@@ -31,6 +31,7 @@ def test_conservative_field_matches_grad():
     net = V()
     field = ConservativeForceField(net)
     pos = torch.randn(2, 3, 2, requires_grad=False)
+    assert pos.requires_grad is False
     f = field(pos)
     assert f.shape == pos.shape
 
@@ -87,3 +88,61 @@ def test_torch_force_matches_neg_dVdr_all_potentials():
         assert torch.allclose(got, expected, atol=1e-4), (
             f"{type(pot).__name__}: F != -dV/dr: {got.tolist()} vs {expected.tolist()}"
         )
+
+
+def test_potential_scales_and_dt_exact():
+    # Exact scale/dt values kill constant mutants in simulator.py.
+    from emergentia.simulator import (
+        LennardJonesPotential, MorsePotential, GravityPotential,
+        BuckinghamPotential, YukawaPotential, CompositePotential,
+    )
+    assert HarmonicPotential().default_scale == 2.0
+    assert HarmonicPotential().dt == 0.01
+    assert LennardJonesPotential().default_scale == 3.5
+    assert LennardJonesPotential().dt == 0.001
+    assert MorsePotential().default_scale == 3.0
+    assert MorsePotential().dt == 0.005
+    assert GravityPotential().default_scale == 5.0
+    assert GravityPotential().dt == 0.01
+    assert BuckinghamPotential().default_scale == 3.0
+    assert BuckinghamPotential().dt == 0.001
+    assert YukawaPotential().default_scale == 4.0
+    assert YukawaPotential().dt == 0.005
+    comp = CompositePotential([HarmonicPotential(), GravityPotential()])
+    assert comp.default_scale == 5.0
+    assert comp.dt == 0.01
+
+
+def test_force_spot_values_kill_coefficient_mutants():
+    from emergentia.simulator import (
+        LennardJonesPotential, MorsePotential, GravityPotential,
+        BuckinghamPotential, YukawaPotential, CompositePotential,
+    )
+    # Harmonic: F = -k*(r-r0), k=10, r0=1
+    h = HarmonicPotential(k=10.0, r0=1.0)
+    assert float(h.compute_force_magnitude(torch.tensor([[1.0]])).view(-1)[0]) == 0.0
+    assert float(h.compute_force_magnitude(torch.tensor([[2.0]])).view(-1)[0]) == -10.0
+    # Gravity: F = -G/r^2
+    g = GravityPotential(G=1.0)
+    assert abs(float(g.compute_force_magnitude(torch.tensor([2.0])).view(-1)[0]) + 0.25) < 1e-6
+    # LJ at r=1 (unclamped interior): 48 - 24 = 24
+    lj = LennardJonesPotential(epsilon=1.0, sigma=1.0)
+    assert abs(float(lj.compute_force_magnitude(torch.tensor([1.0])).view(-1)[0]) - 24.0) < 1e-4
+    # Morse at r=re: F = 0
+    m = MorsePotential(De=1.0, a=1.0, re=1.0)
+    assert abs(float(m.compute_force_magnitude(torch.tensor([1.0])).view(-1)[0])) < 1e-6
+    # Buckingham / Yukawa spot values vs closed form (kills A*B / 6*C mutants)
+    import math
+    b = BuckinghamPotential(A=10.0, B=1.0, C=1.0)
+    r = 1.0
+    expect_b = 10.0 * math.exp(-r) - 6.0 * r**-7
+    assert abs(float(b.compute_force_magnitude(torch.tensor([r])).view(-1)[0]) - expect_b) < 1e-4
+    y = YukawaPotential(A=1.0, B=1.0)
+    expect_y = math.exp(-r) * (1.0 / r + 1.0 / r**2)
+    assert abs(float(y.compute_force_magnitude(torch.tensor([r])).view(-1)[0]) - expect_y) < 1e-4
+    # Composite sums components
+    comp = CompositePotential([HarmonicPotential(k=10.0, r0=1.0), GravityPotential(G=1.0)])
+    rr = torch.tensor([2.0])
+    expect_c = float(HarmonicPotential(k=10.0, r0=1.0).compute_force_magnitude(rr).view(-1)[0]) + float(
+        GravityPotential(G=1.0).compute_force_magnitude(rr).view(-1)[0])
+    assert abs(float(comp.compute_force_magnitude(rr).view(-1)[0]) - expect_c) < 1e-6

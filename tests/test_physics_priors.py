@@ -133,3 +133,47 @@ def test_to_gplearn_exp_log_sqrt_and_unknown_func():
     assert provider.to_gplearn_program(sp.log(r + 1), ["r"]).startswith("log(")
     assert provider.to_gplearn_program(sp.Function("sqrt")(r), ["r"]) == "sqrt(X0)"
     assert provider.to_gplearn_program(sp.sin(r), ["r"]) == "X0"
+
+
+def test_prior_counts_exact_per_mode():
+    # Exact per-mode counts kill mutants that add/remove suggested forms.
+    # Note: some raw strings (e.g. "exp(-2r)", "combination of terms") fail
+    # sympy parsing and are filtered, so counts are post-parse lengths.
+    provider = PhysicsPriorProvider()
+    expected = {
+        "gravity": 8,
+        "lj": 7,
+        "morse": 4,
+        "spring": 5,
+        "buckingham": 4,
+        "yukawa": 4,
+        "electric": 4,
+        "mixed": 1,
+    }
+    for mode, count in expected.items():
+        assert len(provider.generate_priors(mode)) == count, mode
+
+
+def test_generate_priors_falsy_max_candidates_falls_back_to_default():
+    # `n = max_candidates or self.max_candidates`: falsy override must use default.
+    provider = PhysicsPriorProvider()
+    assert len(provider.generate_priors("spring", max_candidates=0)) == 5
+    assert len(provider.generate_priors("spring", max_candidates=None)) == 5
+
+
+def test_generate_priors_from_llm_dataset_summary_mode():
+    provider = PhysicsPriorProvider()
+    # Explicit mode wins over dataset summary.
+    assert provider.generate_priors_from_llm(dataset_summary={"mode": "gravity"}, mode="spring") == provider.generate_priors("spring")
+    # Falsy mode falls back to dataset summary.
+    assert provider.generate_priors_from_llm(dataset_summary={"mode": "spring"}, mode=None) == provider.generate_priors("spring")
+
+
+def test_to_gplearn_program_exact_strings():
+    # Exact strings kill operator/format mutants in to_gplearn_program.
+    provider = PhysicsPriorProvider()
+    r = sp.Symbol("r")
+    assert provider.to_gplearn_program(r + 1, ["r"]) == "add(1.0, X0)"
+    assert provider.to_gplearn_program(2 * r, ["r"]) == "mul(2.0, X0)"
+    assert provider.to_gplearn_program(r**2, ["r"]) == "power(X0, 2.0)"
+    assert provider.to_gplearn_program(sp.exp(-r), ["r"]) == "exp(mul(-1.0, X0))"

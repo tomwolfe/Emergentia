@@ -236,11 +236,6 @@ class PhysicsSim:
         diff = pos.unsqueeze(1) - pos.unsqueeze(0)
         dist = torch.norm(diff, dim=-1, keepdim=True)
         dist_clip = torch.clamp(dist, min=1e-6)
-        
-        # Validation check for numerical instability
-        if torch.any(dist + torch.eye(self.n, device=self.device).unsqueeze(-1) * 10.0 < 0.1):
-            # We don't want to print every step in a compiled function, but this is a raw fallback
-            pass
 
         f_mag = self.potential.compute_force_magnitude(dist)
             
