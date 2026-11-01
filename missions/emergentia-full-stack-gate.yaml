@@ -16,6 +16,8 @@ constraints:
 verification:
   commands:
     - python -m pytest tests/test_no_zai_leakage.py tests/test_physics_priors.py tests/test_registry_consistency.py tests/test_unit_checker.py tests/test_conservative_grad.py -v
+    - python3 -c "import sympy as sp; from emergentia.simulator import HarmonicPotential; from emergentia.utils import verify_equivalence; ok, m = verify_equivalence(-10*(sp.Symbol('r')-1), 'spring', potential=HarmonicPotential()); print('SPRING_R2:', m.get('r2'), 'SUCCESS:', ok); assert ok and m.get('r2', 0) > 0.9"
+    - python3 -c "import pathlib, re; pats = ['zai', 'glm-4', 'ZAI_API', 'socket', 'requests', 'urllib', 'http.client', 'xmlrpc']; bad = [(str(p), i, l.strip()) for p in list(pathlib.Path('emergentia').rglob('*.py')) + [pathlib.Path('run_benchmarks.py')] for i, l in enumerate(p.read_text().splitlines(), 1) for pat in pats if re.search(pat, l, re.I)]; print('NETWORK_LEAKAGE_SCAN:', 'CLEAN' if not bad else bad); assert not bad"
   probes:
     - command: 'python3 -c "from emergentia.physics_priors import PhysicsPriorProvider; print(len(PhysicsPriorProvider().generate_priors(''spring'')))"'
       contains: "5"
