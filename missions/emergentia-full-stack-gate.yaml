@@ -4,6 +4,7 @@ mission:
     Full-stack gate: commands + no-zai artifacts + probes (spring R2>0.9 shape check) + mutation>=0.8 + clean room + review. No network, no new deps.
 tasks:
   - Verify committed behavior; fix minimally only if verification fails.
+  - Close surviving source-mutant gaps first (simulator.py neighbor-list compare/arithmetic sites, physics_priors.py break_return sites): harden source or add killing tests; remove code only if provably dead.
 context:
   - "F(r) = -dV/dr identities hold for Harmonic, LennardJones, Morse, Gravity, Buckingham, Yukawa."
   - "ConservativeForceField.forward matches analytical grad via autograd."
