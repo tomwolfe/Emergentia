@@ -14,10 +14,12 @@ constraints:
   - Never edit outside allowed_paths; sandbox enforce.
 verification:
   commands:
-    - python -m pytest tests/test_physics_priors.py tests/test_registry_consistency.py tests/test_unit_checker.py -v
+    - python -m pytest tests/test_no_zai_leakage.py tests/test_physics_priors.py tests/test_registry_consistency.py tests/test_unit_checker.py tests/test_conservative_grad.py -vcker.py -v
   probes:
     - command: 'python3 -c "from emergentia.physics_priors import PhysicsPriorProvider; print(len(PhysicsPriorProvider().generate_priors(''spring'')))"'
       contains: "5"
+    - command: 'python3 -c "import sympy as sp; from emergentia.simulator import HarmonicPotential; from emergentia.utils import verify_equivalence; ok, m = verify_equivalence(-10*(sp.Symbol(''r'')-1), ''spring'', potential=HarmonicPotential()); print(''spring analytic R2:'', m.get(''r2''), ''success:'', ok)"'
+      contains: "spring analytic R2: 0.99"
   artifacts:
     - "emergentia/physics_priors.py"
     - "emergentia/engine.py"

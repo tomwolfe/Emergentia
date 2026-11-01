@@ -279,6 +279,42 @@ class TestUnitChecker:
         L, T, M, Q = checker._get_dimensional_signature(expr)
         assert abs(L - 3.0) < 0.01
 
+    def test_sqrt_halves_dimensions(self):
+        checker = UnitChecker()
+        assert checker._get_dimensional_signature(sp.sqrt(sp.Symbol("r"))) == (0.5, 0.0, 0.0, 0.0)
+
+    def test_explicit_sqrt_function_halves_dimensions(self):
+        checker = UnitChecker()
+        expr = sp.Function("sqrt")(sp.Symbol("r"))
+        assert checker._get_dimensional_signature(expr) == (0.5, 0.0, 0.0, 0.0)
+
+    def test_consistent_metric_is_one(self):
+        ok, metric, _, _ = UnitChecker().check_consistency(sp.sympify("1/r**2"))
+        assert ok and metric == 1.0
+
+    def test_mismatch_metric_is_point_three(self):
+        ok, metric, _, _ = UnitChecker(mode="spring").check_consistency(sp.sympify("1/r**2"))
+        assert not ok and metric == 0.3
+
+    def test_signature_is_valid_roundtrip(self):
+        sig = UnitChecker.DimensionalSignature()
+        assert sig.is_valid()
+        sig.dimensions["L"] = 0.123456789
+        assert not sig.is_valid()
+
+    def test_fallback_signature_is_zero(self):
+        checker = UnitChecker()
+        r = sp.Symbol("r")
+        assert checker._get_dimensional_signature(sp.Derivative(r**2, r, evaluate=False)) == (0.0, 0.0, 0.0, 0.0)
+
+    def test_validate_expression_keeps_reduced_units(self):
+        checker = UnitChecker(reduced_units=True)
+        assert checker.validate_expression(sp.sympify("exp(-r)*r"))["is_valid"]
+
+    def test_reduced_units_rejects_nan(self):
+        ok, _, _, _ = UnitChecker(reduced_units=True).check_consistency(sp.nan)
+        assert not ok
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

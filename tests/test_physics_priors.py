@@ -60,5 +60,41 @@ def test_generate_priors_caching():
     assert result1 is result2 or result1 == result2
 
 
+def test_alias_matches_generate_priors():
+    provider = PhysicsPriorProvider()
+    assert provider.generate_priors_from_llm(mode="spring") == provider.generate_priors("spring")
+    assert len(provider.generate_priors_from_llm(mode="spring")) >= 1
+
+
+def test_to_gplearn_unknown_symbol_maps_X0():
+    provider = PhysicsPriorProvider()
+    assert provider.to_gplearn_program(sp.Symbol("r"), ["r"]) == "X0"
+    assert provider.to_gplearn_program(sp.Symbol("q"), ["r"]) == "X0"
+
+
+def test_modes_are_mode_specific():
+    provider = PhysicsPriorProvider()
+    spring = [str(e) for e in provider.generate_priors("spring")]
+    gravity = [str(e) for e in provider.generate_priors("gravity")]
+    assert spring != gravity
+
+
+def test_spring_prior_count_is_five():
+    provider = PhysicsPriorProvider()
+    assert len(provider.generate_priors("spring")) == 5
+
+
+def test_lazy_package_exports_resolve():
+    import emergentia
+
+    assert emergentia.PhysicsPriorProvider is PhysicsPriorProvider
+    from emergentia.unit_checker import UnitChecker as DirectChecker
+
+    assert emergentia.UnitChecker is DirectChecker
+    assert callable(emergentia.is_dimensionally_consistent)
+    with pytest.raises(AttributeError):
+        emergentia.__getattr__("__nonexistent_attr__")
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
