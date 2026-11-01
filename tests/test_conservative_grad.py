@@ -70,3 +70,20 @@ def test_conservative_field_sign_is_neg_grad():
     f = field(pos)
     assert float(f[0, 0, 0].detach()) > 0, "attractive V=r must pull pos0 +x"
     assert float(f[0, 1, 0].detach()) < 0, "attractive V=r must pull pos1 -x"
+
+
+def test_torch_force_matches_neg_dVdr_all_potentials():
+    """Torch identity: compute_force_magnitude == -dV/dr via autograd."""
+    pots = [
+        HarmonicPotential(), LennardJonesPotential(), MorsePotential(),
+        GravityPotential(), BuckinghamPotential(), YukawaPotential(),
+    ]
+    for pot in pots:
+        rg = torch.tensor([0.8, 1.0, 1.5, 2.0], requires_grad=True)
+        Vg = pot.compute_potential(rg)
+        Vg.sum().backward()
+        expected = -rg.grad
+        got = pot.compute_force_magnitude(rg.detach())
+        assert torch.allclose(got, expected, atol=1e-4), (
+            f"{type(pot).__name__}: F != -dV/dr: {got.tolist()} vs {expected.tolist()}"
+        )

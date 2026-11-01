@@ -41,5 +41,13 @@ def test_registry_consistency():
         np.testing.assert_allclose(np_out, sp_out, atol=tolerance, rtol=tolerance, 
                                    err_msg=f"NumPy vs SymPy inconsistency for basis '{name}'")
 
-if __name__ == "__main__":
-    test_registry_consistency()
+def test_registry_unknown_basis_raises():
+    with pytest.raises(ValueError):
+        PhysicalBasisRegistry.get("no_such_basis", backend="torch")
+
+
+def test_registry_get_registry_complete():
+    reg = PhysicalBasisRegistry.get_registry(backend="torch")
+    assert set(reg.keys()) == set(PhysicalBasisRegistry.list_basis())
+    assert len(reg) > 0
+    assert all(callable(v) for v in reg.values())

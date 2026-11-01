@@ -110,5 +110,26 @@ def test_spring_prior_respects_max_candidates():
     assert len(provider.generate_priors("spring", max_candidates=10)) == 5
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+def test_get_mode_priors_unknown_mode_fallback():
+    provider = PhysicsPriorProvider()
+    info = provider.get_mode_priors("no_such_mode_xyz")
+    assert "Generic force mode no_such_mode_xyz" in info["description"]
+    assert "expected_terms" in info and "suggested_functional_forms" in info
+    priors = provider.generate_priors("no_such_mode_xyz")
+    assert len(priors) >= 1
+    assert all(isinstance(e, sp.Expr) for e in priors)
+
+
+def test_parse_invalid_returns_none():
+    provider = PhysicsPriorProvider()
+    assert provider._parse("(((") is None
+    assert provider._parse("1/r^2 +* ??? [[[") is None
+
+
+def test_to_gplearn_exp_log_sqrt_and_unknown_func():
+    provider = PhysicsPriorProvider()
+    r = sp.Symbol("r")
+    assert provider.to_gplearn_program(sp.exp(-r), ["r"]).startswith("exp(")
+    assert provider.to_gplearn_program(sp.log(r + 1), ["r"]).startswith("log(")
+    assert provider.to_gplearn_program(sp.Function("sqrt")(r), ["r"]) == "sqrt(X0)"
+    assert provider.to_gplearn_program(sp.sin(r), ["r"]) == "X0"

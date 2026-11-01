@@ -8,27 +8,27 @@ context:
   - "F(r) = -dV/dr identities hold for Harmonic, LennardJones, Morse, Gravity, Buckingham, Yukawa."
   - "ConservativeForceField.forward matches analytical grad via autograd."
   - "reduced_units defaults False."
+  - "A test-only patch that raises the source-mutant kill rate is substantive hardening, not a vacuous change; judge it by the kill rate and gate evidence."
 constraints:
   - Do not add new dependencies or network calls.
   - Keep existing tests green.
   - Never edit outside allowed_paths; sandbox enforce.
 verification:
   commands:
-    - python -m pytest tests/test_no_zai_leakage.py tests/test_physics_priors.py tests/test_registry_consistency.py tests/test_unit_checker.py tests/test_conservative_grad.py -vcker.py -v
+    - python -m pytest tests/test_no_zai_leakage.py tests/test_physics_priors.py tests/test_registry_consistency.py tests/test_unit_checker.py tests/test_conservative_grad.py -v
   probes:
     - command: 'python3 -c "from emergentia.physics_priors import PhysicsPriorProvider; print(len(PhysicsPriorProvider().generate_priors(''spring'')))"'
       contains: "5"
     - command: 'python3 -c "import sympy as sp; from emergentia.simulator import HarmonicPotential; from emergentia.utils import verify_equivalence; ok, m = verify_equivalence(-10*(sp.Symbol(''r'')-1), ''spring'', potential=HarmonicPotential()); print(''spring analytic R2:'', m.get(''r2''), ''success:'', ok)"'
       contains: "spring analytic R2: 0.99"
+    - command: "grep -R -icE 'zai' emergentia/ run_benchmarks.py README.md 2>/dev/null || echo NO_LEAKAGE"
+      contains: "NO_LEAKAGE"
   artifacts:
     - "emergentia/physics_priors.py"
     - "emergentia/engine.py"
   assertions:
     - path: "emergentia/physics_priors.py"
       contains: "PhysicsPriorProvider"
-  probes:
-    - command: "grep -R -icE 'zai' emergentia/ run_benchmarks.py README.md 2>/dev/null || echo NO_LEAKAGE"
-      contains: "NO_LEAKAGE"
   clean_room: true
   mutation:
     enabled: true

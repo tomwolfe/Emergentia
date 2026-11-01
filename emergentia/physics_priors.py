@@ -115,7 +115,7 @@ class PhysicsPriorProvider:
             return None
 
     def generate_priors(self, mode: str, max_candidates: int = None) -> List[sp.Expr]:
-        n = max_candidates and self.max_candidates
+        n = max_candidates or self.max_candidates
         info = self.get_mode_priors(mode)
         out = []
         for s in info.get("suggested_functional_forms", [])[:n]:
