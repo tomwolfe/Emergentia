@@ -1,11 +1,11 @@
 import pytest
 import sympy as sp
-from emergentia.physics_priors import PhysicsPriorProvider as LLMPriorProvider
+from emergentia.physics_priors import PhysicsPriorProvider as PhysicsPriorProvider
 
 
 def test_generate_priors_fallback_returns_expressions():
     """Test that generate_priors works locally."""
-    provider = LLMPriorProvider()
+    provider = PhysicsPriorProvider()
     result = provider.generate_priors("gravity")
 
     assert len(result) >= 1, "Fallback path should return at least 1 expression"
@@ -15,7 +15,7 @@ def test_generate_priors_fallback_returns_expressions():
 
 def test_no_nan_or_zoo_in_priors():
     """Test that no expression in the result contains nan or zoo."""
-    provider = LLMPriorProvider()
+    provider = PhysicsPriorProvider()
     result = provider.generate_priors("gravity")
 
     for expr in result:
@@ -25,7 +25,7 @@ def test_no_nan_or_zoo_in_priors():
 
 def test_generate_priors_all_modes():
     """Test fallback path for all known physics modes."""
-    provider = LLMPriorProvider()
+    provider = PhysicsPriorProvider()
     modes = ["spring", "gravity", "lj", "morse", "buckingham", "yukawa", "electric"]
 
     for mode in modes:
@@ -39,7 +39,7 @@ def test_generate_priors_all_modes():
 
 def test_get_mode_priors():
     """Test that get_mode_priors returns expected structure."""
-    provider = LLMPriorProvider()
+    provider = PhysicsPriorProvider()
     gravity_priors = provider.get_mode_priors("gravity")
 
     assert "description" in gravity_priors
@@ -50,7 +50,7 @@ def test_get_mode_priors():
 
 def test_generate_priors_caching():
     """Test that priors are cached."""
-    provider = LLMPriorProvider()
+    provider = PhysicsPriorProvider()
     summary = {"mode": "spring"}
 
     result1 = provider.generate_priors("spring")

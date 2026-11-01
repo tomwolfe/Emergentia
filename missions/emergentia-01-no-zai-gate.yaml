@@ -12,6 +12,7 @@ constraints:
   - Keep existing tests green.
 verification:
   commands:
+    - python -m pytest tests/test_no_zai_leakage.py -v
     - python -m pytest tests/test_physics_priors.py tests/test_registry_consistency.py -v
   artifacts:
     - "emergentia/physics_priors.py"
