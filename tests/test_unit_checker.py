@@ -10,7 +10,7 @@ class TestUnitChecker:
         checker = UnitChecker()
         assert checker.mode == "generic"
         assert checker.VARIABLE_DIMENSIONS is not None
-        assert checker.reduced_units is True
+        assert checker.reduced_units is False
 
     def test_init_custom_mode(self):
         """Test UnitChecker initialization with custom physics mode."""
@@ -20,7 +20,7 @@ class TestUnitChecker:
 
     def test_init_reduced_units_true(self):
         """Test that reduced_units=True makes all atoms dimensionless."""
-        checker = UnitChecker()
+        checker = UnitChecker(reduced_units=True)
         assert checker.reduced_units is True
         # r should be dimensionless in reduced units
         L, T, M, Q = checker._get_dimensional_signature(sp.Symbol("r"))
@@ -110,7 +110,7 @@ class TestUnitChecker:
 
     def test_check_consistency_reduced_units_exp_r(self):
         """Test that exp(-r) is consistent in reduced_units mode (r is dimensionless)."""
-        checker = UnitChecker(mode="morse")  # reduced_units=True by default
+        checker = UnitChecker(mode="morse", reduced_units=True)
         expr = sp.sympify("exp(-r) * r")
         is_consistent, metric, signature, message = checker.check_consistency(expr)
         # In reduced units, r is dimensionless, so exp(-r) is valid
@@ -169,7 +169,7 @@ class TestUnitChecker:
 
     def test_unit_checker_consistency_with_morse(self):
         """Test Unit-Checker with Morse in reduced_units mode (should be consistent)."""
-        checker = UnitChecker(mode="morse")  # reduced_units=True by default
+        checker = UnitChecker(mode="morse", reduced_units=True)
 
         # Morse potential derivative: exp(-r) * r
         # In reduced units, r is dimensionless, so exp(-r) is valid
@@ -181,7 +181,7 @@ class TestUnitChecker:
 
     def test_unit_checker_consistency_with_gravity(self):
         """Test Unit-Checker with gravity."""
-        checker = UnitChecker(mode="gravity")
+        checker = UnitChecker(mode="gravity", reduced_units=True)
 
         # Gravitational force: F = G*m*m/r^2
         expr = sp.sympify("G * m * m / r**2")
@@ -229,7 +229,7 @@ class TestUnitChecker:
 
     def test_unit_checker_with_complex_expressions(self):
         """Test Unit-Checker with complex nested expressions in reduced_units mode."""
-        checker = UnitChecker(mode="yukawa")  # reduced_units=True by default
+        checker = UnitChecker(mode="yukawa", reduced_units=True)
 
         # Yukawa potential: exp(-r)/r
         # In reduced units, r is dimensionless, so exp(-r) is valid

@@ -1,0 +1,45 @@
+{
+  "default_adapter": "opencode",
+  "audit_dir": ".tether/sessions",
+  "backup_dir": ".tether/backups",
+  "dry_run": false,
+  "log_level": "INFO",
+  "command_timeout_seconds": 3600,
+  "verification_timeout_seconds": 1800,
+  "max_attempts": 3,
+  "allow_dirty": false,
+  "auto_rollback": false,
+  "redact_prompts": false,
+  "secret_denylist": [],
+  "secret_allowlist": [],
+  "sandbox_mode": "enforce",
+  "writer_lock_stale_seconds": 43200,
+  "retention_days": null,
+  "adapters": {
+    "opencode": {
+      "command": [
+        "python3",
+        "../tether/scripts/opencode_tty.py",
+        "opencode-go/muse-spark-1.3-contributor",
+        "{prompt}"
+      ]
+    }
+  },
+  "verification": {
+    "commands": [
+      "python -m pytest tests/ -v"
+    ],
+    "timeout_seconds": null,
+    "artifacts": null,
+    "assertions": null,
+    "probes": null,
+    "mutation": null,
+    "clean_room": null,
+    "clean_room_copy": null,
+    "auto_probes": null
+  },
+  "retries": {
+    "max_transient_retries": 2,
+    "transient_backoff_seconds": 10
+  }
+}

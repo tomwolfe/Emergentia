@@ -1,0 +1,24 @@
+{
+  "session_id": "2b6fc4d471f4",
+  "mission_name": "emergentia-01-no-zai-gate",
+  "adapter": "opencode",
+  "status": "failed",
+  "started_at": "2026-11-01T20:34:33+00:00",
+  "finished_at": "2026-11-01T20:34:33+00:00",
+  "verification_results": [],
+  "recovery_attempts": [],
+  "changed_files": [],
+  "checkpoint_info": {
+    "created": false,
+    "is_git_repo": true,
+    "original_head": "587340c052db9a641faad110336361bfc893f501",
+    "ref": null,
+    "dirty": true,
+    "warning": "Working tree is dirty. Refusing to proceed without --allow-dirty. Uncommitted changes cannot be restored by rollback."
+  },
+  "plan": "",
+  "next_steps": [
+    "Working tree is dirty; refusing to start the agent. Commit or stash your changes in /Users/tom/Documents/apps/Emergentia, or re-run with --allow-dirty."
+  ],
+  "audit_dir": "/Users/tom/Documents/apps/Emergentia/.tether/sessions/20261101-133433-emergentia-01-no-zai-gate-2b6fc4d4"
+}

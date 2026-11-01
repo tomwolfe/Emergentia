@@ -31,7 +31,7 @@ def run_trial(mode, potential, noise_std, trial_idx, dim=2):
     sim = PhysicsSim(n=3, dim=dim, potential=potential, seed=seed, device=device)
     pipeline = DiscoveryPipeline(
         mode=mode, potential=potential, device=device, seed=seed,
-        enable_llm_priors=True  # Enable LLM priors as required by mission contract
+        enable_physics_priors=True
     )
 
     start_time = time.perf_counter()
@@ -55,7 +55,7 @@ def run_trial(mode, potential, noise_std, trial_idx, dim=2):
             f.write(f"Mode: {mode}\n")
             f.write(f"Dimension: {dim}\n")
             f.write(f"Noise Std: {noise_std}\n")
-            f.write(f"LLM Seeds Used: {result.get('llm_priors_enabled', False)}\n")
+            f.write(f"Physics Seeds Used: {result.get('physics_priors_enabled', False)}\n")
             f.write(f"Raw Formula: {result.get('raw_formula')}\n")
             f.write(f"Refined Formula: {result.get('formula')}\n")
             f.write(f"Success: {result.get('success')}\n")

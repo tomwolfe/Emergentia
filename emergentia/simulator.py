@@ -76,7 +76,7 @@ class MorsePotential(Potential):
         diff = dist - self.re
         exp_neg_a = torch.exp(-self.a * diff)
         exp_neg_2a = torch.exp(-2.0 * self.a * diff)
-        return 2.0 * self.De * self.a * (exp_neg_a - exp_neg_2a)
+        return -2.0 * self.De * self.a * (exp_neg_a - exp_neg_2a)
 
     def compute_potential(self, dist):
         # V(r) = De * (1 - exp(-a(r-re)))^2

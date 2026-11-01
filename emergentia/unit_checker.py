@@ -127,7 +127,7 @@ class UnitChecker:
         "generic": None,  # skip output check
     }
 
-    def __init__(self, mode: str = "generic", reduced_units: bool = True):
+    def __init__(self, mode: str = "generic", reduced_units: bool = False):
         self.mode = mode
         self.reduced_units = reduced_units
         self._setup_mode_specific_dimensions()
@@ -419,7 +419,7 @@ class UnitChecker:
         return valid_candidates
 
 
-def is_dimensionally_consistent(expr: sp.Expr, mode: str = None, reduced_units: bool = True) -> bool:
+def is_dimensionally_consistent(expr: sp.Expr, mode: str = None, reduced_units: bool = False) -> bool:
     """Convenience function to check if an expression is dimensionally consistent."""
     checker = UnitChecker(mode=mode, reduced_units=reduced_units)
     is_consistent, _, _, _ = checker.check_consistency(expr)

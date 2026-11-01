@@ -2,7 +2,7 @@ from .simulator import PhysicsSim
 from .engine import DiscoveryPipeline
 from .models import DiscoveryNet, TrajectoryScaler
 from .unit_checker import UnitChecker, is_dimensionally_consistent
-from .llm_priors import LLMPriorProvider, ZaiClient
+from .physics_priors import PhysicsPriorProvider
 from .preprocessing import AutoSmoother, TrajectorySmoother, GaussianSmoother
 
 __all__ = [
@@ -12,8 +12,7 @@ __all__ = [
     "TrajectoryScaler",
     "UnitChecker",
     "is_dimensionally_consistent",
-    "LLMPriorProvider",
-    "ZaiClient",
+    "PhysicsPriorProvider",
     "AutoSmoother",
     "TrajectorySmoother",
     "GaussianSmoother",

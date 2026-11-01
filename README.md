@@ -15,7 +15,7 @@
 * **🧪 Comprehensive Testing:** A full suite of unit and integration tests verify physics integrity, scaling logic, registry consistency, and discovery robustness.
 * **🔄 Differentiable Simulation (Experimental):** An experimental `DifferentiableDiscoveryPipeline` integrates `torchdiffeq` to train the neural network by matching simulated particle trajectories directly, enforcing energy conservation by design.
 * **🌐 Consistent Multi-Backend Registry:** A centralized `PhysicalBasisRegistry` ensures identical definitions for physical functions (`1/r`, `exp(-r)`, etc.) across NumPy, PyTorch, and SymPy backends.
-* **🤖 LLM-Powered Priors (Optional):** Integrates with the Z.AI SDK to leverage the GLM-4.7-flash model for generating physics-informed symbolic expressions as priors for the symbolic regression engine, enhancing discovery accuracy.
+* **⚛️ Local Physics Priors:** Pure-local `PhysicsPriorProvider` generates physics-informed symbolic expressions as priors for the symbolic regression engine. No network calls, no API keys, no extra dependencies.
 
 ---
 ## 🚀 Performance Benchmarks
@@ -35,42 +35,14 @@ Emergentia achieves high-fidelity results across multiple physical regimes. Benc
 ## 🛠 Installation
 Emergentia requires **Python 3.9+**. Install the core dependencies via pip:
 ```bash
-pip install torch numpy sympy gplearn pandas scipy pytest zai-sdk==0.1.0
+pip install torch numpy sympy gplearn pandas scipy pytest
 ```
-> **Note:** The `zai-sdk==0.1.0` package is required to use the optional LLM priors feature with the GLM-4.7-flash model.
+
 
 For optimal performance, ensure you have compatible hardware drivers for CUDA (NVIDIA GPUs) or MPS (Apple Silicon Macs).
 
 ---
-## 🔐 Configuring the GLM API Key (LLM Priors)
-The `LLMPriorProvider` component can optionally use the **GLM-4.7-flash** model via the **Z.AI SDK** to generate physics-informed symbolic expressions as priors for the symbolic regression engine, potentially improving discovery accuracy.
-
-To enable this feature, you must provide your Z.AI API key. This is done by setting an environment variable:
-
-1.  **Obtain your API key** from the Z.AI platform.
-2.  **Set the `ZAI_API_KEY` environment variable** before running any Emergentia script.
-
-    *   **Linux/macOS (Terminal):**
-        ```bash
-        export ZAI_API_KEY="your_actual_api_key_here"
-        python run_benchmarks.py
-        ```
-
-    *   **Windows (Command Prompt):**
-        ```cmd
-        set ZAI_API_KEY=your_actual_api_key_here
-        python run_benchmarks.py
-        ```
-
-    *   **Windows (PowerShell):**
-        ```powershell
-        $env:ZAI_API_KEY="your_actual_api_key_here"
-        python run_benchmarks.py
-        ```
-
-3.  **For permanent setup:** Add the `export` (Linux/macOS) or `setx` (Windows) command to your shell profile file (like `.bashrc`, `.zshrc`, or the Windows System Environment Variables).
-
-**Important:** The `run_benchmarks.py` script has `enable_llm_priors=True` by default. If the `ZAI_API_KEY` environment variable is not set, the system will fall back to generating physics-based priors from a predefined knowledge base, ensuring the core functionality remains operational.
+---
 
 ---
 ## 💻 Usage

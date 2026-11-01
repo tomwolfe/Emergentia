@@ -1,0 +1,14 @@
+default_adapter: opencode
+audit_dir: .tether/sessions
+dry_run: false
+log_level: INFO
+command_timeout_seconds: 3600
+verification_timeout_seconds: 1800
+max_attempts: 3
+sandbox_mode: enforce
+verification:
+  commands:
+    - python -m pytest tests/ -v
+adapters:
+  opencode:
+    command: ["python3", "../tether/scripts/opencode_tty.py", "opencode-go/muse-spark-1.3-contributor", "{prompt}"]

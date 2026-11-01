@@ -1,0 +1,4 @@
+{"ts": "2026-11-01T20:34:33+00:00", "kind": "session_start", "session_id": "2b6fc4d471f4", "adapter": "opencode", "project_dir": "/Users/tom/Documents/apps/Emergentia", "mission_name": "emergentia-01-no-zai-gate", "dry_run": false, "prev": ""}
+{"ts": "2026-11-01T20:34:33+00:00", "kind": "checkpoint", "created": false, "is_git_repo": true, "original_head": "587340c052db9a641faad110336361bfc893f501", "ref": null, "dirty": true, "warning": "Working tree is dirty. Refusing to proceed without --allow-dirty. Uncommitted changes cannot be restored by rollback.", "prev": "36e5397949efde828eb80016a43a5e8f4629b1f8f6c7ed73bc9b331260a0c09d"}
+{"ts": "2026-11-01T20:34:33+00:00", "kind": "aborted_dirty", "session_id": "2b6fc4d471f4", "prev": "2f438c9186a72aca8ce294be2c17b656a0d6e3d97cf78a576f45c4373e9f0a5a"}
+{"ts": "2026-11-01T20:34:33+00:00", "kind": "session_end", "status": "failed", "prev": "6767a884cd5ad00c2bf2061cb606a93aa8a99a02a26942cd5e7de60aeeae8679"}

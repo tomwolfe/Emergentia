@@ -11,7 +11,7 @@ from .registry import PhysicalBasisRegistry
 from .utils import verify_equivalence
 from .differentiable_solver import DifferentiableSimulator
 from .unit_checker import UnitChecker, is_dimensionally_consistent
-from .llm_priors import LLMPriorProvider, ZaiClient
+from .physics_priors import PhysicsPriorProvider
 from .preprocessing import AutoSmoother, TrajectorySmoother
 from .physics_constraints import ConservativeForceField, InvariantLayer
 
@@ -68,7 +68,7 @@ class DiscoveryPipeline:
         device="cpu",
         seed=42,
         enable_unit_checker=True,
-        enable_llm_priors=True,
+        enable_physics_priors=True,
         enable_auto_smoother=True,
         use_conservative_field=False,
         use_ensemble=False,
@@ -88,7 +88,7 @@ class DiscoveryPipeline:
 
         # Reliability layers
         self.enable_unit_checker = enable_unit_checker
-        self.enable_llm_priors = enable_llm_priors
+        self.enable_physics_priors = enable_physics_priors
         self.enable_auto_smoother = enable_auto_smoother
         self.use_conservative_field = use_conservative_field
 
@@ -100,26 +100,26 @@ class DiscoveryPipeline:
 
         # Reliability layers
         self.enable_unit_checker = enable_unit_checker
-        self.enable_llm_priors = enable_llm_priors
+        self.enable_physics_priors = enable_physics_priors
         self.enable_auto_smoother = enable_auto_smoother
 
         # Initialize reliability layers
         self.unit_checker = None
-        self.llm_prior_provider = None
+        self.physics_prior_provider = None
         self.auto_smoother = None
 
         if enable_unit_checker:
             self.unit_checker = UnitChecker(mode=mode)
             print(f"Unit-Checker initialized for mode: {mode}")
 
-        if enable_llm_priors:
+        if enable_physics_priors:
             try:
-                self.llm_prior_provider = LLMPriorProvider(
-                    model="glm-4.7-flash", max_candidates=10
+                self.physics_prior_provider = PhysicsPriorProvider(
+                    max_candidates=10
                 )
-                print("LLM Prior Provider initialized (may use fallback if no API key)")
+                print("Physics Prior Provider initialized (local only)")
             except Exception as e:
-                print(f"Warning: Could not initialize LLM Prior Provider: {e}")
+                print(f"Warning: Could not initialize Physics Prior Provider: {e}")
 
         if enable_auto_smoother:
             self.auto_smoother = AutoSmoother(init_bandwidth=1.0)
@@ -309,8 +309,8 @@ class DiscoveryPipeline:
         self,
         population_size=2000,
         generations=40,
-        use_llm_priors=False,
-        llm_priors=None,
+        use_physics_priors=False,
+        physics_priors=None,
     ):
         # Distill over the range the trajectory actually sampled. The NN is
         # only reliable where it was trained; extrapolating beyond that range
@@ -347,19 +347,19 @@ class DiscoveryPipeline:
 
         print(f"Running Symbolic Regression for {self.mode}...")
 
-        # Apply LLM priors by seeding the GP population with prior-derived
+        # Apply physics priors by seeding the GP population with prior-derived
         # programs (warm-start) instead of only tweaking hyperparameters.
         prior_programs = None
-        if use_llm_priors and llm_priors is not None and len(llm_priors) > 0:
-            print(f"Using {len(llm_priors)} LLM priors to seed GP population")
+        if use_physics_priors and physics_priors is not None and len(physics_priors) > 0:
+            print(f"Using {len(physics_priors)} physics priors to seed GP population")
             prior_programs = []
-            for expr in llm_priors:
+            for expr in physics_priors:
                 try:
-                    prog = self.llm_prior_provider.to_gplearn_program(expr, ["r"])
+                    prog = self.physics_prior_provider.to_gplearn_program(expr, ["r"])
                     prior_programs.append(prog)
-                    print(f"LLM Prior: {expr} -> {prog}")
+                    print(f"Physics Prior: {expr} -> {prog}")
                 except Exception as e:
-                    print(f"Skipping LLM prior ({expr}): {e}")
+                    print(f"Skipping physics prior ({expr}): {e}")
             parsimony = 0.01
 
         # Function set: `log` is deliberately omitted (combined with `power`
@@ -411,11 +411,11 @@ class DiscoveryPipeline:
 
         expr = self._safe_simplify(expr)
 
-        # If the GP result is poor, try template-fitting with LLM priors.
+        # If the GP result is poor, try template-fitting with physics priors.
         # The GP often overfits the NN target's noise into deep expressions;
         # fitting coefficients to a known functional form is far more robust.
-        if prior_programs or (use_llm_priors and llm_priors):
-            template_expr = self._try_template_fit(r, r_phys, mag_phys, llm_priors)
+        if prior_programs or (use_physics_priors and physics_priors):
+            template_expr = self._try_template_fit(r, r_phys, mag_phys, physics_priors)
             if template_expr is not None:
                 print(f"Template fit succeeded: {template_expr}")
                 expr = template_expr
@@ -434,15 +434,15 @@ class DiscoveryPipeline:
 
         return expr
 
-    def _try_template_fit(self, r, X_sr, mag_phys, llm_priors):
-        """Fit coefficients to LLM-prior templates and return the best expression.
+    def _try_template_fit(self, r, X_sr, mag_phys, physics_priors):
+        """Fit coefficients to physics-prior templates and return the best expression.
 
         For each prior, we treat the expression as a linear combination of
         basis terms (e.g. r**(-13), r**(-7)) and fit the coefficients via
         least-squares. We also try an augmented basis (adding 1 and r) to
         capture affine forms like -k*(r - r0).
         """
-        if not llm_priors:
+        if not physics_priors:
             return None
 
         x = X_sr.ravel()
@@ -468,7 +468,7 @@ class DiscoveryPipeline:
             mse = float(np.mean((pred - y) ** 2))
             return expr, mse
 
-        for prior in llm_priors:
+        for prior in physics_priors:
             try:
                 terms = list(prior.args) if prior.is_Add else [prior]
                 basis_terms = []
@@ -521,7 +521,7 @@ class DiscoveryPipeline:
         return result["expr"]
 
     def _seed_gp_population(self, est, prior_programs, X, y):
-        """Inject LLM-prior programs into the GP population via warm_start."""
+        """Inject physics-prior programs into the GP population via warm_start."""
         try:
             from gplearn._program import _Program
 
@@ -550,9 +550,9 @@ class DiscoveryPipeline:
 
             if programs:
                 est._programs = [programs]
-                print(f"Seeded GP population with {len(programs)} LLM prior program(s)")
+                print(f"Seeded GP population with {len(programs)} physics prior program(s)")
         except Exception as e:
-            print(f"Warning: could not seed GP population with LLM priors: {e}")
+            print(f"Warning: could not seed GP population with physics priors: {e}")
 
     def refine_constants(self, expr, p_traj, f_traj):
         from scipy.optimize import minimize
@@ -722,7 +722,7 @@ class DiscoveryPipeline:
             auto_smoother=self.auto_smoother,
         )
 
-        # Generate dataset summary for LLM if needed
+        # Generate dataset summary for physics priors if needed
         llm_dataset_summary = {
             "min_force": float(np.min(train_f.cpu().numpy()))
             if isinstance(train_f, torch.Tensor)
@@ -734,19 +734,17 @@ class DiscoveryPipeline:
             "mode": self.mode,
         }
 
-        # Generate LLM priors if enabled
-        llm_priors = None
-        if self.enable_llm_priors and self.llm_prior_provider is not None:
-            llm_priors = self.llm_prior_provider.generate_priors_from_llm(
-                llm_dataset_summary, self.mode
-            )
-            print(f"Generated {len(llm_priors)} LLM priors")
+        # Generate physics priors if enabled
+        physics_priors = None
+        if self.enable_physics_priors and self.physics_prior_provider is not None:
+            physics_priors = self.physics_prior_provider.generate_priors(self.mode)
+            print(f"Generated {len(physics_priors)} physics priors")
 
         discovered_expr = self.distill_symbolic(
             population_size=sr_population,
             generations=sr_generations,
-            use_llm_priors=bool(llm_priors),
-            llm_priors=llm_priors,
+            use_physics_priors=bool(physics_priors),
+            physics_priors=physics_priors,
         )
 
         print(f"Raw discovered formula: {discovered_expr}")
@@ -813,7 +811,7 @@ class DiscoveryPipeline:
             "success": success,
             "conservative": is_conservative,
             "unit_checker_enabled": self.enable_unit_checker,
-            "llm_priors_enabled": self.enable_llm_priors,
+            "physics_priors_enabled": self.enable_physics_priors,
             "auto_smoother_enabled": self.enable_auto_smoother,
             "bandwidth": self.auto_smoother.get_bandwidth()
             if self.auto_smoother
