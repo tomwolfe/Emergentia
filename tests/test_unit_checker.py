@@ -315,6 +315,22 @@ class TestUnitChecker:
         ok, _, _, _ = UnitChecker(reduced_units=True).check_consistency(sp.nan)
         assert not ok
 
+    def test_filter_excludes_output_mismatch(self):
+        checker = UnitChecker(mode="spring", reduced_units=False)
+        mismatch = sp.sympify("1/r**2")
+        filtered = checker.filter_inconsistent_candidates([mismatch], mode="spring")
+        assert filtered == []
+
+    def test_add_consistent_returns_first_signature(self):
+        checker = UnitChecker()
+        r = sp.Symbol("r")
+        x = sp.Symbol("x")
+        # r + x stays an Add (same L dims) and must return first signature
+        assert checker._get_dimensional_signature(r + x) == (1, 0, 0, 0)
+        assert checker._get_dimensional_signature(r + 1 / r) == (float("nan"),) * 4 or any(
+            __import__("math").isnan(d) for d in checker._get_dimensional_signature(r + 1 / r)
+        )
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

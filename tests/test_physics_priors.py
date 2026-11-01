@@ -96,5 +96,19 @@ def test_lazy_package_exports_resolve():
         emergentia.__getattr__("__nonexistent_attr__")
 
 
+def test_to_gplearn_program_arithmetic_branches():
+    provider = PhysicsPriorProvider()
+    r = sp.Symbol("r")
+    assert provider.to_gplearn_program(r + 1, ["r"]).startswith("add(")
+    assert provider.to_gplearn_program(2 * r, ["r"]).startswith("mul(")
+    assert provider.to_gplearn_program(r**2, ["r"]).startswith("power(")
+
+
+def test_spring_prior_respects_max_candidates():
+    provider = PhysicsPriorProvider()
+    assert len(provider.generate_priors("spring", max_candidates=2)) == 2
+    assert len(provider.generate_priors("spring", max_candidates=10)) == 5
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

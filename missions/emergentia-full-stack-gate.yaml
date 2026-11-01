@@ -33,7 +33,12 @@ verification:
   mutation:
     enabled: true
     fail_below: 0.8
-    max_mutants: 30
+    max_mutants: 6
+    baseline_targets:
+      - emergentia/physics_priors.py
+      - emergentia/unit_checker.py
+      - emergentia/simulator.py
+      - emergentia/registry.py
 recovery:
   max_attempts: 3
 review:

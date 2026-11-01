@@ -33,3 +33,40 @@ def test_conservative_field_matches_grad():
     pos = torch.randn(2, 3, 2, requires_grad=False)
     f = field(pos)
     assert f.shape == pos.shape
+
+
+def test_spring_functional_form_rejects_exp():
+    from emergentia.utils import check_functional_form
+    r = sp.Symbol('r')
+    assert check_functional_form(r, "spring") is True
+    assert check_functional_form(sp.exp(-r), "spring") is False
+
+
+def test_verify_equivalence_rejects_bad_expr():
+    from emergentia.utils import verify_equivalence
+    ok, m = verify_equivalence(sp.sympify("0"), "spring", potential=HarmonicPotential())
+    assert not ok
+    assert m.get("r2", 0.0) < 0.95
+
+
+def test_harmonic_force_sign():
+    pot = HarmonicPotential(k=10.0, r0=1.0)
+    f = pot.compute_force_magnitude(torch.tensor([[2.0]]))
+    assert float(f.view(-1)[0]) < 0, "F(2) must be -k*(2-1)=-10"
+
+
+def test_conservative_field_sign_is_neg_grad():
+    from emergentia.physics_constraints import ConservativeForceField
+    import torch.nn as nn
+    class IdentityV(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Identity()
+            self._dist_min = 1e-4
+        def forward(self, x):
+            return x
+    field = ConservativeForceField(IdentityV())
+    pos = torch.tensor([[[0.0], [1.0]]])
+    f = field(pos)
+    assert float(f[0, 0, 0].detach()) > 0, "attractive V=r must pull pos0 +x"
+    assert float(f[0, 1, 0].detach()) < 0, "attractive V=r must pull pos1 -x"
