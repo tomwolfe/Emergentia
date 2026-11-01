@@ -14,6 +14,7 @@ constraints:
   - Do not add new dependencies or network calls.
   - Keep existing tests green.
   - Never edit outside allowed_paths; sandbox enforce.
+  - Do NOT delete or bypass production logic to satisfy mutants; close gaps with tests or genuine fixes.
 verification:
   commands:
     - python -m pytest tests/test_no_zai_leakage.py tests/test_physics_priors.py tests/test_registry_consistency.py tests/test_unit_checker.py tests/test_conservative_grad.py -v

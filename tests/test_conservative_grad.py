@@ -146,3 +146,53 @@ def test_force_spot_values_kill_coefficient_mutants():
     expect_c = float(HarmonicPotential(k=10.0, r0=1.0).compute_force_magnitude(rr).view(-1)[0]) + float(
         GravityPotential(G=1.0).compute_force_magnitude(rr).view(-1)[0])
     assert abs(float(comp.compute_force_magnitude(rr).view(-1)[0]) - expect_c) < 1e-6
+
+
+def test_composite_potential_sums_potential():
+    from emergentia.simulator import CompositePotential
+    comp = CompositePotential([HarmonicPotential(k=10.0, r0=1.0), GravityPotential(G=1.0)])
+    d = torch.tensor([2.0])
+    got = comp.compute_potential(d)
+    assert got is not None
+    h = HarmonicPotential(k=10.0, r0=1.0).compute_potential(d)
+    g = GravityPotential(G=1.0).compute_potential(d)
+    assert torch.allclose(got, h + g, atol=1e-6)
+
+
+def test_initial_positions_use_multiplicative_scale():
+    from emergentia.simulator import PhysicsSim
+    sim = PhysicsSim(n=2, dim=2, potential=HarmonicPotential(k=10.0, r0=1.0), seed=0, device=torch.device("cpu"), use_neighbor_list=True, cutoff=10.0)
+    assert sim.use_neighbor_list is True
+    assert float(sim.pos.max()) > 1.0
+    assert float(sim.pos.max()) <= 2.0
+
+
+def _make_nl_sim(cutoff, seed=0):
+    from emergentia.simulator import PhysicsSim
+    return PhysicsSim(n=2, dim=2, potential=HarmonicPotential(k=10.0, r0=1.0), seed=seed, device=torch.device("cpu"), use_neighbor_list=True, cutoff=cutoff)
+
+
+def test_neighbor_list_matches_raw_when_cutoff_covers_all():
+    sim = _make_nl_sim(cutoff=10.0)
+    pos = torch.tensor([[0.0, 0.0], [1.2, 0.3]])
+    f_nl = sim._compute_forces_neighbor_list(pos)
+    f_raw = sim._compute_forces_raw(pos)
+    assert torch.allclose(f_nl, f_raw, atol=1e-6)
+
+
+def test_neighbor_list_boundary_inclusive_kills_gte_mutant():
+    sim = _make_nl_sim(cutoff=2.0)
+    pos = torch.tensor([[0.0, 0.0], [2.0, 0.0]])
+    f_nl = sim._compute_forces_neighbor_list(pos)
+    f_raw = sim._compute_forces_raw(pos)
+    assert torch.allclose(f_nl, f_raw, atol=1e-6)
+    assert f_nl.abs().max().item() > 1.0
+
+
+def test_neighbor_list_excludes_beyond_cutoff():
+    sim = _make_nl_sim(cutoff=2.0)
+    pos = torch.tensor([[0.0, 0.0], [2.5, 0.0]])
+    f_nl = sim._compute_forces_neighbor_list(pos)
+    assert torch.allclose(f_nl, torch.zeros_like(f_nl), atol=1e-6)
+    f_raw = sim._compute_forces_raw(pos)
+    assert f_raw.abs().max().item() > 1.0

@@ -177,3 +177,11 @@ def test_to_gplearn_program_exact_strings():
     assert provider.to_gplearn_program(2 * r, ["r"]) == "mul(2.0, X0)"
     assert provider.to_gplearn_program(r**2, ["r"]) == "power(X0, 2.0)"
     assert provider.to_gplearn_program(sp.exp(-r), ["r"]) == "exp(mul(-1.0, X0))"
+
+
+def test_parse_return_none_mutant_breaks_priors():
+    provider = PhysicsPriorProvider()
+    assert provider._parse("r") is not None
+    priors = provider.generate_priors("spring")
+    assert len(priors) == 5
+    assert all(e is not None and isinstance(e, sp.Expr) for e in priors)
