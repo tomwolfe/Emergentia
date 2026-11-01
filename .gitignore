@@ -138,3 +138,4 @@ logs/
 *.png
 !discovery_*.png
 .pytest_cache/
+.tether/
