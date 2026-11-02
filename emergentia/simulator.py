@@ -179,6 +179,17 @@ class CompositePotential(Potential):
     def dt(self):
         return min(p.dt for p in self.potentials)
 
+
+def _flat_cell_index(c0, c1, stride):
+    """Flat index for 2D cell (c0, c1) with row stride `stride`."""
+    return c0 * stride + c1
+
+
+def _cells_adjacent_2d(c0_i, c1_i, c0_j, c1_j):
+    """Cells are adjacent iff they differ by at most 1 in each dimension."""
+    return abs(c0_i - c0_j) <= 1 and abs(c1_i - c1_j) <= 1
+
+
 class PhysicsSim:
     def __init__(self, n=4, dim=2, potential=None, seed=None, device=None, use_neighbor_list=False, cutoff=None):
         if seed is not None:
@@ -325,7 +336,7 @@ class PhysicsSim:
             if self.dim == 2:
                 c0 = cell_pos[i, 0]
                 c1 = cell_pos[i, 1]
-                flat_cell = c0 * n_cells[1] + c1
+                flat_cell = _flat_cell_index(c0, c1, n_cells[1])
             else:
                 flat_cell = cell_pos[i, 0]
 
@@ -364,7 +375,7 @@ class PhysicsSim:
                         c0_i, c1_i = cell_i[0].item(), cell_i[1].item()
                         c0_j, c1_j = cell_j[0].item(), cell_j[1].item()
                         # Cells are adjacent if they differ by at most 1 in each dimension
-                        cell_adj = (abs(c0_i - c0_j) <= 1 and abs(c1_i - c1_j) <= 1)
+                        cell_adj = _cells_adjacent_2d(c0_i, c1_i, c0_j, c1_j)
                     else:
                         cell_adj = True  # 1D: any distance within cutoff is fine
 
