@@ -1,0 +1,86 @@
+{
+ "session": "f461bcf086f4",
+ "mission": "emergentia-full-stack-gate",
+ "status": "success",
+ "mutation": {
+  "total": 24,
+  "killed": 21,
+  "survived": 3,
+  "skipped": 0,
+  "kill_rate": 0.875,
+  "per_file": {
+   "emergentia/physics_priors.py": {
+    "killed": 5,
+    "survived": 1
+   },
+   "emergentia/registry.py": {
+    "killed": 6,
+    "survived": 0
+   },
+   "emergentia/simulator.py": {
+    "killed": 4,
+    "survived": 2
+   },
+   "emergentia/unit_checker.py": {
+    "killed": 6,
+    "survived": 0
+   }
+  },
+  "target_source": "baseline"
+ },
+ "verification": [
+  {
+   "key": "python -m pytest tests/test_no_zai_leakage.py tests/test_physics_priors.py tests/test_registry_consistency.py tests/test_unit_checker.py tests/test_conservative_grad.py -v",
+   "passed": true,
+   "exit_code": 0
+  },
+  {
+   "key": "python3 -c \"import sympy as sp; from emergentia.simulator import HarmonicPotential; from emergentia.utils import verify_equivalence; ok, m = verify_equivalence(-10*(sp.Symbol('r')-1), 'spring', potential=HarmonicPotential()); print('SPRING_R2:', m.get('r2'), 'SUCCESS:', ok); assert ok and m.get('r2', 0) > 0.9\"",
+   "passed": true,
+   "exit_code": 0
+  },
+  {
+   "key": "python3 -c \"import pathlib, re; pats = ['zai', 'glm-4', 'ZAI_API', 'socket', 'requests', 'urllib', 'http.client', 'xmlrpc']; bad = [(str(p), i, l.strip()) for p in list(pathlib.Path('emergentia').rglob('*.py')) + [pathlib.Path('run_benchmarks.py')] for i, l in enumerate(p.read_text().splitlines(), 1) for pat in pats if re.search(pat, l, re.I)]; print('NETWORK_LEAKAGE_SCAN:', 'CLEAN' if not bad else bad); assert not bad\"",
+   "passed": true,
+   "exit_code": 0
+  },
+  {
+   "key": "emergentia/physics_priors.py",
+   "passed": true,
+   "exit_code": null
+  },
+  {
+   "key": "emergentia/engine.py",
+   "passed": true,
+   "exit_code": null
+  },
+  {
+   "key": "emergentia/physics_priors.py",
+   "passed": true,
+   "exit_code": null
+  },
+  {
+   "key": "python3 -c \"from emergentia.physics_priors import PhysicsPriorProvider; print(len(PhysicsPriorProvider().generate_priors('spring')))\"",
+   "passed": true,
+   "exit_code": 0
+  },
+  {
+   "key": "python3 -c \"import sympy as sp; from emergentia.simulator import HarmonicPotential; from emergentia.utils import verify_equivalence; ok, m = verify_equivalence(-10*(sp.Symbol('r')-1), 'spring', potential=HarmonicPotential()); print('spring analytic R2:', m.get('r2'), 'success:', ok)\"",
+   "passed": true,
+   "exit_code": 0
+  },
+  {
+   "key": "grep -R -icE 'zai' emergentia/ run_benchmarks.py README.md 2>/dev/null || echo NO_LEAKAGE",
+   "passed": true,
+   "exit_code": 2
+  }
+ ],
+ "changed_files": [],
+ "sandbox_violations": [],
+ "review": {
+  "enabled": true,
+  "adapter": "opencode",
+  "verdict": "approve",
+  "reason": "All gates show substantive green evidence: 86 tests passed, SPRING_R2\u22481.0>0.9, CLEAN leakage scan, mutation 0.88\u22650.8 with no changes/deps."
+ }
+}
