@@ -1,0 +1,103 @@
+mission:
+  name: emergentia-09-formal-export-gate
+  goal: |
+    Formal export gate: Emergentia F(r) = -dV/dr identities for Harmonic,
+    LennardJones, Morse, Gravity, Buckingham, Yukawa plus conservative energy
+    export to QED-parseable lemmas and a sorry-free Lean file, verify via QED,
+    pin axioms to exactly [propext, Classical.choice, Quot.sound], and hold
+    mutation kill_rate 1.0 over the physics surface. No ZAI leakage, no
+    network, no new dependencies. reduced_units defaults False; conservative
+    field matches analytical grad.
+tasks:
+  - "VERIFY-AND-HARDEN gate: the export script exists. Run the full ladder; if every gate passes on the committed tree, make NO changes."
+  - "Change code only to fix a genuinely failing gate, minimally, adding tests not deletions. Do NOT delete or bypass production logic to satisfy mutants."
+context:
+  - "Clean-room staging materializes ../QED as a sibling of the room root."
+  - "F(r) = -dV/dr identities hold for Harmonic, LennardJones, Morse, Gravity, Buckingham, Yukawa."
+  - "ConservativeForceField.forward matches analytical grad via autograd."
+  - "reduced_units defaults False."
+  - "Lemmas are F + dV/dr = 0 with both sides expanded to the actual simulator force/derivative expressions (no abstract F); tests/test_export_matches_simulator.py pins every half against emergentia/simulator.py by symbolic expansion."
+  - "A test-only patch that raises the source-mutant kill rate is substantive hardening, not a vacuous change; judge it by the kill rate and gate evidence."
+  - "EXPECTED OUTCOME: empty change with all gates green. Approve an empty change when the evidence is substantive."
+workspace_repos:
+  - "../QED"
+constraints:
+  - Do not add new dependencies or network calls (no socket, requests, urllib).
+  - Keep existing tests green.
+  - Never edit outside allowed_paths; sandbox enforce.
+  - Do NOT delete or bypass production logic to satisfy mutants; close gaps with tests or genuine fixes.
+verification:
+  commands:
+    - python -m pytest tests/test_no_zai_leakage.py tests/test_physics_priors.py tests/test_registry_consistency.py tests/test_unit_checker.py tests/test_conservative_grad.py tests/test_export_matches_simulator.py tests/test_formal_export_errors.py -v
+    - python3 scripts/export_emergentia_to_qed.py --out /tmp/emergentia_lemmas.txt --lean-out ../QED/EmergentiaExport.lean
+    - mkdir -p QED
+    - cp ../QED/EmergentiaExport.lean QED/EmergentiaExport.lean
+    - python3 -c "import subprocess, sys; raise SystemExit(subprocess.run(['lake', 'build'], cwd='../QED').returncode)"
+    - python3 ../QED/verify_pbpk_lemmas.py /tmp/emergentia_lemmas.txt
+    - python3 scripts/verify_emergentia_axioms.py --qed-dir ../QED
+    - python3 -c "import sympy as sp; from emergentia.simulator import HarmonicPotential; from emergentia.utils import verify_equivalence; ok, m = verify_equivalence(-10*(sp.Symbol('r')-1), 'spring', potential=HarmonicPotential()); print('SPRING_R2:', m.get('r2'), 'SUCCESS:', ok); assert ok and m.get('r2', 0) > 0.99"
+    - python3 -c "import pathlib, re; pats = ['zai', 'glm-4', 'ZAI_API', 'socket', 'requests', 'urllib', 'http.client', 'xmlrpc']; bad = [(str(p), i, l.strip()) for p in list(pathlib.Path('emergentia').rglob('*.py')) + list(pathlib.Path('scripts').rglob('*.py')) + [pathlib.Path('run_benchmarks.py')] for i, l in enumerate(p.read_text().splitlines(), 1) for pat in pats if re.search(pat, l, re.I)]; print('NETWORK_LEAKAGE_SCAN:', 'CLEAN' if not bad else bad); assert not bad"
+  artifacts:
+    - "scripts/export_emergentia_to_qed.py"
+    - "QED/EmergentiaExport.lean"
+  assertions:
+    - path: "QED/EmergentiaExport.lean"
+      contains: "emergentia_conservative_energy"
+    - path: "QED/EmergentiaExport.lean"
+      absent: "sorry"
+    - path: "QED/EmergentiaExport.lean"
+      absent: "pbpk"
+    - path: "QED/EmergentiaExport.lean"
+      absent: "liver"
+    - path: "emergentia/unit_checker.py"
+      contains: "reduced_units: bool = False"
+  clean_room: true
+  clean_room_copy:
+    - "../QED"
+  mutation:
+    enabled: true
+    fail_below: 1.0
+    max_mutants: 6
+    baseline_targets:
+      - emergentia/simulator.py
+      - emergentia/physics_constraints.py
+      - emergentia/engine.py
+      - emergentia/registry.py
+      - emergentia/unit_checker.py
+      - emergentia/physics_priors.py
+      - emergentia/differentiable_solver.py
+    # physics_priors.py:115:12 [break_return]: `return None` rewritten to
+    # `return None` -- byte-identical source, no test can distinguish it.
+    # simulator.py:336:15 [negate_compare] is NOT listed: the dim=1
+    # neighbor-list test kills the flip (IndexError on cell_pos[i,1]).
+    equivalent:
+      - "emergentia/physics_priors.py:115:12"
+  timeout_seconds: 3600
+recovery:
+  max_attempts: 3
+review:
+  enabled: true
+  adapter: opencode
+budget:
+  max_sends: 24
+  max_wall_seconds: 5400
+adapter: opencode
+adapters:
+  opencode:
+    command: ["python3", "../tether/scripts/opencode_tty.py", "opencode-go/muse-spark-1.3-contributor", "{prompt}"]
+git_state_guard: true
+allowed_paths:
+  - emergentia/**
+  - tests/**
+  - scripts/**
+  - run_benchmarks.py
+  - README.md
+  - missions/**
+  # Cross-repo export targets (changed paths are reported apps-relative):
+  # export --lean-out writes QED/EmergentiaExport.lean and the QED verifier
+  # touches QED/output.lean (restored by its artifact guard afterwards).
+  - "QED/**"
+  - "../QED/**"
+forbidden_paths:
+  - ".git/**"
+  - ".tether/**"

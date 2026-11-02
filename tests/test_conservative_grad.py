@@ -196,3 +196,41 @@ def test_neighbor_list_excludes_beyond_cutoff():
     assert torch.allclose(f_nl, torch.zeros_like(f_nl), atol=1e-6)
     f_raw = sim._compute_forces_raw(pos)
     assert f_raw.abs().max().item() > 1.0
+
+
+def _identity_field():
+    from emergentia.physics_constraints import ConservativeForceField
+    import torch.nn as nn
+    class IdentityV(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Identity()
+            self._dist_min = 1e-4
+        def forward(self, x):
+            return x
+    return ConservativeForceField(IdentityV())
+
+
+def test_conservative_field_force_magnitude_pins_pair_half():
+    # V(r) = r identity net: E = 0.5 * sum_{i!=j} |xi-xj| = 1.0 for unit pair.
+    # Kills total_energy scale mutants (0.5 -> 0.6 gives |F| = 1.2).
+    field = _identity_field()
+    pos = torch.tensor([[[0.0], [1.0]]])
+    f = field(pos)
+    assert torch.allclose(f, torch.tensor([[[1.0], [-1.0]]]), atol=1e-6), f
+
+
+def test_get_potential_energy_pins_pair_half():
+    # Same identity setup: scalar energy must be exactly 1.0 (kills *0.5 mutants).
+    field = _identity_field()
+    pos = torch.tensor([[[0.0], [1.0]]])
+    e = field.get_potential_energy(pos)
+    assert abs(float(e.detach())) - 1.0 < 1e-6, e
+
+
+def test_predict_mag_is_neg_dvdr_identity():
+    # V(r) = r -> F = -dV/dr = -1 everywhere (kills negation-drop mutants).
+    field = _identity_field()
+    r = torch.tensor([[0.5], [2.0]])
+    got = field.predict_mag(r)
+    assert torch.allclose(got, torch.tensor([[-1.0], [-1.0]]), atol=1e-6), got
