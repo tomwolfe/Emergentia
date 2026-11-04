@@ -467,3 +467,109 @@ def test_differentiable_train_early_return_pins_max_idx():
         ret = pipe.train_nn(p_traj, f_traj, epochs=1)
     assert ret == 0.0
     assert "Not enough timesteps" in buf.getvalue(), buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Preprocessing teeth: the deliverable requires kill_rate 1.0 over
+# emergentia/preprocessing.py, which no gate suite covered (0.0000 measured).
+# ---------------------------------------------------------------------------
+
+def _sine_fixture(T=150, seed=0):
+    import numpy as np
+    rng = np.random.RandomState(seed)
+    y = np.sin(np.linspace(0, 6, T))[:, None, None]
+    y = y + 0.05 * rng.randn(T, 1, 1)
+    return torch.tensor(y, dtype=torch.float32)
+
+
+def test_smoother_forward_grad_path_returns_tensor():
+    # Kills preprocessing.py:134:12 (return _differentiable_smooth -> None):
+    # requires_grad input must take the differentiable path and return a
+    # finite tensor carrying a grad_fn (the mutant returns None).
+    from emergentia.preprocessing import AutoSmoother
+    s = AutoSmoother()
+    out = s(torch.randn(32, 2, 1, requires_grad=True))
+    assert isinstance(out, torch.Tensor), type(out)
+    assert torch.isfinite(out).all().item(), out
+    assert out.grad_fn is not None, "differentiable path must keep grad"
+
+
+def test_smoother_forward_nongrad_matches_scipy():
+    # Guards the SciPy branch: non-grad input returns a finite tensor of the
+    # same shape (and the smoother is enabled by default).
+    from emergentia.preprocessing import AutoSmoother
+    s = AutoSmoother()
+    t = torch.randn(32, 2, 1)
+    out = s(t)
+    assert isinstance(out, torch.Tensor) and out.shape == t.shape
+    assert torch.isfinite(out).all().item()
+
+
+def test_optimize_bandwidth_pins_exact_schedule():
+    # Kills preprocessing.py:210:18 (trial schedule), 249:50, 249:70,
+    # 276:54 (LOO edge-index arithmetic): any change to the tried bandwidth
+    # set or the leave-one-out predictions moves best_bandwidth and hence
+    # the smoothed update. Values calibrated on the committed implementation
+    # (pure-numpy LOO loop, bit-stable across runs).
+    from emergentia.preprocessing import AutoSmoother
+    s = AutoSmoother()
+    assert abs(s.get_bandwidth() - 1.0) < 1e-9
+    traj = _sine_fixture()
+    r1 = s.optimize_bandwidth(traj, [])
+    assert abs(r1 - 1.3242257833480835) < 1e-6, r1
+    r2 = s.optimize_bandwidth(traj, [r1])
+    assert abs(r2 - 1.6118903160095215) < 1e-6, r2
+    assert 0.1 <= r2 <= 5.0
+
+
+def test_optimize_bandwidth_disabled_returns_max():
+    # Pins the is_enabled early return (fail-closed coverage of the branch).
+    from emergentia.preprocessing import AutoSmoother
+    s = AutoSmoother()
+    s.disable()
+    assert s.optimize_bandwidth(_sine_fixture(T=32), []) == s.max_bandwidth
+
+
+def _spike_fixtures(T=150, seed=0):
+    import numpy as np
+    rng = np.random.RandomState(seed)
+    base = np.sin(np.linspace(0, 6, T))[:, None, None]
+    base = base + 0.05 * rng.randn(T, 1, 1)
+    spike = np.zeros((T, 1, 1))
+    spike[75, 0, 0] = 2.0
+    d1 = torch.tensor(base + spike, dtype=torch.float32)
+    d2 = torch.tensor(np.concatenate([base, base + spike], axis=2),
+                      dtype=torch.float32)
+    return d1, d2
+
+
+def test_optimize_bandwidth_mid_spike_selects_wide_kernel():
+    # Kills preprocessing.py:249:70 (`(T-1-pad)` -> `(T-1+pad)` in the D==1
+    # edge branch): with a mid-trajectory spike the wide kernel (5.0) wins
+    # LOO-CV; the mutant shifts edge predictions by 2*pad, the ranking flips
+    # to 2.55, and the smoothed update moves from 1.6206... to 1.3242....
+    from emergentia.preprocessing import AutoSmoother
+    d1, _ = _spike_fixtures()
+    got = AutoSmoother().optimize_bandwidth(d1, [])
+    assert abs(got - 1.6206566095352173) < 1e-6, got
+
+
+def test_optimize_bandwidth_multifeature_mid_spike():
+    # Kills preprocessing.py:276:54 (`+ (...)` -> `- (...)` in the D>1 edge
+    # branch): the D==1 fixture never executes that branch, so a two-feature
+    # fixture with the spike in one feature is required. Same flip shape.
+    from emergentia.preprocessing import AutoSmoother
+    _, d2 = _spike_fixtures()
+    got = AutoSmoother().optimize_bandwidth(d2, [])
+    assert abs(got - 1.6206566095352173) < 1e-6, got
+
+
+def test_gaussian_smoother_4d_returns_input_tensor():
+    # Kills preprocessing.py:625:24 (is_tensor True->False): a >3-D tensor
+    # input must come back as the same tensor; the mutant returns numpy.
+    from emergentia.preprocessing import GaussianSmoother
+    g = GaussianSmoother()
+    x = torch.randn(2, 2, 2, 2)
+    out = g(x)
+    assert isinstance(out, torch.Tensor), type(out)
+    assert out is x
