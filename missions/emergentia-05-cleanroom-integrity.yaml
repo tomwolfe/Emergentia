@@ -11,8 +11,11 @@ verification:
   commands:
     - python -m pytest tests/test_physics_priors.py tests/test_registry_consistency.py -v
   probes:
+    # Gravity ships 8 priors (pinned by test_prior_counts_exact_per_mode);
+    # an earlier revision of this probe expected 4 and could only pass by
+    # weakening the priors, which the reviewer correctly rejected as gaming.
     - command: 'python3 -c "from emergentia.physics_priors import PhysicsPriorProvider; print(len(PhysicsPriorProvider().generate_priors(''gravity'')))"'
-      contains: "4"
+      contains: "8"
   clean_room: true
 recovery:
   max_attempts: 3
