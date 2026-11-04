@@ -35,7 +35,7 @@ Emergentia achieves high-fidelity results across multiple physical regimes. Benc
 ## 🛠 Installation
 Emergentia requires **Python 3.9+**. Install the core dependencies via pip:
 ```bash
-pip install torch numpy sympy gplearn pandas scipy pytest
+pip install torch numpy sympy gplearn scikit-learn pandas scipy pytest torchdiffeq
 ```
 
 
