@@ -70,8 +70,15 @@ verification:
     # `return None` -- byte-identical source, no test can distinguish it.
     # simulator.py:336:15 [negate_compare] is NOT listed: the dim=1
     # neighbor-list test kills the flip (IndexError on cell_pos[i,1]).
+    # engine.py:601:19,612:19 [flip_bool] (`not isinstance` -> `isinstance`):
+    # value-equivalent. For array mag, np.full(shape, mag) with identical
+    # shape is the identity; for scalar mag, scalar*dir*mask broadcasts
+    # identically to full*dir*mask. Only perf differs, so no value/grad
+    # test can distinguish; suppressed as equivalent.
     equivalent:
       - "emergentia/physics_priors.py:115:12"
+      - "emergentia/engine.py:601:19"
+      - "emergentia/engine.py:612:19"
   timeout_seconds: 3600
 recovery:
   max_attempts: 3

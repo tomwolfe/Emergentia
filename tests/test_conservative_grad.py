@@ -234,3 +234,236 @@ def test_predict_mag_is_neg_dvdr_identity():
     r = torch.tensor([[0.5], [2.0]])
     got = field.predict_mag(r)
     assert torch.allclose(got, torch.tensor([[-1.0], [-1.0]]), atol=1e-6), got
+
+
+# ---------------------------------------------------------------------------
+# Mutation-hardening for emergentia-09 formal-export gate (test-only,
+# behavioral: each test checks numerics/grads/errors, not source text).
+# ---------------------------------------------------------------------------
+
+def _make_odefunc(n_particles=2, dim=2):
+    from emergentia.differentiable_solver import ODEFunc
+    from emergentia.models import DiscoveryNet
+    torch.manual_seed(0)
+    model = DiscoveryNet(hidden_size=8)
+    return ODEFunc(model, mass=1.0, dim=dim, n_particles=n_particles)
+
+
+def test_odefunc_valid_forward_shape_and_finite():
+    # Kills 28:15, 32:19, 33:15: valid (batch, 2*n*dim) must succeed.
+    # n=3, dim=2 separates 2*n*dim=12 from (2*n)/dim=3.
+    from emergentia.differentiable_solver import ODEFunc
+    from emergentia.models import DiscoveryNet
+    torch.manual_seed(0)
+    model = DiscoveryNet(hidden_size=8)
+    ode = ODEFunc(model, mass=1.0, dim=2, n_particles=3)
+    state = torch.tensor([[0.0, 0.0, 2.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                          [0.0, 1.0, 0.0, 3.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
+    out = ode(torch.tensor(0.0), state)
+    assert out.shape == (2, 12), out.shape
+    assert torch.isfinite(out).all().item(), out
+
+
+def test_odefunc_rejects_bad_shapes():
+    ode = _make_odefunc(n_particles=3, dim=2)
+    t = torch.tensor(0.0)
+    # Build a valid state then corrupt it; mutant (== -> !=) accepts bad.
+    import pytest
+    with pytest.raises(AssertionError):
+        ode(t, torch.randn(2, 11))
+    with pytest.raises(AssertionError):
+        ode(t, torch.randn(2, 12, 1))
+
+
+def test_odefunc_requires_grad_true_branch():
+    # Kills 59:55 (requires_grad_(True)->False): forward must not raise
+    # and output must stay finite; mutant raises RuntimeError in grad.
+    ode = _make_odefunc(n_particles=2, dim=2)
+    state = torch.tensor([[0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
+    out = ode(torch.tensor(0.0), state)
+    assert torch.isfinite(out).all().item(), out
+
+
+def test_odefunc_grad_to_params_kills_retain_mutant():
+    # Kills 64:65 (retain_graph True->False): the first outer grad works
+    # either way, but only the original survives a SECOND backward through
+    # the same graph. Mutant raises "backward through the graph a second
+    # time" on the repeat.
+    ode = _make_odefunc(n_particles=2, dim=2)
+    state = torch.tensor([[0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
+    out = ode(torch.tensor(0.0), state)
+    assert torch.isfinite(out).all().item(), out
+    params = list(ode.model.parameters())
+    grads = torch.autograd.grad(out.sum(), params, allow_unused=True, retain_graph=True)
+    assert any(g is not None for g in grads), "grad must reach model params"
+    grads2 = torch.autograd.grad(out.sum(), params, allow_unused=True)
+    assert any(g is not None for g in grads2), "second backward must work"
+
+
+def test_odefunc_accel_scales_with_inverse_mass():
+    # Kills 81:18 arithmetic variants: with mass=2.0, `/ mass` halves the
+    # force while `* mass` doubles it (indistinguishable only at mass=1.0,
+    # so this test pins mass=2.0 explicitly).
+    # Fixed, well-separated geometry: no coincident pair, dist = 2.0,
+    # so no singular path can produce NaNs.
+    state = torch.tensor([[[0.0, 0.0], [2.0, 0.0], [0.0, 0.0], [0.0, 0.0]]]).view(1, 8)
+    t = torch.tensor(0.0)
+    torch.manual_seed(0)
+    from emergentia.models import DiscoveryNet
+    from emergentia.differentiable_solver import ODEFunc
+    ode1 = ODEFunc(DiscoveryNet(hidden_size=8), mass=1.0, dim=2, n_particles=2)
+    torch.manual_seed(0)
+    ode2 = ODEFunc(DiscoveryNet(hidden_size=8), mass=2.0, dim=2, n_particles=2)
+    a1 = ode1(t, state)[:, 4:]
+    a2 = ode2(t, state)[:, 4:]
+    assert torch.isfinite(a2).all().item(), a2
+    assert torch.allclose(a2, a1 / 2.0, atol=1e-6), (a1, a2)
+
+
+def test_odefunc_finite_forces_kill_div_mutant():
+    # Kills 81:18 (f_mag * dir_vec -> / gives inf/nan).
+    ode = _make_odefunc(n_particles=2, dim=2)
+    state = torch.tensor([[0.0, 0.0, 2.0, 0.0, 0.5, -0.5, 0.25, 0.75]])
+    out = ode(torch.tensor(0.0), state)
+    assert torch.isfinite(out).all().item(), out
+    assert out.abs().max().item() < 1e6, out
+
+
+def test_simulator_dim1_neighbor_list_matches_raw():
+    # Kills simulator.py:336:15 (dim==2 -> !=2): dim=1 takes the flat
+    # branch; mutant takes the 2D branch and raises IndexError.
+    from emergentia.simulator import HarmonicPotential, PhysicsSim
+    sim = PhysicsSim(n=2, dim=1, potential=HarmonicPotential(k=10.0, r0=1.0),
+                     seed=0, device=torch.device("cpu"),
+                     use_neighbor_list=True, cutoff=10.0)
+    # Pin the flag itself: kills tests/test_conservative_grad.py:338:39
+    # [flip_bool] (True -> False is otherwise unobservable since the test
+    # calls _compute_forces_neighbor_list directly).
+    assert sim.use_neighbor_list is True
+    assert getattr(sim._compute_forces_compiled, "__func__", None) is PhysicsSim._compute_forces_neighbor_list
+    pos = torch.tensor([[0.0], [1.2]])
+    f_nl = sim._compute_forces_neighbor_list(pos)
+    f_raw = sim._compute_forces_raw(pos)
+    assert torch.allclose(f_nl, f_raw, atol=1e-6), (f_nl, f_raw)
+    # Dispatched path must follow the flag.
+    f_dispatch = sim._compute_forces_compiled(pos)
+    assert torch.allclose(f_dispatch, f_raw, atol=1e-6), (f_dispatch, f_raw)
+
+
+def test_get_potential_energy_requires_grad():
+    # Kills physics_constraints.py:62:11 (not -> identity): non-grad input
+    # must still yield an energy that requires grad for -grad(V).
+    field = _identity_field()
+    pos = torch.tensor([[[0.0], [1.0]]])
+    assert pos.requires_grad is False
+    e = field.get_potential_energy(pos)
+    assert abs(float(e.detach()) - 1.0) < 1e-6, e
+    assert e.requires_grad is True, "energy must require grad"
+    assert e.grad_fn is not None
+
+
+def test_pairwise_mask_multiplies_not_divides():
+    # Kills physics_constraints.py:35:17 (* mask -> / mask): with
+    # _dist_min=0 the diagonal V is exactly 0, so * masks it to 0
+    # (finite, exact forces) while / divides 0/0 on the False diagonal
+    # (nan -> nan forces). With the default 1e-4 floor the mutant still
+    # yields finite forces (diagonal grad is zero), so the zero floor is
+    # required to make the mutant observable.
+    from emergentia.physics_constraints import ConservativeForceField
+    import torch.nn as nn
+
+    class ZeroMinNet(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Identity()
+            self._dist_min = 0.0
+
+    field = ConservativeForceField(ZeroMinNet())
+    pos = torch.tensor([[[0.0], [1.0]]])
+    f = field(pos)
+    assert torch.isfinite(f).all().item(), f
+    assert torch.allclose(f, torch.tensor([[[1.0], [-1.0]]]), atol=1e-6), f
+    e = field.get_potential_energy(pos)
+    assert torch.isfinite(e).item() and abs(float(e.detach()) - 1.0) < 1e-6, e
+
+
+def test_refine_constants_recovers_spring_kills_objective_mutant():
+    # Kills engine.py:605:26 (* -> / gives nan MSE, refine stalls at 9).
+    import sympy as sp
+    import numpy as np
+    from emergentia.engine import DiscoveryPipeline
+    from emergentia.simulator import HarmonicPotential, PhysicsSim
+    r = sp.Symbol("r")
+    torch.manual_seed(0)
+    np.random.seed(0)
+    pot = HarmonicPotential(k=10.0, r0=1.0)
+    sim = PhysicsSim(n=2, dim=2, potential=pot, seed=0,
+                     device=torch.device("cpu"))
+    p_traj = torch.randn(10, 2, 2) * 2.0
+    f_traj = torch.stack([sim._compute_forces_raw(p) for p in p_traj])
+    pipe = DiscoveryPipeline(mode="spring", potential=pot, device="cpu",
+                             seed=0, enable_unit_checker=False,
+                             enable_physics_priors=False,
+                             enable_auto_smoother=False)
+    ref = pipe.refine_constants(sp.Float(9.0) * (r - 1), p_traj, f_traj)
+    fn = sp.lambdify(r, ref, "numpy")
+    assert abs(float(fn(2.0)) - 10.0) < 0.5, ref
+
+
+def test_engine_validate_trajectory_sub_vs_add():
+    # Kills engine.py:865:32 (- -> +): true law diff-error < 2.0,
+    # sum-error is several x larger.
+    import sympy as sp
+    from emergentia.engine import DiscoveryPipeline
+    from emergentia.simulator import HarmonicPotential, PhysicsSim
+    sim = PhysicsSim(n=2, dim=2, potential=HarmonicPotential(), seed=1,
+                     device=torch.device("cpu"))
+    pipe = DiscoveryPipeline(mode="spring", potential=sim.potential, seed=1,
+                             device="cpu", enable_unit_checker=False,
+                             enable_physics_priors=False,
+                             enable_auto_smoother=False)
+    r = sp.Symbol("r")
+    res = pipe.validate_trajectory(-10 * (r - 1), sim, steps=5)
+    assert res["trajectory_mape"] < 2.0, res
+
+
+def test_engine_run_returns_dict():
+    # Kills engine.py:825:8 (return result_dict -> None) via fast mocks.
+    from emergentia.engine import DiscoveryPipeline
+    from emergentia.simulator import HarmonicPotential, PhysicsSim
+    import sympy as sp
+    sim = PhysicsSim(n=2, dim=2, potential=HarmonicPotential(), seed=0,
+                     device=torch.device("cpu"))
+    pipe = DiscoveryPipeline(mode="spring", potential=sim.potential, seed=0,
+                             device="cpu", enable_unit_checker=False,
+                             enable_physics_priors=False,
+                             enable_auto_smoother=False)
+    pipe.train_nn = lambda *a, **k: 0.01
+    pipe.distill_symbolic = lambda *a, **k: sp.Symbol("r")
+    pipe.refine_constants = lambda expr, p, f: expr
+    pipe.validate_trajectory = lambda expr, s, steps=200: {"trajectory_mape": 0.0}
+    sim.generate = lambda steps=2000, noise_std=0.0, impulses=True: (
+        torch.randn(100, 2, 2), torch.randn(100, 2, 2))
+    result = pipe.run(sim, nn_epochs=1, noise_std=0.0)
+    assert isinstance(result, dict), type(result)
+    assert "mode" in result and "formula" in result, result.keys()
+
+
+def test_differentiable_train_early_return_pins_max_idx():
+    # Kills engine.py:930:22 (- 1 -> + 1): T=11, epochs=1 gives n_steps=10,
+    # orig max_idx=0 early-returns, mutant max_idx=2 proceeds to ODE error.
+    import io
+    import contextlib
+    from emergentia.engine import DifferentiableDiscoveryPipeline
+    from emergentia.simulator import HarmonicPotential
+    pipe = DifferentiableDiscoveryPipeline(
+        mode="spring", potential=HarmonicPotential(), device="cpu", seed=0,
+        enable_unit_checker=False, enable_physics_priors=False,
+        enable_auto_smoother=False)
+    p_traj = torch.randn(11, 2, 2)
+    f_traj = torch.randn(11, 2, 2)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        ret = pipe.train_nn(p_traj, f_traj, epochs=1)
+    assert ret == 0.0
+    assert "Not enough timesteps" in buf.getvalue(), buf.getvalue()
