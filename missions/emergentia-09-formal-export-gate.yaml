@@ -66,7 +66,7 @@ verification:
       - emergentia/unit_checker.py
       - emergentia/physics_priors.py
       - emergentia/differentiable_solver.py
-    # physics_priors.py:115:12 [break_return]: `return None` rewritten to
+    # physics_priors.py:118:12 [break_return]: `return None` rewritten to
     # `return None` -- byte-identical source, no test can distinguish it.
     # simulator.py:336:15 [negate_compare] is NOT listed: the dim=1
     # neighbor-list test kills the flip (IndexError on cell_pos[i,1]).
@@ -76,7 +76,7 @@ verification:
     # identically to full*dir*mask. Only perf differs, so no value/grad
     # test can distinguish; suppressed as equivalent.
     equivalent:
-      - "emergentia/physics_priors.py:115:12"
+      - "emergentia/physics_priors.py:118:12"
       - "emergentia/engine.py:601:19"
       - "emergentia/engine.py:612:19"
   timeout_seconds: 3600

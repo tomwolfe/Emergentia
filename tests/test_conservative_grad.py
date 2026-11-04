@@ -573,3 +573,45 @@ def test_gaussian_smoother_4d_returns_input_tensor():
     out = g(x)
     assert isinstance(out, torch.Tensor), type(out)
     assert out is x
+
+
+def test_select_generalizing_max_term_multiplies_not_divides():
+    # Kills engine.py:544:45 (* -> /): the dynamic-range term must grow with
+    # max|y| (x), not shrink (/). gp has smaller amplitude and smaller max, so
+    # the correct penalty prefers gp; the / mutant prefers the template.
+    import sympy as sp
+    from emergentia.engine import DiscoveryPipeline
+    r = sp.Symbol("r")
+    gp = sp.Float(0.001) + sp.Float(1e-12) * r
+    tm = sp.Float(0.002) + sp.Float(1e-12) * r
+    assert DiscoveryPipeline._select_generalizing(r, gp, tm).equals(gp)
+
+
+def test_select_generalizing_unevaluable_gp_loses_to_template():
+    # Kills engine.py:546:16 (except -> return None): an un-evaluable GP
+    # candidate must take infinite penalty, not None (which raises TypeError
+    # on comparison instead of selecting the valid template).
+    import sympy as sp
+    from emergentia.engine import DiscoveryPipeline
+    r = sp.Symbol("r")
+    bad_gp = sp.Function("undefined_fn")(r)
+    tm = sp.Float(0.002) + sp.Float(1e-12) * r
+    assert DiscoveryPipeline._select_generalizing(r, bad_gp, tm).equals(tm)
+
+
+def test_validate_conservativeness_true_and_imaginary():
+    # Kills engine.py:728:19 (return True -> False): r integrates to a
+    # non-constant, imaginary-free potential, so it must validate True;
+    # I*r carries an imaginary potential and must validate False.
+    import sympy as sp
+    from emergentia.engine import DiscoveryPipeline
+    from emergentia.simulator import HarmonicPotential, PhysicsSim
+    sim = PhysicsSim(n=2, dim=2, potential=HarmonicPotential(), seed=1,
+                     device=torch.device("cpu"))
+    pipe = DiscoveryPipeline(mode="spring", potential=sim.potential, seed=1,
+                             device="cpu", enable_unit_checker=False,
+                             enable_physics_priors=False,
+                             enable_auto_smoother=False)
+    r = sp.Symbol("r")
+    assert pipe.validate_conservativeness(r) is True
+    assert pipe.validate_conservativeness(sp.I * r) is False

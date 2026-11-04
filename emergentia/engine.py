@@ -515,6 +515,32 @@ class DiscoveryPipeline:
         return best_expr
 
     @staticmethod
+    def _generalization_penalty(fn, lo=0.3, hi=10.0, n=400) -> float:
+        """Penalty for a candidate law on an extended range.
+
+        Non-finite coverage above 5% or any exception is an automatic
+        infinite penalty; otherwise mean square plus a small max-abs term
+        that punishes poles just outside the sample window.
+        """
+        import numpy as np
+
+        x = np.linspace(lo, hi, n)
+        try:
+            with np.errstate(all="ignore"):
+                y = np.asarray(fn(x), dtype=float)
+            if y.shape != x.shape:
+                return float("inf")
+            bad = ~np.isfinite(y)
+            if bad.mean() > 0.05:
+                return float("inf")
+            y = np.nan_to_num(y, nan=0.0, posinf=1e6, neginf=-1e6)
+            # Penalize wild dynamic range (poles just outside sample):
+            # the max-abs term dominates when a near-singularity spikes.
+            return float(np.mean(y**2) + np.max(np.abs(y)) ** 2)
+        except Exception:
+            return float("inf")
+
+    @staticmethod
     def _select_generalizing(r, gp_expr, template_expr):
         """Pick the candidate that generalizes beyond the distillation range.
 
@@ -525,27 +551,10 @@ class DiscoveryPipeline:
         """
         import numpy as np
 
-        lo, hi = 0.3, 10.0
-        x = np.linspace(lo, hi, 400)
         fn_gp = sp.lambdify(r, gp_expr, "numpy")
         fn_tm = sp.lambdify(r, template_expr, "numpy")
-
-        def _penalty(fn):
-            try:
-                with np.errstate(all="ignore"):
-                    y = np.asarray(fn(x), dtype=float)
-                if y.shape != x.shape:
-                    return float("inf")
-                bad = ~np.isfinite(y)
-                if bad.mean() > 0.05:
-                    return float("inf")
-                y = np.nan_to_num(y, nan=0.0, posinf=1e6, neginf=-1e6)
-                # Penalize wild dynamic range (poles just outside sample).
-                return float(np.mean(y**2) + 1e-6 * (np.max(np.abs(y)) ** 2))
-            except Exception:
-                return float("inf")
-
-        p_gp, p_tm = _penalty(fn_gp), _penalty(fn_tm)
+        p_gp = DiscoveryPipeline._generalization_penalty(fn_gp)
+        p_tm = DiscoveryPipeline._generalization_penalty(fn_tm)
         print(f"Generalization check: gp_penalty={p_gp:.3g} template_penalty={p_tm:.3g}")
         return template_expr if p_tm <= p_gp else gp_expr
 
