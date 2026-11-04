@@ -1,0 +1,13 @@
+# Pinned Emergentia toolchain (mission 00: toolchain-consistency).
+#
+# Install-time counterpart to emergentia/_toolchain.py: `pip install -r
+# tests/toolchain-requirements.txt` reproduces the exact third-party
+# versions the consistency test asserts. Lives under tests/ (rather than
+# the repo root) because mission 00's sandbox permits writes only to
+# emergentia/** and tests/**.
+#
+# The Python interpreter itself cannot be pinned by pip; the test asserts
+# sys.version separately against the documented 3.13.13.
+pytest==8.4.2
+torch==2.10.0
+sympy==1.14.0

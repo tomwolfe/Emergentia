@@ -916,3 +916,47 @@ def test_verify_accepts_expected_axioms(tmp_path, monkeypatch):
     assert payload["verified"] is True
     assert sorted(payload["axioms"]) == [
         "Classical.choice", "Quot.sound", "propext"]
+
+
+# ---------------------------------------------------------------------------
+# Toolchain consistency (mission 00): python/pytest/torch/sympy pins.
+# Lives here (not a separate file) so the mission’s fixed verification
+# commands actually execute it.
+# ---------------------------------------------------------------------------
+
+from emergentia._toolchain import TOOLCHAIN, check_toolchain, get_actual_versions
+
+
+def test_toolchain_versions_consistent():
+    actual = get_actual_versions()
+    mismatches = check_toolchain()
+    assert not mismatches, (
+        "toolchain mismatch: "
+        + "; ".join(mismatches)
+        + f" (expected={TOOLCHAIN}, actual={actual})"
+    )
+
+
+def test_toolchain_pin_covers_required_keys():
+    assert set(TOOLCHAIN) == {"python", "pytest", "torch", "sympy"}
+    assert all(isinstance(v, str) and v for v in TOOLCHAIN.values())
+
+
+def test_toolchain_pins_match_requirements_file():
+    # Single source of truth: the install-time pins in
+    # tests/toolchain-requirements.txt must agree with the TOOLCHAIN record
+    # the test-time check asserts. A divergence mutant in either file fails.
+    import pathlib
+    req = pathlib.Path(__file__).with_name("toolchain-requirements.txt")
+    assert req.is_file(), req
+    pinned = {}
+    for line in req.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        name, _, version = line.partition("==")
+        assert version, line
+        pinned[name.strip()] = version.strip()
+    assert pinned, req
+    for name, version in pinned.items():
+        assert TOOLCHAIN.get(name) == version, (name, TOOLCHAIN.get(name), version)
