@@ -88,9 +88,12 @@ class PhysicsPriorProvider:
             "description": "Composite potential (combination of forces)",
             "expected_terms": ["combination", "sum", "subtraction", "weighted"],
             "suggested_functional_forms": [
-                "combination of terms",
-                "weighted sum",
-                "superposition",
+                "1/r^2 + r",
+                "constant - r + 1/r^2",
+                "1/r^2",
+                "r",
+                "1/r^7 + r",
+                "constant - r",
             ],
         },
     }

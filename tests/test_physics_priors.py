@@ -137,7 +137,7 @@ def test_to_gplearn_exp_log_sqrt_and_unknown_func():
 
 def test_prior_counts_exact_per_mode():
     # Exact per-mode counts kill mutants that add/remove suggested forms.
-    # Note: some raw strings (e.g. "exp(-2r)", "combination of terms") fail
+    # Note: some raw strings (e.g. "exp(-2r)") fail
     # sympy parsing and are filtered, so counts are post-parse lengths.
     provider = PhysicsPriorProvider()
     expected = {
@@ -148,7 +148,7 @@ def test_prior_counts_exact_per_mode():
         "buckingham": 4,
         "yukawa": 4,
         "electric": 4,
-        "mixed": 1,
+        "mixed": 6,
     }
     for mode, count in expected.items():
         assert len(provider.generate_priors(mode)) == count, mode

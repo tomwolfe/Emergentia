@@ -56,8 +56,11 @@ def test_mixed_potential_discovery_with_noise():
     result = pipeline.run(sim, nn_epochs=500, noise_std=0.01)
     
     # Check that R^2 is positive and the model is learning something meaningful
-    # Even with noise, it should achieve some level of correlation
-    assert result['r2'] > 0.20, f"Expected R^2 > 0.20, got {result['r2']}"
+    # Even with noise, it should achieve some level of correlation.
+    # Tightened from 0.20 to 0.85 after the mixed-potential gap was closed
+    # (conservative field + composite priors + generalizing selection);
+    # tests/test_mixed_r2_085.py pins the full 1000-epoch bar independently.
+    assert result['r2'] > 0.85, f"Expected R^2 > 0.85, got {result['r2']}"
     print(f"Test passed: R^2 = {result['r2']:.4f}")
 
 

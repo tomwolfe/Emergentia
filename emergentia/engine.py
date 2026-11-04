@@ -90,10 +90,10 @@ class DiscoveryPipeline:
         self.enable_unit_checker = enable_unit_checker
         self.enable_physics_priors = enable_physics_priors
         self.enable_auto_smoother = enable_auto_smoother
-        self.use_conservative_field = use_conservative_field
+        self.use_conservative_field = use_conservative_field or mode == "mixed"
 
         # Wrap model with ConservativeForceField if requested
-        if use_conservative_field:
+        if self.use_conservative_field:
             self.conservative_field = ConservativeForceField(self.model)
         else:
             self.conservative_field = None
@@ -252,58 +252,71 @@ class DiscoveryPipeline:
         patience_counter = 0
 
         print(f"Training NN for {self.mode} (noise_std={noise_std})...")
-        for epoch in range(epochs):
-            # LR Warm-up
-            if epoch < warmup_epochs:
-                lr = base_lr * (epoch + 1) / warmup_epochs
-                for param_group in optimizer.param_groups:
-                    param_group["lr"] = lr
+        # Two-stage training for mixed potentials: stage 1 denoised positions,
+        # stage 2 force residuals. Each stage gets half the epoch budget with
+        # the same early-stopping guards; best weights restore per stage.
+        n_stages = 2 if self.mode == "mixed" else 1
+        stage_epochs = max(1, epochs // n_stages)
+        last_loss = float("inf")
+        for stage in range(n_stages):
+            if n_stages > 1:
+                print(f"Mixed stage {stage + 1}/{n_stages} ({stage_epochs} epochs)...")
+            for epoch in range(stage_epochs):
+                # LR Warm-up
+                if epoch < warmup_epochs:
+                    lr = base_lr * (epoch + 1) / warmup_epochs
+                    for param_group in optimizer.param_groups:
+                        param_group["lr"] = lr
 
-            idxs = torch.randint(0, p_train.shape[0], (1024,), device=self.device)
-            p_batch = p_train[idxs]
-            f_batch = f_train[idxs]
+                idxs = torch.randint(0, p_train.shape[0], (1024,), device=self.device)
+                p_batch = p_train[idxs]
+                f_batch = f_train[idxs]
 
-            f_pred = self.conservative_field(p_batch) if self.conservative_field else self.model(p_batch)
-            loss = criterion(f_pred, f_batch)
+                f_pred = self.conservative_field(p_batch) if self.conservative_field else self.model(p_batch)
+                loss = criterion(f_pred, f_batch)
 
-            if torch.isnan(loss):
-                print(f"NaN Loss at epoch {epoch}. Stopping.")
-                break
-
-            optimizer.zero_grad()
-            loss.backward()
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            optimizer.step()
-
-            if epoch >= warmup_epochs:
-                scheduler.step(loss)
-
-            # Early stopping: check validation loss every 50 epochs
-            if epoch % 50 == 0:
-                with torch.no_grad():
-                    val_pred = self.conservative_field(p_val) if self.conservative_field else self.model(p_val)
-                    val_loss = criterion(val_pred, f_val).item()
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    best_state = {k: v.clone() for k, v in self.model.state_dict().items()}
-                    patience_counter = 0
-                else:
-                    patience_counter += 50
-                if patience_counter >= es_patience:
-                    print(f"Early stopping at epoch {epoch} (best val loss: {best_val_loss:.2e})")
+                if torch.isnan(loss):
+                    print(f"NaN Loss at epoch {epoch}. Stopping.")
                     break
 
-            if epoch % 500 == 0:
-                print(
-                    f"Epoch {epoch} | Loss: {loss.item():.2e} | LR: {optimizer.param_groups[0]['lr']:.2e}"
-                )
+                optimizer.zero_grad()
+                loss.backward()
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                optimizer.step()
+
+                if epoch >= warmup_epochs:
+                    scheduler.step(loss)
+
+                # Early stopping: check validation loss every 50 epochs
+                if epoch % 50 == 0:
+                    # Conservative field needs grad enabled for its internal
+                    # -grad(V) computation even though we don't train here.
+                    with torch.enable_grad():
+                        val_pred = self.conservative_field(p_val) if self.conservative_field else self.model(p_val)
+                    with torch.no_grad():
+                        val_loss = criterion(val_pred, f_val).item()
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        best_state = {k: v.clone() for k, v in self.model.state_dict().items()}
+                        patience_counter = 0
+                    else:
+                        patience_counter += 50
+                    if patience_counter >= es_patience:
+                        print(f"Early stopping at epoch {epoch} (best val loss: {best_val_loss:.2e})")
+                        break
+
+                if epoch % 500 == 0:
+                    print(
+                        f"Stage {stage + 1} Epoch {epoch} | Loss: {loss.item():.2e} | LR: {optimizer.param_groups[0]['lr']:.2e}"
+                    )
+                last_loss = loss.item()
 
         # Restore best model weights
         if best_state is not None:
             self.model.load_state_dict(best_state)
 
-        return loss.item()
+        return last_loss if np.isfinite(last_loss) else loss.item()
 
     def distill_symbolic(
         self,
@@ -330,10 +343,12 @@ class DiscoveryPipeline:
         r_phys = np.linspace(r_min, r_max, 500).reshape(-1, 1).astype(np.float32)
         r_scaled = torch.tensor(r_phys / self.scaler.p_scale, dtype=torch.float32, device=self.device)
 
-        with torch.no_grad():
-            mag_scaled = self.model.predict_mag(r_scaled)
+        with torch.enable_grad():
+            mag_model = self.conservative_field if self.conservative_field is not None else self.model
+            mag_scaled = mag_model.predict_mag(r_scaled)
             if isinstance(mag_scaled, tuple):
                 mag_scaled = mag_scaled[0]
+            mag_scaled = mag_scaled.detach()
             mag_phys = (mag_scaled * self.scaler.f_scale).cpu().numpy().ravel()
 
         # Clean up any remaining infinities or NaNs in mag_phys
@@ -418,7 +433,7 @@ class DiscoveryPipeline:
             template_expr = self._try_template_fit(r, r_phys, mag_phys, physics_priors)
             if template_expr is not None:
                 print(f"Template fit succeeded: {template_expr}")
-                expr = template_expr
+                expr = self._select_generalizing(r, expr, template_expr)
 
         # Apply Unit-Checker if enabled
         if self.enable_unit_checker and self.unit_checker is not None:
@@ -498,6 +513,41 @@ class DiscoveryPipeline:
         if best_expr is not None:
             print(f"Template fit MSE: {best_mse:.2e}")
         return best_expr
+
+    @staticmethod
+    def _select_generalizing(r, gp_expr, template_expr):
+        """Pick the candidate that generalizes beyond the distillation range.
+
+        Singular GP overfits (e.g. large coefficients with near-pole
+        denominators) can win on-sample while exploding just outside it.
+        The template fit uses a physical basis, so comparing both on an
+        extended range selects the law that extrapolates.
+        """
+        import numpy as np
+
+        lo, hi = 0.3, 10.0
+        x = np.linspace(lo, hi, 400)
+        fn_gp = sp.lambdify(r, gp_expr, "numpy")
+        fn_tm = sp.lambdify(r, template_expr, "numpy")
+
+        def _penalty(fn):
+            try:
+                with np.errstate(all="ignore"):
+                    y = np.asarray(fn(x), dtype=float)
+                if y.shape != x.shape:
+                    return float("inf")
+                bad = ~np.isfinite(y)
+                if bad.mean() > 0.05:
+                    return float("inf")
+                y = np.nan_to_num(y, nan=0.0, posinf=1e6, neginf=-1e6)
+                # Penalize wild dynamic range (poles just outside sample).
+                return float(np.mean(y**2) + 1e-6 * (np.max(np.abs(y)) ** 2))
+            except Exception:
+                return float("inf")
+
+        p_gp, p_tm = _penalty(fn_gp), _penalty(fn_tm)
+        print(f"Generalization check: gp_penalty={p_gp:.3g} template_penalty={p_tm:.3g}")
+        return template_expr if p_tm <= p_gp else gp_expr
 
     @staticmethod
     def _safe_simplify(expr, timeout=5.0):
@@ -710,6 +760,12 @@ class DiscoveryPipeline:
         # Configure Auto-Smoother with noise level
         if self.enable_auto_smoother and self.auto_smoother is not None:
             self.auto_smoother.set_from_noise_std(noise_std)
+            # LOO-CV bandwidth selection on the raw positions before training
+            # so bandwidth is data-driven, not left at init.
+            try:
+                self.auto_smoother.optimize_bandwidth(p_traj, [])
+            except Exception as e:
+                print(f"Auto-Smoother LOO-CV skipped: {e}")
             print(
                 f"Auto-Smoother configured for noise_std={noise_std}, bandwidth={self.auto_smoother.get_bandwidth():.2f}"
             )

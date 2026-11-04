@@ -21,9 +21,18 @@ class ConservativeForceField(nn.Module):
 
     def _pairwise_potential(self, dist):
         """Compute pairwise potentials from distances using the inner network."""
+        net = getattr(self.potential_net, "net", None)
+        if net is None and hasattr(self.potential_net, "members"):
+            # Ensemble: mean potential across members.
+            dmin = min(getattr(m, "_dist_min", 1e-4) for m in self.potential_net.members)
+            dist_safe = torch.clamp(dist, min=dmin)
+            return torch.mean(
+                torch.stack([m.net(dist_safe) for m in self.potential_net.members]),
+                dim=0,
+            )
         dmin = getattr(self.potential_net, '_dist_min', 1e-4)
         dist_safe = torch.clamp(dist, min=dmin)
-        return self.potential_net.net(dist_safe)
+        return net(dist_safe)
 
     def forward(self, pos):
         if not pos.requires_grad:

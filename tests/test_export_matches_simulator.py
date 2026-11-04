@@ -96,10 +96,17 @@ def test_lemma_force_half_matches_simulator(name):
 
 
 def _export_lemmas() -> dict[str, str]:
-    text = (Path(__file__).parent.parent / "scripts"
-            / "export_emergentia_to_qed.py").read_text()
-    body = text.split("LEMMAS", 1)[1]
-    return dict(re.findall(r'"(\w+)":\s*"([^"]+?)\s*=\s*0"', body))
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "export_emergentia_to_qed",
+        Path(__file__).parent.parent / "scripts" / "export_emergentia_to_qed.py",
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    out = {}
+    for name, lemma in mod.LEMMAS.items():
+        out[name] = re.sub(r"\s*=\s*0\s*$", "", lemma)
+    return out
 
 
 def test_export_file_matches_test_halves():
