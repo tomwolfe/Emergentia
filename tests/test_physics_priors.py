@@ -960,3 +960,51 @@ def test_toolchain_pins_match_requirements_file():
     assert pinned, req
     for name, version in pinned.items():
         assert TOOLCHAIN.get(name) == version, (name, TOOLCHAIN.get(name), version)
+
+
+# ---------------------------------------------------------------------------
+# Mission 02 pins (must live in this file: the 02 gate executes exactly
+# tests/test_physics_priors.py + tests/test_registry_consistency.py).
+# ---------------------------------------------------------------------------
+
+def test_mission02_reduced_units_defaults_false():
+    # Goal: reduced_units defaults False (strict SI checking out of the box).
+    import inspect
+    from emergentia.unit_checker import UnitChecker
+    sig = inspect.signature(UnitChecker.__init__)
+    assert sig.parameters["reduced_units"].default is False
+    assert UnitChecker().reduced_units is False
+    assert UnitChecker(mode="gravity").reduced_units is False
+
+
+def test_mission02_inconsistent_add_returns_nan_and_fails_closed():
+    # Goal: inconsistent Add (r + G, length + gravity-constant) returns a NaN
+    # signature with is_consistent False -- fail-closed, no exception, no
+    # silent pass. DimensionalInconsistencyError is the caller-raised type;
+    # the checker itself reports (False, nan-sig).
+    import math
+    import sympy as sp
+    from emergentia.unit_checker import UnitChecker
+    c = UnitChecker(mode="gravity")
+    ok, metric, signature, message = c.check_consistency(
+        sp.Symbol("r") + sp.Symbol("G"))
+    assert ok is False
+    assert any(math.isnan(d) for d in signature), signature
+    assert metric == 0.0, metric
+    assert isinstance(message, str) and message
+
+
+def test_mission02_mode_tables_do_not_leak_across_instances():
+    # Hardening: mode-specific keys must live on the instance table, not the
+    # class attribute. Constructing an electric checker used to permanently
+    # register k_e/inv_k_e for every later checker (including strict ones in
+    # other modes). Killed mutants: the per-instance dict copy in __init__.
+    import sympy as sp
+    from emergentia.unit_checker import UnitChecker
+    UnitChecker(mode="electric")
+    generic = UnitChecker(mode="generic")
+    assert generic._get_atom_dimensions(sp.Symbol("k_e")) == (0, 0, 0, 0)
+    assert "k_e" not in UnitChecker.VARIABLE_DIMENSIONS
+    assert "inv_k_e" not in UnitChecker.VARIABLE_DIMENSIONS
+    electric = UnitChecker(mode="electric")
+    assert electric.VARIABLE_DIMENSIONS["k_e"] == (1, 3, -2, -2)

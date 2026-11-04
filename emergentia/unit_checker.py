@@ -130,6 +130,12 @@ class UnitChecker:
     def __init__(self, mode: str = "generic", reduced_units: bool = False):
         self.mode = mode
         self.reduced_units = reduced_units
+        # Per-instance table: mode setup below must not mutate the class
+        # attribute, otherwise constructing e.g. mode="electric" permanently
+        # registers k_e/inv_k_e for every later checker (including strict
+        # ones in other modes). Class-level reads keep working because the
+        # copy starts identical to the class table.
+        self.VARIABLE_DIMENSIONS = dict(self.VARIABLE_DIMENSIONS)
         self._setup_mode_specific_dimensions()
 
     def _setup_mode_specific_dimensions(self):
