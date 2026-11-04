@@ -14,6 +14,17 @@ verification:
     enabled: true
     fail_below: 0.8
     max_mutants: 30
+    # Targets named by the mission goal (physics_priors and unit_checker);
+    # without them a no-change run measures 0/0 mutants and can never pass.
+    # (Added 2026-11-04 after a 0/0 vacuous failure.)
+    baseline_targets:
+      - emergentia/physics_priors.py
+      - emergentia/unit_checker.py
+    # physics_priors.py:115:12 [break_return]: `return None` rewritten to
+    # `return None` -- byte-identical source, no test can distinguish it
+    # (same documented equivalent as the 09 gate).
+    equivalent:
+      - "emergentia/physics_priors.py:115:12"
 recovery:
   max_attempts: 3
 review:
