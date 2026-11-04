@@ -795,8 +795,13 @@ def test_export_main_guard_runs_as_script(tmp_path):
 def test_verify_default_qed_dir_points_at_sibling_qed():
     verify_mod = _load_export_script_module(
         "verify_emergentia_axioms", "verify_emergentia_axioms.py")
+    from pathlib import Path as _Path
+    expected = _Path(verify_mod.__file__).resolve().parents[2] / "QED"
     default = verify_mod._default_qed_dir()
+    assert default == expected, (default, expected)
     assert default.name == "QED"
+    if not expected.is_dir():
+        pytest.skip("no QED sibling staged in this room (Emergentia-only gate)")
     assert default.is_dir()
 
 
