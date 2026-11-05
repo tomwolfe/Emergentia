@@ -117,3 +117,45 @@ def test_export_file_matches_test_halves():
         assert norm(exported[name]) == norm(f"{f_half} + {d_half}"), (
             f"{name}: export lemma drifted from test pins"
         )
+
+
+def _load_export_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "export_emergentia_to_qed",
+        Path(__file__).parent.parent / "scripts" / "export_emergentia_to_qed.py",
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_export_main_returns_zero_int(tmp_path):
+    """Pin main() exit contract: int 0 on both branches.
+
+    Kills break_return mutants (``return 0`` -> ``return None``) which keep
+    the subprocess exit code at 0 via ``SystemExit(None)``.
+    """
+    mod = _load_export_module()
+    out = tmp_path / "lemmas.txt"
+    lean = tmp_path / "EmergentiaExport.lean"
+    rc = mod.main(["--out", str(out), "--lean-out", str(lean)])
+    assert rc == 0, f"main() must return 0, got {rc!r}"
+    assert isinstance(rc, int), f"main() must return int, got {type(rc)}"
+    assert out.is_file() and lean.is_file()
+    rc_stdout = mod.main(["--stdout"],)
+    assert rc_stdout == 0, f"main(--stdout) must return 0, got {rc_stdout!r}"
+    assert isinstance(rc_stdout, int)
+
+
+def test_check_identity_returns_derivative():
+    """Pin _check_identity return: the dV/dr expression, not None.
+
+    Kills the break_return mutant on ``return dV`` whose value is otherwise
+    discarded by build_from_simulator().
+    """
+    mod = _load_export_module()
+    r, k, r0 = sp.symbols("r k r0")
+    dV = mod._check_identity(-k * (r - r0), k * (r - r0) ** 2 / 2, r)
+    assert dV is not None, "_check_identity must return dV, got None"
+    assert sp.expand(dV - k * (r - r0)) == 0

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Hardened: main() must return int 0 and _check_identity must return dV;
+# pinned by tests/test_export_matches_simulator.py (return-value teeth).
 """Export Emergentia F(r) = -dV/dr lemmas to QED-parseable text.
 
 Mirrors the VeriTrial and DRIFT exporter scripts: deterministic lemma strings,
