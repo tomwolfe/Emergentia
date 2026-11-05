@@ -615,3 +615,12 @@ def test_validate_conservativeness_true_and_imaginary():
     r = sp.Symbol("r")
     assert pipe.validate_conservativeness(r) is True
     assert pipe.validate_conservativeness(sp.I * r) is False
+
+
+def test_validate_conservativeness_fail_closed_on_exception():
+    # Kills engine.py:739:12 [break_return] (except: return False -> True/None):
+    # non-sympifiable input must raise inside sp.integrate and fail closed
+    # to exactly False (strict identity kills True and None mutants).
+    from emergentia.engine import DiscoveryPipeline
+    pipe = DiscoveryPipeline.__new__(DiscoveryPipeline)
+    assert pipe.validate_conservativeness(object()) is False

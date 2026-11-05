@@ -433,7 +433,7 @@ class DiscoveryPipeline:
             template_expr = self._try_template_fit(r, r_phys, mag_phys, physics_priors)
             if template_expr is not None:
                 print(f"Template fit succeeded: {template_expr}")
-                expr = self._select_generalizing(r, expr, template_expr)
+                expr = self._select_generalizing(r, expr, template_expr, r_phys.ravel(), mag_phys)
 
         # Apply Unit-Checker if enabled
         if self.enable_unit_checker and self.unit_checker is not None:
@@ -541,18 +541,43 @@ class DiscoveryPipeline:
             return float("inf")
 
     @staticmethod
-    def _select_generalizing(r, gp_expr, template_expr):
+    def _select_generalizing(r, gp_expr, template_expr, X=None, y=None):
         """Pick the candidate that generalizes beyond the distillation range.
 
         Singular GP overfits (e.g. large coefficients with near-pole
         denominators) can win on-sample while exploding just outside it.
         The template fit uses a physical basis, so comparing both on an
         extended range selects the law that extrapolates.
+
+        When the in-sample distillation data (X, y) is provided, a template
+        that explains it (R^2 > 0.999) and is strictly simpler (fewer sympy
+        ops) than the GP expression wins outright: a low-dimensional
+        physical-basis fit cannot overfit the distillation curve, while a
+        deep GP expression that merely matches it is the overfit risk. The
+        extended-range penalty below measures magnitude, not correctness,
+        so it can prefer a small overfit artifact over the true growing law.
         """
         import numpy as np
 
         fn_gp = sp.lambdify(r, gp_expr, "numpy")
         fn_tm = sp.lambdify(r, template_expr, "numpy")
+        if X is not None and y is not None:
+            try:
+                Xa = np.asarray(X, dtype=float).ravel()
+                ya = np.asarray(y, dtype=float).ravel()
+                if Xa.shape == ya.shape and ya.size > 0 and np.all(np.isfinite(ya)):
+                    var_y = float(np.var(ya))
+                    if var_y > 1e-9:
+                        with np.errstate(all="ignore"):
+                            y_tm = np.asarray(fn_tm(Xa), dtype=float)
+                        if y_tm.shape == ya.shape and np.all(np.isfinite(y_tm)):
+                            mse_tm = float(np.mean((y_tm - ya) ** 2))
+                            r2_tm = 1.0 - mse_tm / var_y
+                            if r2_tm > 0.999 and int(template_expr.count_ops()) < int(gp_expr.count_ops()):
+                                print(f"Generalization check: template explains distillation data (R^2={r2_tm:.5f}) with fewer ops; selecting template")
+                                return template_expr
+            except Exception as e:
+                print(f"Generalization parsimony check skipped: {e}")
         p_gp = DiscoveryPipeline._generalization_penalty(fn_gp)
         p_tm = DiscoveryPipeline._generalization_penalty(fn_tm)
         print(f"Generalization check: gp_penalty={p_gp:.3g} template_penalty={p_tm:.3g}")
