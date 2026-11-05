@@ -75,10 +75,17 @@ verification:
     # shape is the identity; for scalar mag, scalar*dir*mask broadcasts
     # identically to full*dir*mask. Only perf differs, so no value/grad
     # test can distinguish; suppressed as equivalent.
+    # engine.py:763:11 [negate_compare] (`remainder > 0` -> `<=`):
+    # value-equivalent. run() hardcodes steps=2000 with chunk_size=50, so
+    # remainder is always 0; train_chunks is drawn from permutation(40), so
+    # n_chunks=40 is never a member. Both spellings skip the branch on every
+    # reachable input; only a steps%50 != 0 caller could distinguish, and
+    # run() has no such caller.
     equivalent:
       - "emergentia/physics_priors.py:118:12"
       - "emergentia/engine.py:601:19"
       - "emergentia/engine.py:612:19"
+      - "emergentia/engine.py:763:11"
   timeout_seconds: 3600
 recovery:
   max_attempts: 3
@@ -87,7 +94,7 @@ review:
   adapter: opencode
 budget:
   max_sends: 24
-  max_wall_seconds: 5400
+  max_wall_seconds: 7200
 adapter: opencode
 adapters:
   opencode:

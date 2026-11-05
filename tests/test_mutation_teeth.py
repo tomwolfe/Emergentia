@@ -76,6 +76,13 @@ def test_validate_conservativeness_rejects_imaginary():
     assert pipe.validate_conservativeness(sp.I * r) is False
 
 
+def test_validate_conservativeness_fail_closed_on_invalid_input():
+    # Kills the except-branch break_return: integration must raise and the
+    # method must return False (not None) on non-sympifiable input.
+    pipe = DiscoveryPipeline.__new__(DiscoveryPipeline)
+    assert pipe.validate_conservativeness(object()) is False
+
+
 def test_parse_fail_closed_returns_none():
     provider = PhysicsPriorProvider()
     assert provider._parse("not a valid expression @@") is None
